@@ -1,0 +1,15 @@
+#vs及git缓存
+.vs/
+.git/
+#编译输出和CMake缓存
+build/
+triplets/
+#vcpkg安装包和依赖
+vcpkg_installed/
+proto/
+deps/
+#日志文件
+*.log
+test/
+#临时文件
+*.tmp

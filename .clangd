@@ -1,0 +1,6 @@
+# ClangD 配置，辅助 VS IntelliSense 找到生成的 protobuf 头文件
+CompileFlags:
+  Add:
+    - -ID:/Users/21405/source/repos/AgentBackendPredict/build/x64-Release
+    - -ID:/Users/21405/source/repos/AgentBackendPredict/build/x64-Debug
+    - -ID:/Users/21405/source/repos/vcpkg/installed/x64-windows/include

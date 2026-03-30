@@ -1,0 +1,203 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows Release
+            os: windows-latest
+            triplet: x64-windows
+            build_dir: build/gha-windows
+            artifact_dir: build/gha-windows/Release
+            ort_url: https://github.com/microsoft/onnxruntime/releases/download/v1.17.1/onnxruntime-win-x64-1.17.1.zip
+            ort_archive: deps/onnxruntime-win-x64-1.17.1.zip
+            ort_root: deps/onnxruntime-win-x64-1.17.1
+          - name: Ubuntu Release
+            os: ubuntu-latest
+            triplet: x64-linux
+            build_dir: build/gha-linux
+            artifact_dir: build/gha-linux
+            ort_url: https://github.com/microsoft/onnxruntime/releases/download/v1.17.1/onnxruntime-linux-x64-1.17.1.tgz
+            ort_archive: deps/onnxruntime-linux-x64-1.17.1.tgz
+            ort_root: deps/onnxruntime-linux-x64-1.17.1
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache vcpkg installed tree
+        uses: actions/cache@v4
+        with:
+          path: vcpkg_installed/${{ matrix.triplet }}
+          key: ${{ runner.os }}-${{ matrix.triplet }}-vcpkg-${{ hashFiles('vcpkg.json', 'CMakeLists.txt', '.github/workflows/ci.yml') }}
+
+      - name: Cache ONNX Runtime archive
+        uses: actions/cache@v4
+        with:
+          path: ${{ matrix.ort_archive }}
+          key: ${{ runner.os }}-ort-${{ hashFiles('.github/workflows/ci.yml') }}-${{ matrix.ort_archive }}
+
+      - name: Install Ubuntu build tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build pkg-config curl tar unzip zip
+
+      - name: Bootstrap vcpkg (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (-not (Test-Path vcpkg)) {
+            git clone --depth 1 https://github.com/microsoft/vcpkg.git vcpkg
+          }
+          & .\vcpkg\bootstrap-vcpkg.bat -disableMetrics
+
+      - name: Bootstrap vcpkg (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          if [[ ! -d vcpkg ]]; then
+            git clone --depth 1 https://github.com/microsoft/vcpkg.git vcpkg
+          fi
+          ./vcpkg/bootstrap-vcpkg.sh -disableMetrics
+
+      - name: Install dependencies (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $manifestDir = Join-Path $pwd ".ci-vcpkg"
+          New-Item -ItemType Directory -Force -Path $manifestDir | Out-Null
+          @'
+          {
+            "name": "ci-deps",
+            "version-string": "1",
+            "dependencies": [
+              "grpc",
+              "protobuf"
+            ]
+          }
+          '@ | Set-Content -LiteralPath (Join-Path $manifestDir "vcpkg.json")
+          & .\vcpkg\vcpkg.exe install --triplet ${{ matrix.triplet }} --x-manifest-root="$manifestDir" --x-install-root="$pwd\vcpkg_installed"
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          manifest_dir="$GITHUB_WORKSPACE/.ci-vcpkg"
+          mkdir -p "$manifest_dir"
+          cat > "$manifest_dir/vcpkg.json" <<'EOF'
+          {
+            "name": "ci-deps",
+            "version-string": "1",
+            "dependencies": [
+              "grpc",
+              "protobuf"
+            ]
+          }
+          EOF
+          ./vcpkg/vcpkg install --triplet ${{ matrix.triplet }} --x-manifest-root="$manifest_dir" --x-install-root="$GITHUB_WORKSPACE/vcpkg_installed"
+
+      - name: Download ONNX Runtime (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          .\.github\scripts\download-onnxruntime.ps1 `
+            -Url "${{ matrix.ort_url }}" `
+            -ArchivePath "${{ github.workspace }}\${{ matrix.ort_archive }}" `
+            -ExtractRoot "${{ github.workspace }}\deps" `
+            -ExpectedRoot "${{ github.workspace }}\${{ matrix.ort_root }}"
+
+      - name: Download ONNX Runtime (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          chmod +x .github/scripts/download-onnxruntime.sh
+          ./.github/scripts/download-onnxruntime.sh \
+            "${{ matrix.ort_url }}" \
+            "${{ github.workspace }}/${{ matrix.ort_archive }}" \
+            "${{ github.workspace }}/deps" \
+            "${{ github.workspace }}/${{ matrix.ort_root }}"
+
+      - name: Configure (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cmake -S . -B "${{ matrix.build_dir }}" `
+            -G "Visual Studio 17 2022" `
+            -A x64 `
+            -DCMAKE_CONFIGURATION_TYPES=Release `
+            -DBERT_VCPKG_TRIPLET=${{ matrix.triplet }} `
+            -DBERT_USE_ONNXRUNTIME_GPU=OFF `
+            -DONNXRUNTIME_CPU_ROOT="${{ github.workspace }}\${{ matrix.ort_root }}"
+
+      - name: Configure (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          cmake -S . -B "${{ matrix.build_dir }}" \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBERT_VCPKG_TRIPLET=${{ matrix.triplet }} \
+            -DBERT_USE_ONNXRUNTIME_GPU=OFF \
+            -DONNXRUNTIME_CPU_ROOT="${{ github.workspace }}/${{ matrix.ort_root }}"
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cmake --build "${{ matrix.build_dir }}" --config Release --parallel
+
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          cmake --build "${{ matrix.build_dir }}" --parallel
+
+      - name: Verify build outputs (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "${{ github.workspace }}\${{ matrix.artifact_dir }}\bert_inference_server.exe")) {
+            throw "bert_inference_server.exe was not produced"
+          }
+          Get-ChildItem "${{ github.workspace }}\${{ matrix.artifact_dir }}"
+
+      - name: Verify build outputs (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          test -x "${{ github.workspace }}/${{ matrix.artifact_dir }}/bert_inference_server"
+          ls -la "${{ github.workspace }}/${{ matrix.artifact_dir }}"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: bert-inference-${{ matrix.triplet }}
+          if-no-files-found: error
+          path: |
+            ${{ matrix.artifact_dir }}/bert_inference_server*
+            ${{ matrix.artifact_dir }}/bert_inference_client*
+            ${{ matrix.artifact_dir }}/bert_benchmark_client*
+            ${{ matrix.artifact_dir }}/onnxruntime*.dll
+            ${{ matrix.artifact_dir }}/libonnxruntime*.so*
+            ${{ matrix.artifact_dir }}/*.dll
+            ${{ matrix.artifact_dir }}/*.so*

@@ -41,7 +41,7 @@ public:
         ClientContext context;
         Status status = stub_->Predict(&context, request, response);
 
-        return status.ok();
+        return status.ok() && response->error().empty();
     }
 
     bool PredictBatch(size_t batch_size,
@@ -68,14 +68,14 @@ public:
         ClientContext context;
         Status status = stub_->PredictBatch(&context, request, response);
 
-        return status.ok();
+        return status.ok() && response->error().empty();
     }
 
 private:
     std::unique_ptr<BERTInference::Stub> stub_;
 };
 
-void TestSingle(BERTClient& client, size_t seq_len) {
+bool TestSingle(BERTClient& client, size_t seq_len) {
     std::cout << "\n=== Single Prediction Test ===" << std::endl;
 
     std::vector<int64_t> input_ids(seq_len, 101);  // [CLS]
@@ -101,9 +101,10 @@ void TestSingle(BERTClient& client, size_t seq_len) {
     } else {
         std::cout << "Failed: " << response.error() << std::endl;
     }
+    return success;
 }
 
-void TestBatch(BERTClient& client, size_t batch_size, size_t seq_len) {
+bool TestBatch(BERTClient& client, size_t batch_size, size_t seq_len) {
     std::cout << "\n=== Batch Prediction Test (batch=" << batch_size << ") ===" << std::endl;
 
     PredictBatchResponse response;
@@ -122,9 +123,10 @@ void TestBatch(BERTClient& client, size_t batch_size, size_t seq_len) {
     } else {
         std::cout << "Failed: " << response.error() << std::endl;
     }
+    return success;
 }
 
-void Benchmark(BERTClient& client, size_t iterations, size_t seq_len) {
+bool Benchmark(BERTClient& client, size_t iterations, size_t seq_len) {
     std::cout << "\n=== Benchmark (" << iterations << " iterations) ===" << std::endl;
 
     std::vector<int64_t> input_ids(seq_len, 101);
@@ -134,14 +136,20 @@ void Benchmark(BERTClient& client, size_t iterations, size_t seq_len) {
     // 预热
     PredictResponse warmup;
     for (int i = 0; i < 5; ++i) {
-        client.Predict(input_ids, attention_mask, personality, &warmup);
+        if (!client.Predict(input_ids, attention_mask, personality, &warmup)) {
+            std::cout << "Warmup failed" << std::endl;
+            return false;
+        }
     }
 
     // 正式测试
     auto start = std::chrono::high_resolution_clock::now();
     for (size_t i = 0; i < iterations; ++i) {
         PredictResponse response;
-        client.Predict(input_ids, attention_mask, personality, &response);
+        if (!client.Predict(input_ids, attention_mask, personality, &response)) {
+            std::cout << "Benchmark request failed at iteration " << i << std::endl;
+            return false;
+        }
     }
     auto end = std::chrono::high_resolution_clock::now();
 
@@ -151,6 +159,7 @@ void Benchmark(BERTClient& client, size_t iterations, size_t seq_len) {
     std::cout << "Total: " << total_ms << " ms" << std::endl;
     std::cout << "Average: " << avg_ms << " ms/call" << std::endl;
     std::cout << "Throughput: " << (1000.0 / avg_ms) << " calls/sec" << std::endl;
+    return true;
 }
 
 int main(int argc, char** argv) {
@@ -165,14 +174,14 @@ int main(int argc, char** argv) {
     BERTClient client(channel);
 
     // 测试单条
-    TestSingle(client, 64);
+    const bool single_ok = TestSingle(client, 64);
 
     // 测试不同 batch 大小
-    TestBatch(client, 4, 64);
-    TestBatch(client, 8, 64);
+    const bool batch4_ok = TestBatch(client, 4, 64);
+    const bool batch8_ok = TestBatch(client, 8, 64);
 
     // 基准测试
-    Benchmark(client, 100, 64);
+    const bool benchmark_ok = Benchmark(client, 100, 64);
 
-    return 0;
+    return (single_ok && batch4_ok && batch8_ok && benchmark_ok) ? 0 : 1;
 }

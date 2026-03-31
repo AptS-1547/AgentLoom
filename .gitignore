@@ -13,3 +13,7 @@ deps/
 test/
 #临时文件
 *.tmp
+
+# Python cache
+__pycache__/
+*.py[cod]

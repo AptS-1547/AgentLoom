@@ -222,6 +222,27 @@ if(WIN32 AND BERT_VCPKG_TRIPLET)
     endforeach()
 endif()
 
+if(UNIX AND NOT APPLE AND BERT_VCPKG_TRIPLET)
+    file(GLOB VCPKG_RUNTIME_SOS "${CMAKE_CURRENT_SOURCE_DIR}/vcpkg_installed/${BERT_VCPKG_TRIPLET}/lib/*.so*")
+    foreach(VCPKG_RUNTIME_SO ${VCPKG_RUNTIME_SOS})
+        add_custom_command(TARGET bert_inference_server POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${VCPKG_RUNTIME_SO}"
+                $<TARGET_FILE_DIR:bert_inference_server>
+        )
+        add_custom_command(TARGET bert_inference_client POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${VCPKG_RUNTIME_SO}"
+                $<TARGET_FILE_DIR:bert_inference_client>
+        )
+        add_custom_command(TARGET bert_benchmark_client POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${VCPKG_RUNTIME_SO}"
+                $<TARGET_FILE_DIR:bert_benchmark_client>
+        )
+    endforeach()
+endif()
+
 # 复制 CUDA / cuDNN 运行时 DLL（如果存在）
 if(WIN32 AND EXISTS "${CUDA_RUNTIME_DLL_ROOT}")
     file(GLOB CUDA_RUNTIME_LIBS "${CUDA_RUNTIME_DLL_ROOT}/*.dll")

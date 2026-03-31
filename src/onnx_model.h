@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <array>
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -21,15 +22,15 @@ namespace bert {
  */
 struct InferenceResult {
     // emotion_logits [10]
-    std::vector<float> emotion_logits;
+    std::array<float, 10> emotion_logits{};
     // behavior_logits [12]
-    std::vector<float> behavior_logits;
+    std::array<float, 12> behavior_logits{};
     // tone_logits [8]
-    std::vector<float> tone_logits;
+    std::array<float, 8> tone_logits{};
     // intensity [0-1]
-    float intensity;
+    float intensity = 0.0f;
     // response_length_logits [3]
-    std::vector<float> response_length_logits;
+    std::array<float, 3> response_length_logits{};
 
     bool success = false;
     std::string error_message;

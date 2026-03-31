@@ -6,7 +6,6 @@ build/
 triplets/
 #vcpkg安装包和依赖
 vcpkg_installed/
-proto/
 deps/
 #日志文件
 *.log

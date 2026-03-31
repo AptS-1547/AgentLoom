@@ -40,6 +40,7 @@ if(BERT_VCPKG_TRIPLET)
 endif()
 find_package(Protobuf CONFIG REQUIRED)
 find_package(gRPC CONFIG REQUIRED)
+find_package(spdlog CONFIG REQUIRED)
 
 # onnxruntime: 使用预编译二进制（优先 GPU 包，不可用时回退 CPU 包）
 if(WIN32)
@@ -146,6 +147,8 @@ target_link_libraries(bert_proto PUBLIC
 # 服务端
 add_executable(bert_inference_server
     src/bert_inference_server.cpp
+    src/logger.cpp
+    src/logger.h
     src/onnx_model.cpp
     src/onnx_model.h
 )
@@ -160,6 +163,7 @@ target_link_libraries(bert_inference_server PRIVATE
     bert_proto
     onnxruntime
     gRPC::grpc++
+    spdlog::spdlog
 )
 
 # 测试客户端

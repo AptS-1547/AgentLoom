@@ -7,10 +7,13 @@
 
 #include <algorithm>
 #include <cctype>
-#include <iostream>
 #include <numeric>
 #include <sstream>
 #include <thread>
+
+#include <spdlog/spdlog.h>
+
+#include "logger.h"
 
 namespace bert {
 
@@ -224,21 +227,24 @@ bool OnnxBERTModel::LoadModel(const std::filesystem::path& model_path,
         }
 
         loaded_ = true;
-        std::cout << "[BERT] ONNX model loaded: " << impl_->input_names.size()
-                  << " inputs, " << impl_->output_names.size()
-                  << " outputs, provider=" << impl_->active_provider
-                  << ", intra_op=" << impl_->intra_op_num_threads
-                  << ", inter_op=" << impl_->inter_op_num_threads << std::endl;
+        spdlog::info(
+            "[BERT] ONNX model loaded: {} inputs, {} outputs, provider={}, intra_op={}, inter_op={}",
+            impl_->input_names.size(),
+            impl_->output_names.size(),
+            impl_->active_provider,
+            impl_->intra_op_num_threads,
+            impl_->inter_op_num_threads
+        );
         if (!impl_->provider_note.empty()) {
-            std::cout << "[BERT] " << impl_->provider_note << std::endl;
+            spdlog::warn("[BERT] {}", impl_->provider_note);
         }
         return true;
 
     } catch (const Ort::Exception& e) {
-        std::cerr << "[BERT] ONNX Runtime error: " << e.what() << std::endl;
+        spdlog::error("[BERT] ONNX Runtime error: {}", e.what());
         return false;
     } catch (const std::exception& e) {
-        std::cerr << "[BERT] Error loading model: " << e.what() << std::endl;
+        spdlog::error("[BERT] Error loading model: {}", e.what());
         return false;
     }
 }
@@ -315,15 +321,15 @@ InferenceResult OnnxBERTModel::Predict(
 
         // emotion_logits [1, 10]
         float* emotion_data = output_tensors[0].GetTensorMutableData<float>();
-        result.emotion_logits.assign(emotion_data, emotion_data + impl_->num_emotions);
+        std::copy_n(emotion_data, result.emotion_logits.size(), result.emotion_logits.begin());
 
         // behavior_logits [1, 12]
         float* behavior_data = output_tensors[1].GetTensorMutableData<float>();
-        result.behavior_logits.assign(behavior_data, behavior_data + impl_->num_behaviors);
+        std::copy_n(behavior_data, result.behavior_logits.size(), result.behavior_logits.begin());
 
         // tone_logits [1, 8]
         float* tone_data = output_tensors[2].GetTensorMutableData<float>();
-        result.tone_logits.assign(tone_data, tone_data + impl_->num_tones);
+        std::copy_n(tone_data, result.tone_logits.size(), result.tone_logits.begin());
 
         // intensity [1, 1]
         float* intensity_data = output_tensors[3].GetTensorMutableData<float>();
@@ -331,7 +337,7 @@ InferenceResult OnnxBERTModel::Predict(
 
         // response_length [1, 3]
         float* length_data = output_tensors[4].GetTensorMutableData<float>();
-        result.response_length_logits.assign(length_data, length_data + impl_->num_length_classes);
+        std::copy_n(length_data, result.response_length_logits.size(), result.response_length_logits.begin());
 
         return result;
 
@@ -357,7 +363,7 @@ std::vector<InferenceResult> OnnxBERTModel::PredictBatch(
     if (input_ids.size() != batch_size * seq_len ||
         attention_mask.size() != batch_size * seq_len ||
         personality.size() != batch_size * impl_->personality_dim) {
-        std::cerr << "[BERT] Batch input size mismatch" << std::endl;
+        spdlog::error("[BERT] Batch input size mismatch");
         return {};
     }
 
@@ -428,30 +434,34 @@ std::vector<InferenceResult> OnnxBERTModel::PredictBatch(
             result.success = true;
 
             // emotion_logits [batch, 10]
-            result.emotion_logits.assign(
-                emotion_data + i * impl_->num_emotions,
-                emotion_data + (i + 1) * impl_->num_emotions
+            std::copy_n(
+                emotion_data + i * result.emotion_logits.size(),
+                result.emotion_logits.size(),
+                result.emotion_logits.begin()
             );
 
             // behavior_logits [batch, 12]
-            result.behavior_logits.assign(
-                behavior_data + i * impl_->num_behaviors,
-                behavior_data + (i + 1) * impl_->num_behaviors
+            std::copy_n(
+                behavior_data + i * result.behavior_logits.size(),
+                result.behavior_logits.size(),
+                result.behavior_logits.begin()
             );
 
             // tone_logits [batch, 8]
-            result.tone_logits.assign(
-                tone_data + i * impl_->num_tones,
-                tone_data + (i + 1) * impl_->num_tones
+            std::copy_n(
+                tone_data + i * result.tone_logits.size(),
+                result.tone_logits.size(),
+                result.tone_logits.begin()
             );
 
             // intensity [batch, 1]
             result.intensity = intensity_data[i];
 
             // response_length [batch, 3]
-            result.response_length_logits.assign(
-                length_data + i * impl_->num_length_classes,
-                length_data + (i + 1) * impl_->num_length_classes
+            std::copy_n(
+                length_data + i * result.response_length_logits.size(),
+                result.response_length_logits.size(),
+                result.response_length_logits.begin()
             );
 
             results.push_back(std::move(result));
@@ -460,10 +470,10 @@ std::vector<InferenceResult> OnnxBERTModel::PredictBatch(
         return results;
 
     } catch (const Ort::Exception& e) {
-        std::cerr << "[BERT] Batch inference error: " << e.what() << std::endl;
+        spdlog::error("[BERT] Batch inference error: {}", e.what());
         return {};
     } catch (const std::exception& e) {
-        std::cerr << "[BERT] Batch inference error: " << e.what() << std::endl;
+        spdlog::error("[BERT] Batch inference error: {}", e.what());
         return {};
     }
 }

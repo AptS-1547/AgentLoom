@@ -1,0 +1,80 @@
+syntax = "proto3";
+
+package bert_inference;
+
+// BERT 推理服务
+service BERTInference {
+  // 单条推理
+  rpc Predict(PredictRequest) returns (PredictResponse);
+
+  // 批量推理
+  rpc PredictBatch(PredictBatchRequest) returns (PredictBatchResponse);
+}
+
+// 输入张量
+message TensorInt64 {
+  repeated int64 data = 1;
+  repeated int64 shape = 2;  // [batch, seq_len]
+}
+
+message TensorFloat {
+  repeated float data = 1;
+  repeated int64 shape = 2;  // [batch, dim]
+}
+
+// 单条预测请求
+message PredictRequest {
+  // token IDs，长度 = max_length (默认64)
+  repeated int64 input_ids = 1;
+  // attention mask，与 input_ids 同长
+  repeated int64 attention_mask = 2;
+  // personality 向量，长度 = 11
+  repeated float personality = 3;
+}
+
+// 单条预测响应
+message PredictResponse {
+  // 情绪 logits [10]
+  repeated float emotion_logits = 1;
+  // 行为 logits [12]
+  repeated float behavior_logits = 2;
+  // 语气 logits [8]
+  repeated float tone_logits = 3;
+  // 情绪强度 [0-1]
+  float intensity = 4;
+  // 回复长度 logits [3] (short/medium/long)
+  repeated float response_length_logits = 5;
+
+  // 错误信息（成功为空）
+  string error = 6;
+}
+
+// 批量预测请求
+message PredictBatchRequest {
+  // 展平的 token IDs，总长度 = batch * seq_len
+  repeated int64 input_ids = 1;
+  // 展平的 attention mask
+  repeated int64 attention_mask = 2;
+  // 展平的 personality，总长度 = batch * 11
+  repeated float personality = 3;
+  // batch size
+  int32 batch_size = 4;
+  // sequence length (默认64)
+  int32 seq_length = 5;
+}
+
+// 批量预测响应
+message PredictBatchResponse {
+  // 展平的 emotion logits，长度 = batch * 10
+  repeated float emotion_logits = 1;
+  // 展平的行为 logits，长度 = batch * 12
+  repeated float behavior_logits = 2;
+  // 展平的语气 logits，长度 = batch * 8
+  repeated float tone_logits = 3;
+  // 情绪强度数组，长度 = batch
+  repeated float intensity = 4;
+  // 展平的回复长度 logits，长度 = batch * 3
+  repeated float response_length_logits = 5;
+
+  string error = 6;
+}

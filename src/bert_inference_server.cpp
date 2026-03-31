@@ -39,8 +39,10 @@
 #include <grpcpp/server_builder.h>
 #include <grpcpp/server_context.h>
 #include <grpcpp/security/server_credentials.h>
+#include <spdlog/spdlog.h>
 
 #include "bert_inference.grpc.pb.h"
+#include "logger.h"
 #include "onnx_model.h"
 
 using grpc::Server;
@@ -261,14 +263,24 @@ public:
         stats_.EndRequest(success_, latency_us, error_message_);
 
         if (slow_request_ms_ > 0 && latency_us >= static_cast<int64_t>(slow_request_ms_) * 1000) {
-            std::cout << "[ServerSlowRequest] method=" << method_name_
-                      << " samples=" << sample_count_
-                      << " latency_ms=" << static_cast<double>(latency_us) / 1000.0
-                      << " success=" << (success_ ? "true" : "false");
             if (!error_message_.empty()) {
-                std::cout << " error=" << error_message_;
+                spdlog::warn(
+                    "[ServerSlowRequest] method={} samples={} latency_ms={:.3f} success={} error={}",
+                    method_name_,
+                    sample_count_,
+                    static_cast<double>(latency_us) / 1000.0,
+                    success_,
+                    error_message_
+                );
+            } else {
+                spdlog::warn(
+                    "[ServerSlowRequest] method={} samples={} latency_ms={:.3f} success={}",
+                    method_name_,
+                    sample_count_,
+                    static_cast<double>(latency_us) / 1000.0,
+                    success_
+                );
             }
-            std::cout << std::endl;
         }
     }
 
@@ -314,25 +326,30 @@ void LogStatsPeriodically(
                 1000.0;
         }
 
-        std::cout << "[ServerStats] bind=" << bind_address
-                  << " uptime_ms=" << snapshot.uptime_ms
-                  << " inflight=" << snapshot.inflight_requests
-                  << " total_rpc=" << snapshot.total_rpc_requests
-                  << " interval_rpc=" << interval_rpc
-                  << " total_samples=" << snapshot.total_samples
-                  << " interval_samples=" << interval_samples
-                  << " total_errors=" << snapshot.total_errors
-                  << " interval_errors=" << interval_errors
-                  << " avg_latency_ms=" << snapshot.average_latency_ms
-                  << " interval_avg_latency_ms=" << interval_average_latency_ms
-                  << " max_latency_ms=" << snapshot.max_latency_ms
-                  << " max_batch_size=" << snapshot.max_batch_size
-                  << " working_set_mb=" << snapshot.working_set_mb
-                  << " private_usage_mb=" << snapshot.private_usage_mb
-                  << " peak_working_set_mb=" << snapshot.peak_working_set_mb
-                  << std::endl;
+        spdlog::info(
+            "[ServerStats] bind={} uptime_ms={} inflight={} total_rpc={} interval_rpc={} "
+            "total_samples={} interval_samples={} total_errors={} interval_errors={} "
+            "avg_latency_ms={:.3f} interval_avg_latency_ms={:.3f} max_latency_ms={:.3f} "
+            "max_batch_size={} working_set_mb={:.2f} private_usage_mb={:.2f} peak_working_set_mb={:.2f}",
+            bind_address,
+            snapshot.uptime_ms,
+            snapshot.inflight_requests,
+            snapshot.total_rpc_requests,
+            interval_rpc,
+            snapshot.total_samples,
+            interval_samples,
+            snapshot.total_errors,
+            interval_errors,
+            snapshot.average_latency_ms,
+            interval_average_latency_ms,
+            snapshot.max_latency_ms,
+            snapshot.max_batch_size,
+            snapshot.working_set_mb,
+            snapshot.private_usage_mb,
+            snapshot.peak_working_set_mb
+        );
         if (!snapshot.last_error.empty()) {
-            std::cout << "[ServerStats] last_error=" << snapshot.last_error << std::endl;
+            spdlog::warn("[ServerStats] last_error={}", snapshot.last_error);
         }
 
         previous_snapshot = snapshot;
@@ -396,16 +413,22 @@ public:
         }
 
         // 填充响应
+        response->mutable_emotion_logits()->Reserve(static_cast<int>(result.emotion_logits.size()));
         for (float v : result.emotion_logits) {
             response->add_emotion_logits(v);
         }
+        response->mutable_behavior_logits()->Reserve(static_cast<int>(result.behavior_logits.size()));
         for (float v : result.behavior_logits) {
             response->add_behavior_logits(v);
         }
+        response->mutable_tone_logits()->Reserve(static_cast<int>(result.tone_logits.size()));
         for (float v : result.tone_logits) {
             response->add_tone_logits(v);
         }
         response->set_intensity(result.intensity);
+        response->mutable_response_length_logits()->Reserve(
+            static_cast<int>(result.response_length_logits.size())
+        );
         for (float v : result.response_length_logits) {
             response->add_response_length_logits(v);
         }
@@ -462,6 +485,13 @@ public:
         }
 
         // 填充响应（展平）
+        response->mutable_emotion_logits()->Reserve(static_cast<int>(batch_size * results.front().emotion_logits.size()));
+        response->mutable_behavior_logits()->Reserve(static_cast<int>(batch_size * results.front().behavior_logits.size()));
+        response->mutable_tone_logits()->Reserve(static_cast<int>(batch_size * results.front().tone_logits.size()));
+        response->mutable_intensity()->Reserve(static_cast<int>(batch_size));
+        response->mutable_response_length_logits()->Reserve(
+            static_cast<int>(batch_size * results.front().response_length_logits.size())
+        );
         for (const auto& result : results) {
             for (float v : result.emotion_logits) {
                 response->add_emotion_logits(v);
@@ -496,6 +526,7 @@ struct ServerOptions {
     bert::ModelRuntimeOptions model_runtime;
     std::string host = "127.0.0.1";
     std::string port = "50051";
+    std::string log_dir = "logs";
     int grpc_num_cqs = 0;
     int grpc_min_pollers = 0;
     int grpc_max_pollers = 0;
@@ -550,6 +581,11 @@ ServerOptions ParseServerOptions(int argc, char** argv) {
                 throw std::runtime_error("--host requires a value");
             }
             options.host = argv[++i];
+        } else if (arg == "--log-dir") {
+            if (i + 1 >= argc) {
+                throw std::runtime_error("--log-dir requires a value");
+            }
+            options.log_dir = argv[++i];
         } else if (arg == "--cuda-device") {
             if (i + 1 >= argc) {
                 throw std::runtime_error("--cuda-device requires a value");
@@ -641,6 +677,7 @@ void PrintUsage(const char* program) {
     std::cerr << "  port: Server port (default: 50051)" << std::endl;
     std::cerr << "Options:" << std::endl;
     std::cerr << "  --host <ip>                    Bind address (default: 127.0.0.1)" << std::endl;
+    std::cerr << "  --log-dir <path>              Persistent log directory (default: ./logs)" << std::endl;
     std::cerr << "  --provider <auto|cpu|cuda>   Execution provider preference (default: auto)" << std::endl;
     std::cerr << "  --cuda-device <id>           CUDA device id (default: 0)" << std::endl;
     std::cerr << "  --intra-op <n>               ONNX Runtime intra-op threads" << std::endl;
@@ -688,29 +725,41 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    std::string server_address = options.host + ":" + options.port;
+    logging::LoggerOptions log_options;
+    log_options.log_dir = options.log_dir;
+    if (!logging::Initialize(log_options)) {
+        return 1;
+    }
 
-    std::cout << "[Server] Loading ONNX model..." << std::endl;
-    std::cout << "[Server] Bind address: " << server_address << std::endl;
-    std::cout << "[Server] Provider preference: " << options.model_runtime.execution_provider
-              << ", CUDA device: " << options.model_runtime.cuda_device_id
-              << ", gRPC CQs: " << options.grpc_num_cqs
-              << ", pollers: " << options.grpc_min_pollers
-              << "-" << options.grpc_max_pollers
-              << ", stats_log_interval_seconds: " << options.stats_log_interval_seconds
-              << ", slow_request_ms: " << options.slow_request_ms
-              << std::endl;
+    std::string server_address = options.host + ":" + options.port;
+    const auto log_file = logging::GetLogFilePath(log_options);
+
+    spdlog::info("[Server] Persistent logging enabled: {}", log_file.string());
+    spdlog::info("[Server] Loading ONNX model...");
+    spdlog::info("[Server] Bind address: {}", server_address);
+    spdlog::info(
+        "[Server] Provider preference: {}, CUDA device: {}, gRPC CQs: {}, pollers: {}-{}, "
+        "stats_log_interval_seconds: {}, slow_request_ms: {}",
+        options.model_runtime.execution_provider,
+        options.model_runtime.cuda_device_id,
+        options.grpc_num_cqs,
+        options.grpc_min_pollers,
+        options.grpc_max_pollers,
+        options.stats_log_interval_seconds,
+        options.slow_request_ms
+    );
 
     // 加载模型
     auto model = std::make_unique<bert::OnnxBERTModel>();
     if (!model->LoadModel(model_path, options.model_runtime)) {
-        std::cerr << "[Server] Failed to load model" << std::endl;
+        spdlog::error("[Server] Failed to load model");
+        logging::Shutdown();
         return 1;
     }
 
-    std::cout << "[Server] Model loaded successfully" << std::endl;
-    std::cout << "[Server] " << model->GetInfo() << std::endl;
-    std::cout << "[Server] Starting gRPC server on " << server_address << std::endl;
+    spdlog::info("[Server] Model loaded successfully");
+    spdlog::info("[Server] {}", model->GetInfo());
+    spdlog::info("[Server] Starting gRPC server on {}", server_address);
 
     // 创建服务
     RuntimeStats stats;
@@ -728,7 +777,8 @@ int main(int argc, char** argv) {
 
     std::unique_ptr<Server> server(builder.BuildAndStart());
     if (server == nullptr) {
-        std::cerr << "[Server] Failed to start gRPC server" << std::endl;
+        spdlog::error("[Server] Failed to start gRPC server");
+        logging::Shutdown();
         return 1;
     }
 
@@ -736,11 +786,13 @@ int main(int argc, char** argv) {
         health != nullptr) {
         health->SetServingStatus("bert_inference.BERTInference", true);
         health->SetServingStatus(true);
-        std::cout << "[Server] Health check service enabled for grpc.health.v1.Health "
-                  << "(service=bert_inference.BERTInference)" << std::endl;
+        spdlog::info(
+            "[Server] Health check service enabled for grpc.health.v1.Health "
+            "(service=bert_inference.BERTInference)"
+        );
     }
 
-    std::cout << "[Server] Ready" << std::endl;
+    spdlog::info("[Server] Ready");
 
     std::jthread stats_thread(
         [&stats, server_address, interval = options.stats_log_interval_seconds](std::stop_token stop_token) {
@@ -750,6 +802,8 @@ int main(int argc, char** argv) {
 
     // 等待终止
     server->Wait();
+    spdlog::info("[Server] Shutdown complete");
+    logging::Shutdown();
 
     return 0;
 }

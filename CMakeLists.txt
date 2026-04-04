@@ -8,8 +8,7 @@ if(MSVC)
     add_compile_options(/utf-8)
 endif()
 
-# 源文件为 UTF-8，中文 Windows 默认代码页 936 会导致解析错误
-add_compile_options(/utf-8)
+# Source files are UTF-8. Only MSVC needs an explicit `/utf-8` compile option.
 
 # vcpkg 集成 - 直接指向已安装目录，不触发 manifest 重新安装
 # 如需重新安装依赖，手动运行: vcpkg install --triplet=x64-windows

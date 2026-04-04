@@ -80,11 +80,13 @@ jobs:
           sudo apt-get clean
           df -h
 
-      - name: Cache vcpkg installed tree
+      - name: Cache vcpkg install root
         uses: actions/cache@v4
         with:
-          path: vcpkg_installed/${{ matrix.triplet }}
-          key: ${{ runner.os }}-${{ matrix.triplet }}-vcpkg-${{ hashFiles('vcpkg.json', 'CMakeLists.txt', '.github/workflows/release.yml') }}
+          path: vcpkg_installed
+          key: ${{ runner.os }}-${{ matrix.triplet }}-vcpkg-${{ hashFiles('vcpkg.json', 'triplets/**') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.triplet }}-vcpkg-
 
       - name: Cache ONNX Runtime archive
         uses: actions/cache@v4
@@ -96,7 +98,16 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build pkg-config curl tar unzip zip
+          sudo apt-get install -y ninja-build pkg-config curl tar unzip zip ccache
+
+      - name: Cache ccache
+        if: runner.os == 'Linux'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ${{ runner.os }}-${{ matrix.triplet }}-ccache-${{ hashFiles('CMakeLists.txt', 'src/**', 'proto/**') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.triplet }}-ccache-
 
       - name: Bootstrap vcpkg (Windows)
         if: runner.os == 'Windows'
@@ -120,39 +131,13 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $manifestDir = Join-Path $pwd ".ci-vcpkg"
-          New-Item -ItemType Directory -Force -Path $manifestDir | Out-Null
-          @'
-          {
-            "name": "release-deps",
-            "version-string": "1",
-            "dependencies": [
-              "grpc",
-              "protobuf",
-              "spdlog"
-            ]
-          }
-          '@ | Set-Content -LiteralPath (Join-Path $manifestDir "vcpkg.json")
-          & .\vcpkg\vcpkg.exe install --triplet ${{ matrix.triplet }} --x-manifest-root="$manifestDir" --x-install-root="$pwd\vcpkg_installed" --clean-after-build
+          & .\vcpkg\vcpkg.exe install --triplet ${{ matrix.triplet }} --x-manifest-root="$pwd" --x-install-root="$pwd\vcpkg_installed" --clean-after-build
 
       - name: Install dependencies (Linux)
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          manifest_dir="$GITHUB_WORKSPACE/.ci-vcpkg"
-          mkdir -p "$manifest_dir"
-          cat > "$manifest_dir/vcpkg.json" <<'EOF'
-          {
-            "name": "release-deps",
-            "version-string": "1",
-            "dependencies": [
-              "grpc",
-              "protobuf",
-              "spdlog"
-            ]
-          }
-          EOF
-          ./vcpkg/vcpkg install --triplet ${{ matrix.triplet }} --x-manifest-root="$manifest_dir" --x-install-root="$GITHUB_WORKSPACE/vcpkg_installed" --clean-after-build
+          ./vcpkg/vcpkg install --triplet ${{ matrix.triplet }} --x-manifest-root="$GITHUB_WORKSPACE" --x-install-root="$GITHUB_WORKSPACE/vcpkg_installed" --clean-after-build
 
       - name: Download ONNX Runtime (Windows)
         if: runner.os == 'Windows'
@@ -190,10 +175,17 @@ jobs:
       - name: Configure (Linux)
         if: runner.os == 'Linux'
         shell: bash
+        env:
+          CCACHE_BASEDIR: ${{ github.workspace }}
+          CCACHE_COMPILERCHECK: content
+          CCACHE_DIR: ~/.cache/ccache
         run: |
+          ccache --set-config=max_size=500M
+          ccache --zero-stats || true
           cmake -S . -B "${{ matrix.build_dir }}" \
             -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DBERT_VCPKG_TRIPLET=${{ matrix.triplet }} \
             -DBERT_USE_ONNXRUNTIME_GPU=OFF \
             -DONNXRUNTIME_CPU_ROOT="${{ github.workspace }}/${{ matrix.ort_root }}"
@@ -207,8 +199,13 @@ jobs:
       - name: Build (Linux)
         if: runner.os == 'Linux'
         shell: bash
+        env:
+          CCACHE_BASEDIR: ${{ github.workspace }}
+          CCACHE_COMPILERCHECK: content
+          CCACHE_DIR: ~/.cache/ccache
         run: |
           cmake --build "${{ matrix.build_dir }}" --parallel
+          ccache --show-stats || true
 
       - name: Generate smoke-test model
         run: |

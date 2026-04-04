@@ -29,15 +29,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: Windows Release
-            os: windows-latest
-            triplet: x64-windows
-            build_dir: build/gha-windows
-            artifact_dir: build/gha-windows/Release
-            ort_url: https://github.com/microsoft/onnxruntime/releases/download/v1.17.1/onnxruntime-win-x64-1.17.1.zip
-            ort_archive: deps/onnxruntime-win-x64-1.17.1.zip
-            ort_root: deps/onnxruntime-win-x64-1.17.1
-            package_name: bert-inference-windows-x64.zip
           - name: Ubuntu Release
             os: ubuntu-latest
             triplet: x64-linux
@@ -66,8 +57,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install onnx grpcio protobuf
 
-      - name: Free disk space (Linux)
-        if: runner.os == 'Linux'
+      - name: Free disk space
         shell: bash
         run: |
           df -h
@@ -94,14 +84,12 @@ jobs:
           path: ${{ matrix.ort_archive }}
           key: ${{ runner.os }}-ort-release-${{ hashFiles('.github/workflows/release.yml') }}-${{ matrix.ort_archive }}
 
-      - name: Install Ubuntu build tools
-        if: runner.os == 'Linux'
+      - name: Install build tools
         run: |
           sudo apt-get update
           sudo apt-get install -y ninja-build pkg-config curl tar unzip zip ccache
 
       - name: Cache ccache
-        if: runner.os == 'Linux'
         uses: actions/cache@v4
         with:
           path: ~/.cache/ccache
@@ -109,17 +97,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-${{ matrix.triplet }}-ccache-
 
-      - name: Bootstrap vcpkg (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          if (-not (Test-Path vcpkg)) {
-            git clone --depth 1 https://github.com/microsoft/vcpkg.git vcpkg
-          }
-          & .\vcpkg\bootstrap-vcpkg.bat -disableMetrics
-
-      - name: Bootstrap vcpkg (Linux)
-        if: runner.os == 'Linux'
+      - name: Bootstrap vcpkg
         shell: bash
         run: |
           if [[ ! -d vcpkg ]]; then
@@ -127,30 +105,12 @@ jobs:
           fi
           ./vcpkg/bootstrap-vcpkg.sh -disableMetrics
 
-      - name: Install dependencies (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          & .\vcpkg\vcpkg.exe install --triplet ${{ matrix.triplet }} --x-manifest-root="$pwd" --x-install-root="$pwd\vcpkg_installed" --clean-after-build
-
-      - name: Install dependencies (Linux)
-        if: runner.os == 'Linux'
+      - name: Install dependencies
         shell: bash
         run: |
           ./vcpkg/vcpkg install --triplet ${{ matrix.triplet }} --x-manifest-root="$GITHUB_WORKSPACE" --x-install-root="$GITHUB_WORKSPACE/vcpkg_installed" --clean-after-build
 
-      - name: Download ONNX Runtime (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          .\.github\scripts\download-onnxruntime.ps1 `
-            -Url "${{ matrix.ort_url }}" `
-            -ArchivePath "${{ github.workspace }}\${{ matrix.ort_archive }}" `
-            -ExtractRoot "${{ github.workspace }}\deps" `
-            -ExpectedRoot "${{ github.workspace }}\${{ matrix.ort_root }}"
-
-      - name: Download ONNX Runtime (Linux)
-        if: runner.os == 'Linux'
+      - name: Download ONNX Runtime
         shell: bash
         run: |
           chmod +x .github/scripts/download-onnxruntime.sh
@@ -160,20 +120,7 @@ jobs:
             "${{ github.workspace }}/deps" \
             "${{ github.workspace }}/${{ matrix.ort_root }}"
 
-      - name: Configure (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          cmake -S . -B "${{ matrix.build_dir }}" `
-            -G "Visual Studio 17 2022" `
-            -A x64 `
-            -DCMAKE_CONFIGURATION_TYPES=Release `
-            -DBERT_VCPKG_TRIPLET=${{ matrix.triplet }} `
-            -DBERT_USE_ONNXRUNTIME_GPU=OFF `
-            -DONNXRUNTIME_CPU_ROOT="${{ github.workspace }}\${{ matrix.ort_root }}"
-
-      - name: Configure (Linux)
-        if: runner.os == 'Linux'
+      - name: Configure
         shell: bash
         env:
           CCACHE_BASEDIR: ${{ github.workspace }}
@@ -190,14 +137,7 @@ jobs:
             -DBERT_USE_ONNXRUNTIME_GPU=OFF \
             -DONNXRUNTIME_CPU_ROOT="${{ github.workspace }}/${{ matrix.ort_root }}"
 
-      - name: Build (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          cmake --build "${{ matrix.build_dir }}" --config Release --parallel
-
-      - name: Build (Linux)
-        if: runner.os == 'Linux'
+      - name: Build
         shell: bash
         env:
           CCACHE_BASEDIR: ${{ github.workspace }}
@@ -211,19 +151,7 @@ jobs:
         run: |
           python .github/scripts/create_smoke_test_model.py --output build/smoke/bert_smoke_test.onnx
 
-      - name: Run smoke test (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          python .github/scripts/run_smoke_test.py `
-            --server "${{ github.workspace }}\${{ matrix.artifact_dir }}\bert_inference_server.exe" `
-            --client "${{ github.workspace }}\${{ matrix.artifact_dir }}\bert_inference_client.exe" `
-            --model "${{ github.workspace }}\build\smoke\bert_smoke_test.onnx" `
-            --health-probe "${{ github.workspace }}\tools\grpc_health_probe.py" `
-            --target 127.0.0.1:50051
-
-      - name: Run smoke test (Linux)
-        if: runner.os == 'Linux'
+      - name: Run smoke test
         shell: bash
         run: |
           python .github/scripts/run_smoke_test.py \
@@ -233,22 +161,7 @@ jobs:
             --health-probe "${{ github.workspace }}/tools/grpc_health_probe.py" \
             --target 127.0.0.1:50051
 
-      - name: Package release (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $stageDir = Join-Path $pwd "dist\windows-x64"
-          New-Item -ItemType Directory -Force -Path $stageDir | Out-Null
-          Copy-Item -LiteralPath README.md -Destination $stageDir
-          Copy-Item -LiteralPath tools\grpc_health_probe.py -Destination $stageDir
-          Copy-Item -LiteralPath "${{ matrix.artifact_dir }}\bert_inference_server.exe" -Destination $stageDir
-          Copy-Item -LiteralPath "${{ matrix.artifact_dir }}\bert_inference_client.exe" -Destination $stageDir
-          Copy-Item -LiteralPath "${{ matrix.artifact_dir }}\bert_benchmark_client.exe" -Destination $stageDir
-          Get-ChildItem "${{ matrix.artifact_dir }}" -Filter *.dll | Copy-Item -Destination $stageDir
-          Compress-Archive -Path "$stageDir\*" -DestinationPath (Join-Path $pwd "dist\${{ matrix.package_name }}") -Force
-
-      - name: Package release (Linux)
-        if: runner.os == 'Linux'
+      - name: Package release
         shell: bash
         run: |
           stage_dir="$GITHUB_WORKSPACE/dist/linux-x64"

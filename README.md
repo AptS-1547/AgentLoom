@@ -62,12 +62,12 @@ CI 中的构建流程是当前仓库可用的参考流程。
 - Windows: Visual Studio 2022（v143 工具集）
 - Linux: Ninja
 
-`grpc` 和 `protobuf` 通过 vcpkg 管理，ONNX Runtime 使用预编译包。
+`grpc`、`protobuf` 和 `spdlog` 通过 vcpkg 管理，ONNX Runtime 使用预编译包。
 
 ### Windows
 
 ```powershell
-.\vcpkg\vcpkg.exe install grpc:x64-windows protobuf:x64-windows
+.\vcpkg\vcpkg.exe install grpc:x64-windows protobuf:x64-windows spdlog:x64-windows
 
 cmake -S . -B build\gha-windows `
   -G "Visual Studio 17 2022" `
@@ -88,7 +88,7 @@ cmake --build build\gha-windows --config Release --parallel
 sudo apt-get update
 sudo apt-get install -y ninja-build pkg-config curl tar unzip zip
 
-./vcpkg/vcpkg install grpc:x64-linux protobuf:x64-linux
+./vcpkg/vcpkg install grpc:x64-linux protobuf:x64-linux spdlog:x64-linux
 
 cmake -S . -B build/gha-linux \
   -G Ninja \

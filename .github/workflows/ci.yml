@@ -118,7 +118,8 @@ jobs:
             "version-string": "1",
             "dependencies": [
               "grpc",
-              "protobuf"
+              "protobuf",
+              "spdlog"
             ]
           }
           '@ | Set-Content -LiteralPath (Join-Path $manifestDir "vcpkg.json")
@@ -136,7 +137,8 @@ jobs:
             "version-string": "1",
             "dependencies": [
               "grpc",
-              "protobuf"
+              "protobuf",
+              "spdlog"
             ]
           }
           EOF

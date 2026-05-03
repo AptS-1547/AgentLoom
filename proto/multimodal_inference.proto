@@ -1,0 +1,102 @@
+syntax = "proto3";
+
+package multimodal_inference;
+
+// 统一多模态推理服务
+service MultimodalInference {
+  // BERT 情绪分类（单条）
+  rpc PredictEmotion(EmotionRequest) returns (EmotionResponse);
+
+  // BERT 情绪分类（批量）
+  rpc PredictEmotionBatch(EmotionBatchRequest) returns (EmotionBatchResponse);
+
+  // ViT 显著度检测（视频流事件筛选）
+  rpc DetectSaliency(SaliencyRequest) returns (SaliencyResponse);
+
+  // VLM 推理（流式）
+  rpc GenerateVLM(VLMRequest) returns (stream VLMToken);
+
+  // VLM 推理（同步）
+  rpc GenerateVLMSync(VLMRequest) returns (VLMResponse);
+}
+
+// ===== BERT 情绪分类（接收已编码张量，tokenizer 在 Python 端完成） =====
+message EmotionRequest {
+  repeated int64 input_ids = 1;       // token IDs [seq_len]
+  repeated int64 attention_mask = 2;  // 注意力掩码 [seq_len]
+  repeated float personality = 3;     // 人格向量 [11]
+}
+
+message EmotionResponse {
+  repeated float emotion_logits = 1;          // [10]
+  repeated float behavior_logits = 2;         // [12]
+  repeated float tone_logits = 3;             // [8]
+  float intensity = 4;                        // [0-1]
+  repeated float response_length_logits = 5;  // [3]
+  string error = 6;
+}
+
+message EmotionBatchRequest {
+  repeated int64 input_ids = 1;       // 展平 [batch * seq_len]
+  repeated int64 attention_mask = 2;
+  repeated float personality = 3;     // 展平 [batch * 11]
+  int32 batch_size = 4;
+  int32 seq_length = 5;
+}
+
+message EmotionBatchResponse {
+  repeated float emotion_logits = 1;          // 展平 [batch * 10]
+  repeated float behavior_logits = 2;         // 展平 [batch * 12]
+  repeated float tone_logits = 3;             // 展平 [batch * 8]
+  repeated float intensity = 4;               // [batch]
+  repeated float response_length_logits = 5;  // 展平 [batch * 3]
+  string error = 6;
+}
+
+// ===== ViT 显著度检测 =====
+message SaliencyRequest {
+  bytes frame_data = 1;         // JPEG/PNG 编码的帧
+  int64 timestamp_ms = 2;
+  int32 width = 3;
+  int32 height = 4;
+}
+
+message SaliencyResponse {
+  float saliency_score = 1;     // 0-1
+  bool trigger_vlm = 2;         // 是否触发 VLM 分析
+  float inference_ms = 3;
+}
+
+// ===== VLM 推理 =====
+message VLMRequest {
+  oneof image_source {
+    bytes image_data = 1;       // JPEG/PNG 二进制
+    string image_path = 8;      // 本地路径（同机部署时零拷贝）
+  }
+  string prompt = 2;
+
+  // 生成参数
+  int32 max_tokens = 3;
+  float temperature = 4;
+  int32 context_size = 5;
+  float top_p = 6;
+  int32 top_k = 7;
+}
+
+message VLMToken {
+  string token = 1;
+  bool is_final = 2;
+}
+
+message VLMResponse {
+  string text = 1;
+
+  // 性能指标
+  float image_encode_ms = 2;
+  float prompt_eval_ms = 3;
+  float eval_ms = 4;
+  int32 prompt_tokens = 5;
+  int32 generated_tokens = 6;
+
+  string error = 7;
+}

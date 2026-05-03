@@ -10,7 +10,12 @@
       "buildCommandArgs": "",
       "ctestCommandArgs": "",
       "platform": "x64",
-      "intelliSenseMode": "windows-msvc-x64"
+      "intelliSenseMode": "windows-msvc-x64",
+      "variables": [
+        { "name": "BERT_VCPKG_TRIPLET", "value": "x64-windows", "type": "STRING" },
+        { "name": "BERT_USE_ONNXRUNTIME_GPU", "value": "OFF", "type": "STRING" },
+        { "name": "LLAMA_CPP_ROOT", "value": "D:/Users/21405/source/repos/LocalLLMPredict/llama.cpp", "type": "PATH" }
+      ]
     },
     {
       "name": "x64-Debug",
@@ -19,11 +24,15 @@
       "inheritEnvironments": [ "msvc_x86_x64" ],
       "buildRoot": "${projectDir}\\build\\${name}",
       "installRoot": "${projectDir}\\install",
-      "cmakeCommandArgs": "-A x64",
       "buildCommandArgs": "",
       "ctestCommandArgs": "",
       "platform": "x64",
-      "intelliSenseMode": "windows-msvc-x64"
+      "intelliSenseMode": "windows-msvc-x64",
+      "variables": [
+        { "name": "BERT_VCPKG_TRIPLET", "value": "x64-windows", "type": "STRING" },
+        { "name": "BERT_USE_ONNXRUNTIME_GPU", "value": "OFF", "type": "STRING" },
+        { "name": "LLAMA_CPP_ROOT", "value": "D:/Users/21405/source/repos/LocalLLMPredict/llama.cpp", "type": "PATH" }
+      ]
     }
   ]
 }

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(BERTInferenceService VERSION 1.0.0 LANGUAGES CXX)
+project(MultimodalInferenceService VERSION 2.0.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -8,10 +8,7 @@ if(MSVC)
     add_compile_options(/utf-8)
 endif()
 
-# Source files are UTF-8. Only MSVC needs an explicit `/utf-8` compile option.
-
-# vcpkg 集成 - 直接指向已安装目录，不触发 manifest 重新安装
-# 如需重新安装依赖，手动运行: vcpkg install --triplet=x64-windows
+# vcpkg 集成
 if(WIN32)
     set(BERT_VCPKG_TRIPLET_DEFAULT "x64-windows")
 elseif(UNIX AND NOT APPLE)
@@ -41,7 +38,7 @@ find_package(Protobuf CONFIG REQUIRED)
 find_package(gRPC CONFIG REQUIRED)
 find_package(spdlog CONFIG REQUIRED)
 
-# onnxruntime: 使用预编译二进制（优先 GPU 包，不可用时回退 CPU 包）
+# ONNX Runtime 预编译二进制
 if(WIN32)
     set(BERT_DEFAULT_ONNXRUNTIME_CPU_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/deps/onnxruntime-win-x64-1.17.1")
     set(BERT_DEFAULT_ONNXRUNTIME_GPU_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/deps/onnxruntime-win-x64-gpu-1.20.1")
@@ -60,15 +57,9 @@ else()
     message(FATAL_ERROR "Unsupported platform")
 endif()
 
-set(ONNXRUNTIME_CPU_ROOT
-    "${BERT_DEFAULT_ONNXRUNTIME_CPU_ROOT}"
-    CACHE PATH "Path to the CPU ONNX Runtime package")
-set(ONNXRUNTIME_GPU_ROOT
-    "${BERT_DEFAULT_ONNXRUNTIME_GPU_ROOT}"
-    CACHE PATH "Path to the GPU ONNX Runtime package")
-set(CUDA_RUNTIME_DLL_ROOT
-    "${BERT_DEFAULT_CUDA_RUNTIME_ROOT}"
-    CACHE PATH "Directory containing CUDA/cuDNN runtime libraries for the ONNX Runtime CUDA provider")
+set(ONNXRUNTIME_CPU_ROOT "${BERT_DEFAULT_ONNXRUNTIME_CPU_ROOT}" CACHE PATH "Path to the CPU ONNX Runtime package")
+set(ONNXRUNTIME_GPU_ROOT "${BERT_DEFAULT_ONNXRUNTIME_GPU_ROOT}" CACHE PATH "Path to the GPU ONNX Runtime package")
+set(CUDA_RUNTIME_DLL_ROOT "${BERT_DEFAULT_CUDA_RUNTIME_ROOT}" CACHE PATH "Directory containing CUDA/cuDNN runtime libraries")
 set(BERT_USE_ONNXRUNTIME_GPU "AUTO" CACHE STRING "Use the GPU ONNX Runtime package: AUTO, ON, or OFF")
 set_property(CACHE BERT_USE_ONNXRUNTIME_GPU PROPERTY STRINGS AUTO ON OFF)
 
@@ -109,79 +100,153 @@ if(WIN32)
     )
 endif()
 
-# 生成 proto 代码
+# llama.cpp 预编译路径
+set(LLAMA_CPP_ROOT "D:/Users/21405/source/repos/LocalLLMPredict/llama.cpp" CACHE PATH "Path to llama.cpp repository")
+set(LLAMA_CPP_BUILD "${LLAMA_CPP_ROOT}/build")
+
+# ==================== Proto 代码生成 ====================
+
 set(PROTO_DIR ${CMAKE_CURRENT_SOURCE_DIR}/proto)
 set(GENERATED_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated)
 file(MAKE_DIRECTORY ${GENERATED_DIR})
 
-set(PROTO_FILE ${PROTO_DIR}/bert_inference.proto)
-set(PROTO_SRC ${GENERATED_DIR}/bert_inference.pb.cc)
-set(PROTO_HDR ${GENERATED_DIR}/bert_inference.pb.h)
-set(GRPC_SRC ${GENERATED_DIR}/bert_inference.grpc.pb.cc)
-set(GRPC_HDR ${GENERATED_DIR}/bert_inference.grpc.pb.h)
+# BERT proto（保留，客户端工具仍需要）
+set(BERT_PROTO_FILE ${PROTO_DIR}/bert_inference.proto)
+set(BERT_PROTO_SRC ${GENERATED_DIR}/bert_inference.pb.cc)
+set(BERT_PROTO_HDR ${GENERATED_DIR}/bert_inference.pb.h)
+set(BERT_GRPC_SRC ${GENERATED_DIR}/bert_inference.grpc.pb.cc)
+set(BERT_GRPC_HDR ${GENERATED_DIR}/bert_inference.grpc.pb.h)
 
 add_custom_command(
-    OUTPUT ${PROTO_SRC} ${PROTO_HDR} ${GRPC_SRC} ${GRPC_HDR}
+    OUTPUT ${BERT_PROTO_SRC} ${BERT_PROTO_HDR} ${BERT_GRPC_SRC} ${BERT_GRPC_HDR}
     COMMAND protobuf::protoc
     ARGS --cpp_out=${GENERATED_DIR}
          --grpc_out=${GENERATED_DIR}
          --plugin=protoc-gen-grpc=$<TARGET_FILE:gRPC::grpc_cpp_plugin>
          -I ${PROTO_DIR}
-         ${PROTO_FILE}
-    DEPENDS ${PROTO_FILE}
-    COMMENT "Generating protobuf/gRPC code"
+         ${BERT_PROTO_FILE}
+    DEPENDS ${BERT_PROTO_FILE}
+    COMMENT "Generating BERT protobuf/gRPC code"
 )
 
-add_custom_target(generate_proto ALL DEPENDS ${PROTO_SRC} ${PROTO_HDR} ${GRPC_SRC} ${GRPC_HDR})
+# Multimodal proto（统一协议）
+set(MULTIMODAL_PROTO_FILE ${PROTO_DIR}/multimodal_inference.proto)
+set(MULTIMODAL_PROTO_SRC ${GENERATED_DIR}/multimodal_inference.pb.cc)
+set(MULTIMODAL_PROTO_HDR ${GENERATED_DIR}/multimodal_inference.pb.h)
+set(MULTIMODAL_GRPC_SRC ${GENERATED_DIR}/multimodal_inference.grpc.pb.cc)
+set(MULTIMODAL_GRPC_HDR ${GENERATED_DIR}/multimodal_inference.grpc.pb.h)
 
-# proto 库
-add_library(bert_proto STATIC ${PROTO_SRC} ${GRPC_SRC})
+add_custom_command(
+    OUTPUT ${MULTIMODAL_PROTO_SRC} ${MULTIMODAL_PROTO_HDR} ${MULTIMODAL_GRPC_SRC} ${MULTIMODAL_GRPC_HDR}
+    COMMAND protobuf::protoc
+    ARGS --cpp_out=${GENERATED_DIR}
+         --grpc_out=${GENERATED_DIR}
+         --plugin=protoc-gen-grpc=$<TARGET_FILE:gRPC::grpc_cpp_plugin>
+         -I ${PROTO_DIR}
+         ${MULTIMODAL_PROTO_FILE}
+    DEPENDS ${MULTIMODAL_PROTO_FILE}
+    COMMENT "Generating Multimodal protobuf/gRPC code"
+)
+
+add_custom_target(generate_proto ALL DEPENDS
+    ${BERT_PROTO_SRC} ${BERT_PROTO_HDR} ${BERT_GRPC_SRC} ${BERT_GRPC_HDR}
+    ${MULTIMODAL_PROTO_SRC} ${MULTIMODAL_PROTO_HDR} ${MULTIMODAL_GRPC_SRC} ${MULTIMODAL_GRPC_HDR}
+)
+
+# Proto 库
+add_library(bert_proto STATIC ${BERT_PROTO_SRC} ${BERT_GRPC_SRC})
 add_dependencies(bert_proto generate_proto)
 target_include_directories(bert_proto PUBLIC ${GENERATED_DIR})
-target_link_libraries(bert_proto PUBLIC
-    protobuf::libprotobuf
-    gRPC::grpc++
+target_link_libraries(bert_proto PUBLIC protobuf::libprotobuf gRPC::grpc++)
+
+add_library(multimodal_proto STATIC ${MULTIMODAL_PROTO_SRC} ${MULTIMODAL_GRPC_SRC})
+add_dependencies(multimodal_proto generate_proto)
+target_include_directories(multimodal_proto PUBLIC ${GENERATED_DIR})
+target_link_libraries(multimodal_proto PUBLIC protobuf::libprotobuf gRPC::grpc++)
+
+# ==================== 公共库 ====================
+
+add_library(server_common STATIC
+    src/common/server_common.cpp
+    src/common/server_common.h
+    src/common/logger.cpp
+    src/common/logger.h
 )
 
-# 服务端
-add_executable(bert_inference_server
-    src/bert_inference_server.cpp
-    src/logger.cpp
-    src/logger.h
-    src/onnx_model.cpp
-    src/onnx_model.h
+target_include_directories(server_common PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/common
 )
 
-target_include_directories(bert_inference_server PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
+target_link_libraries(server_common PUBLIC spdlog::spdlog)
+
+# ==================== 统一多模态推理服务端 ====================
+
+add_executable(multimodal_inference_server
+    src/server/multimodal_inference_server.cpp
+    src/models/llama_runner.cpp
+    src/models/llama_runner.h
+    src/models/onnx_model.cpp
+    src/models/onnx_model.h
+)
+
+target_include_directories(multimodal_inference_server PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/common
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/models
     ${GENERATED_DIR}
     ${ONNXRUNTIME_ROOT}/include
+    ${LLAMA_CPP_ROOT}/include
+    ${LLAMA_CPP_ROOT}/tools/mtmd
+    ${LLAMA_CPP_ROOT}/common
+    ${LLAMA_CPP_ROOT}/ggml/include
 )
 
-target_link_libraries(bert_inference_server PRIVATE
-    bert_proto
+target_link_libraries(multimodal_inference_server PRIVATE
+    multimodal_proto
+    server_common
     onnxruntime
     gRPC::grpc++
     spdlog::spdlog
+    ${LLAMA_CPP_BUILD}/src/Release/llama.lib
+    ${LLAMA_CPP_BUILD}/tools/mtmd/Release/mtmd.lib
+    ${LLAMA_CPP_BUILD}/common/Release/llama-common.lib
+    ${LLAMA_CPP_BUILD}/ggml/src/Release/ggml.lib
+    ${LLAMA_CPP_BUILD}/ggml/src/Release/ggml-base.lib
 )
 
-# 测试客户端
+# 拷贝 llama.cpp DLL 到输出目录
+add_custom_command(TARGET multimodal_inference_server POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${LLAMA_CPP_BUILD}/bin/Release/llama.dll"
+        "${LLAMA_CPP_BUILD}/bin/Release/ggml.dll"
+        "${LLAMA_CPP_BUILD}/bin/Release/ggml-base.dll"
+        "${LLAMA_CPP_BUILD}/bin/Release/ggml-cpu.dll"
+        "${LLAMA_CPP_BUILD}/bin/Release/ggml-cuda.dll"
+        "${LLAMA_CPP_BUILD}/bin/Release/mtmd.dll"
+        "${LLAMA_CPP_BUILD}/bin/Release/llama-common.dll"
+        $<TARGET_FILE_DIR:multimodal_inference_server>
+    COMMENT "Copying llama.cpp DLLs"
+)
+
+# ==================== 客户端工具（BERT 协议，用于向后兼容测试） ====================
+
 add_executable(bert_inference_client
-    src/client_test.cpp
+    src/client/client_test.cpp
 )
 
 target_include_directories(bert_inference_client PRIVATE ${GENERATED_DIR})
 target_link_libraries(bert_inference_client PRIVATE bert_proto gRPC::grpc++)
 
-# 并发压测客户端
 add_executable(bert_benchmark_client
-    src/benchmark_client.cpp
+    src/client/benchmark_client.cpp
 )
 
 target_include_directories(bert_benchmark_client PRIVATE ${GENERATED_DIR})
 target_link_libraries(bert_benchmark_client PRIVATE bert_proto gRPC::grpc++)
+
+# ==================== 平台适配 ====================
+
 if(UNIX AND NOT APPLE)
-    foreach(target bert_inference_server bert_inference_client bert_benchmark_client)
+    foreach(target multimodal_inference_server bert_inference_client bert_benchmark_client)
         set_target_properties(${target} PROPERTIES
             BUILD_RPATH "$ORIGIN"
             INSTALL_RPATH "$ORIGIN"
@@ -190,79 +255,57 @@ if(UNIX AND NOT APPLE)
 endif()
 
 # 安装
-install(TARGETS bert_inference_server bert_inference_client bert_benchmark_client RUNTIME DESTINATION bin)
+install(TARGETS multimodal_inference_server bert_inference_client bert_benchmark_client RUNTIME DESTINATION bin)
 
-# 复制 ONNX Runtime 运行时 DLL 到输出目录
-file(GLOB ONNXRUNTIME_RUNTIME_DLLS "${ONNXRUNTIME_ROOT}/lib/onnxruntime*.dll")
+# 复制 ONNX Runtime 运行时库
 file(GLOB ONNXRUNTIME_RUNTIME_LIBS "${ONNXRUNTIME_ROOT}/${BERT_ONNXRUNTIME_RUNTIME_GLOB}")
 foreach(ONNXRUNTIME_RUNTIME_LIB ${ONNXRUNTIME_RUNTIME_LIBS})
-    add_custom_command(TARGET bert_inference_server POST_BUILD
+    add_custom_command(TARGET multimodal_inference_server POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${ONNXRUNTIME_RUNTIME_LIB}"
-            $<TARGET_FILE_DIR:bert_inference_server>
+            $<TARGET_FILE_DIR:multimodal_inference_server>
     )
 endforeach()
 
-# 复制 vcpkg 动态库依赖（gRPC / Protobuf / OpenSSL 等）
+# 复制 vcpkg 动态库依赖
 if(WIN32 AND BERT_VCPKG_TRIPLET)
     file(GLOB VCPKG_RUNTIME_DLLS "${CMAKE_CURRENT_SOURCE_DIR}/vcpkg_installed/${BERT_VCPKG_TRIPLET}/bin/*.dll")
-    foreach(VCPKG_RUNTIME_DLL ${VCPKG_RUNTIME_DLLS})
-        add_custom_command(TARGET bert_inference_server POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${VCPKG_RUNTIME_DLL}"
-                $<TARGET_FILE_DIR:bert_inference_server>
-        )
-        add_custom_command(TARGET bert_inference_client POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${VCPKG_RUNTIME_DLL}"
-                $<TARGET_FILE_DIR:bert_inference_client>
-        )
-        add_custom_command(TARGET bert_benchmark_client POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${VCPKG_RUNTIME_DLL}"
-                $<TARGET_FILE_DIR:bert_benchmark_client>
-        )
+    foreach(target multimodal_inference_server bert_inference_client bert_benchmark_client)
+        foreach(VCPKG_RUNTIME_DLL ${VCPKG_RUNTIME_DLLS})
+            add_custom_command(TARGET ${target} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${VCPKG_RUNTIME_DLL}"
+                    $<TARGET_FILE_DIR:${target}>
+            )
+        endforeach()
     endforeach()
 endif()
 
 if(UNIX AND NOT APPLE AND BERT_VCPKG_TRIPLET)
     file(GLOB VCPKG_RUNTIME_SOS "${CMAKE_CURRENT_SOURCE_DIR}/vcpkg_installed/${BERT_VCPKG_TRIPLET}/lib/*.so*")
-    foreach(VCPKG_RUNTIME_SO ${VCPKG_RUNTIME_SOS})
-        add_custom_command(TARGET bert_inference_server POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${VCPKG_RUNTIME_SO}"
-                $<TARGET_FILE_DIR:bert_inference_server>
-        )
-        add_custom_command(TARGET bert_inference_client POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${VCPKG_RUNTIME_SO}"
-                $<TARGET_FILE_DIR:bert_inference_client>
-        )
-        add_custom_command(TARGET bert_benchmark_client POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${VCPKG_RUNTIME_SO}"
-                $<TARGET_FILE_DIR:bert_benchmark_client>
-        )
+    foreach(target multimodal_inference_server bert_inference_client bert_benchmark_client)
+        foreach(VCPKG_RUNTIME_SO ${VCPKG_RUNTIME_SOS})
+            add_custom_command(TARGET ${target} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${VCPKG_RUNTIME_SO}"
+                    $<TARGET_FILE_DIR:${target}>
+            )
+        endforeach()
     endforeach()
 endif()
 
-# 复制 CUDA / cuDNN 运行时 DLL（如果存在）
-if(WIN32 AND EXISTS "${CUDA_RUNTIME_DLL_ROOT}")
-    file(GLOB CUDA_RUNTIME_LIBS "${CUDA_RUNTIME_DLL_ROOT}/*.dll")
+# 复制 CUDA / cuDNN 运行时库（如果存在）
+if(EXISTS "${CUDA_RUNTIME_DLL_ROOT}")
+    if(WIN32)
+        file(GLOB CUDA_RUNTIME_LIBS "${CUDA_RUNTIME_DLL_ROOT}/*.dll")
+    elseif(UNIX AND NOT APPLE)
+        file(GLOB CUDA_RUNTIME_LIBS "${CUDA_RUNTIME_DLL_ROOT}/*.so*")
+    endif()
     foreach(CUDA_RUNTIME_LIB ${CUDA_RUNTIME_LIBS})
-        add_custom_command(TARGET bert_inference_server POST_BUILD
+        add_custom_command(TARGET multimodal_inference_server POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 "${CUDA_RUNTIME_LIB}"
-                $<TARGET_FILE_DIR:bert_inference_server>
-        )
-    endforeach()
-elseif(UNIX AND NOT APPLE AND EXISTS "${CUDA_RUNTIME_DLL_ROOT}")
-    file(GLOB CUDA_RUNTIME_LIBS "${CUDA_RUNTIME_DLL_ROOT}/*.so*")
-    foreach(CUDA_RUNTIME_LIB ${CUDA_RUNTIME_LIBS})
-        add_custom_command(TARGET bert_inference_server POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${CUDA_RUNTIME_LIB}"
-                $<TARGET_FILE_DIR:bert_inference_server>
+                $<TARGET_FILE_DIR:multimodal_inference_server>
         )
     endforeach()
 endif()

@@ -16,3 +16,5 @@ test/
 # Python cache
 __pycache__/
 *.py[cod]
+# CMake生成的文件
+CMakeFiles/

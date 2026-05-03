@@ -13,7 +13,10 @@
       },
       "cacheVariables": {
         "CMAKE_CONFIGURATION_TYPES": "Release",
-        "CMAKE_GENERATOR_INSTANCE": "D:/VS2022"
+        "CMAKE_GENERATOR_INSTANCE": "D:/VS2022",
+        "BERT_VCPKG_TRIPLET": "x64-windows",
+        "BERT_USE_ONNXRUNTIME_GPU": "OFF",
+        "LLAMA_CPP_ROOT": "D:/Users/21405/source/repos/LocalLLMPredict/llama.cpp"
       }
     },
     {
@@ -28,7 +31,10 @@
       },
       "cacheVariables": {
         "CMAKE_CONFIGURATION_TYPES": "Debug",
-        "CMAKE_GENERATOR_INSTANCE": "D:/VS2022"
+        "CMAKE_GENERATOR_INSTANCE": "D:/VS2022",
+        "BERT_VCPKG_TRIPLET": "x64-windows",
+        "BERT_USE_ONNXRUNTIME_GPU": "OFF",
+        "LLAMA_CPP_ROOT": "D:/Users/21405/source/repos/LocalLLMPredict/llama.cpp"
       }
     },
     {

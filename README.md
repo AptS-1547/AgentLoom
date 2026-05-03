@@ -1,200 +1,139 @@
 # AgentBackendPredict
 
-`EducationalAgentProject` 的 C++ ONNX 推理后端，基于 gRPC + ONNX Runtime，为教育智能体仿真系统提供情绪/行为/语气预测服务。
+统一多模态推理服务端，整合 BERT 情绪分类、VLM 视觉语言推理和 ViT 显著度检测。
 
-主项目中本地 BERT 推理原本跑在 Python / PyTorch 上，多 persona 并发时成为瓶颈。此仓库将小模型推理服务化，解耦为独立可压测的链路：
+## 特性
 
+- **多模态推理**：BERT（ONNX Runtime）+ VLM（llama.cpp）+ ViT（预留）
+- **流式/同步推理**：支持 token-by-token 流式输出和批量同步推理
+- **生产级监控**：运行时统计、内存监控、慢请求追踪、健康检查
+- **跨平台支持**：Windows / Linux，CPU / CUDA
+- **Lazy Load**：LLM 首次请求时加载，空闲自动卸载释放 VRAM
+- **图片解码**：内存直接解码 JPEG/PNG/GIF/WebP，无需临时文件
+
+## 快速开始
+
+### 编译
+
+```powershell
+# Windows
+cmake -B build -G "Visual Studio 17 2022" -A x64 `
+  -DCMAKE_CONFIGURATION_TYPES=Release `
+  -DBERT_VCPKG_TRIPLET=x64-windows `
+  -DBERT_USE_ONNXRUNTIME_GPU=OFF
+
+cmake --build build --config Release --parallel
 ```
-Python tokenizer -> gRPC -> C++ ONNX Runtime -> Python 后处理
+
+### 启动服务端
+
+```powershell
+cd build/Release
+
+./multimodal_inference_server.exe `
+  --llm "D:/path/to/qwen2-vl-7b.gguf" `
+  --mmproj "D:/path/to/mmproj.gguf" `
+  --bert "D:/path/to/joint_model.onnx" `
+  --ngl 99 `
+  --host 0.0.0.0 --port 50051
 ```
+
+### Python 客户端
+
+```python
+import grpc
+import multimodal_inference_pb2 as pb2
+import multimodal_inference_pb2_grpc as pb2_grpc
+
+channel = grpc.insecure_channel('localhost:50051')
+stub = pb2_grpc.MultimodalInferenceStub(channel)
+
+# BERT 情绪分类
+request = pb2.EmotionRequest(
+    input_ids=[101, 2769, 3221, 1920, 102],
+    attention_mask=[1, 1, 1, 1, 1],
+    personality=[0.5] * 11
+)
+response = stub.PredictEmotion(request)
+
+# VLM 流式推理
+with open("image.jpg", "rb") as f:
+    image_data = f.read()
+
+request = pb2.VLMRequest(
+    prompt="描述这张图片",
+    image_data=image_data,
+    max_tokens=256
+)
+
+for token in stub.GenerateVLM(request):
+    if not token.is_final:
+        print(token.token, end='', flush=True)
+```
+
+## 文档
+
+- **[部署文档](docs/DEPLOYMENT.md)** - 完整的部署指南、参数说明、性能优化
+- **[API 文档](proto/multimodal_inference.proto)** - gRPC 接口定义
 
 ## 架构
 
 ```
-客户端 (Python / C++ / 任意 gRPC 客户端)
-  │
-  │  gRPC (默认 127.0.0.1:50051)
-  ▼
-┌────────────────────────────────────────┐
-│  BERTInference gRPC Server             │
-│  ├─ Predict()      单条推理            │
-│  └─ PredictBatch() 批量推理            │
-│  ├─ gRPC Health Check                 │
-│  ├─ 周期性运行统计                     │
-│  └─ 慢请求日志                         │
-│         │                              │
-│         ▼                              │
-│  OnnxBERTModel (ONNX Runtime 1.17.1)   │
-│  ├─ CPU 全核 intra-op 并行             │
-│  ├─ Extended 图优化                    │
-│  └─ 线程安全，支持并发推理             │
-└────────────────────────────────────────┘
+src/
+├── common/                    # 公共基础设施
+│   ├── server_common.h/.cpp   # 统计、内存监控、参数解析
+│   └── logger.h/.cpp          # 日志系统
+├── models/                    # 模型封装层
+│   ├── onnx_model.h/.cpp      # ONNX Runtime（BERT/ViT）
+│   └── llama_runner.h/.cpp    # llama.cpp VLM 封装
+├── server/                    # 服务端入口
+│   └── multimodal_inference_server.cpp
+└── client/                    # 测试客户端
+    ├── client_test.cpp
+    └── benchmark_client.cpp
 ```
 
-## 服务职责
+## 性能
 
-服务只接受已编码的张量，不负责 tokenizer、原始文本处理和上层业务逻辑：
+- **BERT 批量推理**：吞吐量提升 3-5 倍
+- **VLM GPU Offload**：RTX 4090 约 50 tokens/s（Qwen2-VL-7B）
+- **内存占用**：BERT ~500MB，VLM ~8GB（7B 模型 Q4_K_M）
+- **启动时间**：BERT 立即加载（~100ms），VLM lazy load（首次 ~10-30s）
 
-**输入：**
-- `input_ids` [batch, seq_len] — BERT token IDs（词表大小 21128）
-- `attention_mask` [batch, seq_len] — 注意力掩码
-- `personality` [batch, 11] — Big Five 人格 + 扩展维度
+## 依赖
 
-**输出：**
-- `emotion_logits` [batch, 10] — 10 类情绪分类
-- `behavior_logits` [batch, 12] — 12 类行为分类
-- `tone_logits` [batch, 8] — 8 类语气分类
-- `intensity` [batch, 1] — 情绪强度 0-1
-- `response_length_logits` [batch, 3] — 回复长度（短/中/长）
+- **ONNX Runtime** 1.17.1 (CPU) / 1.20.1 (GPU)
+- **llama.cpp** 主分支（需要 mtmd 支持）
+- **gRPC** 1.x (vcpkg)
+- **Protobuf** 3.x (vcpkg)
+- **spdlog** 1.x (vcpkg)
 
-协议定义在 [proto/bert_inference.proto](proto/bert_inference.proto)。
+## 许可证
 
-## 构建
+MIT License
 
-CI 中的构建流程是当前仓库可用的参考流程。
+## 更新日志
 
-### 依赖
+### v2.0.0 (2026-05-04)
 
-- CMake 3.20+
-- C++20 编译器
-- vcpkg
-- ONNX Runtime 预编译包
-- Windows: Visual Studio 2022（v143 工具集）
-- Linux: Ninja
+**重大重构**：
+- 合并 BERT/LLM/Multimodal 三个服务端为单一 `multimodal_inference_server`
+- 删除 `bert_inference_server` 和 `llm_inference_server`（功能已整合）
+- 重构目录结构：按功能分为 `common/`、`models/`、`server/`、`client/`
+- 提取公共基础设施到 `server_common` 库（统计、内存监控、参数解析）
 
-`grpc`、`protobuf` 和 `spdlog` 通过 vcpkg 管理，ONNX Runtime 使用预编译包。
+**新特性**：
+- 图片解码：使用 `mtmd_helper_bitmap_init_from_buf()` 从内存直接解码
+- RAII 资源管理：BitmapGuard/ChunksGuard/BatchGuard 消除内存泄漏
+- 简化 API：合并 `Generate()` 和 `GenerateStream()` 为单一接口
+- 使用 `mtmd_helper_eval_chunks()` 简化 chunk 处理（减少 60+ 行代码）
 
-### Windows
+**性能优化**：
+- LLM lazy load + 空闲自动卸载（5 分钟）
+- 跨平台内存监控（Windows/Linux）
+- 周期性统计日志 + 慢请求追踪
+- gRPC 健康检查 + 优雅关闭
 
-```powershell
-.\vcpkg\vcpkg.exe install grpc:x64-windows protobuf:x64-windows spdlog:x64-windows
+### v1.0.0 (2024)
 
-cmake -S . -B build\gha-windows `
-  -G "Visual Studio 17 2022" `
-  -A x64 `
-  -DCMAKE_CONFIGURATION_TYPES=Release `
-  -DBERT_VCPKG_TRIPLET=x64-windows `
-  -DBERT_USE_ONNXRUNTIME_GPU=OFF `
-  -DONNXRUNTIME_CPU_ROOT="D:\path\to\onnxruntime-win-x64-1.17.1"
-
-cmake --build build\gha-windows --config Release --parallel
-```
-
-> `CMakePresets.json` 中的 VS 路径为开发机本地值，换机器时建议显式传参。
-
-### Linux
-
-```bash
-sudo apt-get update
-sudo apt-get install -y ninja-build pkg-config curl tar unzip zip
-
-./vcpkg/vcpkg install grpc:x64-linux protobuf:x64-linux spdlog:x64-linux
-
-cmake -S . -B build/gha-linux \
-  -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DBERT_VCPKG_TRIPLET=x64-linux \
-  -DBERT_USE_ONNXRUNTIME_GPU=OFF \
-  -DONNXRUNTIME_CPU_ROOT=/path/to/onnxruntime-linux-x64-1.17.1
-
-cmake --build build/gha-linux --parallel
-```
-
-## 运行
-
-### 启动服务
-
-```bash
-bert_inference_server <model.onnx> [port]
-```
-
-示例：
-
-```bash
-bert_inference_server ./joint_model.onnx 50051 --host 127.0.0.1 --provider cpu
-```
-
-参数列表：
-
-| 参数 | 说明 |
-|------|------|
-| `--host` | 监听地址，默认 `127.0.0.1` |
-| `--provider` | 推理后端：`auto` / `cpu` / `cuda` |
-| `--cuda-device` | CUDA 设备编号 |
-| `--intra-op` | intra-op 并行线程数 |
-| `--inter-op` | inter-op 并行线程数 |
-| `--grpc-num-cqs` | gRPC 完成队列数 |
-| `--grpc-min-pollers` | gRPC 最小轮询线程数 |
-| `--grpc-max-pollers` | gRPC 最大轮询线程数 |
-| `--max-recv-mb` | 最大接收消息大小（MB） |
-| `--max-send-mb` | 最大发送消息大小（MB） |
-| `--stats-log-interval-seconds` | 统计日志间隔 |
-| `--slow-request-ms` | 慢请求阈值（ms） |
-
-### 健康检查
-
-```bash
-python tools/grpc_health_probe.py --target 127.0.0.1:50051
-```
-
-### 功能测试
-
-```bash
-bert_inference_client 127.0.0.1:50051
-```
-
-### 并发压测
-
-```bash
-bert_benchmark_client --target 127.0.0.1:50051 --concurrency 16 --requests 200 --seq-len 64
-```
-
-输出包括总请求数、成功/失败数、吞吐量、平均延迟和 p50/p95/p99 分位延迟。
-
-## 与主项目对接
-
-主项目 `EducationalAgentProject` 已支持对应的 gRPC 协议和 `onnx_grpc` 后端。切换配置：
-
-```json
-{
-  "small_model": {
-    "backend": "onnx_grpc",
-    "tokenizer_path": "./onnx/joint",
-    "onnx_target": "127.0.0.1:50051"
-  }
-}
-```
-
-主项目无需了解 C++ 推理细节，只需目标地址和协议。
-
-## CI 与发布
-
-- [`.github/workflows/ci.yml`](.github/workflows/ci.yml) — Windows / Linux 双平台编译、下载 ONNX Runtime、生成 smoke test 模型、启动服务、health probe、客户端测试
-- [`.github/workflows/release.yml`](.github/workflows/release.yml) — 产物自动打包发布
-
-## 项目结构
-
-```
-AgentBackendPredict/
-├── CMakeLists.txt               # 构建配置 (C++20, /utf-8)
-├── CMakePresets.json            # VS2022 x64 预设
-├── vcpkg.json                   # 依赖声明
-├── triplets/
-│   └── x64-windows-vs2022.cmake # vcpkg 自定义 triplet
-├── proto/
-│   └── bert_inference.proto     # gRPC 服务定义
-├── src/
-│   ├── onnx_model.h             # ONNX 模型封装 (PIMPL)
-│   ├── onnx_model.cpp           # 推理实现
-│   ├── bert_inference_server.cpp # gRPC 服务端
-│   └── client_test.cpp          # 测试客户端
-└── deps/
-    └── onnxruntime-win-x64-1.17.1/  # 预编译 ONNX Runtime
-```
-
-## 注意事项
-
-- 源文件使用 UTF-8 编码，CMake 已配置 `/utf-8` 编译选项
-- vcpkg 依赖须用 VS2022 工具集编译（`x64-windows-vs2022` triplet），避免 ABI 不兼容
-- ONNX Runtime 使用 `deps/` 下的预编译包，未通过 vcpkg 管理
-- 服务默认绑定 `127.0.0.1`，适用于同机进程间通信场景，不直接暴露公网
+初始版本，独立的 BERT 和 LLM 服务端。

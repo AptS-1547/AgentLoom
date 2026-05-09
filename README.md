@@ -6,10 +6,13 @@
 
 - **多模态推理**：BERT（ONNX Runtime）+ VLM（llama.cpp）+ ViT（预留）
 - **流式/同步推理**：支持 token-by-token 流式输出和批量同步推理
-- **生产级监控**：运行时统计、内存监控、慢请求追踪、健康检查
+- **智能缓存**：VLM 结果缓存（内存/持久化），支持过期策略和降级读取
+- **生产级监控**：运行时统计、VRAM 监控、慢请求追踪、健康检查
 - **跨平台支持**：Windows / Linux，CPU / CUDA
 - **Lazy Load**：LLM 首次请求时加载，空闲自动卸载释放 VRAM
 - **图片解码**：内存直接解码 JPEG/PNG/GIF/WebP，无需临时文件
+- **配置文件支持**：JSON 配置文件 + 命令行参数混合配置
+- **请求验证**：Token 认证、请求限流、参数校验
 
 ## 快速开始
 
@@ -30,12 +33,46 @@ cmake --build build --config Release --parallel
 ```powershell
 cd build/Release
 
+# 方式 1：命令行参数
 ./multimodal_inference_server.exe `
   --llm "D:/path/to/qwen2-vl-7b.gguf" `
   --mmproj "D:/path/to/mmproj.gguf" `
   --bert "D:/path/to/joint_model.onnx" `
   --ngl 99 `
-  --host 0.0.0.0 --port 50051
+  --host 0.0.0.0 --port 50051 `
+  --cache-enabled --cache-persist
+
+# 方式 2：配置文件（推荐）
+./multimodal_inference_server.exe --config config/server.json
+```
+
+配置文件示例 `config/server.json`：
+```json
+{
+  "grpc": {
+    "host": "0.0.0.0",
+    "port": 50051
+  },
+  "models": {
+    "bert": "models/joint_model.onnx",
+    "llm": "models/qwen2-vl-7b.gguf",
+    "mmproj": "models/mmproj.gguf"
+  },
+  "llm": {
+    "n_gpu_layers": 99
+  },
+  "vlm_cache": {
+    "enabled": true,
+    "persist": true,
+    "cache_dir": "cache/vlm",
+    "max_entries": 512,
+    "ttl_seconds": 3600
+  },
+  "auth": {
+    "enabled": true,
+    "token_file": "config/auth_token.txt"
+  }
+}
 ```
 
 ### Python 客户端
@@ -63,12 +100,22 @@ with open("image.jpg", "rb") as f:
 request = pb2.VLMRequest(
     prompt="描述这张图片",
     image_data=image_data,
-    max_tokens=256
+    max_tokens=256,
+    temperature=0.7,
+    allow_cache=True  # 启用缓存
 )
 
 for token in stub.GenerateVLM(request):
+    if token.cache_hit:
+        print(f"[缓存命中: {token.cache_key}]")
     if not token.is_final:
         print(token.token, end='', flush=True)
+    else:
+        print(f"\n[生成完成，来源: {token.result_source}]")
+
+# VLM 同步推理（适合批量处理）
+response = stub.GenerateVLMSync(request)
+print(response.text)
 ```
 
 ## 文档
@@ -86,19 +133,31 @@ src/
 ├── models/                    # 模型封装层
 │   ├── onnx_model.h/.cpp      # ONNX Runtime（BERT/ViT）
 │   └── llama_runner.h/.cpp    # llama.cpp VLM 封装
-├── server/                    # 服务端入口
-│   └── multimodal_inference_server.cpp
+├── server/                    # 服务端核心
+│   ├── multimodal_inference_server.cpp  # gRPC 服务实现
+│   ├── server_config.h/.cpp             # 配置文件加载
+│   ├── server_options.h                 # 配置结构定义
+│   ├── request_validation.h/.cpp        # 请求验证和限流
+│   └── vlm_cache.h/.cpp                 # VLM 结果缓存
 └── client/                    # 测试客户端
-    ├── client_test.cpp
-    └── benchmark_client.cpp
+    ├── client_test.cpp        # 功能测试
+    └── benchmark_client.cpp   # 性能测试
+
+config/                        # 配置文件目录
+third_party/                   # 第三方库（nlohmann/json 等）
+proto/                         # gRPC 协议定义
+    ├── multimodal_inference.proto  # 统一多模态协议
+    └── bert_inference.proto        # BERT 协议（向后兼容）
 ```
 
 ## 性能
 
 - **BERT 批量推理**：吞吐量提升 3-5 倍
-- **VLM GPU Offload**：RTX 4090 约 50 tokens/s（Qwen2-VL-7B）
-- **内存占用**：BERT ~500MB，VLM ~8GB（7B 模型 Q4_K_M）
+- **VLM GPU Offload**：RTX 5060 约 126 tokens/s（Qwen2-VL-3B）
+- **VLM 缓存命中**：响应时间 < 10ms（vs 首次推理 ~5s）
+- **内存占用**：BERT ~500MB，VLM ~4GB（3B 模型 Q4_K_M）
 - **启动时间**：BERT 立即加载（~100ms），VLM lazy load（首次 ~10-30s）
+- **VRAM 管理**：自动监控，低于阈值时卸载模型释放显存
 
 ## 依赖
 
@@ -107,6 +166,37 @@ src/
 - **gRPC** 1.x (vcpkg)
 - **Protobuf** 3.x (vcpkg)
 - **spdlog** 1.x (vcpkg)
+- **nlohmann/json** (header-only，已包含在 third_party/)
+
+## 核心功能模块
+
+### VLM 缓存系统
+
+智能缓存 VLM 推理结果，显著降低重复请求延迟：
+
+- **缓存键生成**：基于图片 SHA256 + Prompt SHA256
+- **过期策略**：TTL（默认 1 小时）+ LRU 淘汰
+- **持久化**：可选磁盘持久化，重启后恢复
+- **降级读取**：推理失败时返回过期缓存（可配置）
+- **统计信息**：命中率、缓存大小、热点查询追踪
+
+### 请求验证与限流
+
+生产级安全防护：
+
+- **Token 认证**：支持文件/环境变量配置
+- **参数校验**：自动验证 max_tokens、temperature 等参数范围
+- **请求限流**：防止恶意大批量请求
+- **慢请求追踪**：自动记录超时请求
+
+### VRAM 监控
+
+自动管理 GPU 显存：
+
+- **周期性监控**：每 10 秒检查可用 VRAM
+- **自动卸载**：低于阈值时卸载 LLM 释放显存
+- **OOM 保护**：捕获 CUDA OOM 错误并自动恢复
+- **跨平台支持**：Windows (NVML) / Linux (nvidia-smi)
 
 ## 许可证
 
@@ -114,7 +204,7 @@ MIT License
 
 ## 更新日志
 
-### v2.0.0 (2026-05-04)
+### v0.0.1beta 1 (2026-05-04)
 
 **重大重构**：
 - 合并 BERT/LLM/Multimodal 三个服务端为单一 `multimodal_inference_server`
@@ -123,10 +213,14 @@ MIT License
 - 提取公共基础设施到 `server_common` 库（统计、内存监控、参数解析）
 
 **新特性**：
-- 图片解码：使用 `mtmd_helper_bitmap_init_from_buf()` 从内存直接解码
-- RAII 资源管理：BitmapGuard/ChunksGuard/BatchGuard 消除内存泄漏
-- 简化 API：合并 `Generate()` 和 `GenerateStream()` 为单一接口
-- 使用 `mtmd_helper_eval_chunks()` 简化 chunk 处理（减少 60+ 行代码）
+- **VLM 缓存系统**：内存/持久化缓存，支持 TTL、LRU 淘汰、降级读取
+- **配置文件支持**：JSON 配置文件 + 命令行参数混合配置
+- **请求验证**：Token 认证、参数校验、请求限流
+- **VRAM 监控**：自动监控显存，低于阈值时卸载模型
+- **图片解码**：使用 `mtmd_helper_bitmap_init_from_buf()` 从内存直接解码
+- **RAII 资源管理**：BitmapGuard/ChunksGuard/BatchGuard 消除内存泄漏
+- **简化 API**：合并 `Generate()` 和 `GenerateStream()` 为单一接口
+- **使用 `mtmd_helper_eval_chunks()`** 简化 chunk 处理（减少 60+ 行代码）
 
 **性能优化**：
 - LLM lazy load + 空闲自动卸载（5 分钟）
@@ -134,6 +228,11 @@ MIT License
 - 周期性统计日志 + 慢请求追踪
 - gRPC 健康检查 + 优雅关闭
 
-### v1.0.0 (2024)
+**架构改进**：
+- 模块化设计：`server_config`、`request_validation`、`vlm_cache` 独立模块
+- 更清晰的职责分离：配置加载、请求验证、缓存管理各司其职
+- 更好的可测试性和可维护性
+
+### v0.0.1a (2026.3)
 
 初始版本，独立的 BERT 和 LLM 服务端。

@@ -5,6 +5,8 @@
 
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -39,6 +41,20 @@ struct GenerateParams {
     int32_t context_size = 2048;
     float top_p = 0.9f;
     int32_t top_k = 40;
+};
+
+struct DeviceMemoryInfo {
+    std::string name;
+    std::string description;
+    size_t free_bytes = 0;
+    size_t total_bytes = 0;
+    bool is_gpu = false;
+};
+
+struct MemorySnapshot {
+    bool loaded = false;
+    uint64_t model_size_bytes = 0;
+    std::vector<DeviceMemoryInfo> devices;
 };
 
 /**
@@ -80,8 +96,9 @@ public:
                        std::function<void(const std::string&)> token_callback = nullptr);
 
     void Unload();
-    bool IsLoaded() const { return loaded_; }
+    bool IsLoaded() const;
     std::string GetInfo() const;
+    MemorySnapshot GetMemorySnapshot() const;
 
 private:
     struct Impl;

@@ -81,11 +81,22 @@ message VLMRequest {
   int32 context_size = 5;
   float top_p = 6;
   int32 top_k = 7;
+  string session_id = 9;
+  string request_id = 10;
+  string task_type = 11;
+  bool allow_cache = 12;
+  bool force_refresh = 13;
+  bool allow_stale_cache = 14;
 }
 
 message VLMToken {
   string token = 1;
   bool is_final = 2;
+  string error = 3;
+  string cache_key = 4;
+  bool cache_hit = 5;
+  bool cache_stale = 6;
+  string result_source = 7;
 }
 
 message VLMResponse {
@@ -99,4 +110,10 @@ message VLMResponse {
   int32 generated_tokens = 6;
 
   string error = 7;
+  bool cache_hit = 8;
+  bool cache_stale = 9;
+  string cache_key = 10;
+  string image_sha256 = 11;
+  string prompt_sha256 = 12;
+  string result_source = 13;
 }

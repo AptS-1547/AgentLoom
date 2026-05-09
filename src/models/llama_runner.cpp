@@ -7,11 +7,13 @@
 #include "server_common.h"
 
 #include <llama.h>
+#include <ggml-backend.h>
 #include <mtmd.h>
 #include <mtmd-helper.h>
 #include <common.h>
 
 #include <chrono>
+#include <utility>
 
 namespace llm {
 
@@ -118,13 +120,13 @@ struct LlamaRunner::Impl {
             llama_free(ctx);
             ctx = nullptr;
         }
-        if (model) {
-            llama_free_model(model);
-            model = nullptr;
-        }
         if (mtmd_ctx) {
             mtmd_free(mtmd_ctx);
             mtmd_ctx = nullptr;
+        }
+        if (model) {
+            llama_free_model(model);
+            model = nullptr;
         }
     }
 };
@@ -376,6 +378,11 @@ void LlamaRunner::Unload() {
     loaded_ = false;
 }
 
+bool LlamaRunner::IsLoaded() const {
+    std::lock_guard lock(mutex_);
+    return loaded_;
+}
+
 std::string LlamaRunner::GetInfo() const {
     std::lock_guard lock(mutex_);
 
@@ -384,6 +391,47 @@ std::string LlamaRunner::GetInfo() const {
     }
 
     return "Llama model loaded: " + impl_->model_path.string();
+}
+
+MemorySnapshot LlamaRunner::GetMemorySnapshot() const {
+    std::lock_guard lock(mutex_);
+
+    MemorySnapshot snapshot;
+    snapshot.loaded = loaded_;
+    if (loaded_ && impl_->model) {
+        snapshot.model_size_bytes = llama_model_size(impl_->model);
+    }
+
+    const size_t device_count = ggml_backend_dev_count();
+    snapshot.devices.reserve(device_count);
+    for (size_t i = 0; i < device_count; ++i) {
+        ggml_backend_dev_t device = ggml_backend_dev_get(i);
+        if (!device) {
+            continue;
+        }
+
+        size_t free_bytes = 0;
+        size_t total_bytes = 0;
+        ggml_backend_dev_memory(device, &free_bytes, &total_bytes);
+
+        const auto type = ggml_backend_dev_type(device);
+        DeviceMemoryInfo info;
+        if (const char* name = ggml_backend_dev_name(device)) {
+            info.name = name;
+        }
+        if (const char* description = ggml_backend_dev_description(device)) {
+            info.description = description;
+        }
+        info.free_bytes = free_bytes;
+        info.total_bytes = total_bytes;
+        info.is_gpu =
+            type == GGML_BACKEND_DEVICE_TYPE_GPU ||
+            type == GGML_BACKEND_DEVICE_TYPE_IGPU ||
+            type == GGML_BACKEND_DEVICE_TYPE_META;
+        snapshot.devices.push_back(std::move(info));
+    }
+
+    return snapshot;
 }
 
 } // namespace llm

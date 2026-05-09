@@ -183,6 +183,13 @@ target_link_libraries(server_common PUBLIC spdlog::spdlog)
 
 add_executable(multimodal_inference_server
     src/server/multimodal_inference_server.cpp
+    src/server/request_validation.cpp
+    src/server/request_validation.h
+    src/server/server_config.cpp
+    src/server/server_config.h
+    src/server/server_options.h
+    src/server/vlm_cache.cpp
+    src/server/vlm_cache.h
     src/models/llama_runner.cpp
     src/models/llama_runner.h
     src/models/onnx_model.cpp
@@ -192,6 +199,7 @@ add_executable(multimodal_inference_server
 target_include_directories(multimodal_inference_server PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src/common
     ${CMAKE_CURRENT_SOURCE_DIR}/src/models
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party
     ${GENERATED_DIR}
     ${ONNXRUNTIME_ROOT}/include
     ${LLAMA_CPP_ROOT}/include

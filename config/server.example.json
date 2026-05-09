@@ -1,0 +1,65 @@
+{
+  "models": {
+    "llm": "D:/path/to/qwen2-vl.gguf",
+    "mmproj": "D:/path/to/mmproj.gguf",
+    "bert": "D:/path/to/joint_model.onnx",
+    "vit": "",
+    "n_gpu_layers": -1,
+    "provider": "auto",
+    "cuda_device": 0
+  },
+  "grpc": {
+    "host": "127.0.0.1",
+    "port": "50051",
+    "log_dir": "logs",
+    "num_cqs": 0,
+    "min_pollers": 0,
+    "max_pollers": 0,
+    "max_receive_message_mb": 100,
+    "max_send_message_mb": 10,
+    "stats_log_interval_seconds": 30,
+    "slow_request_ms": 250
+  },
+  "auth": {
+    "metadata_key": "x-agent-auth",
+    "token": "",
+    "token_file": "",
+    "token_env": "AGENT_BACKEND_AUTH_TOKEN"
+  },
+  "limits": {
+    "max_image_mb": 20,
+    "max_image_pixels": 16777216,
+    "max_image_width": 8192,
+    "max_image_height": 8192,
+    "max_prompt_bytes": 8192,
+    "min_context_size": 128,
+    "max_context_size": 8192,
+    "max_vlm_tokens": 2048,
+    "max_temperature": 2.0,
+    "max_top_k": 1000,
+    "max_sequence_length": 512,
+    "max_batch_size": 64,
+    "max_token_id": 10000000,
+    "max_abs_personality": 100.0
+  },
+  "vram_guard": {
+    "monitor_interval_seconds": 10,
+    "warning_free_mb": 1024,
+    "unload_free_mb": 512,
+    "min_free_before_load_mb": 0,
+    "reload_after_unload": false,
+    "unload_on_oom_error": true
+  },
+  "vlm_cache": {
+    "enabled": false,
+    "persist": false,
+    "dir": "cache/vlm",
+    "max_entries": 512,
+    "max_mb": 1024,
+    "ttl_seconds": 3600,
+    "store_images": true,
+    "store_prompts": true,
+    "stale_on_failure": true,
+    "default_allow_cache": true
+  }
+}

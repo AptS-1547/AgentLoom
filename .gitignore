@@ -7,6 +7,13 @@ triplets/
 #vcpkg安装包和依赖
 vcpkg_installed/
 deps/
+third_party/
+!third_party/
+third_party/*
+!third_party/nlohmann/
+third_party/nlohmann/*
+!third_party/nlohmann/json.hpp
+!third_party/nlohmann/LICENSE.MIT
 #日志文件
 *.log
 test/

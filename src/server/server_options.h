@@ -3,6 +3,7 @@
 #include "onnx_model.h"
 #include "request_validation.h"
 #include "server_common.h"
+#include "vector_cache.h"
 #include "vlm_cache.h"
 
 #include <cstddef>
@@ -24,6 +25,7 @@ struct MultimodalServerOptions {
     request_validation::RequestLimits limits;
     VramGuardOptions vram;
     vlm_cache::Options vlm_cache;
+    vlm_cache::VectorOptions vlm_cache_vector;
     std::string auth_token_file;
     std::string auth_token_env = "AGENT_BACKEND_AUTH_TOKEN";
     std::string auth_source;

@@ -28,6 +28,10 @@ struct VLMResult {
     int32_t prompt_tokens = 0;
     int32_t generated_tokens = 0;
 
+    std::vector<float> image_embedding;
+    int32_t image_embedding_dim = 0;
+    int32_t image_embedding_tokens = 0;
+
     bool success = false;
     std::string error_message;
 };
@@ -41,6 +45,7 @@ struct GenerateParams {
     int32_t context_size = 2048;
     float top_p = 0.9f;
     int32_t top_k = 40;
+    bool capture_image_embedding = false;
 };
 
 struct DeviceMemoryInfo {
@@ -94,6 +99,8 @@ public:
                        const std::string& prompt,
                        const GenerateParams& params = {},
                        std::function<void(const std::string&)> token_callback = nullptr);
+
+    VLMResult EncodeImageOnly(const std::vector<uint8_t>& image_data);
 
     void Unload();
     bool IsLoaded() const;

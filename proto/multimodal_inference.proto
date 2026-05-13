@@ -87,6 +87,7 @@ message VLMRequest {
   bool allow_cache = 12;
   bool force_refresh = 13;
   bool allow_stale_cache = 14;
+  float saliency_hint = 15;
 }
 
 message VLMToken {

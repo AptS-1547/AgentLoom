@@ -60,6 +60,15 @@
     "store_images": true,
     "store_prompts": true,
     "stale_on_failure": true,
-    "default_allow_cache": true
+    "default_allow_cache": true,
+    "vector": {
+      "enabled": false,
+      "sim_threshold_high": 0.97,
+      "sim_threshold_mid": 0.93,
+      "max_saliency_for_mid": 0.15,
+      "max_entries_per_bucket": 256,
+      "ttl_seconds": 3600,
+      "dir": "cache/vlm/vectors"
+    }
   }
 }

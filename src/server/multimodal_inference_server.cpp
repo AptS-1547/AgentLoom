@@ -23,6 +23,7 @@
 #include "request_validation.h"
 #include "server_config.h"
 #include "server_options.h"
+#include "vector_cache.h"
 #include "vlm_cache.h"
 
 #include <grpc/grpc.h>
@@ -73,6 +74,7 @@ using multimodal_inference::VLMToken;
 
 class MultimodalInferenceServiceImpl final : public MultimodalInference::Service {
 public:
+    static constexpr int32_t kMinTokensForVectorCache = 8;
     MultimodalInferenceServiceImpl(
         const MultimodalServerOptions& options,
         server_common::RuntimeStats& stats)
@@ -82,6 +84,7 @@ public:
           request_limits_(options.limits),
           vram_options_(options.vram),
           vlm_cache_(options.vlm_cache),
+          vector_index_(options.vlm_cache_vector),
           llm_model_path_(options.llm_model),
           mmproj_path_(options.mmproj),
           model_fingerprint_(BuildModelFingerprint(options.llm_model, options.mmproj, options.n_gpu_layers)),
@@ -271,7 +274,7 @@ public:
             return Status(StatusCode::INVALID_ARGUMENT, validation.error);
         }
 
-        auto params = BuildGenerateParams(*request);
+        auto params = BuildGenerateParamsWithEmbedding(*request);
         auto image_data = ExtractImageData(*request);
         auto key = BuildVLMCacheKey(image_data, request->prompt(), params);
         const bool use_cache = ShouldUseVLMCache(*request);
@@ -279,6 +282,14 @@ public:
         if (use_cache && !request->force_refresh()) {
             if (auto cached = vlm_cache_.Get(key.cache_key)) {
                 WriteCachedStream(writer, *cached, false, "exact_cache");
+                request_stats.MarkSuccess();
+                return Status::OK;
+            }
+
+            vlm_cache::Result vec_result;
+            std::string vec_source;
+            if (TryVectorCache(*request, image_data, key, &vec_result, &vec_source)) {
+                WriteCachedStream(writer, vec_result, false, vec_source);
                 request_stats.MarkSuccess();
                 return Status::OK;
             }
@@ -319,6 +330,7 @@ public:
 
         if (result.success) {
             StoreVLMCacheResult(*request, image_data, params, key, result);
+            StoreVectorCacheEntry(key, result);
             VLMToken final_token;
             final_token.set_is_final(true);
             FillVLMTokenCacheMetadata(&final_token, key, false, false, "fresh");
@@ -364,7 +376,7 @@ public:
             return Status(StatusCode::INVALID_ARGUMENT, validation.error);
         }
 
-        auto params = BuildGenerateParams(*request);
+        auto params = BuildGenerateParamsWithEmbedding(*request);
         auto image_data = ExtractImageData(*request);
         auto key = BuildVLMCacheKey(image_data, request->prompt(), params);
         const bool use_cache = ShouldUseVLMCache(*request);
@@ -372,6 +384,14 @@ public:
         if (use_cache && !request->force_refresh()) {
             if (auto cached = vlm_cache_.Get(key.cache_key)) {
                 FillVLMResponseFromCache(response, *cached, false, "exact_cache");
+                request_stats.MarkSuccess();
+                return Status::OK;
+            }
+
+            vlm_cache::Result vec_result;
+            std::string vec_source;
+            if (TryVectorCache(*request, image_data, key, &vec_result, &vec_source)) {
+                FillVLMResponseFromCache(response, vec_result, false, vec_source);
                 request_stats.MarkSuccess();
                 return Status::OK;
             }
@@ -403,6 +423,7 @@ public:
 
         if (result.success) {
             StoreVLMCacheResult(*request, image_data, params, key, result);
+            StoreVectorCacheEntry(key, result);
             FillVLMResponseCacheMetadata(response, key, false, false, "fresh");
             request_stats.MarkSuccess();
             return Status::OK;
@@ -613,6 +634,67 @@ private:
         vlm_cache_.Put(std::move(record));
     }
 
+    bool TryVectorCache(
+        const VLMRequest& request,
+        const std::vector<uint8_t>& image_data,
+        const vlm_cache::KeyInfo& key,
+        vlm_cache::Result* out_result,
+        std::string* out_source) {
+        if (!vector_index_.options().enabled || image_data.empty()) {
+            return false;
+        }
+        if (!llm_runner_.IsLoaded()) {
+            return false;
+        }
+
+        auto encode_result = llm_runner_.EncodeImageOnly(image_data);
+        if (!encode_result.success || encode_result.image_embedding.empty()) {
+            LOG_DEBUG("[VectorCache] EncodeImageOnly failed: {}", encode_result.error_message);
+            return false;
+        }
+
+        const float saliency = request.saliency_hint();
+        auto hit = vector_index_.Query(
+            key.prompt_sha256, model_fingerprint_,
+            encode_result.image_embedding, saliency);
+
+        if (!hit) {
+            return false;
+        }
+
+        auto cached = vlm_cache_.Get(hit->cache_key);
+        if (!cached) {
+            vector_index_.Evict(key.prompt_sha256, hit->cache_key);
+            LOG_DEBUG("[VectorCache] hit key {} not in VLMCache, evicted from vector index", hit->cache_key);
+            return false;
+        }
+
+        *out_result = std::move(*cached);
+        *out_source = hit->tentative ? "vector_cache_tentative" : "vector_cache";
+        LOG_INFO("[VectorCache] {} hit: sim={:.4f} key={}",
+                 hit->tentative ? "tentative" : "confident",
+                 hit->similarity, hit->cache_key);
+        return true;
+    }
+
+    void StoreVectorCacheEntry(
+        const vlm_cache::KeyInfo& key,
+        const llm::VLMResult& result) {
+        if (!vector_index_.options().enabled || result.image_embedding.empty()) {
+            return;
+        }
+        if (result.generated_tokens < kMinTokensForVectorCache) {
+            LOG_DEBUG("[VectorCache] skip store: generated_tokens={} < min={}",
+                      result.generated_tokens, kMinTokensForVectorCache);
+            return;
+        }
+        vlm_cache::VectorEntry entry;
+        entry.cache_key = key.cache_key;
+        entry.model_fingerprint = model_fingerprint_;
+        entry.embedding = result.image_embedding;
+        vector_index_.Put(key.prompt_sha256, std::move(entry));
+    }
+
     static double BytesToMiB(size_t bytes) {
         return static_cast<double>(bytes) / (1024.0 * 1024.0);
     }
@@ -756,6 +838,14 @@ private:
         return params;
     }
 
+    llm::GenerateParams BuildGenerateParamsWithEmbedding(const VLMRequest& request) const {
+        auto params = BuildGenerateParams(request);
+        if (vector_index_.options().enabled) {
+            params.capture_image_embedding = true;
+        }
+        return params;
+    }
+
     static std::vector<uint8_t> ExtractImageData(const VLMRequest& request) {
         if (request.image_source_case() == VLMRequest::kImageData) {
             return {request.image_data().begin(), request.image_data().end()};
@@ -796,6 +886,7 @@ private:
     request_validation::RequestLimits request_limits_;
     VramGuardOptions vram_options_;
     vlm_cache::VLMCache vlm_cache_;
+    vlm_cache::VectorIndex vector_index_;
 
     // LLM lazy load 配置
     std::string llm_model_path_;

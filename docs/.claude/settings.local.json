@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(Get-Content \"D:\\\\Users\\\\21405\\\\source\\\\repos\\\\AgentBackendPredict\\\\docs\\\\COMMERCIAL_ARCHITECTURE_V2.md\")",
+      "Bash(Measure-Object -Line)",
+      "PowerShell(Get-Content *)"
+    ]
+  }
+}

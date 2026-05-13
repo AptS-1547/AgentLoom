@@ -371,6 +371,22 @@ public:
         SetBool(*section, Name(), "store_prompts", options.vlm_cache.store_prompts);
         SetBool(*section, Name(), "stale_on_failure", options.vlm_cache.allow_stale_on_failure);
         SetBool(*section, Name(), "default_allow_cache", options.vlm_cache.default_allow_cache);
+
+        const json* vec = FindSection(*section, "vector");
+        if (vec) {
+            SetBool(*vec, "vlm_cache.vector", "enabled", options.vlm_cache_vector.enabled);
+            SetFloat(*vec, "vlm_cache.vector", "sim_threshold_high",
+                     options.vlm_cache_vector.sim_threshold_high, 0.0f, 1.0f);
+            SetFloat(*vec, "vlm_cache.vector", "sim_threshold_mid",
+                     options.vlm_cache_vector.sim_threshold_mid, 0.0f, 1.0f);
+            SetFloat(*vec, "vlm_cache.vector", "max_saliency_for_mid",
+                     options.vlm_cache_vector.max_saliency_for_mid, 0.0f, 1.0f);
+            SetSize(*vec, "vlm_cache.vector", "max_entries_per_bucket",
+                    options.vlm_cache_vector.max_entries_per_bucket);
+            SetInt64(*vec, "vlm_cache.vector", "ttl_seconds",
+                     options.vlm_cache_vector.ttl_seconds, 0);
+            SetPath(*vec, "vlm_cache.vector", "dir", options.vlm_cache_vector.vector_dir);
+        }
     }
 };
 

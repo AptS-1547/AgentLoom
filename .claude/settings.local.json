@@ -1,7 +1,11 @@
 {
   "permissions": {
     "allow": [
-      "PowerShell(Get-ChildItem -Path src -Recurse -File | Select-Object FullName | ForEach-Object { $_.FullName.Replace\\(\\(Get-Location\\).Path + '\\\\', ''\\) })"
+      "PowerShell(Get-ChildItem -Path src -Recurse -File | Select-Object FullName | ForEach-Object { $_.FullName.Replace\\(\\(Get-Location\\).Path + '\\\\', ''\\) })",
+      "Bash(python -c \"import grpc_tools.protoc\")",
+      "Bash(/d/Users/21405/source/repos/MyNeuroLikeSystem/Scripts/python.exe -c \"import grpc_tools.protoc; print\\('grpc_tools ok'\\)\")",
+      "Bash(/d/Users/21405/source/repos/MyNeuroLikeSystem/Scripts/python.exe --version)",
+      "Bash(xargs wc -l)"
     ]
   }
 }

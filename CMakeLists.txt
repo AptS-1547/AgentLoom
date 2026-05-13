@@ -188,6 +188,8 @@ add_executable(multimodal_inference_server
     src/server/server_config.cpp
     src/server/server_config.h
     src/server/server_options.h
+    src/server/vector_cache.cpp
+    src/server/vector_cache.h
     src/server/vlm_cache.cpp
     src/server/vlm_cache.h
     src/models/llama_runner.cpp
@@ -199,6 +201,7 @@ add_executable(multimodal_inference_server
 target_include_directories(multimodal_inference_server PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src/common
     ${CMAKE_CURRENT_SOURCE_DIR}/src/models
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/server
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party
     ${GENERATED_DIR}
     ${ONNXRUNTIME_ROOT}/include

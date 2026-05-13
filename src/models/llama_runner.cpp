@@ -240,6 +240,9 @@ VLMResult LlamaRunner::Generate(const std::vector<uint8_t>& image_data,
         return result;
     }
 
+    llama_memory_clear(llama_get_memory(impl_->ctx), true);
+    llama_sampler_reset(impl_->sampler);
+
     // 1. 从内存解码图片（如果有）
     BitmapGuard bitmap;
 
@@ -264,9 +267,28 @@ VLMResult LlamaRunner::Generate(const std::vector<uint8_t>& image_data,
     // 2. 分词（文本 + 图片 marker）
     auto t_prompt_start = std::chrono::high_resolution_clock::now();
 
-    std::string full_prompt = prompt;
-    if (bitmap && full_prompt.find(mtmd_default_marker()) == std::string::npos) {
-        full_prompt = std::string(mtmd_default_marker()) + full_prompt;
+    std::string user_content = prompt;
+    if (bitmap && user_content.find(mtmd_default_marker()) == std::string::npos) {
+        user_content = std::string(mtmd_default_marker()) + user_content;
+    }
+
+    std::string full_prompt = user_content;
+    const char* tmpl = llama_model_chat_template(impl_->model, nullptr);
+    if (tmpl) {
+        llama_chat_message msg{"user", user_content.c_str()};
+        std::vector<char> tmpl_buf(user_content.size() * 2 + 512);
+        int32_t tmpl_len = llama_chat_apply_template(
+            tmpl, &msg, 1, /*add_ass=*/true, tmpl_buf.data(), static_cast<int32_t>(tmpl_buf.size()));
+        if (tmpl_len < 0) {
+            result.error_message = "llama_chat_apply_template failed";
+            return result;
+        }
+        if (tmpl_len > static_cast<int32_t>(tmpl_buf.size())) {
+            tmpl_buf.resize(tmpl_len);
+            tmpl_len = llama_chat_apply_template(
+                tmpl, &msg, 1, true, tmpl_buf.data(), static_cast<int32_t>(tmpl_buf.size()));
+        }
+        full_prompt.assign(tmpl_buf.data(), static_cast<size_t>(tmpl_len));
     }
 
     mtmd_input_text text;
@@ -289,22 +311,48 @@ VLMResult LlamaRunner::Generate(const std::vector<uint8_t>& image_data,
         return result;
     }
 
-    // 3. 使用 helper 函数处理所有 chunks（文本 + 图片 embedding）
+    // 3. 逐 chunk 处理，支持 image embedding 捕获
     llama_pos n_past = 0;
-    int32_t eval_res = mtmd_helper_eval_chunks(
-        impl_->mtmd_ctx,
-        impl_->ctx,
-        chunks.get(),
-        n_past,
-        0,     // seq_id
-        512,   // n_batch
-        true,  // logits_last
-        &n_past
-    );
+    const size_t n_chunks = mtmd_input_chunks_size(chunks.get());
 
-    if (eval_res != 0) {
-        result.error_message = "Failed to evaluate chunks";
-        return result;
+    for (size_t i = 0; i < n_chunks; ++i) {
+        const mtmd_input_chunk* chunk = mtmd_input_chunks_get(chunks.get(), i);
+        const auto chunk_type = mtmd_input_chunk_get_type(chunk);
+
+        if (chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE
+            && params.capture_image_embedding
+            && result.image_embedding.empty()) {
+            const int32_t n_embd = llama_model_n_embd_inp(impl_->model);
+            if (mtmd_encode_chunk(impl_->mtmd_ctx, chunk) != 0) {
+                result.error_message = "Failed to encode image chunk for embedding";
+                return result;
+            }
+            float* embd = mtmd_get_output_embd(impl_->mtmd_ctx);
+            const int32_t n_tokens = static_cast<int32_t>(mtmd_input_chunk_get_n_tokens(chunk));
+
+            result.image_embedding.assign(n_embd, 0.0f);
+            for (int32_t t = 0; t < n_tokens; ++t) {
+                for (int32_t d = 0; d < n_embd; ++d) {
+                    result.image_embedding[d] += embd[t * n_embd + d];
+                }
+            }
+            const float inv = 1.0f / std::max(1, n_tokens);
+            for (auto& v : result.image_embedding) v *= inv;
+            result.image_embedding_dim = n_embd;
+            result.image_embedding_tokens = n_tokens;
+
+            if (mtmd_helper_decode_image_chunk(impl_->mtmd_ctx, impl_->ctx, chunk,
+                                               embd, n_past, 0, 512, &n_past) != 0) {
+                result.error_message = "Failed to decode image chunk";
+                return result;
+            }
+        } else {
+            if (mtmd_helper_eval_chunk_single(impl_->mtmd_ctx, impl_->ctx, chunk,
+                                              n_past, 0, 512, true, &n_past) != 0) {
+                result.error_message = "Failed to evaluate chunk";
+                return result;
+            }
+        }
     }
 
     result.prompt_tokens = n_past;
@@ -362,6 +410,91 @@ VLMResult LlamaRunner::Generate(const std::vector<uint8_t>& image_data,
                  result.eval_ms,
                  result.generated_tokens * 1000.0f / result.eval_ms);
     }
+
+    return result;
+}
+
+VLMResult LlamaRunner::EncodeImageOnly(const std::vector<uint8_t>& image_data) {
+    std::lock_guard lock(mutex_);
+
+    VLMResult result;
+
+    if (!loaded_) {
+        result.error_message = "Model not loaded";
+        return result;
+    }
+    if (!impl_->mtmd_ctx) {
+        result.error_message = "No mmproj loaded";
+        return result;
+    }
+    if (image_data.empty()) {
+        result.error_message = "Empty image data";
+        return result;
+    }
+
+    llama_memory_clear(llama_get_memory(impl_->ctx), true);
+
+    auto t_start = std::chrono::high_resolution_clock::now();
+
+    BitmapGuard bitmap(mtmd_helper_bitmap_init_from_buf(
+        impl_->mtmd_ctx, image_data.data(), image_data.size()));
+    if (!bitmap) {
+        result.error_message = "Failed to decode image";
+        return result;
+    }
+
+    std::string marker_prompt(mtmd_default_marker());
+    mtmd_input_text text;
+    text.text = marker_prompt.c_str();
+    text.add_special = true;
+    text.parse_special = true;
+
+    ChunksGuard chunks;
+    const mtmd_bitmap* bitmaps_arr[] = {bitmap.get()};
+    if (mtmd_tokenize(impl_->mtmd_ctx, chunks.get(), &text, bitmaps_arr, 1) != 0) {
+        result.error_message = "Failed to tokenize for embedding";
+        return result;
+    }
+
+    const size_t n_chunks = mtmd_input_chunks_size(chunks.get());
+    const int32_t n_embd = llama_model_n_embd_inp(impl_->model);
+
+    for (size_t i = 0; i < n_chunks; ++i) {
+        const mtmd_input_chunk* chunk = mtmd_input_chunks_get(chunks.get(), i);
+        if (mtmd_input_chunk_get_type(chunk) != MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+            continue;
+        }
+
+        if (mtmd_encode_chunk(impl_->mtmd_ctx, chunk) != 0) {
+            result.error_message = "Failed to encode image chunk";
+            return result;
+        }
+
+        const float* embd = mtmd_get_output_embd(impl_->mtmd_ctx);
+        const int32_t n_tokens = static_cast<int32_t>(mtmd_input_chunk_get_n_tokens(chunk));
+
+        result.image_embedding.assign(n_embd, 0.0f);
+        for (int32_t t = 0; t < n_tokens; ++t) {
+            for (int32_t d = 0; d < n_embd; ++d) {
+                result.image_embedding[d] += embd[t * n_embd + d];
+            }
+        }
+        const float inv = 1.0f / std::max(1, n_tokens);
+        for (auto& v : result.image_embedding) v *= inv;
+        result.image_embedding_dim = n_embd;
+        result.image_embedding_tokens = n_tokens;
+        break;
+    }
+
+    auto t_end = std::chrono::high_resolution_clock::now();
+    result.image_encode_ms = std::chrono::duration<float, std::milli>(t_end - t_start).count();
+    result.success = !result.image_embedding.empty();
+    if (!result.success) {
+        result.error_message = "No image chunk found";
+    }
+
+    llama_memory_clear(llama_get_memory(impl_->ctx), true);
+    llama_sampler_reset(impl_->sampler);
 
     return result;
 }

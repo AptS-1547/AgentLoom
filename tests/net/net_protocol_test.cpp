@@ -1,6 +1,8 @@
 #include "backpressure_queue.h"
+#include "connection_pool.h"
 #include "http_server.h"
 #include "http_types.h"
+#include "request_interfaces.h"
 #include "static_file_handler.h"
 #include "websocket_types.h"
 
@@ -102,6 +104,51 @@ TEST(BackpressureQueueTest, RejectsByItemAndByteLimits) {
     EXPECT_EQ(stats.rejected_items, 2u);
 }
 
+TEST(ConnectionPoolTest, TracksLeaseLifetimeAndPerProtocolLimits) {
+    net::ConnectionPool pool({.max_connections = 2, .max_http_connections = 1, .max_websocket_connections = 1});
+
+    auto first = pool.Acquire(net::ProtocolConnectionKind::Http, net::ConnectionContext{1, "127.0.0.1"});
+    ASSERT_TRUE(first.ok()) << first.status().message();
+
+    auto duplicate = pool.Acquire(net::ProtocolConnectionKind::Http, net::ConnectionContext{1, "127.0.0.1"});
+    ASSERT_FALSE(duplicate.ok());
+    EXPECT_EQ(duplicate.status().code(), core::ErrorCode::AlreadyExists);
+
+    auto http_limit = pool.Acquire(net::ProtocolConnectionKind::Http, net::ConnectionContext{2, "127.0.0.1"});
+    ASSERT_FALSE(http_limit.ok());
+    EXPECT_EQ(http_limit.status().code(), core::ErrorCode::ResourceExhausted);
+
+    auto ws = pool.Acquire(net::ProtocolConnectionKind::WebSocket, net::ConnectionContext{2, "127.0.0.1"});
+    ASSERT_TRUE(ws.ok()) << ws.status().message();
+
+    auto stats = pool.Stats();
+    EXPECT_EQ(stats.active_connections, 2u);
+    EXPECT_EQ(stats.active_http_connections, 1u);
+    EXPECT_EQ(stats.active_websocket_connections, 1u);
+    EXPECT_EQ(stats.rejected_connections, 2u);
+
+    std::move(first).value().Close(net::ConnectionCloseInfo::Remote());
+    stats = pool.Stats();
+    EXPECT_EQ(stats.active_connections, 1u);
+    EXPECT_EQ(stats.active_http_connections, 0u);
+    EXPECT_EQ(stats.closed_connections, 1u);
+}
+
+TEST(ConnectionPoolTest, AllowsHttpLeaseToUpgradeWhenPoolIsAtTotalLimit) {
+    net::ConnectionPool pool({.max_connections = 1, .max_websocket_connections = 1});
+    auto lease_result = pool.Acquire(net::ProtocolConnectionKind::Http, net::ConnectionContext{10, "127.0.0.1"});
+    ASSERT_TRUE(lease_result.ok()) << lease_result.status().message();
+
+    auto lease = std::move(lease_result).value();
+    auto status = lease.SetKind(net::ProtocolConnectionKind::WebSocket);
+    ASSERT_TRUE(status.ok()) << status.message();
+
+    auto stats = pool.Stats();
+    EXPECT_EQ(stats.active_connections, 1u);
+    EXPECT_EQ(stats.active_http_connections, 0u);
+    EXPECT_EQ(stats.active_websocket_connections, 1u);
+}
+
 TEST(SharedBufferTest, RejectsWritesBeyondCapacity) {
     core::BucketMemoryPool pool;
     auto buffer_result = net::SharedBuffer::AllocateCapacity(pool, 8);
@@ -193,6 +240,54 @@ TEST(HttpServerRuntimeTest, HandlesHttpRequestWithRegisteredHandler) {
     server.Stop();
 }
 
+TEST(HttpServerRuntimeTest, DispatchesTypedHttpRequestInterface) {
+    net::HttpServer server({.address = "127.0.0.1", .port = 0, .io_threads = 1});
+    std::promise<void> request_seen;
+    auto request_seen_future = request_seen.get_future();
+
+    server.SetHttpRequestHandler([&](std::shared_ptr<net::IHttpRequest> request) {
+        EXPECT_EQ(request->message().method(), net::http::verb::post);
+        EXPECT_EQ(request->message().target(), "/api/vector/query");
+        EXPECT_NE(request->connection().connection_id, 0u);
+        EXPECT_NE(&request->memory_pool(), nullptr);
+        EXPECT_EQ(request->task_pool(), nullptr);
+        request->Respond(net::HttpResponse::Json(net::http::status::ok, R"({"typed":true})").message);
+        request_seen.set_value();
+    });
+
+    auto start_status = server.Start();
+    ASSERT_TRUE(start_status.ok()) << start_status.message();
+
+    asio::io_context io;
+    tcp::resolver resolver(io);
+    beast::tcp_stream stream(io);
+    stream.connect(resolver.resolve("127.0.0.1", std::to_string(server.port())));
+
+    net::BeastHttpRequest request{net::http::verb::post, "/api/vector/query", 11};
+    request.set(net::http::field::host, "127.0.0.1");
+    request.body() = R"({"embedding":[1,0,0]})";
+    request.prepare_payload();
+    net::http::write(stream, request);
+
+    beast::flat_buffer buffer;
+    net::BeastHttpResponse response;
+    net::http::read(stream, buffer, response);
+
+    EXPECT_EQ(response.result(), net::http::status::ok);
+    EXPECT_EQ(response.body(), R"({"typed":true})");
+    EXPECT_EQ(request_seen_future.wait_for(2s), std::future_status::ready);
+
+    beast::error_code ec;
+    stream.socket().shutdown(tcp::socket::shutdown_both, ec);
+    stream.socket().close(ec);
+    for (int i = 0; i < 50 && server.ConnectionStats().active_connections != 0; ++i) {
+        std::this_thread::sleep_for(10ms);
+    }
+
+    server.Stop();
+    EXPECT_EQ(server.ConnectionStats().active_connections, 0u);
+}
+
 TEST(HttpServerRuntimeTest, ServesStaticFileWithBeastFileBody) {
     ScopedTempDirectory temp_dir("agent_net_static_test");
     const auto& root = temp_dir.path();
@@ -223,6 +318,86 @@ TEST(HttpServerRuntimeTest, ServesStaticFileWithBeastFileBody) {
     EXPECT_EQ(response.result(), net::http::status::ok);
     EXPECT_EQ(response[net::http::field::content_type], "text/html; charset=utf-8");
     EXPECT_EQ(response.body(), "<html>ok</html>");
+
+    server.Stop();
+}
+
+TEST(HttpServerRuntimeTest, ServesStaticSpaAndDynamicallyLoadedJavaScriptAssets) {
+    ScopedTempDirectory temp_dir("agent_net_spa_test");
+    const auto& root = temp_dir.path();
+    std::filesystem::create_directories(root / "assets");
+    {
+        std::ofstream file(root / "index.html", std::ios::binary);
+        file << "<!doctype html><html><head>"
+                "<link rel=\"stylesheet\" href=\"/assets/app.css\">"
+                "</head><body><div id=\"app\"></div>"
+                "<script type=\"module\" src=\"/assets/app.js\"></script>"
+                "</body></html>";
+    }
+    {
+        std::ofstream file(root / "assets" / "app.js", std::ios::binary);
+        file << "document.querySelector('#app').textContent = 'boot';\n"
+                "export async function loadDynamic(){ return import('./chunk-view.js?v=42'); }\n";
+    }
+    {
+        std::ofstream file(root / "assets" / "chunk-view.js", std::ios::binary);
+        file << "export const viewName = 'dynamic-view';\n";
+    }
+    {
+        std::ofstream file(root / "assets" / "app.css", std::ios::binary);
+        file << "#app{color:#123456;}\n";
+    }
+
+    net::HttpServer server({.address = "127.0.0.1", .port = 0, .io_threads = 1});
+    server.SetStaticFiles({root});
+    auto start_status = server.Start();
+    ASSERT_TRUE(start_status.ok()) << start_status.message();
+
+    auto fetch = [&](std::string target) {
+        asio::io_context io;
+        tcp::resolver resolver(io);
+        beast::tcp_stream stream(io);
+        stream.connect(resolver.resolve("127.0.0.1", std::to_string(server.port())));
+
+        net::BeastHttpRequest request{net::http::verb::get, target, 11};
+        request.set(net::http::field::host, "127.0.0.1");
+        request.prepare_payload();
+        net::http::write(stream, request);
+
+        beast::flat_buffer buffer;
+        net::BeastHttpResponse response;
+        net::http::read(stream, buffer, response);
+
+        beast::error_code ec;
+        stream.socket().shutdown(tcp::socket::shutdown_both, ec);
+        stream.socket().close(ec);
+        return response;
+    };
+
+    auto index = fetch("/");
+    EXPECT_EQ(index.result(), net::http::status::ok);
+    EXPECT_EQ(index[net::http::field::content_type], "text/html; charset=utf-8");
+    EXPECT_NE(index.body().find("type=\"module\" src=\"/assets/app.js\""), std::string::npos);
+
+    auto app_js = fetch("/assets/app.js");
+    EXPECT_EQ(app_js.result(), net::http::status::ok);
+    EXPECT_EQ(app_js[net::http::field::content_type], "text/javascript; charset=utf-8");
+    EXPECT_NE(app_js.body().find("import('./chunk-view.js?v=42')"), std::string::npos);
+
+    auto dynamic_chunk = fetch("/assets/chunk-view.js?v=42");
+    EXPECT_EQ(dynamic_chunk.result(), net::http::status::ok);
+    EXPECT_EQ(dynamic_chunk[net::http::field::content_type], "text/javascript; charset=utf-8");
+    EXPECT_NE(dynamic_chunk.body().find("dynamic-view"), std::string::npos);
+
+    auto css = fetch("/assets/app.css");
+    EXPECT_EQ(css.result(), net::http::status::ok);
+    EXPECT_EQ(css[net::http::field::content_type], "text/css; charset=utf-8");
+    EXPECT_NE(css.body().find("#app{color:#123456;}"), std::string::npos);
+
+    auto route_fallback = fetch("/classroom/session/42");
+    EXPECT_EQ(route_fallback.result(), net::http::status::ok);
+    EXPECT_EQ(route_fallback[net::http::field::content_type], "text/html; charset=utf-8");
+    EXPECT_NE(route_fallback.body().find("<div id=\"app\"></div>"), std::string::npos);
 
     server.Stop();
 }
@@ -295,6 +470,56 @@ TEST(HttpServerRuntimeTest, UpgradesAndEchoesWebSocketMessage) {
     EXPECT_EQ(beast::buffers_to_string(buffer.data()), "echo:hello");
 
     EXPECT_EQ(message_seen_future.wait_for(2s), std::future_status::ready);
+
+    beast::error_code ec;
+    ws.close(beast::websocket::close_code::normal, ec);
+    server.Stop();
+}
+
+TEST(HttpServerRuntimeTest, DispatchesTypedWebSocketStreamRequestAndTracksConnection) {
+    net::HttpServer server({.address = "127.0.0.1", .port = 0, .io_threads = 1});
+    core::BucketMemoryPool response_pool;
+    std::promise<void> message_seen;
+    auto message_seen_future = message_seen.get_future();
+
+    server.SetWebSocketStreamHandler("/stream", [&](std::shared_ptr<net::IWebSocketStreamRequest> request) {
+        EXPECT_NE(request->connection().connection_id, 0u);
+        EXPECT_EQ(request->message().kind, net::WebSocketMessageKind::Text);
+        ASSERT_EQ(request->message().fragments.size(), 1u);
+        EXPECT_EQ(request->message().fragments.front().view(), "frame");
+        EXPECT_NE(&request->memory_pool(), nullptr);
+
+        auto snapshots = server.ConnectionSnapshots();
+        ASSERT_EQ(snapshots.size(), 1u);
+        EXPECT_EQ(snapshots.front().kind, net::ProtocolConnectionKind::WebSocket);
+
+        auto payload = net::SharedBuffer::Copy(response_pool, "ack");
+        ASSERT_TRUE(payload.ok()) << payload.status().message();
+        auto status = request->Send(net::WebSocketFrame{net::WebSocketMessageKind::Text, true, false, std::move(payload).value()});
+        EXPECT_TRUE(status.ok()) << status.message();
+        message_seen.set_value();
+    });
+
+    auto start_status = server.Start();
+    ASSERT_TRUE(start_status.ok()) << start_status.message();
+
+    asio::io_context io;
+    tcp::resolver resolver(io);
+    beast::websocket::stream<tcp::socket> ws(io);
+    asio::connect(ws.next_layer(), resolver.resolve("127.0.0.1", std::to_string(server.port())));
+    ws.handshake("127.0.0.1", "/stream");
+    ws.text(true);
+    ws.write(asio::buffer(std::string("frame")));
+
+    beast::flat_buffer buffer;
+    ws.read(buffer);
+    EXPECT_TRUE(ws.got_text());
+    EXPECT_EQ(beast::buffers_to_string(buffer.data()), "ack");
+    EXPECT_EQ(message_seen_future.wait_for(2s), std::future_status::ready);
+
+    auto stats = server.ConnectionStats();
+    EXPECT_EQ(stats.active_connections, 1u);
+    EXPECT_EQ(stats.active_websocket_connections, 1u);
 
     beast::error_code ec;
     ws.close(beast::websocket::close_code::normal, ec);

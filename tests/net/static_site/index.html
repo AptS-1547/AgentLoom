@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>AgentBackendPredict Static Site Test</title>
+    <link rel="stylesheet" href="/assets/site.css">
+  </head>
+  <body>
+    <main class="shell">
+      <section class="panel">
+        <p class="eyebrow">HttpServer browser loading test</p>
+        <h1>Static page loaded</h1>
+        <dl class="grid">
+          <div>
+            <dt>HTML</dt>
+            <dd id="html-status">loaded</dd>
+          </div>
+          <div>
+            <dt>module JS</dt>
+            <dd id="module-status">pending</dd>
+          </div>
+          <div>
+            <dt>dynamic import</dt>
+            <dd id="chunk-status">pending</dd>
+          </div>
+          <div>
+            <dt>fetch JSON</dt>
+            <dd id="json-status">pending</dd>
+          </div>
+        </dl>
+        <pre id="log" aria-label="runtime log"></pre>
+      </section>
+    </main>
+    <script type="module" src="/assets/app.js"></script>
+  </body>
+</html>
+

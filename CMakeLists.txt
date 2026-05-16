@@ -363,10 +363,13 @@ target_link_libraries(agent_core PUBLIC spdlog::spdlog)
 
 add_library(agent_net STATIC
     src/net/backpressure_queue.h
+    src/net/connection_pool.cpp
+    src/net/connection_pool.h
     src/net/http_server.cpp
     src/net/http_server.h
     src/net/http_types.h
     src/net/protocol_types.h
+    src/net/request_interfaces.h
     src/net/shared_buffer.h
     src/net/static_file_handler.cpp
     src/net/static_file_handler.h
@@ -384,6 +387,28 @@ target_link_libraries(agent_net PUBLIC
 if(TARGET boost_asio_headers)
     target_link_libraries(agent_net PUBLIC boost_asio_headers)
 endif()
+
+add_executable(static_site_test_server
+    tests/net/static_site_server.cpp
+)
+
+target_link_libraries(static_site_test_server PRIVATE
+    agent_net
+)
+
+add_executable(static_site_concurrency_bench
+    tests/net/static_site_concurrency_bench.cpp
+)
+
+target_link_libraries(static_site_concurrency_bench PRIVATE
+    agent_net
+)
+
+add_custom_command(TARGET static_site_test_server POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/net/static_site"
+        "$<TARGET_FILE_DIR:static_site_test_server>/static_site"
+)
 
 if(BERT_BUILD_TESTS)
     set(BERT_GTEST_ROOT "" CACHE PATH "Path to a prebuilt GTest package")
@@ -593,6 +618,12 @@ target_link_libraries(bert_benchmark_client PRIVATE bert_proto gRPC::grpc++)
 
 if(UNIX AND NOT APPLE)
     set(BERT_RPATH_TARGETS multimodal_inference_server bert_inference_client bert_benchmark_client)
+    if(TARGET static_site_test_server)
+        list(APPEND BERT_RPATH_TARGETS static_site_test_server)
+    endif()
+    if(TARGET static_site_concurrency_bench)
+        list(APPEND BERT_RPATH_TARGETS static_site_concurrency_bench)
+    endif()
     if(TARGET core_tests)
         list(APPEND BERT_RPATH_TARGETS core_tests)
     endif()
@@ -621,6 +652,12 @@ endforeach()
 if(WIN32 AND BERT_VCPKG_TRIPLET)
     file(GLOB VCPKG_RUNTIME_DLLS "${CMAKE_CURRENT_SOURCE_DIR}/vcpkg_installed/${BERT_VCPKG_TRIPLET}/bin/*.dll")
     set(BERT_RUNTIME_COPY_TARGETS multimodal_inference_server bert_inference_client bert_benchmark_client)
+    if(TARGET static_site_test_server)
+        list(APPEND BERT_RUNTIME_COPY_TARGETS static_site_test_server)
+    endif()
+    if(TARGET static_site_concurrency_bench)
+        list(APPEND BERT_RUNTIME_COPY_TARGETS static_site_concurrency_bench)
+    endif()
     if(TARGET core_tests)
         list(APPEND BERT_RUNTIME_COPY_TARGETS core_tests)
     endif()
@@ -635,6 +672,12 @@ endif()
 if(UNIX AND NOT APPLE AND BERT_VCPKG_TRIPLET)
     file(GLOB VCPKG_RUNTIME_SOS "${CMAKE_CURRENT_SOURCE_DIR}/vcpkg_installed/${BERT_VCPKG_TRIPLET}/lib/*.so*")
     set(BERT_RUNTIME_COPY_TARGETS multimodal_inference_server bert_inference_client bert_benchmark_client)
+    if(TARGET static_site_test_server)
+        list(APPEND BERT_RUNTIME_COPY_TARGETS static_site_test_server)
+    endif()
+    if(TARGET static_site_concurrency_bench)
+        list(APPEND BERT_RUNTIME_COPY_TARGETS static_site_concurrency_bench)
+    endif()
     if(TARGET core_tests)
         list(APPEND BERT_RUNTIME_COPY_TARGETS core_tests)
     endif()

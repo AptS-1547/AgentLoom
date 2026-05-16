@@ -46,6 +46,12 @@ struct ConnectionCloseInfo {
                 core::Status::Error(core::ErrorCode::ResourceExhausted, detail),
                 std::move(detail)};
     }
+
+    static ConnectionCloseInfo Shutdown(std::string detail = {}) {
+        return {ConnectionCloseReason::ServerShutdown,
+                core::Status::Error(core::ErrorCode::Cancelled, detail),
+                std::move(detail)};
+    }
 };
 
 struct ConnectionContext {

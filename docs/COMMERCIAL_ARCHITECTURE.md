@@ -1,7 +1,7 @@
 # 教育智能体商业化架构方案
 
-> 基于多模态推理、人格管线、记忆系统的微服务架构设计  
-> 版本：v2.0 | 创建日期：2026-05-10 | 最后更新：2026-05-11
+> 基于多模态推理、人格管线、记忆系统的微服务架构设计
+> 版本：v2.1 | 创建日期：2026-05-10 | 最后更新：2026-05-16
 
 ## 目录
 
@@ -37,8 +37,8 @@
 │                          C++ 网关服务 (Gateway)                          │
 │  - HTTP/WebSocket 协议处理                                              │
 │  - Session 路由和管理                                                   │
-│  - L1 记忆缓存 (最近 12 轮对话)                                          │
-│  - 降级策略和故障隔离                                                    │
+│  - Exact / Semantic / RAG / Memory 缓存路由                               │
+│  - 推理引擎路由、降级策略和故障隔离                                      │
 └───┬────────────────┬────────────────┬────────────────┬─────────────────┘
     │ gRPC           │ gRPC           │ gRPC           │ gRPC (async)
     ▼                ▼                ▼                ▼
@@ -54,7 +54,8 @@
 2. **性能优先**：热路径（高频操作）用 C++ 实现，冷路径（低频操作）保留 Python
 3. **快速迭代**：业务逻辑密集的模块（记忆压缩、RAG）保留 Python
 4. **水平扩展**：各服务独立部署，可按需扩展
-5. **降级策略**：每个服务都有明确的降级方案
+5. **缓存优先**：高频通用对话、标准知识和可复用回答优先通过缓存/RAG 返回，降低在线 LLM 推理压力
+6. **降级策略**：每个服务都有明确的降级方案，LLM 主路径采用 vLLM，低显存/边缘/故障场景保留 llama.cpp 备用路径
 
 ---
 
@@ -79,13 +80,51 @@
 | **情绪状态机更新** | 每次请求 | ~2ms | GIL 限制并发 | C++ 实现 |
 | **L1 缓存读取** | 每次请求 | ~1ms | 内存操作，可接受 | C++ 优化 |
 | **Prompt 构建** | 每次请求 | ~5ms | 字符串拼接，可接受 | C++ 优化 |
+| **Exact Cache 查询** | 每次请求 | <1ms | 无 | C++ 本地缓存 + Redis |
+| **语义缓存检索** | 高频 | 1-10ms | Python/Numpy 不适合网关热路径 | C++ SIMD 向量核 + 本地热索引 + Redis |
+| **RAG 标准知识缓存** | 按需 | 10-100ms | Python 生态成熟但需隔离热路径 | 结构化知识卡 + 向量检索 |
 | **BERT 推理** | 每次请求 | ~10ms | 已在 C++ | 无需改动 |
-| **VLM 推理** | 低频 | ~3000ms | 已在 C++ | 无需改动 |
+| **LLM 在线推理** | 缓存/RAG 未命中时 | 秒级 | 32B 级模型高 QPS 成本高 | vLLM 主路径 + llama.cpp 备用 |
+| **VLM 推理** | 低频 | ~3000ms | 已在 C++ | 保留 llama.cpp / mtmd 路径 |
 | **L1→L2 记忆压缩** | 每 N 轮 | ~50ms | 文件 IO 瓶颈 | 异步 + SQLite |
 | **L3/L4 记忆召回** | 会话开始 | ~100ms | 数据库查询 | Python + 索引优化 |
-| **RAG 检索** | 按需 | ~200ms | 向量数据库 | Python 生态成熟 |
+| **深度 RAG 检索** | 按需 | ~200ms | 向量数据库 | Python 生态成熟 |
 
-**结论**：热路径（每次请求）需要 C++，冷路径（低频触发）可以保留 Python。
+**结论**：热路径（每次请求）需要 C++，冷路径（低频触发）可以保留 Python。商业化部署不能假设 32B 级本地 LLM 能直接承载数百 QPS；对话链路应优先经过 Exact Cache、离线构建的语义缓存基底、RAG 标准知识缓存和多级记忆上下文筛选，仅在缓存/RAG/记忆无法满足时进入在线 LLM 推理。
+
+### 2.3 对话热路径缓存策略
+
+对话热路径缓存是商业化高并发场景的核心降载机制，不应仅作为推理失败后的兜底。建议采用混合方案：
+
+1. **离线语义缓存基底**：从中文教育对话数据库中筛选高频场景，使用 DeepSeek、GLM、Qwen 等中文能力强的模型生成回答，经清洗、去重、质量评审后写入语义缓存。该层覆盖通用教学话术、学习困惑、常见课堂互动和稳定的低上下文依赖回答。
+2. **知识库 RAG 缓存**：将课本、课程标准、经典例题、常见误区和题型讲解沉淀为结构化知识卡与向量索引。知识型问题优先从该层返回或组合回答，保证标准性和可追溯性。
+3. **多级记忆兜底**：保留 L1/L2/L3/L4 记忆作为长上下文基础设施。记忆层用于判断缓存命中是否安全、提供个体化渲染上下文，并在缓存/RAG 不足时作为在线 LLM 推理输入。
+
+建议查询顺序如下：
+
+```text
+请求规范化 / 意图识别 / 上下文风险判断
+  -> Exact Cache
+  -> Curated Semantic Cache
+  -> Knowledge RAG Cache
+  -> Memory Context Layer
+  -> vLLM 在线推理
+  -> llama.cpp 备用推理 / 降级响应
+```
+
+实际执行顺序应由意图路由决定：知识型问题优先 RAG；通用对话优先语义缓存；强上下文依赖问题必须先检查当前会话和记忆 scope。
+
+缓存命中不能只依赖向量相似度，必须同时满足：
+
+- intent / answer_type 兼容
+- subject / grade / topic scope 兼容
+- persona scope 兼容
+- memory scope 兼容
+- prompt / policy / embedding model / corpus version 一致
+- response quality score 达标
+- entry 未过期且未被人工或自动评估淘汰
+
+包含“这个、那个、刚才、上面、这一步、图中、为什么错”等强指代词的请求默认视为上下文依赖请求，不允许直接命中全局语义缓存。
 
 ---
 
@@ -99,6 +138,9 @@
 - HTTP/WebSocket 协议处理（面向客户端）
 - Session 路由和管理
 - L1 记忆缓存（最近 12 轮对话，内存中）
+- Exact Cache、语义缓存、RAG 缓存和记忆上下文的路由协调
+- 本地热向量索引和 Redis 共享缓存的访问协调
+- vLLM / llama.cpp 推理后端选择和降级
 - 降级策略协调
 - 健康检查和监控
 
@@ -109,9 +151,10 @@
 - nlohmann/json (配置解析)
 
 **关键特性**：
-- 轻量级：只做路由和缓存，不做复杂计算
+- 轻量级：只做协议、路由、缓存协调和降级，不承载复杂业务推理
 - 无状态：Session 状态可以从 L1 缓存恢复
-- 降级优先：下游服务不可用时，使用默认策略
+- 缓存优先：优先命中 Exact / Semantic / RAG / Memory 缓存，降低 LLM 在线推理压力
+- 降级优先：下游服务不可用时，使用缓存、默认人格策略或备用推理路径
 
 **代码规模**：~10,000 行（包含流媒体解析、WebSocket 管理、Session 池）
 
@@ -141,17 +184,17 @@
 class EmotionStateMachine {
     float valence, arousal;
     float baseline_valence, baseline_arousal;
-    
+
     void Update(float user_v, float user_a, float ai_v, float ai_a) {
         // Ornstein-Uhlenbeck 过程
-        valence = std::tanh(phi_v * valence + theta_v * baseline_valence 
+        valence = std::tanh(phi_v * valence + theta_v * baseline_valence
                            + kappa * (arousal - baseline_arousal)
                            + beta * ai_v + gamma * user_v + noise());
         arousal = std::tanh(phi_a * arousal + theta_a * baseline_arousal
                            + kappa * (valence - baseline_valence)
                            + beta * ai_a + gamma * user_a + noise());
     }
-    
+
     std::string GenerateHint() const;
 };
 ```
@@ -166,19 +209,25 @@ class EmotionStateMachine {
 - BERT 情绪分类
 - VLM 视觉语言推理
 - 人脸检测 + 情绪识别
-- 向量缓存管理
+- 本地向量相似度核心和轻量向量缓存
+- 语义缓存 embedding 生成 / 归一化 / Top-K 检索接口
 - VRAM 监控和模型生命周期
 
 **技术栈**：
 - C++20
 - ONNX Runtime (BERT + 人脸情绪模型)
-- llama.cpp (VLM)
+- llama.cpp (VLM / 低显存备用 LLM)
+- vLLM (主力高 QPS LLM serving，作为独立 OpenAI-compatible 服务接入)
+- Redis (可选共享语义缓存)
+- Faiss + SQLite (向量索引和元数据持久化，逐步接入)
 - gRPC Server
 
 **关键特性**：
 - 已有代码基础：AgentBackendPredict v0.0.1beta1
 - 故障隔离：CUDA OOM 不影响其他服务
-- 向量缓存：减少重复推理
+- LLM 主路径采用 vLLM 承担高并发在线推理；llama.cpp 保留为低显存、边缘设备和 OOM 降级备用路径
+- 轻量向量缓存：基于预归一化 embedding、SIMD 点积、固定维度 384/768 模板特化和 Top-K 检索减少重复推理
+- 本地热索引优先，Redis 作为共享缓存和失效协调层，不在每次相似度扫描中承担全量向量 IO
 
 **代码规模**：~5,500 行（已有服务端推理核心约 4,600 行，需扩展人脸情绪模型和 gRPC 服务）
 
@@ -215,6 +264,7 @@ class EmotionStateMachine {
 - 记忆召回和检索
 - 持久化（SQLite/RocksDB）
 - 遗忘曲线机制
+- 为语义缓存提供 memory scope 校验和个体化渲染上下文
 
 **技术栈**：
 - Python 3.10+
@@ -227,6 +277,7 @@ class EmotionStateMachine {
 - 降级策略：失败时返回空记忆，不阻塞主流程
 - 复用小橘代码：MyNeuroLikeSystem 的 memory_manager.py（更完善版本）
 - 包含遗忘曲线机制
+- 不作为全局语义缓存的来源；包含用户长期记忆或会话上下文的回答只能进入 user/session scope 缓存
 
 **代码规模**：~2,500 行（复用 ~1,700 行 + 新增 ~800 行 gRPC 封装和持久化）
 
@@ -235,9 +286,11 @@ class EmotionStateMachine {
 #### 3.1.6 Python RAG 服务 (RAG Service)
 
 **职责**：
-- 向量数据库检索（Milvus/Qdrant）
-- 知识库查询
-- 上下文注入
+- 课本、课程标准、经典例题和常见误区的知识库检索
+- 结构化知识卡构建和查询
+- RAG 标准答案缓存管理
+- 证据片段和引用来源返回
+- 必要时为在线 LLM 提供上下文注入
 
 **技术栈**：
 - Python 3.10+
@@ -246,9 +299,10 @@ class EmotionStateMachine {
 - Milvus/Qdrant
 
 **关键特性**：
-- 按需触发：不是每次请求都调用
-- 降级策略：失败时不注入知识库上下文
-- Python 生态成熟
+- 知识型问题优先触发，通用对话不强制调用
+- 标准知识回答优先来自知识卡和教材/课标证据，避免离线语义缓存长期替代权威知识源
+- 降级策略：失败时不注入知识库上下文，但不得错误返回无来源的权威性结论
+- Python 生态成熟；后续可将热知识卡索引迁移到 C++ 本地向量层
 
 **代码规模**：~1,500 行（新实现）
 
@@ -371,37 +425,119 @@ service InferenceService {
 
 | 服务崩溃 | 影响范围 | 降级策略 |
 |---------|---------|---------|
-| **推理服务** | 当前请求失败 | 返回缓存结果或"系统繁忙" |
+| **vLLM 主推理服务** | 在线 LLM 主路径不可用或显存压力过高 | 优先返回缓存/RAG 结果；必要时降级到 llama.cpp 备用模型 |
+| **llama.cpp 备用推理** | 备用推理不可用 | 返回缓存结果或明确的降级响应 |
 | **人格服务** | 当前请求使用默认情绪 | 使用 baseline 情绪和通用 Prompt |
 | **记忆服务** | 记忆压缩失败，但对话继续 | 只用 L1 缓存，不压缩到 L2/L3/L4 |
 | **RAG 服务** | 不注入知识库上下文 | Prompt 中不包含 RAG 召回内容 |
+| **Redis 缓存** | 跨实例共享缓存不可用 | 使用本地热索引和进程内缓存，禁止将 Redis 作为唯一真源 |
 | **网关服务** | 整个系统不可用 | 多实例部署 + Nginx 负载均衡 |
 
 **网关服务的降级逻辑示例**：
 ```cpp
 Response GatewayService::HandleRequest(const Request& req) {
-    // 1. 调用人格服务（带超时和降级）
+    auto route = intent_router.Classify(req);
+
+    // 1. Exact Cache / 语义缓存 / RAG 缓存优先
+    if (auto exact = cache.ExactLookup(req); exact.ok()) {
+        return BuildCachedResponse(exact.value());
+    }
+    if (!route.context_dependent) {
+        if (auto semantic = cache.SemanticLookup(req, route); semantic.ok()) {
+            return BuildCachedResponse(semantic.value());
+        }
+    }
+    if (route.knowledge_question) {
+        if (auto rag = rag_cache.Lookup(req, route); rag.ok()) {
+            return BuildRagResponse(rag.value());
+        }
+    }
+
+    // 2. 调用人格服务（带超时和降级）
     auto persona_result = persona_client.Process(req, /*timeout=*/100ms);
     if (!persona_result.ok()) {
         persona_result = GetDefaultPersona(req.user_id);
         LOG_WARN("Persona service unavailable, using default");
     }
-    
-    // 2. 调用推理服务（带超时和降级）
-    auto inference_result = inference_client.Infer(req.text, /*timeout=*/5s);
+
+    // 3. 在线 LLM 推理：vLLM 主路径，llama.cpp 备用路径
+    auto inference_result = vllm_client.Generate(req, persona_result, /*timeout=*/5s);
     if (!inference_result.ok()) {
-        inference_result = GetCachedResult(req.text);
-        LOG_WARN("Inference service unavailable, using cache");
+        inference_result = llama_fallback.Generate(req, persona_result, /*timeout=*/10s);
+        LOG_WARN("vLLM unavailable or over capacity, trying llama.cpp fallback");
     }
-    
-    // 3. 异步触发记忆压缩（不阻塞主流程）
+
+    // 4. 异步触发记忆压缩和缓存写回（不阻塞主流程）
     if (l1_cache[req.user_id].NeedsCompression()) {
         memory_client.CompressAsync(req.user_id, l1_cache[req.user_id].messages);
     }
-    
+    cache.AdmitAsync(req, inference_result);
+
     return BuildResponse(persona_result, inference_result);
 }
 ```
+
+### 3.4 缓存与检索层设计
+
+商业化架构中的缓存层分为四类，分别解决不同问题，不能混用：
+
+| 缓存层 | 主要内容 | 命中范围 | 存储建议 | 风险控制 |
+|--------|----------|----------|----------|----------|
+| **Exact Cache** | 完全相同 prompt/context/model/persona 的响应 | 单用户、单 session 或严格 scope | 本地 LRU + Redis | 依赖版本 hash |
+| **Curated Semantic Cache** | 离线生成和审核的高频通用教育对话 | 全局、租户、persona 或主题 scope | 本地热向量索引 + Redis payload | intent、scope、quality score、policy version |
+| **Knowledge RAG Cache** | 教材、课标、经典例题、知识卡和标准讲解 | 学科、年级、教材版本、知识点 scope | SQLite metadata + Faiss/向量索引 + Redis 热缓存 | 必须保留来源和 corpus version |
+| **Memory Context Cache** | L1/L2/L3/L4 记忆、用户画像、当前会话状态 | user/session scope | 记忆服务持久化 + 网关 L1 | 禁止进入全局缓存 |
+
+推荐组件划分：
+
+```text
+ConversationAccelerationLayer
+  -> ExactPromptCache
+  -> CuratedSemanticCache
+  -> KnowledgeRagCache
+  -> MemoryContextLayer
+  -> LocalHotVectorIndex
+  -> RedisSharedCache
+  -> LlmFallbackRouter
+```
+
+其中 `LocalHotVectorIndex` 负责本地相似度热路径，使用预归一化 float32 embedding、固定维度 384/768 模板特化、SIMD dot product 和 Top-K/threshold scan。Redis 负责跨实例共享、payload 存储、bucket 列表和失效协调，不应作为每次相似度扫描的全量向量来源。
+
+离线语义缓存基底的构建流程：
+
+```text
+中文教育对话数据筛选
+  -> 去重 / 聚类 / 意图分类
+  -> DeepSeek / GLM / Qwen 等强中文模型生成
+  -> 多模型交叉评审和规则清洗
+  -> answer_core / response_text / metadata 结构化
+  -> embedding 编码和归一化
+  -> 写入 Redis / SQLite / 本地热索引快照
+```
+
+建议缓存 entry 至少包含：
+
+- `entry_id`
+- `canonical_question`
+- `question_variants`
+- `intent`
+- `subject`
+- `grade`
+- `answer_type`
+- `answer_core`
+- `response_text`
+- `persona_scope`
+- `context_requirements`
+- `embedding_model_fingerprint`
+- `model_fingerprint`
+- `prompt_version`
+- `policy_version`
+- `quality_score`
+- `corpus_version`
+- `created_at_ms`
+- `ttl_seconds`
+
+RAG 缓存应优先沉淀为结构化知识卡，而不是只存原始 chunk。知识卡建议包含定义、例子、常见误区、题型模板、引用来源和教材/课标版本。知识型回答优先由知识卡和证据片段生成，在线 LLM 只在多知识点综合、上下文复杂或检索冲突时介入。
 
 
 ---
@@ -423,12 +559,13 @@ Response GatewayService::HandleRequest(const Request& req) {
 | `onnx_model.cpp/h` | 422 + 117 | 直接复用 | 100% |
 | `server_config.cpp` | 404 | 各服务独立配置 | 60% |
 | `server_common.cpp/h` | 290 + 128 | 提取为公共库 | 100% |
-| `vector_cache.cpp/h` | 136 + 53 | 直接复用 | 100% |
+| `vector_cache.cpp/h` | 136 + 53 | 作为轻量向量缓存原型继续演进 | 80% |
 
 **汇总**：
 - **可直接复用**：~2,300 行（推理核心、缓存系统）
 - **需重构/迁移**：~1,700 行（服务端框架、配置系统、请求校验）
 - **需新增**：~1,500 行（人脸情绪模型、gRPC 服务化封装等）
+- **需新增缓存基础设施**：轻量 SIMD 向量相似度核、本地热向量索引、Redis 共享缓存适配和对话缓存 admission policy。
 
 ---
 
@@ -515,6 +652,8 @@ Response GatewayService::HandleRequest(const Request& req) {
 | `gateway_server.cpp` | HTTP/WebSocket 服务器 | 无（新实现，用 Boost.Beast） | 800 |
 | `session_manager.cpp/h` | Session 路由和管理 | `scheduler.py` 部分逻辑 | 400 |
 | `l1_cache.cpp/h` | L1 记忆缓存 | 无（新实现） | 300 |
+| `conversation_cache_router.cpp/h` | Exact / Semantic / RAG / Memory 缓存路由 | 无（新实现） | 500 |
+| `local_hot_vector_index.cpp/h` | 本地热向量索引、Top-K、threshold scan | `vector_cache.cpp/h` 原型 | 600 |
 | `service_clients.cpp/h` | gRPC 客户端封装 | 无（新实现） | 300 |
 | `degradation.cpp/h` | 降级策略 | 无（新实现） | 200 |
 
@@ -548,6 +687,9 @@ Response GatewayService::HandleRequest(const Request& req) {
 |------|------|---------|---------|
 | `face_emotion_model.cpp/h` | 人脸检测+情绪识别 | 无（新实现，用 ONNX Runtime） | 600 |
 | `multimodal_inference_server.cpp` | 重构为独立服务 | 已有 1,132 行，需重构 | +200 |
+| `vector_similarity.cpp/h` | 预归一化向量点积、SIMD、Top-K | 无（新实现） | 500 |
+| `semantic_cache_client.cpp/h` | 语义缓存查询和写回接口 | 无（新实现） | 400 |
+| `llm_engine_router.cpp/h` | vLLM 主路径和 llama.cpp 备用路径路由 | 无（新实现） | 400 |
 
 **已有可复用代码（直接沿用）**：
 
@@ -556,7 +698,7 @@ Response GatewayService::HandleRequest(const Request& req) {
 | `llama_runner.cpp/h` | 570 + 117 | VLM 推理 |
 | `onnx_model.cpp/h` | 507 + 134 | BERT 推理 |
 | `vlm_cache.cpp/h` | 744 + 108 | 向量缓存 |
-| `vector_cache.cpp/h` | 165 + 66 | 向量索引 |
+| `vector_cache.cpp/h` | 165 + 66 | 轻量向量索引原型，需升级为可复用 similarity kernel |
 
 ---
 
@@ -595,6 +737,8 @@ Response GatewayService::HandleRequest(const Request& req) {
 | `rag_service.py` | gRPC 服务器 | 200 |
 | `vector_store.py` | 向量数据库封装（LangChain） | 300 |
 | `retrieval.py` | 检索和排序 | 300 |
+| `knowledge_card.py` | 知识卡结构化、证据引用和版本管理 | 300 |
+| `rag_cache.py` | RAG 标准答案缓存和 corpus version 管理 | 300 |
 
 ---
 
@@ -1001,6 +1145,13 @@ private:
 | `request_latency_ms{service,p50/p95/p99}` | Histogram | 请求延迟分位数 |
 | `grpc_error_count{service,code}` | Counter | gRPC 错误次数 |
 | `l1_cache_hit_rate` | Gauge | 网关 L1 缓存命中率 |
+| `exact_cache_hit_rate` | Gauge | Exact Cache 命中率 |
+| `semantic_cache_hit_rate` | Gauge | 离线语义缓存命中率 |
+| `rag_cache_hit_rate` | Gauge | RAG 标准知识缓存命中率 |
+| `semantic_cache_wrong_hit_count` | Counter | 语义缓存误命中或人工回退次数 |
+| `llm_saved_request_count` | Counter | 缓存/RAG 避免的在线 LLM 请求数 |
+| `vllm_request_count` | Counter | vLLM 主路径请求数 |
+| `llama_fallback_request_count` | Counter | llama.cpp 备用路径请求数 |
 | `active_sessions` | Gauge | 当前活跃会话数 |
 | `inference_queue_depth` | Gauge | 推理队列积压深度 |
 
@@ -1089,11 +1240,13 @@ Month 5–6: Phase 3 交付准备
 | **C++ gRPC** | gRPC C++ | 官方支持，类型安全，生态完善 |
 | **C++ JSON** | nlohmann/json | Header-only，API 直观，无额外依赖 |
 | **C++ 推理（BERT/情绪）** | ONNX Runtime | 跨平台，支持 CUDA/DirectML，推理稳定 |
-| **C++ 推理（VLM）** | llama.cpp | 轻量级，CPU/GPU 均可运行，支持量化 |
+| **LLM 主推理** | vLLM | 高吞吐在线 serving，支持连续批处理、PagedAttention、OpenAI-compatible server |
+| **C++ 备用推理 / VLM** | llama.cpp | 原生 C/C++，低显存和边缘设备友好，支持量化，可作为 vLLM OOM/过载时的备用路径 |
 | **Python gRPC** | grpcio | 官方支持，与 proto 文件自动生成代码 |
 | **Python 持久化** | SQLite / RocksDB | SQLite 轻量易部署；RocksDB 高吞吐写入 |
-| **Python RAG** | LangChain | 生态成熟，向量数据库集成丰富，快速开发 |
-| **向量数据库** | Milvus / Qdrant | 支持 ANN 搜索，水平扩展能力强 |
+| **Python RAG** | LangChain / LlamaIndex | 生态成熟，适合冷路径知识库构建和快速迭代 |
+| **向量检索** | C++ SIMD kernel + Faiss / Qdrant / Milvus | 热路径优先本地轻量向量核；大规模 ANN 可接 Faiss/Qdrant/Milvus |
+| **共享缓存** | Redis / Boost.Redis | 存储 payload、metadata、bucket 列表和失效事件；不作为唯一真源 |
 | **容器编排** | Docker Compose | 单机部署首选，配置简洁，便于本地开发 |
 | **反向代理** | Nginx | 成熟稳定，WebSocket 支持完善，限流配置灵活 |
 | **监控** | Prometheus + Grafana | 开源标准，社区生态完善 |
@@ -1122,18 +1275,21 @@ Month 5–6: Phase 3 交付准备
 ### 8.3 参考资料
 
 - [AgentBackendPredict README](../README.md)
+- [旧架构问题分析与重构方向](./LEGACY_ARCHITECTURE_ANALYSIS.md)
 - [EducationalAgentProject README](../../EducationalAgentProject/README.md)
 - [E2E 测试与情绪管线文档](./E2E_TEST_AND_EMOTION_PIPELINE.md)
 - [团队实施方案（内部参考）](./TEAM_IMPLEMENTATION_PLAN.md)
 - [gRPC C++ Quick Start](https://grpc.io/docs/languages/cpp/quickstart/)
 - [Boost.Beast Documentation](https://www.boost.org/doc/libs/release/libs/beast/)
 - [ONNX Runtime C++ API](https://onnxruntime.ai/docs/api/c/)
-- [llama.cpp](https://github.com/ggerganov/llama.cpp)
+- [vLLM](https://github.com/vllm-project/vllm)
+- [llama.cpp](https://github.com/ggml-org/llama.cpp)
+- [Boost.Redis](https://www.boost.org/doc/libs/release/libs/redis/)
 
 ---
 
-**文档版本**：v2.0  
-**创建日期**：2026-05-10  
-**最后更新**：2026-05-11  
-**作者**：Orange & Claude  
+**文档版本**：v2.1
+**创建日期**：2026-05-10
+**最后更新**：2026-05-16
+**作者**：Orange & Claude
 **状态**：待评审

@@ -63,7 +63,7 @@ WebSocketMessageKind WebSocketKindFromStream(const websocket::stream<beast::tcp_
     return stream.got_text() ? WebSocketMessageKind::Text : WebSocketMessageKind::Binary;
 }
 
-} // namespace
+} 
 
 class HttpServer::Listener : public std::enable_shared_from_this<Listener> {
 public:
@@ -77,10 +77,12 @@ public:
         if (ec) {
             throw core::AppException(core::Status::Error(core::ErrorCode::InternalError, ec.message()));
         }
+#if !defined(_WIN32)
         acceptor_.set_option(asio::socket_base::reuse_address(true), ec);
         if (ec) {
             throw core::AppException(core::Status::Error(core::ErrorCode::InternalError, ec.message()));
         }
+#endif
         acceptor_.bind(endpoint, ec);
         if (ec) {
             throw core::AppException(core::Status::Error(core::ErrorCode::InternalError, ec.message()));
@@ -118,142 +120,165 @@ private:
     tcp::acceptor acceptor_;
 };
 
-class HttpServer::HttpSession : public std::enable_shared_from_this<HttpSession> {
-public:
-    bool TryUpgradeWebSocket();
 
-    HttpSession(HttpServer& server, tcp::socket socket)
-        : server_(server),
-          stream_(std::move(socket)),
-          connection_{server_.NextConnectionId(), RemoteAddress(stream_.socket())} {}
+void HttpServer::HttpSession::DoRead() {
+    request_ = {};
+    buffer_.consume(buffer_.size());
+    stream_.expires_after(server_.options_.request_timeout);
+    http::async_read(
+        stream_,
+        buffer_,
+        request_,
+        beast::bind_front_handler(&HttpSession::OnRead, shared_from_this()));
+}
 
-    void Run() {
-        DoRead();
+void HttpServer::HttpSession::OnRead(beast::error_code ec, std::size_t) {
+    if (ec == http::error::end_of_stream) {
+        Close(ConnectionCloseInfo::Remote());
+        return;
+    }
+    if (ec == beast::error::timeout) {
+        Close(ConnectionCloseInfo::Timeout("http request timeout"));
+        return;
+    }
+    if (ec) {
+        Close({ConnectionCloseReason::ProtocolError,
+               core::Status::Error(core::ErrorCode::InvalidArgument, ec.message()),
+               ec.message()});
+        return;
     }
 
-private:
-    void DoRead() {
-        request_ = {};
-        buffer_.consume(buffer_.size());
-        stream_.expires_after(server_.options_.request_timeout);
-        http::async_read(
-            stream_,
-            buffer_,
-            request_,
-            beast::bind_front_handler(&HttpSession::OnRead, shared_from_this()));
+    if (request_.body().size() > server_.options_.request_body_limit) {
+        Send(MakeStatusResponse(request_, http::status::payload_too_large, "payload too large"));
+        return;
     }
 
-    void OnRead(beast::error_code ec, std::size_t) {
-        if (ec == http::error::end_of_stream) {
-            Close(ConnectionCloseInfo::Remote());
-            return;
-        }
-        if (ec == beast::error::timeout) {
-            Close(ConnectionCloseInfo::Timeout("http request timeout"));
-            return;
-        }
-        if (ec) {
-            Close({ConnectionCloseReason::ProtocolError,
-                   core::Status::Error(core::ErrorCode::InvalidArgument, ec.message()),
-                   ec.message()});
-            return;
-        }
-
-        if (request_.body().size() > server_.options_.request_body_limit) {
-            Send(MakeStatusResponse(request_, http::status::payload_too_large, "payload too large"));
-            return;
-        }
-
-        auto access_controller = server_.AccessControllerSnapshot();
-        if (access_controller) {
-            access_controller(request_, connection_, [self = shared_from_this()](AccessDecision decision) {
-                asio::post(self->stream_.get_executor(), [self, decision = std::move(decision)]() mutable {
-                    self->OnAccessDecision(std::move(decision));
-                });
+    auto access_controller = server_.AccessControllerSnapshot();
+    if (access_controller) {
+        access_controller(request_, lease_.context(), [self = shared_from_this()](AccessDecision decision) {
+            asio::post(self->stream_.get_executor(), [self, decision = std::move(decision)]() mutable {
+                self->OnAccessDecision(std::move(decision));
             });
-            return;
-        }
-
-        OnAccessDecision(AccessDecision::Allow());
+        });
+        return;
     }
 
-    void OnAccessDecision(AccessDecision decision) {
-        if (!decision.allowed()) {
-            auto body = decision.reason.empty() ? std::string("access denied") : decision.reason;
-            Send(MakeStatusResponse(request_, StatusFromAccessDecision(decision), std::move(body)));
-            return;
-        }
+    OnAccessDecision(AccessDecision::Allow());
+}
 
-        if (websocket::is_upgrade(request_) && TryUpgradeWebSocket()) {
-            return;
-        }
-
-        auto handler = server_.HttpHandlerSnapshot();
-        if (handler) {
-            auto request = HttpRequest::FromBeast(std::move(request_), connection_);
-            handler(std::move(request), HttpGeneratorCallback([self = shared_from_this()](http::message_generator response) mutable {
-                asio::post(self->stream_.get_executor(), [self, response = std::move(response)]() mutable {
-                    self->Send(std::move(response));
-                });
-            }));
-            return;
-        }
-
-        if (auto static_files = server_.StaticFileHandlerSnapshot()) {
-            Send(static_files->Handle(request_));
-            return;
-        }
-
-        Send(MakeStatusResponse(request_, http::status::not_found, "not found"));
+void HttpServer::HttpSession::OnAccessDecision(AccessDecision decision) {
+    if (!decision.allowed()) {
+        auto body = decision.reason.empty() ? std::string("access denied") : decision.reason;
+        Send(MakeStatusResponse(request_, StatusFromAccessDecision(decision), std::move(body)));
+        return;
     }
 
-    void Send(http::message_generator message) {
-        const auto keep_alive = message.keep_alive();
-        stream_.expires_after(server_.options_.request_timeout);
-        beast::async_write(
-            stream_,
-            std::move(message),
-            beast::bind_front_handler(&HttpSession::OnWrite, shared_from_this(), keep_alive));
+    if (websocket::is_upgrade(request_) && TryUpgradeWebSocket()) {
+        return;
     }
 
-    void OnWrite(bool keep_alive, beast::error_code ec, std::size_t) {
-        if (ec == beast::error::timeout) {
-            Close(ConnectionCloseInfo::Timeout("http response timeout"));
-            return;
-        }
-        if (ec) {
-            Close({ConnectionCloseReason::InternalError,
-                   core::Status::Error(core::ErrorCode::InternalError, ec.message()),
-                   ec.message()});
-            return;
-        }
-
-        if (!keep_alive) {
-            Close(ConnectionCloseInfo::Remote("http keep-alive disabled"));
-            return;
-        }
-        DoRead();
+    auto request_handler = server_.HttpRequestHandlerSnapshot();
+    if (request_handler) {
+        std::shared_ptr<IHttpRequest> request =
+            std::make_shared<HttpServerRequest>(shared_from_this(), std::move(request_));
+        request_handler(std::move(request));
+        return;
     }
 
-    void Close(ConnectionCloseInfo) {
-        beast::error_code ec;
-        stream_.socket().shutdown(tcp::socket::shutdown_send, ec);
-        stream_.socket().close(ec);
+    auto handler = server_.HttpHandlerSnapshot();
+    if (handler) {
+        auto request = HttpRequest::FromBeast(std::move(request_), lease_.context());
+        handler(std::move(request), HttpGeneratorCallback([self = shared_from_this()](http::message_generator response) mutable {
+            asio::post(self->stream_.get_executor(), [self, response = std::move(response)]() mutable {
+                self->Send(std::move(response));
+            });
+        }));
+        return;
     }
 
-    HttpServer& server_;
-    beast::tcp_stream stream_;
-    beast::flat_buffer buffer_;
-    BeastHttpRequest request_;
-    ConnectionContext connection_;
-};
+    if (auto static_files = server_.StaticFileHandlerSnapshot()) {
+        Send(static_files->Handle(request_));
+        return;
+    }
+
+    Send(MakeStatusResponse(request_, http::status::not_found, "not found"));
+}
+
+void HttpServer::HttpSession::Send(http::message_generator message) {
+    const auto keep_alive = message.keep_alive();
+    stream_.expires_after(server_.options_.request_timeout);
+    beast::async_write(
+        stream_,
+        std::move(message),
+        beast::bind_front_handler(&HttpSession::OnWrite, shared_from_this(), keep_alive));
+}
+
+void HttpServer::HttpSession::OnWrite(bool keep_alive, beast::error_code ec, std::size_t) {
+    if (ec == beast::error::timeout) {
+        Close(ConnectionCloseInfo::Timeout("http response timeout"));
+        return;
+    }
+    if (ec) {
+        Close({ConnectionCloseReason::InternalError,
+               core::Status::Error(core::ErrorCode::InternalError, ec.message()),
+               ec.message()});
+        return;
+    }
+    lease_.Touch();
+
+    if (!keep_alive) {
+        Close(ConnectionCloseInfo::Remote("http keep-alive disabled"));
+        return;
+    }
+    DoRead();
+}
+
+void HttpServer::HttpSession::Close(ConnectionCloseInfo close_info) {
+    beast::error_code ec;
+    stream_.socket().shutdown(tcp::socket::shutdown_send, ec);
+    stream_.socket().close(ec);
+    lease_.Close(std::move(close_info));
+}
+
+core::Status HttpServer::HttpSession::SendFromRequest(http::message_generator response) {
+    asio::post(stream_.get_executor(), [self = shared_from_this(), response = std::move(response)]() mutable {
+        self->Send(std::move(response));
+    });
+    return core::Status::Ok();
+}
+
+void HttpServer::HttpSession::CloseFromRequest(ConnectionCloseInfo close_info) {
+    asio::post(stream_.get_executor(), [self = shared_from_this(), close_info = std::move(close_info)]() mutable {
+        self->Close(std::move(close_info));
+    });
+}
+
+const ConnectionContext& HttpServer::HttpSession::connection() const noexcept {
+    return lease_.context();
+}
+
+core::RawMemoryPool& HttpServer::HttpSession::memory_pool() noexcept {
+    return lease_.memory_pool();
+}
+
+core::ThreadPool* HttpServer::HttpSession::task_pool() const noexcept {
+    return lease_.task_pool();
+}
 
 void HttpServer::Listener::OnAccept(beast::error_code ec, tcp::socket socket) {
     if (!server_.running_.load(std::memory_order_acquire)) {
         return;
     }
     if (!ec) {
-        std::make_shared<HttpSession>(server_, std::move(socket))->Run();
+        ConnectionContext connection{server_.NextConnectionId(), RemoteAddress(socket)};
+        auto lease_result = server_.connection_pool_.Acquire(ProtocolConnectionKind::Http, std::move(connection));
+        if (lease_result.ok()) {
+            std::make_shared<HttpSession>(server_, std::move(socket), std::move(lease_result).value())->Run();
+        } else {
+            beast::error_code close_ec;
+            socket.shutdown(tcp::socket::shutdown_both, close_ec);
+            socket.close(close_ec);
+        }
     }
     DoAccept();
 }
@@ -264,12 +289,12 @@ public:
     WebSocketSession(HttpServer& server,
                      tcp::socket socket,
                      BeastHttpRequest request,
-                     ConnectionContext connection,
+                     ConnectionLease lease,
                      WebSocketMessageHandler handler)
         : server_(server),
           stream_(std::move(socket)),
           request_(std::move(request)),
-          connection_(std::move(connection)),
+          lease_(std::move(lease)),
           handler_(std::move(handler)),
           outbound_queue_(MakeWebSocketOutboundQueue(server_.options_.websocket)) {}
 
@@ -307,6 +332,45 @@ public:
     }
 
 private:
+    class WebSocketStreamRequest final : public IWebSocketStreamRequest {
+    public:
+        WebSocketStreamRequest(std::shared_ptr<WebSocketSession> session, WebSocketMessage message)
+            : session_(std::move(session)),
+              message_(std::move(message)) {}
+
+        const ConnectionContext& connection() const noexcept override {
+            return session_->lease_.context();
+        }
+
+        WebSocketMessage& message() noexcept override {
+            return message_;
+        }
+
+        const WebSocketMessage& message() const noexcept override {
+            return message_;
+        }
+
+        core::RawMemoryPool& memory_pool() noexcept override {
+            return session_->lease_.memory_pool();
+        }
+
+        core::ThreadPool* task_pool() const noexcept override {
+            return session_->lease_.task_pool();
+        }
+
+        core::Status Send(WebSocketFrame frame) override {
+            return session_->Send(std::move(frame));
+        }
+
+        void Close(ConnectionCloseInfo close_info) override {
+            session_->Close(std::move(close_info));
+        }
+
+    private:
+        std::shared_ptr<WebSocketSession> session_;
+        WebSocketMessage message_;
+    };
+
     void OnAccept(beast::error_code ec) {
         stream_.next_layer().expires_never();
         if (ec) {
@@ -405,7 +469,9 @@ private:
             current_message_kind_ = WebSocketMessageKind::Binary;
         }
 
-        if (handler_) {
+        if (auto stream_handler = server_.WebSocketStreamHandlerSnapshot(request_.target())) {
+            stream_handler(std::make_shared<WebSocketStreamRequest>(shared_from_this(), std::move(message)));
+        } else if (handler_) {
             handler_(*this, std::move(message));
         }
 
@@ -458,6 +524,7 @@ private:
         if (close_notified_.exchange(true, std::memory_order_acq_rel)) {
             return;
         }
+        lease_.Close(close_info);
         if (auto close_handler = server_.WebSocketCloseHandlerSnapshot()) {
             close_handler(close_info);
         }
@@ -472,7 +539,7 @@ private:
     HttpServer& server_;
     websocket::stream<beast::tcp_stream> stream_;
     BeastHttpRequest request_;
-    ConnectionContext connection_;
+    ConnectionLease lease_;
     WebSocketMessageHandler handler_;
     WebSocketOutboundQueue outbound_queue_;
     core::BucketMemoryPool memory_pool_;
@@ -488,17 +555,25 @@ private:
 bool HttpServer::HttpSession::TryUpgradeWebSocket() {
     const auto target = std::string_view(request_.target().data(), request_.target().size());
     auto handler = server_.WebSocketHandlerSnapshot(target);
-    if (!handler) {
+    auto stream_handler = server_.WebSocketStreamHandlerSnapshot(target);
+    if (!handler && !stream_handler) {
         return false;
     }
 
-    std::make_shared<WebSocketSession>(server_, stream_.release_socket(), std::move(request_), connection_, std::move(handler))->Run();
+    auto status = lease_.SetKind(ProtocolConnectionKind::WebSocket);
+    if (!status.ok()) {
+        Send(MakeStatusResponse(request_, http::status::service_unavailable, status.message()));
+        return true;
+    }
+
+    std::make_shared<WebSocketSession>(server_, stream_.release_socket(), std::move(request_), std::move(lease_), std::move(handler))->Run();
     return true;
 }
 
 HttpServer::HttpServer(HttpServerOptions options)
     : options_(std::move(options)),
-      io_context_(static_cast<int>(ResolveIoThreads(options_.io_threads))) {
+      io_context_(static_cast<int>(ResolveIoThreads(options_.io_threads))),
+      connection_pool_(options_.connection_pool) {
     if (options_.static_files) {
         static_file_handler_ = std::make_shared<StaticFileHandler>(*options_.static_files);
     }
@@ -559,11 +634,17 @@ void HttpServer::Stop() {
     }
     io_threads_.clear();
     listener_.reset();
+    connection_pool_.CloseAll(ConnectionCloseInfo::Shutdown("http server stopped"));
 }
 
 void HttpServer::SetHttpHandler(HttpGeneratorHandler handler) {
     std::lock_guard lock(handler_mutex_);
     http_handler_ = std::move(handler);
+}
+
+void HttpServer::SetHttpRequestHandler(IHttpRequestHandler handler) {
+    std::lock_guard lock(handler_mutex_);
+    http_request_handler_ = std::move(handler);
 }
 
 void HttpServer::SetAccessController(HttpAccessController controller) {
@@ -581,6 +662,12 @@ void HttpServer::SetWebSocketHandler(std::string path, WebSocketMessageHandler h
     std::lock_guard lock(handler_mutex_);
     websocket_path_ = std::move(path);
     websocket_handler_ = std::move(handler);
+}
+
+void HttpServer::SetWebSocketStreamHandler(std::string path, IWebSocketStreamHandler handler) {
+    std::lock_guard lock(handler_mutex_);
+    websocket_stream_path_ = std::move(path);
+    websocket_stream_handler_ = std::move(handler);
 }
 
 void HttpServer::SetWebSocketAcceptHandler(WebSocketAcceptHandler handler) {
@@ -601,6 +688,14 @@ std::uint16_t HttpServer::port() const noexcept {
     return bound_port_;
 }
 
+ConnectionPoolStats HttpServer::ConnectionStats() const {
+    return connection_pool_.Stats();
+}
+
+std::vector<ConnectionSnapshot> HttpServer::ConnectionSnapshots() const {
+    return connection_pool_.Snapshots();
+}
+
 std::uint64_t HttpServer::NextConnectionId() noexcept {
     return next_connection_id_.fetch_add(1, std::memory_order_relaxed);
 }
@@ -608,6 +703,11 @@ std::uint64_t HttpServer::NextConnectionId() noexcept {
 HttpGeneratorHandler HttpServer::HttpHandlerSnapshot() const {
     std::lock_guard lock(handler_mutex_);
     return http_handler_;
+}
+
+IHttpRequestHandler HttpServer::HttpRequestHandlerSnapshot() const {
+    std::lock_guard lock(handler_mutex_);
+    return http_request_handler_;
 }
 
 HttpAccessController HttpServer::AccessControllerSnapshot() const {
@@ -618,6 +718,11 @@ HttpAccessController HttpServer::AccessControllerSnapshot() const {
 WebSocketMessageHandler HttpServer::WebSocketHandlerSnapshot(std::string_view path) const {
     std::lock_guard lock(handler_mutex_);
     return path == websocket_path_ ? websocket_handler_ : WebSocketMessageHandler{};
+}
+
+IWebSocketStreamHandler HttpServer::WebSocketStreamHandlerSnapshot(std::string_view path) const {
+    std::lock_guard lock(handler_mutex_);
+    return path == websocket_stream_path_ ? websocket_stream_handler_ : IWebSocketStreamHandler{};
 }
 
 WebSocketAcceptHandler HttpServer::WebSocketAcceptHandlerSnapshot() const {

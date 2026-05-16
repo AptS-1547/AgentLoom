@@ -1,7 +1,9 @@
 #pragma once
 
+#include "connection_pool.h"
 #include "http_types.h"
 #include "protocol_types.h"
+#include "request_interfaces.h"
 #include "static_file_handler.h"
 #include "websocket_types.h"
 
@@ -32,6 +34,7 @@ struct HttpServerOptions {
     std::chrono::seconds websocket_idle_timeout{60};
     std::size_t request_body_limit = 16 * 1024 * 1024;
     std::size_t websocket_read_buffer_limit = 16 * 1024 * 1024;
+    ConnectionPoolOptions connection_pool;
     WebSocketOptions websocket;
     std::optional<StaticFileOptions> static_files;
 };
@@ -52,14 +55,18 @@ public:
     void Stop();
 
     void SetHttpHandler(HttpGeneratorHandler handler);
+    void SetHttpRequestHandler(IHttpRequestHandler handler);
     void SetAccessController(HttpAccessController controller);
     void SetStaticFiles(StaticFileOptions options);
     void SetWebSocketHandler(std::string path, WebSocketMessageHandler handler);
+    void SetWebSocketStreamHandler(std::string path, IWebSocketStreamHandler handler);
     void SetWebSocketAcceptHandler(WebSocketAcceptHandler handler);
     void SetWebSocketCloseHandler(WebSocketCloseHandler handler);
 
     bool running() const noexcept;
     std::uint16_t port() const noexcept;
+    ConnectionPoolStats ConnectionStats() const;
+    std::vector<ConnectionSnapshot> ConnectionSnapshots() const;
 
 private:
     class Listener;
@@ -72,8 +79,10 @@ private:
 
     std::uint64_t NextConnectionId() noexcept;
     HttpGeneratorHandler HttpHandlerSnapshot() const;
+    IHttpRequestHandler HttpRequestHandlerSnapshot() const;
     HttpAccessController AccessControllerSnapshot() const;
     WebSocketMessageHandler WebSocketHandlerSnapshot(std::string_view path) const;
+    IWebSocketStreamHandler WebSocketStreamHandlerSnapshot(std::string_view path) const;
     WebSocketAcceptHandler WebSocketAcceptHandlerSnapshot() const;
     WebSocketCloseHandler WebSocketCloseHandlerSnapshot() const;
     std::shared_ptr<StaticFileHandler> StaticFileHandlerSnapshot() const;
@@ -85,15 +94,88 @@ private:
     std::vector<std::jthread> io_threads_;
     mutable std::mutex handler_mutex_;
     HttpGeneratorHandler http_handler_;
+    IHttpRequestHandler http_request_handler_;
     HttpAccessController access_controller_;
     std::string websocket_path_ = "/ws";
     WebSocketMessageHandler websocket_handler_;
+    std::string websocket_stream_path_ = "/ws";
+    IWebSocketStreamHandler websocket_stream_handler_;
     WebSocketAcceptHandler websocket_accept_handler_;
     WebSocketCloseHandler websocket_close_handler_;
     std::shared_ptr<StaticFileHandler> static_file_handler_;
+    ConnectionPool connection_pool_;
     std::atomic<bool> running_{false};
     std::atomic<std::uint64_t> next_connection_id_{1};
     std::uint16_t bound_port_ = 0;
+};
+class HttpServer::HttpSession : public std::enable_shared_from_this<HttpSession> {
+public:
+    class HttpServerRequest;
+
+    bool TryUpgradeWebSocket();
+    core::Status SendFromRequest(http::message_generator response);
+    void CloseFromRequest(ConnectionCloseInfo close_info);
+    const ConnectionContext& connection() const noexcept;
+    core::RawMemoryPool& memory_pool() noexcept;
+    core::ThreadPool* task_pool() const noexcept;
+
+    HttpSession(HttpServer& server, tcp::socket socket, ConnectionLease lease)
+        : server_(server),
+          stream_(std::move(socket)),
+          lease_(std::move(lease)) {}
+
+    void Run() {
+        DoRead();
+    }
+
+private:
+    void DoRead();
+    void OnRead(beast::error_code ec, std::size_t);
+    void OnAccessDecision(AccessDecision decision);
+    void Send(http::message_generator message);
+    void OnWrite(bool keep_alive, beast::error_code ec, std::size_t);
+    void Close(ConnectionCloseInfo close_info);
+
+    HttpServer& server_;
+    beast::tcp_stream stream_;
+    beast::flat_buffer buffer_;
+    BeastHttpRequest request_;
+    ConnectionLease lease_;
+};
+
+class HttpServer::HttpSession::HttpServerRequest final : public IHttpRequest {
+public:
+    HttpServerRequest(std::shared_ptr<HttpSession> session, BeastHttpRequest message)
+        : session_(std::move(session)),
+          message_(std::move(message)) {}
+
+    const BeastHttpRequest& message() const noexcept override {
+        return message_;
+    }
+
+    const ConnectionContext& connection() const noexcept override {
+        return session_->connection();
+    }
+
+    core::RawMemoryPool& memory_pool() noexcept override {
+        return session_->memory_pool();
+    }
+
+    core::ThreadPool* task_pool() const noexcept override {
+        return session_->task_pool();
+    }
+
+    core::Status Respond(http::message_generator response) override {
+        return session_->SendFromRequest(std::move(response));
+    }
+
+    void Close(ConnectionCloseInfo close_info) override {
+        session_->CloseFromRequest(std::move(close_info));
+    }
+
+private:
+    std::shared_ptr<HttpSession> session_;
+    BeastHttpRequest message_;
 };
 
 } // namespace net

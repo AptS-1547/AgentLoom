@@ -65,7 +65,18 @@ private:
     std::vector<Entry> entries_;
 };
 
-void RegisterBuiltinConfigSections();
+template <typename T>
+class ConfigSectionRegistrar {
+public:
+    ConfigSectionRegistrar() {
+        ConfigSectionRegistry::Instance().Register(
+            T::kName,
+            []() -> std::unique_ptr<IConfigSection> {
+                return std::make_unique<T>();
+            });
+    }
+};
+
 std::vector<std::unique_ptr<IConfigSection>> BuildConfigSections();
 void ValidateOptions(MultimodalServerOptions& options);
 
@@ -156,11 +167,4 @@ public: \
     }
 
 #define REGISTER_CONFIG_SECTION(ClassName) \
-void Register##ClassName() { \
-    static const bool registered = ::server_config::ConfigSectionRegistry::Instance().Register( \
-        ClassName::kName, \
-        []() -> std::unique_ptr<::server_config::IConfigSection> { \
-            return std::make_unique<ClassName>(); \
-        }); \
-    (void)registered; \
-}
+static const ::server_config::ConfigSectionRegistrar<ClassName> g_##ClassName##_registrar;

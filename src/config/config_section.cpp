@@ -63,7 +63,6 @@ std::vector<std::unique_ptr<IConfigSection>> ConfigSectionRegistry::CreateSectio
 }
 
 std::vector<std::unique_ptr<IConfigSection>> BuildConfigSections() {
-    RegisterBuiltinConfigSections();
     return ConfigSectionRegistry::Instance().CreateSections();
 }
 

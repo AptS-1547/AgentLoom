@@ -63,6 +63,18 @@ function(copy_runtime_files target)
     endforeach()
 endfunction()
 
+function(link_whole_archive target library)
+    if(MSVC)
+        target_link_options(${target} PRIVATE "/WHOLEARCHIVE:$<TARGET_FILE:${library}>")
+    else()
+        target_link_libraries(${target} PRIVATE
+            "-Wl,--whole-archive"
+            ${library}
+            "-Wl,--no-whole-archive"
+        )
+    endif()
+endfunction()
+
 # ONNX Runtime 预编译二进制
 if(WIN32)
     set(BERT_DEFAULT_ONNXRUNTIME_CPU_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/deps/onnxruntime-win-x64-1.17.1")
@@ -348,7 +360,6 @@ add_library(agent_core STATIC
     src/core/memory_pool.h
     src/core/object_pool.h
     src/core/result.h
-    src/core/shared_memory_block.cpp
     src/core/shared_memory_block.h
     src/core/thread_pool.cpp
     src/core/thread_pool.h
@@ -506,7 +517,6 @@ target_link_libraries(agent_vector PUBLIC spdlog::spdlog)
 add_library(agent_config STATIC
     src/config/config_section.cpp
     src/config/config_section.h
-    src/config/config_sections_builtin.cpp
     src/config/option_parser.cpp
     src/config/option_parser.h
     src/config/request_options.h
@@ -542,6 +552,7 @@ if(BERT_BUILD_TESTS)
         agent_config
         GTest::gtest_main
     )
+    link_whole_archive(config_tests agent_config)
 
     gtest_discover_tests(config_tests DISCOVERY_MODE PRE_TEST)
 endif()
@@ -595,6 +606,7 @@ add_executable(multimodal_inference_server
 )
 
 target_link_libraries(multimodal_inference_server PRIVATE agent_server)
+link_whole_archive(multimodal_inference_server agent_config)
 
 copy_runtime_files(multimodal_inference_server ${LLAMA_CPP_RUNTIME_FILES})
 

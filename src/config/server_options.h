@@ -1,7 +1,7 @@
 #pragma once
 
 #include "onnx_model.h"
-#include "request_validation.h"
+#include "request_options.h"
 #include "server_common.h"
 #include "vector_cache.h"
 #include "vlm_cache.h"

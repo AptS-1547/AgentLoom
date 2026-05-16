@@ -1,0 +1,517 @@
+#include "backpressure_queue.h"
+#include "http_server.h"
+#include "http_types.h"
+#include "static_file_handler.h"
+#include "websocket_types.h"
+
+#include "memory_pool.h"
+
+#include <gtest/gtest.h>
+
+#include <atomic>
+#include <cstdlib>
+#include <string>
+#include <string_view>
+#include <boost/asio.hpp>
+#include <boost/beast.hpp>
+#include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <future>
+#include <mutex>
+#include <utility>
+#include <vector>
+
+namespace {
+
+namespace asio = boost::asio;
+namespace beast = boost::beast;
+using tcp = asio::ip::tcp;
+using namespace std::chrono_literals;
+
+class ScopedTempDirectory {
+public:
+    explicit ScopedTempDirectory(std::string_view name_prefix)
+        : path_(std::filesystem::temp_directory_path() /
+                (std::string(name_prefix) + "_" +
+                 std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + "_" +
+                 std::to_string(std::rand()))) {
+        std::filesystem::create_directories(path_);
+    }
+
+    ~ScopedTempDirectory() {
+        std::error_code ec;
+        std::filesystem::remove_all(path_, ec);
+    }
+
+    const std::filesystem::path& path() const noexcept {
+        return path_;
+    }
+
+private:
+    std::filesystem::path path_;
+};
+
+TEST(HttpTypesTest, WrapsBeastRequestWithoutRedefiningHttpSemantics) {
+    net::BeastHttpRequest request{net::http::verb::post, "/infer", 11};
+    request.set(net::http::field::authorization, "Bearer token");
+    request.set(net::http::field::content_type, "application/json");
+    request.body() = R"({"text":"hello"})";
+    request.prepare_payload();
+
+    auto wrapped = net::HttpRequest::FromBeast(std::move(request), net::ConnectionContext{42, "127.0.0.1"});
+    EXPECT_EQ(wrapped.message.method(), net::http::verb::post);
+    EXPECT_EQ(wrapped.message.target(), "/infer");
+    EXPECT_EQ(wrapped.message[net::http::field::authorization], "Bearer token");
+    EXPECT_EQ(wrapped.message.body(), R"({"text":"hello"})");
+    EXPECT_EQ(wrapped.connection.connection_id, 42u);
+}
+
+TEST(HttpTypesTest, BuildsBeastResponseWithoutExtraBodyCopy) {
+    auto response = net::HttpResponse::Json(net::http::status::accepted, R"({"ok":true})");
+    EXPECT_EQ(response.message.result(), net::http::status::accepted);
+    EXPECT_EQ(response.message[net::http::field::content_type], "application/json; charset=utf-8");
+    EXPECT_EQ(response.message.body(), R"({"ok":true})");
+    EXPECT_EQ(response.message[net::http::field::content_length], "11");
+}
+
+TEST(BackpressureQueueTest, RejectsByItemAndByteLimits) {
+    net::BackpressureQueue<std::string> queue({2, 8}, [](const std::string& value) {
+        return value.size();
+    });
+
+    EXPECT_TRUE(queue.TryPush("1234").ok());
+    EXPECT_TRUE(queue.TryPush("12").ok());
+
+    auto item_rejected = queue.TryPush("1");
+    ASSERT_FALSE(item_rejected.ok());
+    EXPECT_EQ(item_rejected.code(), core::ErrorCode::ResourceExhausted);
+
+    auto first = queue.TryPop();
+    ASSERT_TRUE(first.ok()) << first.status().message();
+    EXPECT_EQ(std::move(first).value(), "1234");
+
+    auto byte_rejected = queue.TryPush("1234567");
+    ASSERT_FALSE(byte_rejected.ok());
+    EXPECT_EQ(byte_rejected.code(), core::ErrorCode::ResourceExhausted);
+
+    auto stats = queue.Stats();
+    EXPECT_EQ(stats.queued_items, 1u);
+    EXPECT_EQ(stats.pushed_items, 2u);
+    EXPECT_EQ(stats.popped_items, 1u);
+    EXPECT_EQ(stats.rejected_items, 2u);
+}
+
+TEST(SharedBufferTest, RejectsWritesBeyondCapacity) {
+    core::BucketMemoryPool pool;
+    auto buffer_result = net::SharedBuffer::AllocateCapacity(pool, 8);
+    ASSERT_TRUE(buffer_result.ok()) << buffer_result.status().message();
+
+    auto buffer = std::move(buffer_result).value();
+    auto write_status = buffer.Write(0, "abcd", 4);
+    ASSERT_TRUE(write_status.ok()) << write_status.message();
+    EXPECT_EQ(buffer.size(), 4u);
+    EXPECT_EQ(buffer.view(), "abcd");
+
+    auto append_status = buffer.Write(4, "ef", 2);
+    ASSERT_TRUE(append_status.ok()) << append_status.message();
+    EXPECT_EQ(buffer.size(), 6u);
+    EXPECT_EQ(buffer.view(), "abcdef");
+
+    auto overflow_status = buffer.Write(7, "xy", 2);
+    ASSERT_FALSE(overflow_status.ok());
+    EXPECT_EQ(overflow_status.code(), core::ErrorCode::ResourceExhausted);
+    EXPECT_EQ(buffer.size(), 6u);
+
+    auto null_status = buffer.Write(0, nullptr, 1);
+    ASSERT_FALSE(null_status.ok());
+    EXPECT_EQ(null_status.code(), core::ErrorCode::InvalidArgument);
+}
+
+TEST(SharedBufferTest, SafeCopyAppliesCallerLimit) {
+    core::BucketMemoryPool pool;
+
+    auto copied = net::SharedBuffer::SafeCopy(pool, "1234", 4);
+    ASSERT_TRUE(copied.ok()) << copied.status().message();
+    EXPECT_EQ(copied.value().view(), "1234");
+
+    auto rejected = net::SharedBuffer::SafeCopy(pool, "12345", 4);
+    ASSERT_FALSE(rejected.ok());
+    EXPECT_EQ(rejected.status().code(), core::ErrorCode::ResourceExhausted);
+}
+
+TEST(StaticFileHandlerTest, ResolvesIndexAndRejectsTraversal) {
+    net::StaticFileHandler handler({std::filesystem::current_path()});
+
+    auto index = handler.ResolveTarget("/");
+    ASSERT_TRUE(index.ok()) << index.status().message();
+    EXPECT_EQ(index.value().filename(), "index.html");
+
+    auto traversal = handler.ResolveTarget("/../secret.txt");
+    ASSERT_FALSE(traversal.ok());
+    EXPECT_EQ(traversal.status().code(), core::ErrorCode::PermissionDenied);
+}
+
+TEST(StaticFileHandlerTest, ProvidesCommonMimeTypes) {
+    EXPECT_EQ(net::MimeType("index.html"), "text/html; charset=utf-8");
+    EXPECT_EQ(net::MimeType("app.js"), "text/javascript; charset=utf-8");
+    EXPECT_EQ(net::MimeType("module.mjs"), "text/javascript; charset=utf-8");
+    EXPECT_EQ(net::MimeType("style.css"), "text/css; charset=utf-8");
+    EXPECT_EQ(net::MimeType("image.svg"), "image/svg+xml");
+    EXPECT_EQ(net::MimeType("model.wasm"), "application/wasm");
+}
+
+TEST(HttpServerRuntimeTest, HandlesHttpRequestWithRegisteredHandler) {
+    net::HttpServer server({.address = "127.0.0.1", .port = 0, .io_threads = 1});
+    server.SetHttpHandler([](net::HttpRequest request, net::HttpGeneratorCallback respond) {
+        EXPECT_EQ(request.message.method(), net::http::verb::get);
+        EXPECT_EQ(request.message.target(), "/health");
+        respond(net::HttpResponse::Json(net::http::status::ok, R"({"status":"ok"})").message);
+    });
+
+    auto start_status = server.Start();
+    ASSERT_TRUE(start_status.ok()) << start_status.message();
+
+    asio::io_context io;
+    tcp::resolver resolver(io);
+    beast::tcp_stream stream(io);
+    auto endpoints = resolver.resolve("127.0.0.1", std::to_string(server.port()));
+    stream.connect(endpoints);
+
+    net::BeastHttpRequest request{net::http::verb::get, "/health", 11};
+    request.set(net::http::field::host, "127.0.0.1");
+    request.prepare_payload();
+    net::http::write(stream, request);
+
+    beast::flat_buffer buffer;
+    net::BeastHttpResponse response;
+    net::http::read(stream, buffer, response);
+
+    EXPECT_EQ(response.result(), net::http::status::ok);
+    EXPECT_EQ(response.body(), R"({"status":"ok"})");
+
+    server.Stop();
+}
+
+TEST(HttpServerRuntimeTest, ServesStaticFileWithBeastFileBody) {
+    ScopedTempDirectory temp_dir("agent_net_static_test");
+    const auto& root = temp_dir.path();
+    {
+        std::ofstream file(root / "index.html", std::ios::binary);
+        file << "<html>ok</html>";
+    }
+
+    net::HttpServer server({.address = "127.0.0.1", .port = 0, .io_threads = 1});
+    server.SetStaticFiles({root});
+    auto start_status = server.Start();
+    ASSERT_TRUE(start_status.ok()) << start_status.message();
+
+    asio::io_context io;
+    tcp::resolver resolver(io);
+    beast::tcp_stream stream(io);
+    stream.connect(resolver.resolve("127.0.0.1", std::to_string(server.port())));
+
+    net::BeastHttpRequest request{net::http::verb::get, "/", 11};
+    request.set(net::http::field::host, "127.0.0.1");
+    request.prepare_payload();
+    net::http::write(stream, request);
+
+    beast::flat_buffer buffer;
+    net::BeastHttpResponse response;
+    net::http::read(stream, buffer, response);
+
+    EXPECT_EQ(response.result(), net::http::status::ok);
+    EXPECT_EQ(response[net::http::field::content_type], "text/html; charset=utf-8");
+    EXPECT_EQ(response.body(), "<html>ok</html>");
+
+    server.Stop();
+}
+
+TEST(HttpServerRuntimeTest, AppliesAccessControllerBeforeHandler) {
+    net::HttpServer server({.address = "127.0.0.1", .port = 0, .io_threads = 1});
+    server.SetAccessController([](const net::BeastHttpRequest&, const net::ConnectionContext&, net::AccessCompletion complete) {
+        complete(net::AccessDecision::Deny(403, "blocked"));
+    });
+    server.SetHttpHandler([](net::HttpRequest, net::HttpGeneratorCallback respond) {
+        respond(net::HttpResponse::Text(net::http::status::ok, "unexpected").message);
+    });
+
+    auto start_status = server.Start();
+    ASSERT_TRUE(start_status.ok()) << start_status.message();
+
+    asio::io_context io;
+    tcp::resolver resolver(io);
+    beast::tcp_stream stream(io);
+    stream.connect(resolver.resolve("127.0.0.1", std::to_string(server.port())));
+
+    net::BeastHttpRequest request{net::http::verb::get, "/blocked", 11};
+    request.set(net::http::field::host, "127.0.0.1");
+    request.prepare_payload();
+    net::http::write(stream, request);
+
+    beast::flat_buffer buffer;
+    net::BeastHttpResponse response;
+    net::http::read(stream, buffer, response);
+
+    EXPECT_EQ(response.result(), net::http::status::forbidden);
+    EXPECT_EQ(response.body(), "blocked");
+
+    server.Stop();
+}
+
+TEST(HttpServerRuntimeTest, UpgradesAndEchoesWebSocketMessage) {
+    net::HttpServer server({.address = "127.0.0.1", .port = 0, .io_threads = 1});
+    core::BucketMemoryPool response_pool;
+    std::promise<void> message_seen;
+    auto message_seen_future = message_seen.get_future();
+
+    server.SetWebSocketHandler("/ws", [&](net::WebSocketSessionHandle& session, net::WebSocketMessage message) {
+        EXPECT_EQ(message.kind, net::WebSocketMessageKind::Text);
+        EXPECT_TRUE(message.final_fragment);
+        ASSERT_EQ(message.fragments.size(), 1u);
+        EXPECT_EQ(message.fragments[0].view(), "hello");
+        auto payload = net::SharedBuffer::Copy(response_pool, "echo:hello");
+        ASSERT_TRUE(payload.ok()) << payload.status().message();
+        auto status = session.Send(net::WebSocketFrame{net::WebSocketMessageKind::Text, true, false, std::move(payload).value()});
+        EXPECT_TRUE(status.ok()) << status.message();
+        message_seen.set_value();
+    });
+
+    auto start_status = server.Start();
+    ASSERT_TRUE(start_status.ok()) << start_status.message();
+
+    asio::io_context io;
+    tcp::resolver resolver(io);
+    beast::websocket::stream<tcp::socket> ws(io);
+    auto endpoints = resolver.resolve("127.0.0.1", std::to_string(server.port()));
+    asio::connect(ws.next_layer(), endpoints);
+    ws.handshake("127.0.0.1", "/ws");
+    ws.text(true);
+    ws.write(asio::buffer(std::string("hello")));
+
+    beast::flat_buffer buffer;
+    ws.read(buffer);
+    EXPECT_TRUE(ws.got_text());
+    EXPECT_EQ(beast::buffers_to_string(buffer.data()), "echo:hello");
+
+    EXPECT_EQ(message_seen_future.wait_for(2s), std::future_status::ready);
+
+    beast::error_code ec;
+    ws.close(beast::websocket::close_code::normal, ec);
+    server.Stop();
+}
+
+TEST(HttpServerRuntimeTest, StreamsLargeWebSocketMessageAsFragments) {
+    net::HttpServerOptions options;
+    options.address = "127.0.0.1";
+    options.port = 0;
+    options.io_threads = 1;
+    options.websocket.max_frame_bytes = 4;
+    options.websocket.max_message_bytes = 64;
+    options.websocket_read_buffer_limit = 64;
+
+    net::HttpServer server(options);
+    core::BucketMemoryPool response_pool;
+    std::mutex fragments_mutex;
+    std::vector<std::string> fragments;
+    std::vector<bool> final_flags;
+    std::promise<void> final_seen;
+    auto final_seen_future = final_seen.get_future();
+    std::atomic_bool final_recorded{false};
+
+    server.SetWebSocketHandler("/ws", [&](net::WebSocketSessionHandle& session, net::WebSocketMessage message) {
+        EXPECT_EQ(message.kind, net::WebSocketMessageKind::Text);
+        EXPECT_EQ(message.fragments.size(), 1u);
+        if (!message.fragments.empty()) {
+            std::lock_guard lock(fragments_mutex);
+            fragments.emplace_back(message.fragments[0].view());
+            final_flags.push_back(message.final_fragment);
+        }
+
+        if (message.final_fragment && !final_recorded.exchange(true)) {
+            auto payload = net::SharedBuffer::Copy(response_pool, "done");
+            ASSERT_TRUE(payload.ok()) << payload.status().message();
+            auto status = session.Send(net::WebSocketFrame{net::WebSocketMessageKind::Text, true, false, std::move(payload).value()});
+            EXPECT_TRUE(status.ok()) << status.message();
+            final_seen.set_value();
+        }
+    });
+
+    auto start_status = server.Start();
+    ASSERT_TRUE(start_status.ok()) << start_status.message();
+
+    asio::io_context io;
+    tcp::resolver resolver(io);
+    beast::websocket::stream<tcp::socket> ws(io);
+    auto endpoints = resolver.resolve("127.0.0.1", std::to_string(server.port()));
+    asio::connect(ws.next_layer(), endpoints);
+    ws.handshake("127.0.0.1", "/ws");
+    ws.text(true);
+
+    const std::string payload = "abcdefghijkl";
+    ws.write(asio::buffer(payload));
+
+    beast::flat_buffer buffer;
+    ws.read(buffer);
+    EXPECT_TRUE(ws.got_text());
+    EXPECT_EQ(beast::buffers_to_string(buffer.data()), "done");
+
+    EXPECT_EQ(final_seen_future.wait_for(2s), std::future_status::ready);
+
+    {
+        std::lock_guard lock(fragments_mutex);
+        ASSERT_GT(fragments.size(), 1u);
+        ASSERT_EQ(final_flags.size(), fragments.size());
+        std::string joined;
+        for (const auto& fragment : fragments) {
+            joined += fragment;
+        }
+        EXPECT_EQ(joined, payload);
+        for (std::size_t i = 0; i + 1 < final_flags.size(); ++i) {
+            EXPECT_FALSE(final_flags[i]);
+        }
+        EXPECT_TRUE(final_flags.back());
+    }
+
+    beast::error_code ec;
+    ws.close(beast::websocket::close_code::normal, ec);
+    server.Stop();
+}
+
+TEST(HttpServerRuntimeTest, ClosesWebSocketMessageAboveConfiguredLimit) {
+    net::HttpServerOptions options;
+    options.address = "127.0.0.1";
+    options.port = 0;
+    options.io_threads = 1;
+    options.websocket.max_frame_bytes = 4;
+    options.websocket.max_message_bytes = 8;
+    options.websocket_read_buffer_limit = 64;
+
+    net::HttpServer server(options);
+    std::atomic_size_t handler_calls{0};
+    std::atomic_bool close_recorded{false};
+    std::promise<net::ConnectionCloseInfo> close_seen;
+    auto close_seen_future = close_seen.get_future();
+
+    server.SetWebSocketHandler("/ws", [&](net::WebSocketSessionHandle&, net::WebSocketMessage) {
+        handler_calls.fetch_add(1, std::memory_order_relaxed);
+    });
+    server.SetWebSocketCloseHandler([&](const net::ConnectionCloseInfo& close_info) {
+        if (!close_recorded.exchange(true)) {
+            close_seen.set_value(close_info);
+        }
+    });
+
+    auto start_status = server.Start();
+    ASSERT_TRUE(start_status.ok()) << start_status.message();
+
+    asio::io_context io;
+    tcp::resolver resolver(io);
+    beast::websocket::stream<tcp::socket> ws(io);
+    auto endpoints = resolver.resolve("127.0.0.1", std::to_string(server.port()));
+    asio::connect(ws.next_layer(), endpoints);
+    ws.handshake("127.0.0.1", "/ws");
+    ws.text(true);
+
+    beast::error_code ec;
+    ws.write(asio::buffer(std::string("123456789")), ec);
+
+    ASSERT_EQ(close_seen_future.wait_for(2s), std::future_status::ready);
+    auto close_info = close_seen_future.get();
+    EXPECT_EQ(close_info.reason, net::ConnectionCloseReason::BackpressureLimit);
+    EXPECT_EQ(close_info.status.code(), core::ErrorCode::ResourceExhausted);
+    EXPECT_LE(handler_calls.load(std::memory_order_relaxed), 1u);
+
+    ws.close(beast::websocket::close_code::normal, ec);
+    server.Stop();
+}
+
+TEST(WebSocketTypesTest, UsesBeastCompressionOptions) {
+    net::WebSocketOptions options;
+    options.enable_compression = true;
+    options.compression_min_bytes = 4096;
+
+    auto server_option = options.CompressionOptions(true);
+    EXPECT_TRUE(server_option.server_enable);
+    EXPECT_FALSE(server_option.client_enable);
+    EXPECT_TRUE(server_option.server_no_context_takeover);
+    EXPECT_TRUE(server_option.client_no_context_takeover);
+    EXPECT_EQ(server_option.msg_size_threshold, 4096u);
+
+    auto client_option = options.CompressionOptions(false);
+    EXPECT_FALSE(client_option.server_enable);
+    EXPECT_TRUE(client_option.client_enable);
+}
+
+TEST(WebSocketTypesTest, AssemblesFragmentedMessageWithoutCoalescingBuffers) {
+    core::BucketMemoryPool pool;
+    net::WebSocketMessageAssembler assembler({64, 1024});
+
+    auto first_payload = net::SharedBuffer::Copy(pool, "hello ");
+    ASSERT_TRUE(first_payload.ok()) << first_payload.status().message();
+    auto second_payload = net::SharedBuffer::Copy(pool, "world");
+    ASSERT_TRUE(second_payload.ok()) << second_payload.status().message();
+
+    auto first_status = assembler.AppendFrame(
+        net::WebSocketFrame{net::WebSocketMessageKind::Text, false, false, std::move(first_payload).value()});
+    ASSERT_TRUE(first_status.ok()) << first_status.message();
+    EXPECT_FALSE(assembler.complete());
+
+    auto second_status = assembler.AppendFrame(
+        net::WebSocketFrame{net::WebSocketMessageKind::Text, true, false, std::move(second_payload).value()});
+    ASSERT_TRUE(second_status.ok()) << second_status.message();
+    ASSERT_TRUE(assembler.complete());
+
+    auto message_result = assembler.TakeMessage();
+    ASSERT_TRUE(message_result.ok()) << message_result.status().message();
+
+    auto message = std::move(message_result).value();
+    EXPECT_EQ(message.kind, net::WebSocketMessageKind::Text);
+    EXPECT_TRUE(message.final_fragment);
+    EXPECT_TRUE(message.fragmented());
+    EXPECT_EQ(message.fragment_count(), 2u);
+    EXPECT_EQ(message.total_bytes, 11u);
+    EXPECT_EQ(message.fragments[0].view(), "hello ");
+    EXPECT_EQ(message.fragments[1].view(), "world");
+}
+
+TEST(WebSocketTypesTest, RejectsMessagesAboveConfiguredLimit) {
+    core::BucketMemoryPool pool;
+    net::WebSocketMessageAssembler assembler({64, 8});
+
+    auto payload = net::SharedBuffer::Copy(pool, "too-large");
+    ASSERT_TRUE(payload.ok()) << payload.status().message();
+
+    auto status = assembler.AppendFrame(
+        net::WebSocketFrame{net::WebSocketMessageKind::Binary, true, false, std::move(payload).value()});
+    ASSERT_FALSE(status.ok());
+    EXPECT_EQ(status.code(), core::ErrorCode::ResourceExhausted);
+}
+
+TEST(WebSocketTypesTest, OutboundQueueAppliesBackpressureToPooledFrames) {
+    core::BucketMemoryPool pool;
+    net::WebSocketOptions options;
+    options.outbound_max_items = 2;
+    options.outbound_max_bytes = 8;
+    auto queue = net::MakeWebSocketOutboundQueue(options);
+
+    auto first = net::SharedBuffer::Copy(pool, "1234");
+    ASSERT_TRUE(first.ok()) << first.status().message();
+    auto second = net::SharedBuffer::Copy(pool, "12");
+    ASSERT_TRUE(second.ok()) << second.status().message();
+    auto third = net::SharedBuffer::Copy(pool, "1");
+    ASSERT_TRUE(third.ok()) << third.status().message();
+
+    EXPECT_TRUE(queue.TryPush(net::WebSocketFrame{net::WebSocketMessageKind::Binary, true, false, std::move(first).value()}).ok());
+    EXPECT_TRUE(queue.TryPush(net::WebSocketFrame{net::WebSocketMessageKind::Binary, true, false, std::move(second).value()}).ok());
+    auto rejected = queue.TryPush(net::WebSocketFrame{net::WebSocketMessageKind::Binary, true, false, std::move(third).value()});
+    ASSERT_FALSE(rejected.ok());
+    EXPECT_EQ(rejected.code(), core::ErrorCode::ResourceExhausted);
+
+    auto stats = queue.Stats();
+    EXPECT_EQ(stats.queued_items, 2u);
+    EXPECT_EQ(stats.queued_bytes, 6u);
+    EXPECT_EQ(stats.rejected_items, 1u);
+}
+
+} // namespace

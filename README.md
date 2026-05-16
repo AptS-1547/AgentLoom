@@ -127,21 +127,18 @@ print(response.text)
 
 ```
 src/
-├── common/                    # 公共基础设施
-│   ├── server_common.h/.cpp   # 统计、内存监控、参数解析
-│   └── logger.h/.cpp          # 日志系统
-├── models/                    # 模型封装层
-│   ├── onnx_model.h/.cpp      # ONNX Runtime（BERT/ViT）
-│   └── llama_runner.h/.cpp    # llama.cpp VLM 封装
-├── server/                    # 服务端核心
-│   ├── multimodal_inference_server.cpp  # gRPC 服务实现
-│   ├── server_config.h/.cpp             # 配置文件加载
-│   ├── server_options.h                 # 配置结构定义
-│   ├── request_validation.h/.cpp        # 请求验证和限流
-│   └── vlm_cache.h/.cpp                 # VLM 结果缓存
-└── client/                    # 测试客户端
-    ├── client_test.cpp        # 功能测试
-    └── benchmark_client.cpp   # 性能测试
+├── core/                      # Result/Status、RAII、内存池、线程池、队列
+├── net/                       # Boost.Beast HTTP/WebSocket runtime、背压、静态文件
+├── config/                    # 配置文件加载、命令行解析、Options
+├── cache/                     # VLM 结果缓存
+├── vector/                    # 向量缓存/索引基础
+├── service/                   # 推理业务编排、请求校验
+├── server/                    # gRPC adapter、进程 runtime、日志/统计/健康检查
+│   ├── grpc/
+│   ├── runtime/
+│   └── main/
+├── models/                    # ONNX Runtime、llama.cpp/mtmd 模型封装
+└── client/                    # 测试客户端和 benchmark
 
 config/                        # 配置文件目录
 third_party/                   # 第三方库（nlohmann/json 等）

@@ -4,8 +4,14 @@ project(MultimodalInferenceService VERSION 2.0.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+option(BERT_BUILD_TESTS "Build C++ unit tests" OFF)
+
 if(MSVC)
     add_compile_options(/utf-8)
+endif()
+
+if(BERT_BUILD_TESTS)
+    enable_testing()
 endif()
 
 # vcpkg 集成
@@ -37,6 +43,25 @@ endif()
 find_package(Protobuf CONFIG REQUIRED)
 find_package(gRPC CONFIG REQUIRED)
 find_package(spdlog CONFIG REQUIRED)
+find_package(OpenSSL CONFIG REQUIRED)
+
+function(require_path path label)
+    if(NOT EXISTS "${path}")
+        message(FATAL_ERROR "${label} not found: ${path}")
+    endif()
+endfunction()
+
+function(copy_runtime_files target)
+    foreach(runtime_file IN LISTS ARGN)
+        if(EXISTS "${runtime_file}")
+            add_custom_command(TARGET ${target} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${runtime_file}"
+                    $<TARGET_FILE_DIR:${target}>
+            )
+        endif()
+    endforeach()
+endfunction()
 
 # ONNX Runtime 预编译二进制
 if(WIN32)
@@ -82,9 +107,7 @@ else()
 endif()
 
 set(BERT_ONNXRUNTIME_SHARED_LIB "${ONNXRUNTIME_ROOT}/${BERT_ONNXRUNTIME_SHARED_LIB_RELATIVE}")
-if(NOT EXISTS "${BERT_ONNXRUNTIME_SHARED_LIB}")
-    message(FATAL_ERROR "ONNX Runtime package not found at ${ONNXRUNTIME_ROOT}")
-endif()
+require_path("${BERT_ONNXRUNTIME_SHARED_LIB}" "ONNX Runtime package")
 
 message(STATUS "Using ONNX Runtime from ${ONNXRUNTIME_ROOT}")
 
@@ -103,6 +126,156 @@ endif()
 # llama.cpp 预编译路径
 set(LLAMA_CPP_ROOT "D:/Users/21405/source/repos/LocalLLMPredict/llama.cpp" CACHE PATH "Path to llama.cpp repository")
 set(LLAMA_CPP_BUILD "${LLAMA_CPP_ROOT}/build")
+
+set(LLAMA_CPP_INCLUDE_DIRS
+    "${LLAMA_CPP_ROOT}/include"
+    "${LLAMA_CPP_ROOT}/tools/mtmd"
+    "${LLAMA_CPP_ROOT}/common"
+    "${LLAMA_CPP_ROOT}/ggml/include"
+)
+
+if(WIN32)
+    set(LLAMA_CPP_LIB_DIR "${LLAMA_CPP_BUILD}/src/Release")
+    set(LLAMA_CPP_COMMON_LIB_DIR "${LLAMA_CPP_BUILD}/common/Release")
+    set(LLAMA_CPP_MTMD_LIB_DIR "${LLAMA_CPP_BUILD}/tools/mtmd/Release")
+    set(LLAMA_CPP_GGML_LIB_DIR "${LLAMA_CPP_BUILD}/ggml/src/Release")
+    set(LLAMA_CPP_BIN_DIR "${LLAMA_CPP_BUILD}/bin/Release")
+    set(LLAMA_CPP_LIBS
+        "${LLAMA_CPP_LIB_DIR}/llama.lib"
+        "${LLAMA_CPP_MTMD_LIB_DIR}/mtmd.lib"
+        "${LLAMA_CPP_COMMON_LIB_DIR}/llama-common.lib"
+        "${LLAMA_CPP_GGML_LIB_DIR}/ggml.lib"
+        "${LLAMA_CPP_GGML_LIB_DIR}/ggml-base.lib"
+    )
+    set(LLAMA_CPP_RUNTIME_FILES
+        "${LLAMA_CPP_BIN_DIR}/llama.dll"
+        "${LLAMA_CPP_BIN_DIR}/ggml.dll"
+        "${LLAMA_CPP_BIN_DIR}/ggml-base.dll"
+        "${LLAMA_CPP_BIN_DIR}/ggml-cpu.dll"
+        "${LLAMA_CPP_BIN_DIR}/ggml-cuda.dll"
+        "${LLAMA_CPP_BIN_DIR}/mtmd.dll"
+        "${LLAMA_CPP_BIN_DIR}/llama-common.dll"
+    )
+elseif(UNIX AND NOT APPLE)
+    set(LLAMA_CPP_LIB_DIR "${LLAMA_CPP_BUILD}/src")
+    set(LLAMA_CPP_COMMON_LIB_DIR "${LLAMA_CPP_BUILD}/common")
+    set(LLAMA_CPP_MTMD_LIB_DIR "${LLAMA_CPP_BUILD}/tools/mtmd")
+    set(LLAMA_CPP_GGML_LIB_DIR "${LLAMA_CPP_BUILD}/ggml/src")
+    set(LLAMA_CPP_BIN_DIR "${LLAMA_CPP_BUILD}/bin")
+    set(LLAMA_CPP_LIBS
+        "${LLAMA_CPP_LIB_DIR}/libllama.so"
+        "${LLAMA_CPP_MTMD_LIB_DIR}/libmtmd.so"
+        "${LLAMA_CPP_COMMON_LIB_DIR}/libllama-common.a"
+        "${LLAMA_CPP_GGML_LIB_DIR}/libggml.so"
+        "${LLAMA_CPP_GGML_LIB_DIR}/libggml-base.so"
+    )
+    file(GLOB LLAMA_CPP_RUNTIME_FILES
+        "${LLAMA_CPP_BIN_DIR}/libllama.so*"
+        "${LLAMA_CPP_BIN_DIR}/libggml*.so*"
+        "${LLAMA_CPP_BIN_DIR}/libmtmd.so*"
+        "${LLAMA_CPP_LIB_DIR}/libllama.so*"
+        "${LLAMA_CPP_MTMD_LIB_DIR}/libmtmd.so*"
+        "${LLAMA_CPP_GGML_LIB_DIR}/libggml*.so*"
+    )
+endif()
+
+foreach(LLAMA_CPP_INCLUDE_DIR ${LLAMA_CPP_INCLUDE_DIRS})
+    require_path("${LLAMA_CPP_INCLUDE_DIR}" "llama.cpp include directory")
+endforeach()
+
+foreach(LLAMA_CPP_LIB ${LLAMA_CPP_LIBS})
+    require_path("${LLAMA_CPP_LIB}" "llama.cpp library")
+endforeach()
+
+if(WIN32)
+    set(BERT_DEFAULT_OPENCV_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/deps/opencv-4.10.0-windows/build")
+    set(OpenCV_DIR "${BERT_DEFAULT_OPENCV_ROOT}/x64/vc16/lib" CACHE PATH "Path to OpenCVConfig.cmake")
+    set(BERT_OPENCV_RUNTIME_DIR "${BERT_DEFAULT_OPENCV_ROOT}/x64/vc16/bin")
+    set(BERT_OPENCV_RUNTIME_GLOB "${BERT_OPENCV_RUNTIME_DIR}/opencv_world*.dll")
+    set(BERT_OPENCV_EXTRA_RUNTIME_GLOB "${BERT_OPENCV_RUNTIME_DIR}/opencv_videoio_*.dll")
+elseif(UNIX AND NOT APPLE)
+    set(BERT_DEFAULT_OPENCV_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/deps/opencv-4.10.0-linux")
+    set(OpenCV_DIR "${BERT_DEFAULT_OPENCV_ROOT}/lib/cmake/opencv4" CACHE PATH "Path to OpenCVConfig.cmake")
+    set(BERT_OPENCV_RUNTIME_DIR "${BERT_DEFAULT_OPENCV_ROOT}/lib")
+    set(BERT_OPENCV_RUNTIME_GLOB "${BERT_OPENCV_RUNTIME_DIR}/libopencv*.so*")
+    set(BERT_OPENCV_EXTRA_RUNTIME_GLOB "")
+endif()
+
+find_package(OpenCV CONFIG REQUIRED COMPONENTS core imgproc videoio)
+file(GLOB BERT_OPENCV_RUNTIME_FILES
+    "${BERT_OPENCV_RUNTIME_GLOB}"
+    "${BERT_OPENCV_EXTRA_RUNTIME_GLOB}"
+)
+
+set(BERT_BOOST_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/deps/boost_1_85_0" CACHE PATH "Path to Boost header package")
+require_path("${BERT_BOOST_ROOT}/boost/asio.hpp" "Boost.Asio header")
+require_path("${BERT_BOOST_ROOT}/boost/beast.hpp" "Boost.Beast header")
+require_path("${BERT_BOOST_ROOT}/boost/redis.hpp" "Boost.Redis header")
+require_path("${BERT_BOOST_ROOT}/boost/redis/src.hpp" "Boost.Redis source header")
+
+add_library(boost_asio_headers INTERFACE)
+target_include_directories(boost_asio_headers INTERFACE "${BERT_BOOST_ROOT}")
+if(WIN32)
+    target_compile_definitions(boost_asio_headers INTERFACE _WIN32_WINNT=0x0602)
+    target_link_libraries(boost_asio_headers INTERFACE ws2_32 mswsock)
+endif()
+
+add_library(boost_redis_headers INTERFACE)
+target_link_libraries(boost_redis_headers INTERFACE boost_asio_headers OpenSSL::SSL OpenSSL::Crypto)
+
+set(BERT_EIGEN_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/deps/eigen-5.0.1" CACHE PATH "Path to Eigen header package")
+require_path("${BERT_EIGEN_ROOT}/Eigen/Dense" "Eigen headers")
+
+add_library(eigen_headers INTERFACE)
+target_include_directories(eigen_headers INTERFACE "${BERT_EIGEN_ROOT}")
+
+set(BERT_SQLITE_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/deps/sqlite-amalgamation-3530100" CACHE PATH "Path to SQLite headers")
+set(BERT_SQLITE_DLL "${CMAKE_CURRENT_SOURCE_DIR}/deps/sqlite3.dll" CACHE FILEPATH "Path to sqlite3.dll")
+set(BERT_SQLITE_DEF "${CMAKE_CURRENT_SOURCE_DIR}/deps/sqlite3.def" CACHE FILEPATH "Path to sqlite3.def")
+set(BERT_SQLITE_BUILD_DEF "${CMAKE_CURRENT_BINARY_DIR}/deps/sqlite3.def")
+set(BERT_SQLITE_IMPLIB "${CMAKE_CURRENT_BINARY_DIR}/deps/sqlite3.lib")
+
+require_path("${BERT_SQLITE_INCLUDE_DIR}/sqlite3.h" "SQLite header")
+require_path("${BERT_SQLITE_DLL}" "SQLite runtime")
+require_path("${BERT_SQLITE_DEF}" "SQLite module definition")
+
+if(WIN32)
+    add_custom_command(
+        OUTPUT "${BERT_SQLITE_IMPLIB}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/deps"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${BERT_SQLITE_DEF}" "${BERT_SQLITE_BUILD_DEF}"
+        COMMAND lib /def:sqlite3.def /machine:x64 /out:sqlite3.lib
+        DEPENDS "${BERT_SQLITE_DEF}"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/deps"
+        VERBATIM
+    )
+    add_custom_target(sqlite_import_lib DEPENDS "${BERT_SQLITE_IMPLIB}")
+
+    add_library(sqlite3 SHARED IMPORTED)
+    add_dependencies(sqlite3 sqlite_import_lib)
+    set_target_properties(sqlite3 PROPERTIES
+        IMPORTED_LOCATION "${BERT_SQLITE_DLL}"
+        IMPORTED_IMPLIB "${BERT_SQLITE_IMPLIB}"
+        INTERFACE_INCLUDE_DIRECTORIES "${BERT_SQLITE_INCLUDE_DIR}"
+    )
+else()
+    message(FATAL_ERROR "SQLite prebuilt dependency currently expects the Windows package")
+endif()
+
+set(BERT_FAISS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/deps/faiss-1.14.1-cpu-win64" CACHE PATH "Path to Faiss CPU package")
+set(BERT_MKL_RUNTIME_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/deps/mkl-2023.1.0-win64" CACHE PATH "Path to MKL runtime package")
+
+require_path("${BERT_FAISS_ROOT}/include/faiss/IndexFlat.h" "Faiss headers")
+require_path("${BERT_FAISS_ROOT}/lib/faiss.lib" "Faiss import library")
+require_path("${BERT_FAISS_ROOT}/bin/faiss.dll" "Faiss runtime")
+require_path("${BERT_MKL_RUNTIME_ROOT}/Library/bin/mkl_rt.2.dll" "MKL runtime")
+
+set(faiss_DIR "${BERT_FAISS_ROOT}/share/faiss" CACHE PATH "Path to Faiss config package")
+find_package(faiss CONFIG REQUIRED)
+set(BERT_FAISS_RUNTIME_FILES
+    "${BERT_FAISS_ROOT}/bin/faiss.dll"
+    "${BERT_MKL_RUNTIME_ROOT}/Library/bin/mkl_rt.2.dll"
+)
 
 # ==================== Proto 代码生成 ====================
 
@@ -166,77 +339,239 @@ target_link_libraries(multimodal_proto PUBLIC protobuf::libprotobuf gRPC::grpc++
 
 # ==================== 公共库 ====================
 
-add_library(server_common STATIC
-    src/common/server_common.cpp
-    src/common/server_common.h
-    src/common/logger.cpp
-    src/common/logger.h
+add_library(agent_core STATIC
+    src/core/blocking_queue.h
+    src/core/error.h
+    src/core/exception.h
+    src/core/logger_adapter.h
+    src/core/memory_pool.cpp
+    src/core/memory_pool.h
+    src/core/object_pool.h
+    src/core/result.h
+    src/core/shared_memory_block.cpp
+    src/core/shared_memory_block.h
+    src/core/thread_pool.cpp
+    src/core/thread_pool.h
+    src/core/unique_handle.h
 )
 
-target_include_directories(server_common PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/common
+target_include_directories(agent_core PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/core
 )
 
-target_link_libraries(server_common PUBLIC spdlog::spdlog)
+target_link_libraries(agent_core PUBLIC spdlog::spdlog)
 
-# ==================== 统一多模态推理服务端 ====================
+add_library(agent_net STATIC
+    src/net/backpressure_queue.h
+    src/net/http_server.cpp
+    src/net/http_server.h
+    src/net/http_types.h
+    src/net/protocol_types.h
+    src/net/shared_buffer.h
+    src/net/static_file_handler.cpp
+    src/net/static_file_handler.h
+    src/net/websocket_types.h
+)
 
-add_executable(multimodal_inference_server
-    src/server/multimodal_inference_server.cpp
-    src/server/request_validation.cpp
-    src/server/request_validation.h
-    src/server/server_config.cpp
-    src/server/server_config.h
-    src/server/server_options.h
-    src/server/vector_cache.cpp
-    src/server/vector_cache.h
-    src/server/vlm_cache.cpp
-    src/server/vlm_cache.h
+target_include_directories(agent_net PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/net
+)
+
+target_link_libraries(agent_net PUBLIC
+    agent_core
+)
+
+if(TARGET boost_asio_headers)
+    target_link_libraries(agent_net PUBLIC boost_asio_headers)
+endif()
+
+if(BERT_BUILD_TESTS)
+    set(BERT_GTEST_ROOT "" CACHE PATH "Path to a prebuilt GTest package")
+    if(BERT_GTEST_ROOT)
+        list(PREPEND CMAKE_PREFIX_PATH "${BERT_GTEST_ROOT}")
+    endif()
+
+    find_package(GTest CONFIG REQUIRED)
+    include(GoogleTest)
+
+    add_executable(core_tests
+        tests/core/core_infra_test.cpp
+    )
+
+    target_link_libraries(core_tests PRIVATE
+        agent_core
+        GTest::gtest_main
+    )
+
+    gtest_discover_tests(core_tests DISCOVERY_MODE PRE_TEST)
+
+    add_executable(net_tests
+        tests/net/net_protocol_test.cpp
+    )
+
+    target_link_libraries(net_tests PRIVATE
+        agent_net
+        GTest::gtest_main
+    )
+
+    gtest_discover_tests(net_tests DISCOVERY_MODE PRE_TEST)
+
+endif()
+
+add_library(server_runtime STATIC
+    src/server/runtime/logger.cpp
+    src/server/runtime/logger.h
+    src/server/runtime/server_common.cpp
+    src/server/runtime/server_common.h
+)
+
+target_include_directories(server_runtime PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/server/runtime
+)
+
+target_link_libraries(server_runtime PUBLIC spdlog::spdlog)
+
+add_library(agent_models STATIC
+    src/models/llama_handles.h
     src/models/llama_runner.cpp
     src/models/llama_runner.h
     src/models/onnx_model.cpp
     src/models/onnx_model.h
 )
 
-target_include_directories(multimodal_inference_server PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/common
+target_include_directories(agent_models PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src/models
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/server
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party
-    ${GENERATED_DIR}
     ${ONNXRUNTIME_ROOT}/include
-    ${LLAMA_CPP_ROOT}/include
-    ${LLAMA_CPP_ROOT}/tools/mtmd
-    ${LLAMA_CPP_ROOT}/common
-    ${LLAMA_CPP_ROOT}/ggml/include
+    ${LLAMA_CPP_INCLUDE_DIRS}
 )
 
-target_link_libraries(multimodal_inference_server PRIVATE
-    multimodal_proto
-    server_common
+target_link_libraries(agent_models PUBLIC
+    agent_core
     onnxruntime
+    spdlog::spdlog
+    ${LLAMA_CPP_LIBS}
+)
+
+add_library(agent_cache STATIC
+    src/cache/vlm_cache.cpp
+    src/cache/vlm_cache.h
+)
+
+target_include_directories(agent_cache PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/cache
+)
+
+target_link_libraries(agent_cache PUBLIC
+    agent_models
+    spdlog::spdlog
+)
+
+add_library(agent_vector STATIC
+    src/vector/vector_cache.cpp
+    src/vector/vector_cache.h
+)
+
+target_include_directories(agent_vector PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/vector
+)
+
+target_link_libraries(agent_vector PUBLIC spdlog::spdlog)
+
+add_library(agent_config STATIC
+    src/config/config_section.cpp
+    src/config/config_section.h
+    src/config/config_sections_builtin.cpp
+    src/config/option_parser.cpp
+    src/config/option_parser.h
+    src/config/request_options.h
+    src/config/sections/auth_config_section.cpp
+    src/config/sections/config_path_section.cpp
+    src/config/sections/grpc_config_section.cpp
+    src/config/sections/limits_config_section.cpp
+    src/config/sections/model_config_section.cpp
+    src/config/sections/vlm_cache_config_section.cpp
+    src/config/sections/vram_config_section.cpp
+    src/config/server_config.cpp
+    src/config/server_config.h
+    src/config/server_options.h
+)
+
+target_include_directories(agent_config PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/config
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party
+)
+
+target_link_libraries(agent_config PUBLIC
+    agent_cache
+    agent_vector
+    server_runtime
+)
+
+if(BERT_BUILD_TESTS)
+    add_executable(config_tests
+        tests/config/config_parser_test.cpp
+    )
+
+    target_link_libraries(config_tests PRIVATE
+        agent_config
+        GTest::gtest_main
+    )
+
+    gtest_discover_tests(config_tests DISCOVERY_MODE PRE_TEST)
+endif()
+
+add_library(agent_service STATIC
+    src/service/inference/multimodal_service.cpp
+    src/service/inference/multimodal_service.h
+)
+
+target_include_directories(agent_service PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/service/inference
+)
+
+target_link_libraries(agent_service PUBLIC
+    multimodal_proto
+    agent_config
+    agent_models
+    agent_cache
+    agent_vector
+    agent_core
+    spdlog::spdlog
+)
+
+# ==================== 统一多模态推理服务端 ====================
+
+add_library(agent_server STATIC
+    src/server/grpc/grpc_error.cpp
+    src/server/grpc/grpc_error.h
+    src/server/grpc/multimodal_grpc_service.cpp
+    src/server/grpc/multimodal_grpc_service.h
+    src/service/inference/request_validation.cpp
+    src/service/inference/request_validation.h
+)
+
+target_include_directories(agent_server PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/server/grpc
+)
+
+target_link_libraries(agent_server PUBLIC
+    multimodal_proto
+    agent_core
+    agent_service
+    server_runtime
+    agent_config
     gRPC::grpc++
     spdlog::spdlog
-    ${LLAMA_CPP_BUILD}/src/Release/llama.lib
-    ${LLAMA_CPP_BUILD}/tools/mtmd/Release/mtmd.lib
-    ${LLAMA_CPP_BUILD}/common/Release/llama-common.lib
-    ${LLAMA_CPP_BUILD}/ggml/src/Release/ggml.lib
-    ${LLAMA_CPP_BUILD}/ggml/src/Release/ggml-base.lib
 )
 
-# 拷贝 llama.cpp DLL 到输出目录
-add_custom_command(TARGET multimodal_inference_server POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${LLAMA_CPP_BUILD}/bin/Release/llama.dll"
-        "${LLAMA_CPP_BUILD}/bin/Release/ggml.dll"
-        "${LLAMA_CPP_BUILD}/bin/Release/ggml-base.dll"
-        "${LLAMA_CPP_BUILD}/bin/Release/ggml-cpu.dll"
-        "${LLAMA_CPP_BUILD}/bin/Release/ggml-cuda.dll"
-        "${LLAMA_CPP_BUILD}/bin/Release/mtmd.dll"
-        "${LLAMA_CPP_BUILD}/bin/Release/llama-common.dll"
-        $<TARGET_FILE_DIR:multimodal_inference_server>
-    COMMENT "Copying llama.cpp DLLs"
+add_executable(multimodal_inference_server
+    src/server/main/multimodal_inference_server.cpp
 )
+
+target_link_libraries(multimodal_inference_server PRIVATE agent_server)
+
+copy_runtime_files(multimodal_inference_server ${LLAMA_CPP_RUNTIME_FILES})
 
 # ==================== 客户端工具（BERT 协议，用于向后兼容测试） ====================
 
@@ -257,7 +592,14 @@ target_link_libraries(bert_benchmark_client PRIVATE bert_proto gRPC::grpc++)
 # ==================== 平台适配 ====================
 
 if(UNIX AND NOT APPLE)
-    foreach(target multimodal_inference_server bert_inference_client bert_benchmark_client)
+    set(BERT_RPATH_TARGETS multimodal_inference_server bert_inference_client bert_benchmark_client)
+    if(TARGET core_tests)
+        list(APPEND BERT_RPATH_TARGETS core_tests)
+    endif()
+    if(TARGET net_tests)
+        list(APPEND BERT_RPATH_TARGETS net_tests)
+    endif()
+    foreach(target ${BERT_RPATH_TARGETS})
         set_target_properties(${target} PROPERTIES
             BUILD_RPATH "$ORIGIN"
             INSTALL_RPATH "$ORIGIN"
@@ -266,42 +608,41 @@ if(UNIX AND NOT APPLE)
 endif()
 
 # 安装
-install(TARGETS multimodal_inference_server bert_inference_client bert_benchmark_client RUNTIME DESTINATION bin)
+set(BERT_INSTALL_TARGETS multimodal_inference_server bert_inference_client bert_benchmark_client)
+install(TARGETS ${BERT_INSTALL_TARGETS} RUNTIME DESTINATION bin)
 
 # 复制 ONNX Runtime 运行时库
 file(GLOB ONNXRUNTIME_RUNTIME_LIBS "${ONNXRUNTIME_ROOT}/${BERT_ONNXRUNTIME_RUNTIME_GLOB}")
 foreach(ONNXRUNTIME_RUNTIME_LIB ${ONNXRUNTIME_RUNTIME_LIBS})
-    add_custom_command(TARGET multimodal_inference_server POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${ONNXRUNTIME_RUNTIME_LIB}"
-            $<TARGET_FILE_DIR:multimodal_inference_server>
-    )
+    copy_runtime_files(multimodal_inference_server "${ONNXRUNTIME_RUNTIME_LIB}")
 endforeach()
 
 # 复制 vcpkg 动态库依赖
 if(WIN32 AND BERT_VCPKG_TRIPLET)
     file(GLOB VCPKG_RUNTIME_DLLS "${CMAKE_CURRENT_SOURCE_DIR}/vcpkg_installed/${BERT_VCPKG_TRIPLET}/bin/*.dll")
-    foreach(target multimodal_inference_server bert_inference_client bert_benchmark_client)
-        foreach(VCPKG_RUNTIME_DLL ${VCPKG_RUNTIME_DLLS})
-            add_custom_command(TARGET ${target} POST_BUILD
-                COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                    "${VCPKG_RUNTIME_DLL}"
-                    $<TARGET_FILE_DIR:${target}>
-            )
-        endforeach()
+    set(BERT_RUNTIME_COPY_TARGETS multimodal_inference_server bert_inference_client bert_benchmark_client)
+    if(TARGET core_tests)
+        list(APPEND BERT_RUNTIME_COPY_TARGETS core_tests)
+    endif()
+    if(TARGET net_tests)
+        list(APPEND BERT_RUNTIME_COPY_TARGETS net_tests)
+    endif()
+    foreach(target ${BERT_RUNTIME_COPY_TARGETS})
+        copy_runtime_files(${target} ${VCPKG_RUNTIME_DLLS})
     endforeach()
 endif()
 
 if(UNIX AND NOT APPLE AND BERT_VCPKG_TRIPLET)
     file(GLOB VCPKG_RUNTIME_SOS "${CMAKE_CURRENT_SOURCE_DIR}/vcpkg_installed/${BERT_VCPKG_TRIPLET}/lib/*.so*")
-    foreach(target multimodal_inference_server bert_inference_client bert_benchmark_client)
-        foreach(VCPKG_RUNTIME_SO ${VCPKG_RUNTIME_SOS})
-            add_custom_command(TARGET ${target} POST_BUILD
-                COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                    "${VCPKG_RUNTIME_SO}"
-                    $<TARGET_FILE_DIR:${target}>
-            )
-        endforeach()
+    set(BERT_RUNTIME_COPY_TARGETS multimodal_inference_server bert_inference_client bert_benchmark_client)
+    if(TARGET core_tests)
+        list(APPEND BERT_RUNTIME_COPY_TARGETS core_tests)
+    endif()
+    if(TARGET net_tests)
+        list(APPEND BERT_RUNTIME_COPY_TARGETS net_tests)
+    endif()
+    foreach(target ${BERT_RUNTIME_COPY_TARGETS})
+        copy_runtime_files(${target} ${VCPKG_RUNTIME_SOS})
     endforeach()
 endif()
 
@@ -312,11 +653,5 @@ if(EXISTS "${CUDA_RUNTIME_DLL_ROOT}")
     elseif(UNIX AND NOT APPLE)
         file(GLOB CUDA_RUNTIME_LIBS "${CUDA_RUNTIME_DLL_ROOT}/*.so*")
     endif()
-    foreach(CUDA_RUNTIME_LIB ${CUDA_RUNTIME_LIBS})
-        add_custom_command(TARGET multimodal_inference_server POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${CUDA_RUNTIME_LIB}"
-                $<TARGET_FILE_DIR:multimodal_inference_server>
-        )
-    endforeach()
+    copy_runtime_files(multimodal_inference_server ${CUDA_RUNTIME_LIBS})
 endif()

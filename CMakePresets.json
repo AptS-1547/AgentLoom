@@ -38,6 +38,24 @@
       }
     },
     {
+      "name": "x64-Release-Tests",
+      "displayName": "x64 Release Tests",
+      "inherits": "x64-Release",
+      "binaryDir": "${sourceDir}/build/x64-Release-Tests",
+      "cacheVariables": {
+        "BERT_BUILD_TESTS": "ON"
+      }
+    },
+    {
+      "name": "x64-Debug-Tests",
+      "displayName": "x64 Debug Tests",
+      "inherits": "x64-Debug",
+      "binaryDir": "${sourceDir}/build/x64-Debug-Tests",
+      "cacheVariables": {
+        "BERT_BUILD_TESTS": "ON"
+      }
+    },
+    {
       "name": "linux-Release",
       "displayName": "Linux Release",
       "generator": "Ninja",

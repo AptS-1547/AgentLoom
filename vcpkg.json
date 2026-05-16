@@ -1,9 +1,19 @@
 {
   "name": "bert-inference-service",
   "version": "1.0.0",
+  "builtin-baseline": "b5d1a94fb7f88fd835e360fd23a45a09ceedbf48",
   "dependencies": [
     "grpc",
+    "openssl",
     "protobuf",
     "spdlog"
-  ]
+  ],
+  "features": {
+    "tests": {
+      "description": "C++ unit test dependencies.",
+      "dependencies": [
+        "gtest"
+      ]
+    }
+  }
 }

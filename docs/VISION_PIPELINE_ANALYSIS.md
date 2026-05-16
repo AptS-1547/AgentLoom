@@ -211,7 +211,7 @@ ImageResult(
 
 #### 2.2.2 C++ gRPC 推理服务 (AgentBackendPredict)
 
-**位置**: `src/server/multimodal_inference_server.cpp`
+**位置**: `src/server/main/multimodal_inference_server.cpp`, `src/server/grpc/`, `src/service/inference/`
 
 **功能**: 统一多模态推理服务，整合 BERT + VLM + ViT
 
@@ -236,7 +236,7 @@ message VLMRequest {
 }
 ```
 
-**VLM 缓存系统** (`src/server/vlm_cache.cpp`):
+**VLM 缓存系统** (`src/cache/vlm_cache.cpp`):
 
 **缓存键生成**:
 ```cpp
@@ -259,7 +259,7 @@ cache_key = SHA256(image_data) + SHA256(prompt)
 - 支持 JPEG/PNG/GIF/WebP
 - 无需临时文件，零拷贝
 
-**VRAM 管理** (`src/server/server_options.h`):
+**VRAM 管理** (`src/config/server_options.h`, `src/service/inference/multimodal_service.cpp`):
 ```cpp
 struct VramGuardOptions {
     int monitor_interval_seconds = 10;           // 监控间隔

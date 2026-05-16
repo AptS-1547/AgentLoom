@@ -140,10 +140,8 @@ struct GrpcServerOptions {
     int slow_request_ms = 250;
 };
 
-bool IsFlag(const std::string& arg);
 int ParseIntValue(const std::string& flag, const char* value);
 int ResolveDefaultGrpcNumCqs();
 int ResolveDefaultGrpcMaxPollers();
-void ParseGrpcServerOptions(int argc, char** argv, int start_index, GrpcServerOptions& options);
 
 } // namespace server_common

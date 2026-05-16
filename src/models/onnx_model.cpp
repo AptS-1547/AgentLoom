@@ -1,4 +1,4 @@
-/**
+﻿/**
  * @file onnx_model.cpp
  * @brief ONNX Runtime BERT 模型实现
  */
@@ -13,7 +13,7 @@
 
 #include <spdlog/spdlog.h>
 
-#include "logger.h"
+#include <spdlog/spdlog.h>
 
 namespace bert {
 

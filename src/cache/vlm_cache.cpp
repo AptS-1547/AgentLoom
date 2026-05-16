@@ -1,6 +1,6 @@
-#include "vlm_cache.h"
+﻿#include "vlm_cache.h"
 
-#include "logger.h"
+#include <spdlog/spdlog.h>
 
 #include <algorithm>
 #include <array>
@@ -496,7 +496,7 @@ void VLMCache::Put(StoreRecord record) {
         try {
             PersistEntry(entry);
         } catch (const std::exception& e) {
-            LOG_WARN("[VLMCache] persist failed for {}: {}", key, e.what());
+            spdlog::warn("[VLMCache] persist failed for {}: {}", key, e.what());
         }
     }
     entries_[key] = std::move(entry);
@@ -519,7 +519,7 @@ Result VLMCache::TouchAndMakeResult(Entry& entry, int64_t now_ms) {
         try {
             PersistEntry(entry);
         } catch (const std::exception& e) {
-            LOG_WARN("[VLMCache] persist touch failed for {}: {}", entry.record.key.cache_key, e.what());
+            spdlog::warn("[VLMCache] persist touch failed for {}: {}", entry.record.key.cache_key, e.what());
         }
     }
     return MakeResult(entry);
@@ -592,7 +592,7 @@ void VLMCache::LoadPersisted() {
         std::filesystem::create_directories(ImagesDir(options_));
         std::filesystem::create_directories(PromptsDir(options_));
     } catch (const std::exception& e) {
-        LOG_WARN("[VLMCache] create cache dirs failed: {}", e.what());
+        spdlog::warn("[VLMCache] create cache dirs failed: {}", e.what());
         return;
     }
 
@@ -621,10 +621,10 @@ void VLMCache::LoadPersisted() {
         ++loaded;
     }
     if (iter_ec) {
-        LOG_WARN("[VLMCache] directory scan failed for {}: {}", dir.string(), iter_ec.message());
+        spdlog::warn("[VLMCache] directory scan failed for {}: {}", dir.string(), iter_ec.message());
     }
     EvictLocked();
-    LOG_INFO("[VLMCache] loaded {} entries from {}", loaded, options_.cache_dir.string());
+    spdlog::info("[VLMCache] loaded {} entries from {}", loaded, options_.cache_dir.string());
 }
 
 void VLMCache::PersistEntry(const Entry& entry) {

@@ -9,5 +9,6 @@ namespace server_config {
 
 std::optional<std::filesystem::path> FindConfigPath(int argc, char** argv);
 void LoadConfigFile(const std::filesystem::path& path, MultimodalServerOptions& options);
+void ApplyCliFallbackOptions(int argc, char** argv, MultimodalServerOptions& options);
 
 }

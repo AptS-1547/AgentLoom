@@ -242,10 +242,6 @@ void LogStatsPeriodically(
     }
 }
 
-bool IsFlag(const std::string& arg) {
-    return arg.rfind("--", 0) == 0;
-}
-
 int ParseIntValue(const std::string& flag, const char* value) {
     try {
         return std::stoi(value);
@@ -262,63 +258,6 @@ int ResolveDefaultGrpcNumCqs() {
 int ResolveDefaultGrpcMaxPollers() {
     const unsigned int hw_threads = std::max(1u, std::thread::hardware_concurrency());
     return std::clamp(static_cast<int>(hw_threads / 2), 2, 16);
-}
-
-void ParseGrpcServerOptions(int argc, char** argv, int start_index, GrpcServerOptions& options) {
-    for (int i = start_index; i < argc; ++i) {
-        const std::string arg = argv[i];
-
-        if (arg == "--host") {
-            if (i + 1 >= argc) throw std::runtime_error("--host requires a value");
-            options.host = argv[++i];
-        } else if (arg == "--port") {
-            if (i + 1 >= argc) throw std::runtime_error("--port requires a value");
-            options.port = argv[++i];
-        } else if (arg == "--log-dir") {
-            if (i + 1 >= argc) throw std::runtime_error("--log-dir requires a value");
-            options.log_dir = argv[++i];
-        } else if (arg == "--grpc-num-cqs") {
-            if (i + 1 >= argc) throw std::runtime_error("--grpc-num-cqs requires a value");
-            options.grpc_num_cqs = ParseIntValue(arg, argv[++i]);
-        } else if (arg == "--grpc-min-pollers") {
-            if (i + 1 >= argc) throw std::runtime_error("--grpc-min-pollers requires a value");
-            options.grpc_min_pollers = ParseIntValue(arg, argv[++i]);
-        } else if (arg == "--grpc-max-pollers") {
-            if (i + 1 >= argc) throw std::runtime_error("--grpc-max-pollers requires a value");
-            options.grpc_max_pollers = ParseIntValue(arg, argv[++i]);
-        } else if (arg == "--max-recv-mb") {
-            if (i + 1 >= argc) throw std::runtime_error("--max-recv-mb requires a value");
-            options.max_receive_message_mb = ParseIntValue(arg, argv[++i]);
-        } else if (arg == "--max-send-mb") {
-            if (i + 1 >= argc) throw std::runtime_error("--max-send-mb requires a value");
-            options.max_send_message_mb = ParseIntValue(arg, argv[++i]);
-        } else if (arg == "--stats-log-interval-seconds") {
-            if (i + 1 >= argc) throw std::runtime_error("--stats-log-interval-seconds requires a value");
-            options.stats_log_interval_seconds = ParseIntValue(arg, argv[++i]);
-        } else if (arg == "--slow-request-ms") {
-            if (i + 1 >= argc) throw std::runtime_error("--slow-request-ms requires a value");
-            options.slow_request_ms = ParseIntValue(arg, argv[++i]);
-        }
-    }
-
-    if (options.grpc_num_cqs <= 0) {
-        options.grpc_num_cqs = ResolveDefaultGrpcNumCqs();
-    }
-    if (options.grpc_min_pollers <= 0) {
-        options.grpc_min_pollers = 1;
-    }
-    if (options.grpc_max_pollers <= 0) {
-        options.grpc_max_pollers = ResolveDefaultGrpcMaxPollers();
-    }
-    if (options.grpc_max_pollers < options.grpc_min_pollers) {
-        options.grpc_max_pollers = options.grpc_min_pollers;
-    }
-    if (options.stats_log_interval_seconds < 0) {
-        options.stats_log_interval_seconds = 0;
-    }
-    if (options.slow_request_ms < 0) {
-        options.slow_request_ms = 0;
-    }
 }
 
 } // namespace server_common

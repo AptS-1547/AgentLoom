@@ -434,6 +434,85 @@ TEST(HttpServerRuntimeTest, AppliesAccessControllerBeforeHandler) {
     server.Stop();
 }
 
+TEST(HttpServerRuntimeTest, FiltersSuspiciousHttpRequestBeforeHandler) {
+    net::HttpServerOptions options;
+    options.address = "127.0.0.1";
+    options.port = 0;
+    options.io_threads = 1;
+    options.request_filter.enabled = true;
+
+    net::HttpServer server(options);
+    std::atomic_size_t handler_calls{0};
+    server.SetHttpHandler([&](net::HttpRequest, net::HttpGeneratorCallback respond) {
+        handler_calls.fetch_add(1, std::memory_order_relaxed);
+        respond(net::HttpResponse::Text(net::http::status::ok, "unexpected").message);
+    });
+
+    auto start_status = server.Start();
+    ASSERT_TRUE(start_status.ok()) << start_status.message();
+
+    asio::io_context io;
+    tcp::resolver resolver(io);
+    beast::tcp_stream stream(io);
+    stream.connect(resolver.resolve("127.0.0.1", std::to_string(server.port())));
+
+    net::BeastHttpRequest request{net::http::verb::post, "/login", 11};
+    request.set(net::http::field::host, "127.0.0.1");
+    request.set(net::http::field::content_type, "application/x-www-form-urlencoded");
+    request.body() = "name=admin' OR 1=1 --";
+    request.prepare_payload();
+    net::http::write(stream, request);
+
+    beast::flat_buffer buffer;
+    net::BeastHttpResponse response;
+    net::http::read(stream, buffer, response);
+
+    EXPECT_EQ(response.result(), net::http::status::forbidden);
+    EXPECT_NE(response.body().find("security filter"), std::string::npos);
+    EXPECT_EQ(handler_calls.load(std::memory_order_relaxed), 0u);
+
+    server.Stop();
+}
+
+TEST(HttpServerRuntimeTest, FiltersOversizedHeaderBeforeHandler) {
+    net::HttpServerOptions options;
+    options.address = "127.0.0.1";
+    options.port = 0;
+    options.io_threads = 1;
+    options.request_filter.enabled = true;
+    options.request_filter.max_header_value_bytes = 8;
+
+    net::HttpServer server(options);
+    std::atomic_size_t handler_calls{0};
+    server.SetHttpHandler([&](net::HttpRequest, net::HttpGeneratorCallback respond) {
+        handler_calls.fetch_add(1, std::memory_order_relaxed);
+        respond(net::HttpResponse::Text(net::http::status::ok, "unexpected").message);
+    });
+
+    auto start_status = server.Start();
+    ASSERT_TRUE(start_status.ok()) << start_status.message();
+
+    asio::io_context io;
+    tcp::resolver resolver(io);
+    beast::tcp_stream stream(io);
+    stream.connect(resolver.resolve("127.0.0.1", std::to_string(server.port())));
+
+    net::BeastHttpRequest request{net::http::verb::get, "/health", 11};
+    request.set(net::http::field::host, "127.0.0.1");
+    request.set("x-long", "123456789");
+    request.prepare_payload();
+    net::http::write(stream, request);
+
+    beast::flat_buffer buffer;
+    net::BeastHttpResponse response;
+    net::http::read(stream, buffer, response);
+
+    EXPECT_EQ(response.result(), net::http::status::request_header_fields_too_large);
+    EXPECT_EQ(handler_calls.load(std::memory_order_relaxed), 0u);
+
+    server.Stop();
+}
+
 TEST(HttpServerRuntimeTest, UpgradesAndEchoesWebSocketMessage) {
     net::HttpServer server({.address = "127.0.0.1", .port = 0, .io_threads = 1});
     core::BucketMemoryPool response_pool;
@@ -603,7 +682,7 @@ TEST(HttpServerRuntimeTest, StreamsLargeWebSocketMessageAsFragments) {
     server.Stop();
 }
 
-TEST(HttpServerRuntimeTest, ClosesWebSocketMessageAboveConfiguredLimit) {
+TEST(HttpServerRuntimeTest, ReportsOversizedWebSocketMessageWithoutClosingConnection) {
     net::HttpServerOptions options;
     options.address = "127.0.0.1";
     options.port = 0;
@@ -613,17 +692,41 @@ TEST(HttpServerRuntimeTest, ClosesWebSocketMessageAboveConfiguredLimit) {
     options.websocket_read_buffer_limit = 64;
 
     net::HttpServer server(options);
+    core::BucketMemoryPool response_pool;
     std::atomic_size_t handler_calls{0};
+    std::atomic_size_t read_errors{0};
     std::atomic_bool close_recorded{false};
-    std::promise<net::ConnectionCloseInfo> close_seen;
-    auto close_seen_future = close_seen.get_future();
+    std::promise<void> read_error_seen;
+    auto read_error_seen_future = read_error_seen.get_future();
+    std::promise<void> next_message_seen;
+    auto next_message_seen_future = next_message_seen.get_future();
 
-    server.SetWebSocketHandler("/ws", [&](net::WebSocketSessionHandle&, net::WebSocketMessage) {
+    server.SetWebSocketHandler("/ws", [&](net::WebSocketSessionHandle& session, net::WebSocketMessage message) {
         handler_calls.fetch_add(1, std::memory_order_relaxed);
+        if (!message.ok()) {
+            EXPECT_EQ(message.status.code(), core::ErrorCode::ResourceExhausted);
+            if (read_errors.fetch_add(1, std::memory_order_relaxed) == 0) {
+                read_error_seen.set_value();
+            }
+            return;
+        }
+
+        ASSERT_EQ(message.fragments.size(), 1u);
+        if (message.fragments.front().view() != "ok") {
+            EXPECT_FALSE(message.final_fragment);
+            return;
+        }
+
+        EXPECT_EQ(message.fragments.front().view(), "ok");
+        auto payload = net::SharedBuffer::Copy(response_pool, "after-error");
+        ASSERT_TRUE(payload.ok()) << payload.status().message();
+        auto status = session.Send(net::WebSocketFrame{net::WebSocketMessageKind::Text, true, false, std::move(payload).value()});
+        EXPECT_TRUE(status.ok()) << status.message();
+        next_message_seen.set_value();
     });
     server.SetWebSocketCloseHandler([&](const net::ConnectionCloseInfo& close_info) {
         if (!close_recorded.exchange(true)) {
-            close_seen.set_value(close_info);
+            EXPECT_NE(close_info.reason, net::ConnectionCloseReason::BackpressureLimit);
         }
     });
 
@@ -640,12 +743,23 @@ TEST(HttpServerRuntimeTest, ClosesWebSocketMessageAboveConfiguredLimit) {
 
     beast::error_code ec;
     ws.write(asio::buffer(std::string("123456789")), ec);
+    ASSERT_FALSE(ec) << ec.message();
 
-    ASSERT_EQ(close_seen_future.wait_for(2s), std::future_status::ready);
-    auto close_info = close_seen_future.get();
-    EXPECT_EQ(close_info.reason, net::ConnectionCloseReason::BackpressureLimit);
-    EXPECT_EQ(close_info.status.code(), core::ErrorCode::ResourceExhausted);
-    EXPECT_LE(handler_calls.load(std::memory_order_relaxed), 1u);
+    ASSERT_EQ(read_error_seen_future.wait_for(2s), std::future_status::ready);
+    EXPECT_EQ(read_errors.load(std::memory_order_relaxed), 1u);
+    EXPECT_FALSE(close_recorded.load(std::memory_order_relaxed));
+
+    ws.write(asio::buffer(std::string("ok")), ec);
+    ASSERT_FALSE(ec) << ec.message();
+
+    beast::flat_buffer buffer;
+    ws.read(buffer, ec);
+    ASSERT_FALSE(ec) << ec.message();
+    EXPECT_TRUE(ws.got_text());
+    EXPECT_EQ(beast::buffers_to_string(buffer.data()), "after-error");
+
+    EXPECT_EQ(next_message_seen_future.wait_for(2s), std::future_status::ready);
+    EXPECT_GE(handler_calls.load(std::memory_order_relaxed), 2u);
 
     ws.close(beast::websocket::close_code::normal, ec);
     server.Stop();

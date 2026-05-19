@@ -65,8 +65,16 @@ struct WebSocketMessage {
     WebSocketMessageKind kind = WebSocketMessageKind::Binary;
     bool final_fragment = true;
     bool compressed = false;
+    // Non-OK status means the read loop rejected the current message fragment
+    // for a recoverable reason such as max_message_bytes. Handlers should not
+    // treat fragments as payload when ok() is false.
+    core::Status status = core::Status::Ok();
     std::vector<SharedBuffer> fragments;
     std::size_t total_bytes = 0;
+
+    bool ok() const noexcept {
+        return status.ok();
+    }
 
     bool fragmented() const noexcept {
         return fragments.size() > 1;
@@ -172,11 +180,14 @@ struct WebSocketControlEvent {
 class WebSocketSessionHandle {
 public:
     virtual ~WebSocketSessionHandle() = default;
+    // Sends one outbound frame. The implementation serializes writes and
+    // copies payloads into session-owned memory before applying backpressure.
     virtual core::Status Send(WebSocketFrame frame) = 0;
     virtual void Close(ConnectionCloseInfo close_info) = 0;
 };
 
 using WebSocketMessageHandler = std::function<void(WebSocketSessionHandle&, WebSocketMessage)>;
+using WebSocketAcceptHandler = std::function<void(WebSocketSessionHandle&)>;
 using WebSocketCloseHandler = std::function<void(const ConnectionCloseInfo&)>;
 
 } // namespace net

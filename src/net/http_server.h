@@ -1,6 +1,7 @@
 #pragma once
 
 #include "connection_pool.h"
+#include "http_request_filter.h"
 #include "http_types.h"
 #include "protocol_types.h"
 #include "request_interfaces.h"
@@ -36,13 +37,14 @@ struct HttpServerOptions {
     std::size_t websocket_read_buffer_limit = 16 * 1024 * 1024;
     ConnectionPoolOptions connection_pool;
     WebSocketOptions websocket;
+    // Optional early HTTP filter. It runs after Beast parses the request and
+    // before access control, route handlers, static files, or WebSocket upgrade.
+    HttpRequestFilterOptions request_filter;
     std::optional<StaticFileOptions> static_files;
 };
 
 using HttpGeneratorCallback = std::function<void(http::message_generator)>;
 using HttpGeneratorHandler = std::function<void(HttpRequest, HttpGeneratorCallback)>;
-using WebSocketAcceptHandler = std::function<void(WebSocketSessionHandle&)>;
-
 class HttpServer {
 public:
     explicit HttpServer(HttpServerOptions options = {});
@@ -55,9 +57,14 @@ public:
     void Stop();
 
     void SetHttpHandler(HttpGeneratorHandler handler);
+    // Typed request handlers own the response timing. Call Respond() once or
+    // Close() explicitly; the server does not auto-generate a fallback response.
     void SetHttpRequestHandler(IHttpRequestHandler handler);
     void SetAccessController(HttpAccessController controller);
     void SetStaticFiles(StaticFileOptions options);
+    // Registers a WebSocket endpoint that receives streamed message fragments.
+    // For oversized input the handler receives a WebSocketMessage with !ok();
+    // the connection is kept open unless a protocol/internal error occurs.
     void SetWebSocketHandler(std::string path, WebSocketMessageHandler handler);
     void SetWebSocketStreamHandler(std::string path, IWebSocketStreamHandler handler);
     void SetWebSocketAcceptHandler(WebSocketAcceptHandler handler);
@@ -71,16 +78,15 @@ public:
 private:
     class Listener;
     class HttpSession;
-    class WebSocketSession;
 
     friend class Listener;
     friend class HttpSession;
-    friend class WebSocketSession;
 
     std::uint64_t NextConnectionId() noexcept;
     HttpGeneratorHandler HttpHandlerSnapshot() const;
     IHttpRequestHandler HttpRequestHandlerSnapshot() const;
     HttpAccessController AccessControllerSnapshot() const;
+    std::shared_ptr<HttpRequestFilter> RequestFilterSnapshot() const;
     WebSocketMessageHandler WebSocketHandlerSnapshot(std::string_view path) const;
     IWebSocketStreamHandler WebSocketStreamHandlerSnapshot(std::string_view path) const;
     WebSocketAcceptHandler WebSocketAcceptHandlerSnapshot() const;
@@ -96,6 +102,7 @@ private:
     HttpGeneratorHandler http_handler_;
     IHttpRequestHandler http_request_handler_;
     HttpAccessController access_controller_;
+    std::shared_ptr<HttpRequestFilter> request_filter_;
     std::string websocket_path_ = "/ws";
     WebSocketMessageHandler websocket_handler_;
     std::string websocket_stream_path_ = "/ws";

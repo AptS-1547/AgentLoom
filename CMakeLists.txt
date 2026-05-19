@@ -289,6 +289,27 @@ set(BERT_FAISS_RUNTIME_FILES
     "${BERT_MKL_RUNTIME_ROOT}/Library/bin/mkl_rt.2.dll"
 )
 
+# GStreamer prebuilt package for media/WebRTC probes and future media pipeline work.
+set(GSTREAMER_ROOT "D:/Program Files/gstreamer/1.0/msvc_x86_64" CACHE PATH "Path to GStreamer MSVC x64 package")
+if(EXISTS "${GSTREAMER_ROOT}/bin/gst-inspect-1.0.exe")
+    add_library(gstreamer_headers INTERFACE)
+    target_include_directories(gstreamer_headers INTERFACE
+        "${GSTREAMER_ROOT}/include/gstreamer-1.0"
+        "${GSTREAMER_ROOT}/include/glib-2.0"
+        "${GSTREAMER_ROOT}/lib/glib-2.0/include"
+    )
+
+    add_library(gstreamer_core INTERFACE)
+    target_link_libraries(gstreamer_core INTERFACE
+        gstreamer_headers
+        "${GSTREAMER_ROOT}/lib/gstreamer-1.0.lib"
+        "${GSTREAMER_ROOT}/lib/gobject-2.0.lib"
+        "${GSTREAMER_ROOT}/lib/glib-2.0.lib"
+    )
+else()
+    message(STATUS "GStreamer package not found at ${GSTREAMER_ROOT}; media_gstreamer_probe will not be built")
+endif()
+
 # ==================== Proto 代码生成 ====================
 
 set(PROTO_DIR ${CMAKE_CURRENT_SOURCE_DIR}/proto)
@@ -376,6 +397,8 @@ add_library(agent_net STATIC
     src/net/backpressure_queue.h
     src/net/connection_pool.cpp
     src/net/connection_pool.h
+    src/net/http_request_filter.cpp
+    src/net/http_request_filter.h
     src/net/http_server.cpp
     src/net/http_server.h
     src/net/http_types.h
@@ -384,6 +407,8 @@ add_library(agent_net STATIC
     src/net/shared_buffer.h
     src/net/static_file_handler.cpp
     src/net/static_file_handler.h
+    src/net/websocket_session.cpp
+    src/net/websocket_session.h
     src/net/websocket_types.h
 )
 
@@ -399,6 +424,46 @@ if(TARGET boost_asio_headers)
     target_link_libraries(agent_net PUBLIC boost_asio_headers)
 endif()
 
+add_library(agent_storage STATIC
+    src/storage/sqlite/sqlite_async_executor.cpp
+    src/storage/sqlite/sqlite_async_executor.h
+    src/storage/sqlite/sqlite_connection.cpp
+    src/storage/sqlite/sqlite_connection.h
+    src/storage/sqlite/sqlite_connection_pool.cpp
+    src/storage/sqlite/sqlite_connection_pool.h
+    src/storage/sqlite/sqlite_error.cpp
+    src/storage/sqlite/sqlite_internal.h
+    src/storage/sqlite/sqlite_statement.cpp
+    src/storage/sqlite/sqlite_statement.h
+    src/storage/sqlite/sqlite_transaction.cpp
+    src/storage/sqlite/sqlite_transaction.h
+)
+
+target_include_directories(agent_storage PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/storage
+)
+
+target_link_libraries(agent_storage PUBLIC
+    agent_core
+    sqlite3
+)
+
+if(TARGET gstreamer_core)
+    add_executable(media_gstreamer_probe
+        src/media/gstreamer_probe.cpp
+    )
+
+    target_link_libraries(media_gstreamer_probe PRIVATE
+        gstreamer_core
+    )
+
+    if(WIN32)
+        set_target_properties(media_gstreamer_probe PROPERTIES
+            VS_DEBUGGER_ENVIRONMENT "PATH=${GSTREAMER_ROOT}/bin;%PATH%;GST_PLUGIN_PATH=${GSTREAMER_ROOT}/lib/gstreamer-1.0"
+        )
+    endif()
+endif()
+
 add_executable(static_site_test_server
     tests/net/static_site_server.cpp
 )
@@ -412,6 +477,30 @@ add_executable(static_site_concurrency_bench
 )
 
 target_link_libraries(static_site_concurrency_bench PRIVATE
+    agent_net
+)
+
+add_executable(net_stability_bench
+    tests/net/net_stability_bench.cpp
+)
+
+target_link_libraries(net_stability_bench PRIVATE
+    agent_net
+)
+
+add_executable(ws_download_server
+    tests/net/ws_download_server.cpp
+)
+
+target_link_libraries(ws_download_server PRIVATE
+    agent_net
+)
+
+add_executable(ws_download_client
+    tests/net/ws_download_client.cpp
+)
+
+target_link_libraries(ws_download_client PRIVATE
     agent_net
 )
 
@@ -451,6 +540,19 @@ if(BERT_BUILD_TESTS)
     )
 
     gtest_discover_tests(net_tests DISCOVERY_MODE PRE_TEST)
+
+    add_executable(storage_tests
+        tests/storage/sqlite_storage_test.cpp
+    )
+
+    target_link_libraries(storage_tests PRIVATE
+        agent_storage
+        GTest::gtest_main
+    )
+
+    copy_runtime_files(storage_tests "${BERT_SQLITE_DLL}")
+
+    gtest_discover_tests(storage_tests DISCOVERY_MODE PRE_TEST)
 
 endif()
 

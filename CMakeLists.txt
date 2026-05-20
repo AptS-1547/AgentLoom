@@ -575,6 +575,8 @@ add_library(agent_models STATIC
     src/models/llama_runner.h
     src/models/onnx_model.cpp
     src/models/onnx_model.h
+    src/models/onnx_session_utils.cpp
+    src/models/onnx_session_utils.h
 )
 
 target_include_directories(agent_models PUBLIC
@@ -605,16 +607,60 @@ target_link_libraries(agent_cache PUBLIC
     spdlog::spdlog
 )
 
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/HfTokenizersCapi.cmake")
+
 add_library(agent_vector STATIC
     src/vector/vector_cache.cpp
     src/vector/vector_cache.h
+    src/vector/hf_tokenizer.cpp
+    src/vector/hf_tokenizer.h
+    src/vector/tokenizer_pool.cpp
+    src/vector/tokenizer_pool.h
+    src/vector/text_embedding_model.h
+    src/vector/text_embedding_pooling.cpp
+    src/vector/onnx_text_embedding_model.cpp
+    src/vector/onnx_text_embedding_model.h
+    src/vector/embedding_pipeline.cpp
+    src/vector/embedding_pipeline.h
+    src/vector/vector_index.h
+    src/vector/exact_vector_index.cpp
+    src/vector/exact_vector_index.h
+    src/vector/faiss_vector_index.cpp
+    src/vector/faiss_vector_index.h
 )
 
 target_include_directories(agent_vector PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vector
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/core
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/models
+    ${ONNXRUNTIME_ROOT}/include
 )
 
-target_link_libraries(agent_vector PUBLIC spdlog::spdlog)
+target_link_libraries(agent_vector PUBLIC
+    agent_core
+    agent_models
+    hf_tokenizers_capi
+    faiss
+    spdlog::spdlog
+)
+
+if(BERT_BUILD_TESTS)
+    add_executable(vector_tests
+        tests/vector/hf_tokenizer_test.cpp
+        tests/vector/tokenizer_pool_test.cpp
+        tests/vector/text_embedding_test.cpp
+        tests/vector/vector_index_test.cpp
+    )
+
+    target_link_libraries(vector_tests PRIVATE
+        agent_vector
+        GTest::gtest_main
+    )
+
+    copy_runtime_files(vector_tests ${BERT_FAISS_RUNTIME_FILES})
+
+    gtest_discover_tests(vector_tests DISCOVERY_MODE PRE_TEST)
+endif()
 
 add_library(agent_config STATIC
     src/config/config_section.cpp
@@ -624,7 +670,9 @@ add_library(agent_config STATIC
     src/config/request_options.h
     src/config/sections/auth_config_section.cpp
     src/config/sections/config_path_section.cpp
+    src/config/sections/embedding_config_section.cpp
     src/config/sections/grpc_config_section.cpp
+    src/config/sections/http_config_section.cpp
     src/config/sections/limits_config_section.cpp
     src/config/sections/model_config_section.cpp
     src/config/sections/vlm_cache_config_section.cpp
@@ -641,6 +689,7 @@ target_include_directories(agent_config PUBLIC
 
 target_link_libraries(agent_config PUBLIC
     agent_cache
+    agent_net
     agent_vector
     server_runtime
 )
@@ -778,6 +827,15 @@ if(WIN32 AND BERT_VCPKG_TRIPLET)
     if(TARGET net_tests)
         list(APPEND BERT_RUNTIME_COPY_TARGETS net_tests)
     endif()
+    if(TARGET storage_tests)
+        list(APPEND BERT_RUNTIME_COPY_TARGETS storage_tests)
+    endif()
+    if(TARGET vector_tests)
+        list(APPEND BERT_RUNTIME_COPY_TARGETS vector_tests)
+    endif()
+    if(TARGET config_tests)
+        list(APPEND BERT_RUNTIME_COPY_TARGETS config_tests)
+    endif()
     foreach(target ${BERT_RUNTIME_COPY_TARGETS})
         copy_runtime_files(${target} ${VCPKG_RUNTIME_DLLS})
     endforeach()
@@ -797,6 +855,15 @@ if(UNIX AND NOT APPLE AND BERT_VCPKG_TRIPLET)
     endif()
     if(TARGET net_tests)
         list(APPEND BERT_RUNTIME_COPY_TARGETS net_tests)
+    endif()
+    if(TARGET storage_tests)
+        list(APPEND BERT_RUNTIME_COPY_TARGETS storage_tests)
+    endif()
+    if(TARGET vector_tests)
+        list(APPEND BERT_RUNTIME_COPY_TARGETS vector_tests)
+    endif()
+    if(TARGET config_tests)
+        list(APPEND BERT_RUNTIME_COPY_TARGETS config_tests)
     endif()
     foreach(target ${BERT_RUNTIME_COPY_TARGETS})
         copy_runtime_files(${target} ${VCPKG_RUNTIME_SOS})

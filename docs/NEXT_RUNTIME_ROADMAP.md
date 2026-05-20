@@ -1,153 +1,98 @@
 # Next Runtime Roadmap
 
 > Working roadmap for the next AgentBackendPredict runtime phase.  
-> Status: planning note  
-> Date: 2026-05-19
+> Status: active planning note  
+> Date: 2026-05-20
 
-## 1. Direction
+## 1. Current Baseline
 
-AgentBackendPredict remains a C++ primary runtime. The project should not be
-rewritten in another language. Rust and Python are allowed where they have clear
-ownership boundaries:
+The protocol and storage foundations are now considered usable runtime
+infrastructure for the next phase.
 
-- C++ owns online hot-path runtime, native model/media integrations, resource
-  governance, vector search, cache routing, and protocol infrastructure.
-- Rust may be used for narrow native kernels exposed through a stable C ABI,
-  especially HuggingFace tokenizer integration.
-- Python owns offline data/model tooling, embedding artifact generation,
-  evaluation, curated cache building, and fast-changing business orchestration.
+Already established:
 
-The next phase should move from protocol/runtime foundations into storage,
-embedding, memory, media, and inference infrastructure.
+- C++ remains the primary online runtime.
+- HTTP/WebSocket is treated as a validated gateway baseline.
+  - Public HTTPS/TLS termination should be handled by Nginx for the current
+    commercial deployment path.
+  - Gateway should remain HTTP/WS internally unless a later deployment target
+    explicitly requires embedded TLS.
+- SQLite RAII, statement, transaction, connection pool, timed acquire, close
+  wakeup, and async executor are implemented and tested.
+- The existing in-memory `VectorIndex` is useful as a small hot-bucket cache
+  pattern, but it is not the final semantic retrieval backend.
+- Faiss dependency discovery is already present in CMake, but no production
+  Faiss wrapper is wired into `agent_vector` yet.
 
-## 2. Guiding Principles
-
-1. External library types must not leak into public module interfaces.
-   - Hide `sqlite3*`, `faiss::Index*`, `GstElement*`, Redis connection handles,
-     `Ort::Session`, and Rust tokenizer handles behind C++ adapters.
-2. Runtime and tooling stay separate.
-   - Offline embedding/data building is Python-first.
-   - Online vector search and cache hit routing are C++-first.
-3. Any buffer crossing async boundaries must be owned by a session/runtime-level
-   pool or copied into one.
-4. Every queue or streaming boundary needs backpressure or a bounded window.
-5. Embedding/vector artifacts must be versioned with model, tokenizer, pooling,
-   normalization, dimension, corpus, and policy fingerprints.
-6. Global, user, and session memory scopes must be validated before cache or
-   memory hits are reused.
-
-## 3. Phase Plan
-
-### Phase 1: Native Dependency Safety Layer
-
-Goal: use existing `core` infrastructure and RAII patterns to wrap native
-dependencies into safe, small C++ APIs.
-
-Initial modules:
+The next phase should move from runtime foundations into the text vectorization
+and semantic retrieval chain:
 
 ```text
-src/storage/sqlite/
-src/vector/faiss/
-src/cache/redis/
-src/media/gstreamer/
+text
+  -> Hugging Face tokenizer FFI
+  -> ONNX text embedding model
+  -> pooling / normalization
+  -> Faiss vector index
+  -> SQLite metadata filter
+  -> semantic cache / RAG / memory routing
 ```
 
-Recommended first implementation: SQLite.
+## 2. Runtime Ownership Model
 
-SQLite first API sketch:
+AgentBackendPredict should keep the same language boundary policy:
+
+- C++ owns online hot paths, resource governance, protocol infrastructure,
+  storage access, vector search, model wrappers, cache routing, and degradation.
+- Rust may be used for narrow native components exposed through a stable C ABI.
+  The first concrete use is Hugging Face `tokenizers`.
+- Python owns offline dataset processing, curated semantic cache construction,
+  model export, evaluation, and fast-changing business orchestration.
+
+The key rule is that external runtime types must not leak into public module
+interfaces.
+
+Do not expose these outside their adapters:
 
 ```text
-SqliteConnection
-SqliteStatement
-SqliteTransaction
+sqlite3*
+sqlite3_stmt*
+faiss::Index*
+Ort::Session
+llama_model*
+llama_context*
+Rust tokenizer handles
+GstElement*
+Redis connection handles
 ```
 
-SQLite test coverage:
+## 3. Guiding Principles
 
-- open in-memory database
-- execute schema
-- prepare/bind/step/query
-- commit transaction
-- rollback on transaction destructor
-- invalid SQL error mapping
-- move semantics and no double close
-- busy timeout
+1. Public C++ APIs should be stable, typed, and ownership-explicit.
+2. Rust/C ABI details must be isolated behind a C++ RAII wrapper.
+3. C++ must copy FFI output into owned `std::vector` buffers in the first
+   implementation. Zero-copy FFI is not a first-version goal.
+4. Batch APIs are required from the beginning for tokenizer, embedding, and
+   vector search.
+5. Every artifact must be fingerprinted by tokenizer, model, pooling,
+   normalization, dimension, corpus, and policy version.
+6. Faiss only owns vector search. Metadata, payload, scope, and cache policy
+   belong outside Faiss.
+7. Vector similarity alone is never sufficient for semantic cache reuse.
+   Metadata and scope filters must run after top-k retrieval.
+8. Private user/session memory must never leak into global semantic cache hits.
+9. Every queue, pool, and async boundary needs bounded capacity, timeout, or
+   explicit cancellation behavior.
+10. Commercial functionality should be layered over stable runtime primitives,
+    not mixed into low-level adapters.
 
-Why SQLite first:
+## 4. Phase Plan
 
-- Small C API.
-- Clear RAII value.
-- Required for future memory metadata/payload store.
-- Good template for Faiss, Redis, and GStreamer adapter style.
+### Phase 1: Tokenizer FFI Boundary
 
-### Phase 2: Vector Similarity and Artifact Runtime
+Goal: create a stable bridge from C++ to Hugging Face `tokenizers` without
+letting Rust or C ABI ownership rules leak into runtime code.
 
-Goal: establish the C++ vector search foundation before connecting full
-embedding model inference.
-
-Core pieces:
-
-```text
-src/vector/vector_similarity.h/.cpp
-src/vector/embedding_matrix.h/.cpp
-src/vector/exact_vector_index.h/.cpp
-```
-
-Functions:
-
-- `NormalizeInPlace`
-- `DotDynamic`
-- `DotFixed<384>`
-- `DotFixed<512>`
-- `DotFixed<768>`
-- `TopKNormalizedDot`
-- `ThresholdScan`
-
-Artifact format:
-
-```text
-artifact/
-  manifest.json
-  vectors.f32
-  entries.jsonl
-  payload.jsonl
-  optional semantic_cache.db
-  optional faiss.index
-```
-
-Runtime should support loading Python-built artifacts and running search from a
-given query vector before online embedding is integrated.
-
-### Phase 3: Faiss Adapter
-
-Goal: add Faiss as a replaceable vector index backend after the exact index
-interface is stable.
-
-Rules:
-
-- Do not expose Faiss types in public headers.
-- Use normalized vectors with inner product for cosine-like search.
-- Keep exact scan backend for tests, fallback, and small hot buckets.
-- Support save/load of index files.
-- Keep row-id mapping external and versioned.
-
-Public interface should look like:
-
-```text
-IVectorIndex
-ExactVectorIndex
-FaissFlatIpIndex
-```
-
-### Phase 4: Rust Tokenizer C ABI + ONNX Embedding Runtime
-
-Goal: C++ hot path can perform online text vectorization:
-
-```text
-text -> tokenizer -> ONNX embedding -> pooling -> L2 normalize -> vector
-```
-
-Rust component:
+Recommended layout:
 
 ```text
 third_party/hf_tokenizers_capi/
@@ -155,96 +100,382 @@ third_party/hf_tokenizers_capi/
   Cargo.lock
   include/hf_tokenizers_capi.h
   src/lib.rs
+
+src/vector/
+  tokenizer_types.h
+  hf_tokenizer.h
+  hf_tokenizer.cpp
+  hf_tokenizer_internal.h
 ```
 
-C++ wrapper:
+The C ABI should use opaque handles:
+
+```c
+typedef struct hf_tokenizer hf_tokenizer_t;
+typedef struct hf_tokenized_batch hf_tokenized_batch_t;
+```
+
+Required C ABI operations:
 
 ```text
-src/embedding/
-  tokenizer.h
-  hf_tokenizer.h/.cpp
-  text_embedder.h
-  onnx_text_embedder.h/.cpp
+create_from_file
+destroy tokenizer
+encode one text
+encode batch
+read input_ids
+read attention_mask
+read token_type_ids
+read batch size
+read sequence length
+destroy tokenized batch
+destroy error string
+```
+
+Prefer byte-span input over null-terminated strings:
+
+```c
+const uint8_t* text
+size_t text_len
+```
+
+This avoids hidden bugs around embedded NUL bytes and keeps UTF-8 handling
+explicit.
+
+C++ public API should look like this conceptually:
+
+```cpp
+struct TokenizerOptions {
+    std::filesystem::path tokenizer_json;
+    std::size_t max_length = 512;
+    bool add_special_tokens = true;
+    bool padding = true;
+    bool truncation = true;
+};
+
+struct TokenizedBatch {
+    std::vector<std::int64_t> input_ids;
+    std::vector<std::int64_t> attention_mask;
+    std::vector<std::int64_t> token_type_ids;
+    std::size_t batch_size = 0;
+    std::size_t sequence_length = 0;
+};
+
+class HfTokenizer {
+public:
+    core::Status Load(const TokenizerOptions& options);
+    core::Result<TokenizedBatch> EncodeBatch(std::span<const std::string_view> texts) const;
+    core::Result<TokenizedBatch> Encode(std::string_view text) const;
+};
+```
+
+First-version threading rule:
+
+- Use a conservative mutex around tokenizer calls unless Rust-side concurrency
+  is explicitly validated.
+- If tokenizer latency becomes a bottleneck, add a `TokenizerPool` later using
+  cloned tokenizer instances.
+
+Validation:
+
+- C++ token IDs match Python Hugging Face output for fixed reference inputs.
+- Batch padding/truncation shape is deterministic.
+- Chinese text, empty text, long text, and invalid UTF-8 behavior are tested.
+- Rust panic must not cross FFI.
+- All Rust-allocated memory has explicit destroy functions.
+
+### Phase 2: ONNX Text Embedding Runtime
+
+Goal: add a dedicated embedding model wrapper rather than reusing the current
+classification-oriented `OnnxBERTModel`.
+
+Recommended layout:
+
+```text
+src/vector/
+  text_embedding_model.h
+  onnx_text_embedding_model.h
+  onnx_text_embedding_model.cpp
+  embedding_pipeline.h
+  embedding_pipeline.cpp
   pooling.h
   normalization.h
 ```
 
-Tokenizer C ABI requirements:
+Conceptual API:
 
-- Opaque tokenizer handle.
-- `create_from_file`.
-- `encode`.
-- `encode_batch`.
-- explicit free functions for all Rust-allocated memory.
-- no panics/exceptions across FFI.
-- output `input_ids`, `attention_mask`, and `token_type_ids` as `int64_t`.
+```cpp
+enum class PoolingStrategy {
+    Cls,
+    Mean,
+    MeanSqrtLen,
+    LastToken,
+    ModelOutput
+};
+
+struct EmbeddingModelOptions {
+    std::filesystem::path model_path;
+    std::string execution_provider = "auto";
+    std::size_t dimension = 768;
+    PoolingStrategy pooling = PoolingStrategy::Mean;
+    bool normalize = true;
+};
+
+struct EmbeddingBatch {
+    std::vector<float> embeddings; // [batch, dim]
+    std::size_t batch_size = 0;
+    std::size_t dimension = 0;
+};
+```
+
+Runtime path:
+
+```text
+TokenizedBatch
+  -> ONNX Runtime session
+  -> select output tensor
+  -> pooling using attention_mask if needed
+  -> L2 normalization
+  -> EmbeddingBatch
+```
 
 Validation:
 
-- C++ token ids exactly match Python HuggingFace tokenizer output.
-- C++ ONNX embedding and Python embedding cosine similarity should be at least
-  `0.999` for reference inputs.
-- Benchmark tokenizer single/batch, ONNX single/batch, and full end-to-end
-  embedding latency.
+- Output dimension matches config.
+- Normalized vectors have norm close to `1.0`.
+- Reference C++ embeddings match Python-exported embeddings with cosine
+  similarity at least `0.999`, when using the same tokenizer/model/pooling.
+- Single and batch inference both work.
 
-### Phase 5: Redis Importer and Cache Runtime
+### Phase 3: Faiss RAII Adapter
 
-Goal: Redis is used as shared payload/cache layer, not as the primary vector
+Goal: add a replaceable Faiss backend behind a small C++ vector-index interface.
+
+Recommended first backend:
+
+```text
+IndexFlatIP
+```
+
+Use normalized vectors with inner product to implement cosine-like search.
+
+Recommended layout:
+
+```text
+src/vector/
+  vector_index.h
+  faiss_index.h
+  faiss_index.cpp
+  exact_vector_index.h
+  exact_vector_index.cpp
+```
+
+Conceptual API:
+
+```cpp
+struct VectorSearchResult {
+    std::int64_t id = 0;
+    float score = 0.0f;
+};
+
+class IVectorIndex {
+public:
+    virtual ~IVectorIndex() = default;
+    virtual core::Status Add(std::span<const float> vectors,
+                             std::span<const std::int64_t> ids,
+                             std::size_t count) = 0;
+    virtual core::Result<std::vector<VectorSearchResult>> Search(
+        std::span<const float> query,
+        std::size_t top_k) const = 0;
+};
+```
+
+Rules:
+
+- Do not expose Faiss headers from public project headers unless the type is an
+  internal implementation detail.
+- Keep an exact scan backend for tests and small buckets.
+- Store row-id to metadata mapping externally.
+- Support save/load after the in-memory path is correct.
+- Do not implement complex ANN variants until correctness and metadata filtering
+  are stable.
+
+Validation:
+
+- Add/search self-retrieval test.
+- Dimension mismatch returns `InvalidArgument`.
+- Empty index returns empty results.
+- Save/load preserves search behavior.
+- Exact index and Faiss flat index agree on reference vectors.
+
+### Phase 4: SQLite Vector Metadata Store
+
+Goal: separate vector similarity from semantic safety policy.
+
+Faiss returns candidate IDs. SQLite decides whether those candidates are legal
+to reuse.
+
+Initial tables:
+
+```sql
+vector_collections(
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL,
+  embedding_model_fingerprint TEXT NOT NULL,
+  tokenizer_fingerprint TEXT NOT NULL,
+  pooling_strategy TEXT NOT NULL,
+  dimension INTEGER NOT NULL,
+  normalization TEXT NOT NULL,
+  corpus_version TEXT NOT NULL,
+  policy_version TEXT NOT NULL,
+  created_at_ms INTEGER NOT NULL
+);
+
+vector_entries(
+  id INTEGER PRIMARY KEY,
+  collection_id INTEGER NOT NULL,
+  tenant_id TEXT,
+  scope TEXT NOT NULL,
+  cache_key TEXT NOT NULL,
+  text_hash TEXT NOT NULL,
+  subject TEXT,
+  grade TEXT,
+  topic TEXT,
+  persona_scope TEXT,
+  memory_scope TEXT,
+  answer_type TEXT,
+  quality_score REAL NOT NULL DEFAULT 0.0,
+  expires_at_ms INTEGER,
+  created_at_ms INTEGER NOT NULL
+);
+```
+
+The exact schema can evolve, but the design rule should remain:
+
+```text
+Vector index:
+  nearest-neighbor candidates only
+
+SQLite metadata:
+  scope, tenant, policy, corpus, quality, expiry, and cache safety
+
+Payload store:
+  actual response / RAG card / memory content
+```
+
+### Phase 5: Semantic Cache Pipeline
+
+Goal: turn tokenizer + embedding + Faiss + metadata into a safe online semantic
+cache lookup path.
+
+Query path:
+
+```text
+Request text
+  -> route / intent / context-risk precheck
+  -> tokenizer
+  -> embedding
+  -> Faiss top-k
+  -> SQLite metadata filter
+  -> quality / expiry / policy check
+  -> payload fetch
+  -> response candidate
+```
+
+Hard cache safety rules:
+
+- Do not use global semantic cache for strong context-dependent requests.
+- Strong context markers include references like this/that/above/previous step,
+  image-local references, and recent-turn dependencies.
+- Tenant, subject, grade, topic, persona, memory scope, answer type, embedding
+  model, tokenizer, corpus, and policy must be compatible.
+- Private user/session memory can only hit user/session scoped entries.
+- RAG authority answers must retain source/citation metadata.
+
+Initial implementation should prefer correctness over hit rate.
+
+### Phase 6: Artifact Importer
+
+Goal: load offline-built semantic cache artifacts into the runtime store.
+
+Offline Python can build:
+
+```text
+artifact/
+  manifest.json
+  vectors.f32
+  entries.jsonl
+  payload.jsonl
+  optional faiss.index
+```
+
+C++ importer should validate:
+
+- dimension
+- vector count
+- entry count
+- model fingerprint
+- tokenizer fingerprint
+- corpus version
+- policy version
+- checksums
+
+The importer should populate:
+
+```text
+Faiss index
+SQLite metadata
+payload store
+```
+
+Payload can start in SQLite or filesystem. Redis can be introduced later as a
+shared hot payload layer.
+
+### Phase 7: Redis Shared Cache Layer
+
+Goal: use Redis as shared payload/cache coordination, not as the primary vector
 compute engine.
 
-Recommended Redis key layout:
+Redis should be introduced after the local semantic cache path is correct.
+
+Recommended layout:
 
 ```text
 semantic:<version>:manifest
 semantic:<version>:payload:<entry_id>
 semantic:<version>:meta:<entry_id>
 semantic:<version>:bucket:<bucket_name>
-semantic:<version>:vector:<entry_id>   optional
+semantic:<version>:invalidate
 ```
 
-Hot-path pattern:
+Hot path:
 
 ```text
-local vector index / mmap matrix
-  -> top-k row ids
-  -> payload keys
+local Faiss / exact index
+  -> top-k ids
+  -> SQLite/local metadata filter
   -> Redis/local payload fetch
-  -> policy and scope verification
+  -> response
 ```
 
-First Redis tool should consume artifact files rather than HuggingFace models:
+Redis must not become the only source of truth.
+
+### Phase 8: Memory and RAG Integration
+
+Goal: reuse the vectorization chain for memory and RAG after semantic cache
+lookup is stable.
+
+Memory query path:
 
 ```text
-semantic_cache_importer
-  --manifest artifact/manifest.json
-  --entries artifact/entries.jsonl
-  --payload artifact/payload.jsonl
-  --redis redis://127.0.0.1:6379
+MemoryQuery
+  -> scope validation
+  -> tokenizer / embedding
+  -> vector search
+  -> metadata filter
+  -> recency / quality scoring
+  -> payload load
+  -> context pack
 ```
-
-### Phase 6: GStreamer Media Frame Runtime
-
-Goal: move from GStreamer probe to decoded frame/audio ingestion.
-
-Already completed:
-
-- Windows MSVC GStreamer probe.
-- `webrtcbin`, `appsink`, `appsrc`, `decodebin`, `videoconvert`,
-  `audioconvert`, `audioresample`, `opusdec`, `vp8dec`, and `rtpbin` verified.
-
-Next steps:
-
-1. `videotestsrc -> videoconvert -> appsink` probe.
-2. Define internal `VideoFrame` and `AudioChunk`.
-3. Build `GstRuntime` wrapper with a GLib loop thread.
-4. Add appsink callback that emits internal frames.
-5. Later connect `webrtcbin` with signaling over the existing WebSocket runtime.
-
-Media module should live under `src/media`, not `src/net`.
-
-### Phase 7: Memory System Rewrite
-
-Goal: use Faiss + SQLite to rebuild the original multi-level memory system.
 
 Memory dimensions:
 
@@ -267,121 +498,95 @@ MemoryType:
   dialogue_turn
 ```
 
-Storage split:
-
-- SQLite: metadata, payload, scope, version, lifecycle, citations.
-- Faiss/exact index: vector search.
-- Redis: hot shared payload, invalidation, multi-instance cache.
-
-Query path:
+Critical rule:
 
 ```text
-MemoryQuery
-  -> scope validation
-  -> online embedding
-  -> vector search
-  -> metadata filter
-  -> recency/quality scoring
-  -> payload load
-  -> context pack
+global semantic cache
+  != user memory
+  != session memory
+  != RAG authority source
 ```
 
-Critical rule: private user/session memory must never leak into global semantic
-cache hits.
+They can share vector infrastructure, but they must not share unsafe reuse
+policy.
 
-### Phase 8: Inference Runtime and Multi-GPU
+### Phase 9: Commercial Runtime Layers
 
-Goal: evolve inference from model wrappers into schedulable, observable,
-degradable runtime.
+Goal: build commercial behavior over the stable runtime primitives.
 
-Scope:
-
-- vLLM as external OpenAI-compatible main LLM path.
-- llama.cpp as fallback/VLM/edge path.
-- ONNX embedding runtime.
-- VLM, ASR, and future TTS adapters.
-- GPU device registry.
-- VRAM guard.
-- queue depth / overload routing.
-- OOM fallback.
-- request budget and max token/context degradation.
-- multi-GPU routing.
-
-Resource model should track:
+Priority order:
 
 ```text
-device_id
-vram_total
-vram_free
-loaded_models
-queue_depth
-estimated_throughput
-oom_count
-health
+storage repositories
+  -> tenant / user / auth context
+  -> session / conversation persistence
+  -> usage accounting
+  -> metrics / tracing
+  -> semantic cache
+  -> RAG / memory
+  -> persona / orchestration
+  -> billing / admin API
 ```
 
-### Phase 9: Full Business Logic
+The gateway should remain a resource-governed orchestration layer. Fast-changing
+education policy, prompt templates, and business workflow should stay
+configuration-driven or service-isolated until they are stable enough to move
+into C++.
 
-Goal: implement complete education-agent behavior on top of stable runtime
-infrastructure.
+## 5. Immediate Next Step
 
-Business logic should remain mostly outside the low-level runtime until hot paths
-are stable:
+Start with the Hugging Face tokenizer FFI boundary.
 
-- persona
-- prompt orchestration
-- classroom/session flow
-- student learning model
-- tutoring policy
-- multi-agent/persona scheduling
-- multimodal interaction loop
-- assessment and feedback
-
-Python can continue to own fast-changing orchestration, while stable hot paths
-can be moved into C++ as needed.
-
-## 4. Immediate Next Step
-
-Start with SQLite RAII.
-
-Recommended files:
+Recommended next discussion/coding target:
 
 ```text
-src/storage/sqlite/sqlite_error.h
-src/storage/sqlite/sqlite_connection.h
-src/storage/sqlite/sqlite_connection.cpp
-src/storage/sqlite/sqlite_statement.h
-src/storage/sqlite/sqlite_statement.cpp
-src/storage/sqlite/sqlite_transaction.h
-src/storage/sqlite/sqlite_transaction.cpp
-tests/storage/sqlite_storage_test.cpp
+Design and implement the Rust C ABI + C++ RAII HfTokenizer wrapper.
 ```
 
-CMake targets:
+First concrete deliverables:
 
 ```text
-agent_storage
-storage_tests
+third_party/hf_tokenizers_capi/include/hf_tokenizers_capi.h
+third_party/hf_tokenizers_capi/src/lib.rs
+src/vector/tokenizer_types.h
+src/vector/hf_tokenizer.h
+src/vector/hf_tokenizer.cpp
+tests/vector/tokenizer_test.cpp
 ```
 
-This creates the storage adapter pattern that later Redis, Faiss, and GStreamer
-wrappers should follow.
+First tests:
 
-## 5. Discussion Anchors for Next Session
+- Load tokenizer from `tokenizer.json`.
+- Encode one UTF-8 Chinese sentence.
+- Encode batch with deterministic padding/truncation.
+- Compare token IDs with Python Hugging Face tokenizer fixture.
+- Verify error path for missing tokenizer file.
+- Verify repeated load/destroy does not crash or leak obvious ownership.
+
+Do not start with Faiss. Faiss is lower risk and should be connected after the
+tokenizer output shape and model fingerprint policy are stable.
+
+## 6. Discussion Anchors for Next Session
 
 Open questions:
 
-1. SQLite API shape: minimal statement/transaction API vs higher-level metadata
-   store.
-2. Whether `agent_storage` should depend only on `agent_core` at first.
-3. Exact vector similarity implementation order and supported dimensions.
-4. Rust tokenizer C ABI shape and build integration.
-5. Redis library choice: Boost.Redis vs hiredis vs custom minimal RESP client.
-6. GStreamer appsink probe design and `VideoFrame` ownership model.
-7. Artifact manifest schema and Redis key layout.
+1. Whether the Rust tokenizer library should be built as a static library or DLL
+   on Windows for the first implementation.
+2. Exact C ABI shape: null-terminated strings vs byte pointer + length. Current
+   recommendation is byte pointer + length.
+3. Tokenizer threading model: shared mutex first vs tokenizer pool from day one.
+4. Where to store tokenizer/model fixtures for C++ tests.
+5. Which embedding model should be the first supported ONNX text embedding
+   model.
+6. Pooling strategy for the first embedding model: model output vs mean pooling.
+7. Whether vector metadata lives first in SQLite only or also writes a filesystem
+   manifest.
+8. Whether `agent_vector` should absorb tokenizer/embedding initially or split
+   into `agent_tokenizer`, `agent_embedding`, and `agent_vector`.
 
 Recommended next coding task:
 
 ```text
-Implement SQLite RAII wrapper + storage tests.
+Tokenizer FFI minimal vertical slice:
+  tokenizer.json -> Rust tokenizers -> C ABI -> C++ HfTokenizer -> GTest fixture
 ```

@@ -5,110 +5,18 @@
 
 #include "onnx_model.h"
 
+#include "onnx_session_utils.h"
+
 #include <algorithm>
-#include <cctype>
 #include <numeric>
 #include <sstream>
-#include <thread>
-
-#include <spdlog/spdlog.h>
 
 #include <spdlog/spdlog.h>
 
 namespace bert {
 
-namespace {
-
-std::string NormalizeProviderPreference(std::string provider) {
-    std::transform(
-        provider.begin(),
-        provider.end(),
-        provider.begin(),
-        [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); }
-    );
-
-    if (provider.empty()) {
-        return "auto";
-    }
-
-    if (provider == "cpu" || provider == "cuda" || provider == "auto") {
-        return provider;
-    }
-
-    return "auto";
-}
-
-int ResolveDefaultIntraOpThreads(const ModelRuntimeOptions& options, bool use_cuda) {
-    if (options.intra_op_num_threads > 0) {
-        return options.intra_op_num_threads;
-    }
-
-    if (use_cuda) {
-        return 1;
-    }
-
-    const unsigned int hw_threads = std::max(1u, std::thread::hardware_concurrency());
-    return static_cast<int>(std::clamp(hw_threads / 2, 1u, 8u));
-}
-
-int ResolveDefaultInterOpThreads(const ModelRuntimeOptions& options) {
-    if (options.inter_op_num_threads > 0) {
-        return options.inter_op_num_threads;
-    }
-
-    return 1;
-}
-
-std::string JoinProviders(const std::vector<std::string>& providers) {
-    if (providers.empty()) {
-        return "none";
-    }
-
-    std::ostringstream oss;
-    for (size_t i = 0; i < providers.size(); ++i) {
-        if (i != 0) {
-            oss << ", ";
-        }
-        oss << providers[i];
-    }
-    return oss.str();
-}
-
-void ApplyCommonSessionOptions(Ort::SessionOptions& session_options,
-                               const ModelRuntimeOptions& options,
-                               bool use_cuda,
-                               int& resolved_intra_op,
-                               int& resolved_inter_op) {
-    resolved_intra_op = ResolveDefaultIntraOpThreads(options, use_cuda);
-    resolved_inter_op = ResolveDefaultInterOpThreads(options);
-
-    session_options.SetIntraOpNumThreads(resolved_intra_op);
-    session_options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_EXTENDED);
-
-    if (resolved_inter_op > 1) {
-        session_options.SetExecutionMode(ExecutionMode::ORT_PARALLEL);
-        session_options.SetInterOpNumThreads(resolved_inter_op);
-    }
-
-    if (!options.enable_cpu_mem_arena) {
-        session_options.DisableCpuMemArena();
-    }
-
-    if (!options.enable_mem_pattern) {
-        session_options.DisableMemPattern();
-    }
-}
-
-} // namespace
-
 // 内部实现结构
 struct OnnxBERTModel::Impl {
-    // ONNX Runtime 环境（进程级单例）
-    static Ort::Env& GetEnv() {
-        static Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "BERTInference");
-        return env;
-    }
-
     std::unique_ptr<Ort::Session> session;
     std::unique_ptr<Ort::MemoryInfo> memory_info;
 
@@ -118,12 +26,7 @@ struct OnnxBERTModel::Impl {
     std::vector<std::string> input_name_strings;
     std::vector<std::string> output_name_strings;
 
-    std::string requested_provider = "auto";
-    std::string active_provider = "cpu";
-    std::string provider_note;
-    std::string available_providers;
-    int intra_op_num_threads = 0;
-    int inter_op_num_threads = 0;
+    OnnxSessionInfo session_info;
 
     // 节点维度信息
     const size_t num_emotions = 10;
@@ -151,93 +54,33 @@ bool OnnxBERTModel::LoadModel(const std::filesystem::path& model_path,
         impl_->input_name_strings.clear();
         impl_->output_name_strings.clear();
 
-        impl_->requested_provider = NormalizeProviderPreference(options.execution_provider);
-        impl_->available_providers = JoinProviders(Ort::GetAvailableProviders());
-        impl_->active_provider = "cpu";
-        impl_->provider_note.clear();
-        impl_->intra_op_num_threads = 0;
-        impl_->inter_op_num_threads = 0;
+        auto bundle = CreateOnnxSessionBundle(model_path, options, "BERT");
+        impl_->session = std::move(bundle.session);
+        impl_->memory_info = std::move(bundle.memory_info);
+        impl_->input_name_strings = std::move(bundle.input_name_strings);
+        impl_->output_name_strings = std::move(bundle.output_name_strings);
+        impl_->input_names = std::move(bundle.input_names);
+        impl_->output_names = std::move(bundle.output_names);
+        impl_->session_info = std::move(bundle.info);
 
-        const auto create_session = [&](bool use_cuda) {
-            Ort::SessionOptions session_options;
-            ApplyCommonSessionOptions(
-                session_options,
-                options,
-                use_cuda,
-                impl_->intra_op_num_threads,
-                impl_->inter_op_num_threads
-            );
-
-            if (use_cuda) {
-                OrtCUDAProviderOptions cuda_options{};
-                cuda_options.device_id = options.cuda_device_id;
-                cuda_options.do_copy_in_default_stream = 1;
-                session_options.AppendExecutionProvider_CUDA(cuda_options);
-            }
-
-            const auto native_model_path = model_path.native();
-            impl_->session = std::make_unique<Ort::Session>(
-                Impl::GetEnv(),
-                native_model_path.c_str(),
-                session_options
-            );
-            impl_->active_provider = use_cuda ? "cuda" : "cpu";
-        };
-
-        if (impl_->requested_provider == "cpu") {
-            create_session(false);
-        } else {
-            try {
-                create_session(true);
-            } catch (const Ort::Exception& e) {
-                if (!options.allow_cpu_fallback) {
-                    throw;
-                }
-
-                impl_->provider_note =
-                    std::string("CUDA provider unavailable, falling back to CPU: ") + e.what();
-                create_session(false);
-            }
+        // After moving input_name_strings/output_name_strings, the c_str()
+        // pointers we previously pushed into bundle.input_names/output_names
+        // still point to the strings now held by impl_, since std::string
+        // moves preserve the underlying buffer for SSO-fitting and heap
+        // strings alike when source is destroyed. To be defensive, rebuild
+        // them from the moved-in name vectors.
+        impl_->input_names.clear();
+        impl_->input_names.reserve(impl_->input_name_strings.size());
+        for (const auto& s : impl_->input_name_strings) {
+            impl_->input_names.push_back(s.c_str());
         }
-
-        // 创建内存信息（CPU）
-        impl_->memory_info = std::make_unique<Ort::MemoryInfo>(
-            Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault)
-        );
-
-        // 获取输入节点名称
-        Ort::AllocatorWithDefaultOptions allocator;
-        size_t num_inputs = impl_->session->GetInputCount();
-        for (size_t i = 0; i < num_inputs; ++i) {
-            auto name = impl_->session->GetInputNameAllocated(i, allocator);
-            impl_->input_name_strings.push_back(name.get());
-        }
-        for (const auto& name : impl_->input_name_strings) {
-            impl_->input_names.push_back(name.c_str());
-        }
-
-        // 获取输出节点名称
-        size_t num_outputs = impl_->session->GetOutputCount();
-        for (size_t i = 0; i < num_outputs; ++i) {
-            auto name = impl_->session->GetOutputNameAllocated(i, allocator);
-            impl_->output_name_strings.push_back(name.get());
-        }
-        for (const auto& name : impl_->output_name_strings) {
-            impl_->output_names.push_back(name.c_str());
+        impl_->output_names.clear();
+        impl_->output_names.reserve(impl_->output_name_strings.size());
+        for (const auto& s : impl_->output_name_strings) {
+            impl_->output_names.push_back(s.c_str());
         }
 
         loaded_ = true;
-        spdlog::info(
-            "[BERT] ONNX model loaded: {} inputs, {} outputs, provider={}, intra_op={}, inter_op={}",
-            impl_->input_names.size(),
-            impl_->output_names.size(),
-            impl_->active_provider,
-            impl_->intra_op_num_threads,
-            impl_->inter_op_num_threads
-        );
-        if (!impl_->provider_note.empty()) {
-            spdlog::warn("[BERT] {}", impl_->provider_note);
-        }
         return true;
 
     } catch (const Ort::Exception& e) {
@@ -486,13 +329,13 @@ std::string OnnxBERTModel::GetInfo() const {
     oss << "ONNX BERT Model loaded with "
         << impl_->input_names.size() << " inputs, "
         << impl_->output_names.size() << " outputs"
-        << ", requested_provider=" << impl_->requested_provider
-        << ", active_provider=" << impl_->active_provider
-        << ", available_providers=[" << impl_->available_providers << "]"
-        << ", intra_op=" << impl_->intra_op_num_threads
-        << ", inter_op=" << impl_->inter_op_num_threads;
-    if (!impl_->provider_note.empty()) {
-        oss << ", note=" << impl_->provider_note;
+        << ", requested_provider=" << impl_->session_info.requested_provider
+        << ", active_provider=" << impl_->session_info.active_provider
+        << ", available_providers=[" << impl_->session_info.available_providers << "]"
+        << ", intra_op=" << impl_->session_info.intra_op_num_threads
+        << ", inter_op=" << impl_->session_info.inter_op_num_threads;
+    if (!impl_->session_info.provider_note.empty()) {
+        oss << ", note=" << impl_->session_info.provider_note;
     }
     return oss.str();
 }
@@ -501,7 +344,7 @@ std::string OnnxBERTModel::GetActiveExecutionProvider() const {
     if (!loaded_) {
         return "unloaded";
     }
-    return impl_->active_provider;
+    return impl_->session_info.active_provider;
 }
 
 } // namespace bert

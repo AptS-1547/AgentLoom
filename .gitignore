@@ -19,9 +19,14 @@ third_party/nlohmann/*
 test/
 #临时文件
 *.tmp
+# Claude/Codex cache
+.claude/
+.codex/
 
 # Python cache
 __pycache__/
 *.py[cod]
 # CMake生成的文件
 CMakeFiles/
+# ONNX Model
+onnx_models/

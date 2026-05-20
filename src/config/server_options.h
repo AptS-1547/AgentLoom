@@ -1,8 +1,10 @@
 #pragma once
 
+#include "http_server.h"
 #include "onnx_model.h"
 #include "request_options.h"
 #include "server_common.h"
+#include "text_embedding_model.h"
 #include "vector_cache.h"
 #include "vlm_cache.h"
 
@@ -18,9 +20,25 @@ struct VramGuardOptions {
     bool unload_on_oom_error = true;
 };
 
+struct EmbeddingModelOptions {
+    std::string tokenizer_path;
+    std::string onnx_model_path;
+    std::string execution_provider = "auto";
+    bool allow_cpu_fallback = true;
+    int cuda_device_id = 0;
+    int intra_op_num_threads = 0;
+    int inter_op_num_threads = 0;
+    std::string pooling_strategy = "mean";
+    bool normalize = true;
+    int expected_dimension = 0;
+    bool require_token_type_ids = false;
+};
+
 struct MultimodalServerOptions {
     server_common::GrpcServerOptions grpc;
+    net::HttpServerOptions http;
     bert::ModelRuntimeOptions bert_runtime;
+    EmbeddingModelOptions embedding;
     request_validation::AuthOptions auth;
     request_validation::RequestLimits limits;
     VramGuardOptions vram;

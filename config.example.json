@@ -1,0 +1,61 @@
+{
+  "models": {
+    "llm": "path/to/llama-model.gguf",
+    "mmproj": "path/to/mmproj.gguf",
+    "bert": "path/to/bert-model.onnx",
+    "vit": "path/to/vit-model.onnx",
+    "n_gpu_layers": -1,
+    "provider": "auto",
+    "cuda_device": 0
+  },
+  "http": {
+    "address": "0.0.0.0",
+    "port": 8080,
+    "io_threads": 4,
+    "request_timeout_seconds": 30,
+    "websocket_idle_timeout_seconds": 300,
+    "request_body_limit_mb": 16,
+    "websocket_read_buffer_limit_mb": 16
+  },
+  "embedding": {
+    "tokenizer_path": "path/to/tokenizer.json",
+    "onnx_model_path": "path/to/embedding-model.onnx",
+    "execution_provider": "auto",
+    "allow_cpu_fallback": true,
+    "cuda_device_id": 0,
+    "intra_op_num_threads": 0,
+    "inter_op_num_threads": 0,
+    "pooling_strategy": "mean",
+    "normalize": true,
+    "expected_dimension": 384,
+    "require_token_type_ids": false
+  },
+  "grpc": {
+    "address": "0.0.0.0",
+    "port": 50051,
+    "max_workers": 4
+  },
+  "auth": {
+    "enabled": false,
+    "token_file": "",
+    "token_env": "AGENT_BACKEND_AUTH_TOKEN"
+  },
+  "limits": {
+    "max_concurrent_requests": 100,
+    "max_request_size_mb": 10,
+    "rate_limit_per_minute": 60
+  },
+  "vram": {
+    "monitor_interval_seconds": 10,
+    "warning_free_mb": 1024,
+    "unload_free_mb": 512,
+    "min_free_before_load_mb": 0,
+    "reload_after_unload": false,
+    "unload_on_oom_error": true
+  },
+  "vlm_cache": {
+    "enabled": true,
+    "max_entries": 1000,
+    "ttl_seconds": 3600
+  }
+}

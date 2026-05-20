@@ -2,6 +2,7 @@
 
 #include "result.h"
 
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <deque>
@@ -55,6 +56,26 @@ public:
             return closed_ || !queue_.empty();
         });
 
+        if (queue_.empty()) {
+            return Status::Error(ErrorCode::Cancelled, "queue is closed");
+        }
+
+        T value = std::move(queue_.front());
+        queue_.pop_front();
+        not_full_.notify_one();
+        return value;
+    }
+
+    template <typename Rep, typename Period>
+    Result<T> WaitPopFor(const std::chrono::duration<Rep, Period>& timeout) {
+        std::unique_lock lock(mutex_);
+        const bool ready = not_empty_.wait_for(lock, timeout, [this] {
+            return closed_ || !queue_.empty();
+        });
+
+        if (!ready) {
+            return Status::Error(ErrorCode::Timeout, "queue wait timed out");
+        }
         if (queue_.empty()) {
             return Status::Error(ErrorCode::Cancelled, "queue is closed");
         }

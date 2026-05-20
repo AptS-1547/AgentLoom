@@ -15,6 +15,8 @@
 // ONNX Runtime
 #include <onnxruntime_cxx_api.h>
 
+#include "onnx_session_utils.h"
+
 namespace bert {
 
 /**
@@ -34,26 +36,6 @@ struct InferenceResult {
 
     bool success = false;
     std::string error_message;
-};
-
-/**
- * ONNX Runtime 会话配置
- */
-struct ModelRuntimeOptions {
-    // auto / cpu / cuda
-    std::string execution_provider = "auto";
-    // 当请求 CUDA 但运行环境不满足时，是否自动回退到 CPU
-    bool allow_cpu_fallback = true;
-    // CUDA 设备 ID
-    int cuda_device_id = 0;
-    // <= 0 表示使用服务端的默认调优值
-    int intra_op_num_threads = 0;
-    // <= 0 表示使用服务端的默认调优值
-    int inter_op_num_threads = 0;
-    // CPU allocator arena
-    bool enable_cpu_mem_arena = true;
-    // 内存 pattern cache
-    bool enable_mem_pattern = true;
 };
 
 /**

@@ -1288,8 +1288,243 @@ Month 5–6: Phase 3 交付准备
 
 ---
 
-**文档版本**：v2.1
+## 14. 架构修订（2026-05-20）：人格服务保留 Python，C++ 退守热路径与存储交互
+
+### 14.1 修订背景
+
+本节是对 §3.1.2（人格服务）和 §5.2（工作量表）的重要修订。
+原方案规划 ~8,000 行 C++ 人格服务，包含 OU 状态机、BERT+LLM 融合、三路 LLM 路由、云 RAG 调度等业务逻辑。
+经过对前置条件的重新评估，**该范围被显式从 C++ 交付物中移除**，代之以保留主项目（MyNeuroLikeSystem）已实现的 Python 编排层。
+
+修订触发因素：
+
+1. **前置依赖已基本剔除**
+   - `torch` / `transformers`：被 Phase 1 (HF Tokenizers FFI) + Phase 2 (ONNX Embedding) 替代
+   - `mem0ai` / `Qdrant Python SDK`：被 Phase 3-4 (Faiss + SQLite) 替代
+   - 视频/图片解析：已规划 OpenCV C++ 替代 Python 实现
+   - **结论**：Python 端运行时已经从"重依赖大栈"瘦身到"薄编排层"
+
+2. **本地 LLM 已锁定 C++ in-process 调用**
+   - llama.cpp / mtmd 已通过 `agent_models` 集成，无 IPC 开销
+   - Python 完全不参与本地 LLM 路径
+
+3. **人格服务的实际瓶颈不在本地计算**
+   - LLM API 延迟为秒级（云 32B 主路径）
+   - OU 状态机 / Prompt 组装 / 路由决策合计 < 5 ms / 请求
+   - C++ 化对端到端延迟的边际收益 < 0.5%
+
+4. **云 RAG 仍依赖 Python 生态**
+   - 教师知识库 / 学生档案为冷路径，调用频次低（1-5 次/对话）
+   - 云 RAG SDK（智谱 / 阿里云 / Mem0 云版）以 Python 优先
+   - C++ 重写 SDK 对接成本高，收益低
+
+5. **比赛交付窗口已度过 / 商业化窗口宽松**
+   - Python 同步原型曾以"思路验证 + 比赛交付"为目标
+   - 商业化阶段无紧迫时间压力，可以做对的事而非快的事
+   - 但 Python 已实现部分（Prompt 模板、状态机、路由策略）已是"对的事"，重写收益低
+
+### 14.2 修订后的服务边界
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│  C++ Gateway（HTTP/WS, 8080）                                  │
+│  - 协议接入、Session 路由、限流、降级、超时治理                   │
+└──────────┬─────────────────────────────────────┬───────────────┘
+           │                                     │
+   缓存命中（高频热路径）                         缓存未命中（低频）
+           │                                     │
+           ▼                                     ▼
+┌──────────────────────────────────┐   ┌──────────────────────────────┐
+│  C++ Cache Service (50055)       │   │  Python Persona Service      │
+│                                  │   │  (50052, gRPC + asyncio)     │
+│  - HF Tokenizer Pool             │   │                              │
+│  - ONNX Embedding (MiniLM)       │   │  保留主项目原型逻辑：         │
+│  - Faiss / 自研向量索引          │   │  - OU 情绪状态机             │
+│  - SQLite metadata + 指纹        │   │  - BERT+LLM 情绪融合          │
+│  - Redis payload (Phase 8+)      │   │  - Prompt 模板 + 组装        │
+│                                  │   │  - 三路 LLM Router           │
+│  对话热路径 Read 主力：           │   │  - 云 RAG 调用               │
+│  返回 cached response 或 nil     │   │  - 多模型异步并发管理         │
+└──────────────────────────────────┘   └──────┬───────────────────────┘
+           ▲                                  │
+           │ Cache Write                      │
+           │ (Persona 端结果回写)             │
+           └──────────────────────────────────┤
+                                              ▼
+                                   ┌─────────────────────────┐
+                                   │  C++ Inference Service  │
+                                   │  (50053)                │
+                                   │  - BERT 情绪小模型      │
+                                   │  - 本地 llama.cpp / mtmd│
+                                   │  Python 通过 gRPC 调    │
+                                   └─────────────────────────┘
+                                              │
+                                              ▼
+                                   ┌─────────────────────────┐
+                                   │  Cloud LLMs             │
+                                   │  Claude / DeepSeek /     │
+                                   │  GLM-4V / 智谱 RAG       │
+                                   └─────────────────────────┘
+```
+
+**职责边界明确**：
+
+| 职责 | 归属 | 原因 |
+|------|------|------|
+| 协议接入、限流、Session、降级 | C++ Gateway | 高 QPS、多连接、需要资源治理 |
+| 语义缓存查询（热路径 Read） | C++ Cache Service | 90%+ 命中率目标，必须毫秒级 |
+| 缓存写入（Cache Write） | C++ Cache Service | Persona 完成调用后回写 |
+| Tokenizer / Embedding 计算 | C++ | 高频，CPU/GPU 并行 |
+| Faiss 向量索引、SQLite 元数据 | C++ | 数据层，复用基础设施 |
+| 本地 LLM 推理（llama.cpp） | C++ Inference Service | 已 C++ 实现，无理由跨 IPC |
+| BERT 情绪小模型推理 | C++ Inference Service | 已 ONNX 化 |
+| OU 状态机、情绪融合、Prompt 组装 | Python Persona | 业务编排，迭代频繁 |
+| 三路 LLM 路由、Cloud LLM 客户端 | Python Persona | 瓶颈在外部 API，C++ 无收益 |
+| 云 RAG 调用（教师库 / 学生档案） | Python Persona | SDK 生态在 Python，冷路径 |
+
+### 14.3 强制约束
+
+为了让"Python 编排 + C++ 后端"在生产环境稳定运行，**强制约束如下**：
+
+1. **Python 端必须异步化**
+   - Persona Service 所有 LLM 调用、RAG 调用必须用 `asyncio` + `httpx` / `aiohttp`
+   - 禁止任何同步阻塞 IO 出现在请求路径
+   - 推荐运行时：`uvicorn` 或 `hypercorn`（HTTP）/ `grpclib` (gRPC asyncio)
+   - **rationale**：单 worker 进程在 LLM 秒级响应下要支撑 N 路并发，GIL 不释放就会卡死
+
+2. **Python 端必须无状态**
+   - Persona Service 不持久化任何数据
+   - 短生命周期 Session 状态可在内存（建议 LRU cap），跨进程持久化必须落 C++ 服务
+   - **rationale**：进程可被随时重启 / 横向扩展 / 升级，不影响数据安全
+
+3. **Python ↔ C++ 互调走 gRPC**
+   - Python 调 C++ Cache：`SemanticCacheClient.Lookup(query) → CachedResponse | nil`
+   - Python 调 C++ Inference：`InferenceClient.RunBert(text) → EmotionLogits`
+   - Python 调 C++ Inference：`InferenceClient.RunLocalLlm(prompt) → Stream<Token>`
+   - Python 写回 C++ Cache：`SemanticCacheClient.Store(query, embedding, response, scope)`
+   - **不允许 Python 直接读写 SQLite / Faiss / Redis**（数据一致性必须由 C++ 服务集中保证）
+
+4. **多 worker 支撑高并发**
+   - 单 Python worker 异步并发上限受 LLM API 连接池限制
+   - 生产部署用多 worker（`--workers N`），按 vCPU 数和 LLM API rate limit 综合设置
+   - **rationale**：商业化目标 30-330 QPS，单进程异步通常足够，但保留多进程兜底
+
+5. **Python 依赖必须精简**
+   - 禁止 `torch` / `transformers` / `numpy>=2.0` 重依赖
+   - 允许：`httpx`, `aiohttp`, `numpy<2.0`（OU 状态机 numpy 化用），`grpcio`, `pydantic`, `tenacity`（重试）
+   - 部署目标：Python 镜像 < 200 MB，启动时间 < 2 秒
+
+### 14.4 工作量重新核算
+
+| 模块 | 原计划 | 修订后 | 差额 |
+|------|--------|--------|------|
+| C++ 人格服务 | 8,000 行 / 5 人月 | 0 行 / 0 人月 | **-5 人月** |
+| Python 编排层适配 | 不在 AgentBackendPredict 范围 | 复用主项目，需异步化改造 | +0.5-1 人月（不在本仓库交付） |
+| C++ Cache Service | 已规划 | 强化（成为 Read 主路径） | +1-2 人月（精细化） |
+| Gateway 业务层 | 已规划 | 不变 | 0 |
+
+**净释放约 3-4 人月**，可投入：
+
+- **Cache Service 精细化**：admission policy、quality scoring、混合 ANN（粗筛+精排）、缓存预热
+- **Gateway 稳定性**：限流（令牌桶）、熔断（半开半闭）、降级（缓存失效时直透 Persona）
+- **集成测试与压测**：端到端 30-330 QPS 压测、长尾延迟 p95/p99 分析
+- **可观测性**：分布式 tracing（OpenTelemetry）、指标（Prometheus）、日志聚合
+- **工作量表更新**：80k 行总目标 → ~72k 行 C++ + Python 编排层（外部）
+
+### 14.5 部署形态
+
+**开发环境**（docker-compose）：
+
+```yaml
+services:
+  gateway:        # C++ binary
+    image: agent-backend:latest
+    ports: ["8080:8080"]
+
+  inference:      # C++ binary
+    image: agent-backend:latest
+    command: agent_backend --service inference
+
+  cache:          # C++ binary
+    image: agent-backend:latest
+    command: agent_backend --service cache
+
+  persona:        # Python asyncio
+    image: agent-persona:latest
+    environment:
+      - INFERENCE_GRPC_ENDPOINT=inference:50053
+      - CACHE_GRPC_ENDPOINT=cache:50055
+
+  redis:
+    image: redis:7
+```
+
+**生产环境**：
+- C++ 服务：多副本 Deployment，资源隔离（CPU pinning + cgroups）
+- Python 服务：多副本 Deployment，每副本 N workers
+- 水平扩展：Gateway + Cache 按 QPS 扩，Persona 按 LLM API 配额扩
+- 私有化部署：单机模式可全 systemd unit 拉起，Python venv + C++ binary 共存
+
+### 14.6 对当前进度的影响
+
+**已完成 / 在做的工作不受影响**：
+
+- ✅ Phase 1: HF Tokenizer FFI + Pool
+- ✅ Phase 2: ONNX Embedding + Pooling
+- ✅ HTTP / Embedding 配置 section
+- ✅ 网关协议层（Beast HTTP/WS）
+- ✅ 存储层（SQLite RAII + pool）
+
+**继续推进**：
+
+- 🔄 Phase 3: Faiss / 自研向量索引封装
+- 🔄 Phase 4: SQLite metadata schema + fingerprint
+- 🔄 Phase 5: Curated Semantic Cache 完整链路
+- 🆕 Phase 6+: Python ↔ C++ gRPC 互调接口（替代原 C++ 人格服务）
+
+**移除范围**：
+
+- ❌ 8,000 行 C++ 人格服务（OU 状态机、BERT+LLM 融合、Prompt 组装、三路 LLM 路由、云 RAG 调用）
+
+### 14.7 风险与回退路径
+
+**风险 1**：Python 异步化改造工作量超预期
+- 现状：主项目原型可能为同步实现
+- 缓解：先小压测验证瓶颈，再决定是否全异步重写
+- 回退：极端情况下保留同步 + 多进程 worker 模式（性能受损但可用）
+
+**风险 2**：Python 端启动慢，影响 SLO
+- 现状：`grpcio` + `numpy` 启动 < 2 秒，可接受
+- 缓解：容器化部署，多副本预热
+- 监控：Persona Service 启动时间作为 SLI 指标
+
+**风险 3**：商业化阶段甲方对"全 C++"有合规要求
+- 概率：低（教育行业未见硬性栈要求）
+- 缓解：保留 C++ 人格服务的设计文档作为后备方案
+- 回退路径：如确实需要，C++ 重写 Persona 是已知工作量（5 人月），可作为后期演进
+
+**风险 4**：Python 编排层成为瓶颈（cache miss 高于预期）
+- 监控：cache hit ratio < 50% 触发告警
+- 缓解：投资 Cache Service 精细化（已纳入释放工时）
+- 回退：极端情况下，将最热的 prompt 模板和路由逻辑用 C++ 实现（局部 C++ 化）
+
+### 14.8 后续待澄清
+
+部分决策细节将在 Phase 6+ 实现时再敲定：
+
+1. Python 端用 `grpcio` 还是 `grpclib`（asyncio 原生支持）
+2. Cloud LLM 客户端是否在 Python 共享一个 connection pool
+3. 配置热更新机制（Python 端用 `watchdog` 监听？）
+4. Persona ↔ Cache 的写回失败处理策略（fire-and-forget 还是 best-effort retry）
+5. 教师知识库的离线索引 Pipeline 归属（Python 离线脚本 vs C++ admin tool）
+
+这些问题不阻塞当前 Phase 3-5 的推进。
+
+---
+
+**文档版本**：v2.2
 **创建日期**：2026-05-10
-**最后更新**：2026-05-16
+**最后更新**：2026-05-20
 **作者**：Orange & Claude
 **状态**：待评审
+

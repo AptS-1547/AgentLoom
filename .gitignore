@@ -3,6 +3,7 @@
 .git/
 #编译输出和CMake缓存
 build/
+build-ide/
 triplets/
 #vcpkg安装包和依赖
 vcpkg_installed/

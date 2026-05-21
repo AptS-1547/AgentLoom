@@ -6,7 +6,11 @@
       "Bash(/d/Users/21405/source/repos/MyNeuroLikeSystem/Scripts/python.exe -c \"import grpc_tools.protoc; print\\('grpc_tools ok'\\)\")",
       "Bash(/d/Users/21405/source/repos/MyNeuroLikeSystem/Scripts/python.exe --version)",
       "Bash(xargs wc -l)",
-      "Bash(cmake --build build --target agent_models --config Release --parallel)"
+      "Bash(cmake --build build --target agent_models --config Release --parallel)",
+      "Bash(ls \"D:/Users/21405/source/repos/MyNeuroLikeSystem/project_src\")",
+      "Read(//d/Users/21405/source/repos/MyNeuroLikeSystem/project_src/**)",
+      "Bash(Get-ChildItem -Path \"D:\\\\Users\\\\21405\\\\source\\\\repos\\\\AgentBackendPredict\\\\src\" -Recurse -Directory)",
+      "Bash(Select-Object -First 50)"
     ]
   }
 }

@@ -4,3 +4,4 @@ CompileFlags:
     - -ID:/Users/21405/source/repos/AgentBackendPredict/build/x64-Release
     - -ID:/Users/21405/source/repos/AgentBackendPredict/build/x64-Debug
     - -ID:/Users/21405/source/repos/vcpkg/installed/x64-windows/include
+  CompilationDatabase: build-ide

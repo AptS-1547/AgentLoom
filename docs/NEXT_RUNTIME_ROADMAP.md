@@ -2,7 +2,7 @@
 
 > Working roadmap for the next AgentBackendPredict runtime phase.  
 > Status: active planning note  
-> Date: 2026-05-20
+> Date: 2026-05-21
 
 ## 1. Current Baseline
 
@@ -87,7 +87,7 @@ Redis connection handles
 
 ## 4. Phase Plan
 
-### Phase 1: Tokenizer FFI Boundary
+### Phase 1: Tokenizer FFI Boundary — ✅ Completed (2026-05-20)
 
 Goal: create a stable bridge from C++ to Hugging Face `tokenizers` without
 letting Rust or C ABI ownership rules leak into runtime code.
@@ -183,7 +183,7 @@ Validation:
 - Rust panic must not cross FFI.
 - All Rust-allocated memory has explicit destroy functions.
 
-### Phase 2: ONNX Text Embedding Runtime
+### Phase 2: ONNX Text Embedding Runtime — ✅ Completed (2026-05-20)
 
 Goal: add a dedicated embedding model wrapper rather than reusing the current
 classification-oriented `OnnxBERTModel`.
@@ -246,7 +246,7 @@ Validation:
   similarity at least `0.999`, when using the same tokenizer/model/pooling.
 - Single and batch inference both work.
 
-### Phase 3: Faiss RAII Adapter
+### Phase 3: Faiss RAII Adapter — ✅ Completed (2026-05-20)
 
 Goal: add a replaceable Faiss backend behind a small C++ vector-index interface.
 
@@ -307,7 +307,7 @@ Validation:
 - Save/load preserves search behavior.
 - Exact index and Faiss flat index agree on reference vectors.
 
-### Phase 4: SQLite Vector Metadata Store
+### Phase 4: SQLite Vector Metadata Store — 🔜 Next
 
 Goal: separate vector similarity from semantic safety policy.
 
@@ -535,36 +535,29 @@ into C++.
 
 ## 5. Immediate Next Step
 
-Start with the Hugging Face tokenizer FFI boundary.
+Phases 1-3 are complete (2026-05-20). Phase 4 — SQLite vector metadata
+store — is next. Open design questions to resolve before coding:
 
-Recommended next discussion/coding target:
+1. **Partition granularity** — coarse `(collection, tenant, user)` with
+   `memory_level` as metadata filter, vs. fine partitioning that includes
+   `memory_level` in the partition key. Working memory and knowledge base
+   have wildly different sizes (~12 vs ~10k entries) so fine partitioning
+   is the leading candidate.
+2. **Data ownership** — vectors live in Faiss files with SQLite holding
+   metadata only (original §4 plan), vs. SQLite holding both metadata and
+   raw vector blobs with in-memory Faiss as a hydrated cache. The second
+   model is stronger for multi-tenant + multi-level memory because there
+   is a single source of truth and TTL eviction stays consistent.
+3. **Hydration policy** — eager load at startup vs. lazy load on first
+   touch per partition. Lazy with an LRU cap on resident partitions is
+   the working assumption.
+4. **Phase 4 scope** — narrow (schema + repository + fingerprint policy)
+   vs. wide (also includes partition registry / index manager). Leaning
+   narrow so the registry can be designed against Phase 5's actual query
+   patterns rather than guessed.
 
-```text
-Design and implement the Rust C ABI + C++ RAII HfTokenizer wrapper.
-```
-
-First concrete deliverables:
-
-```text
-third_party/hf_tokenizers_capi/include/hf_tokenizers_capi.h
-third_party/hf_tokenizers_capi/src/lib.rs
-src/vector/tokenizer_types.h
-src/vector/hf_tokenizer.h
-src/vector/hf_tokenizer.cpp
-tests/vector/tokenizer_test.cpp
-```
-
-First tests:
-
-- Load tokenizer from `tokenizer.json`.
-- Encode one UTF-8 Chinese sentence.
-- Encode batch with deterministic padding/truncation.
-- Compare token IDs with Python Hugging Face tokenizer fixture.
-- Verify error path for missing tokenizer file.
-- Verify repeated load/destroy does not crash or leak obvious ownership.
-
-Do not start with Faiss. Faiss is lower risk and should be connected after the
-tokenizer output shape and model fingerprint policy are stable.
+These will be decided at the start of Phase 4. They do not change the
+Phase 1-3 deliverables already merged.
 
 ## 6. Discussion Anchors for Next Session
 

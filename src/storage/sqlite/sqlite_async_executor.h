@@ -46,7 +46,14 @@ public:
     auto SubmitWrite(Fn&& fn) -> std::future<core::Result<std::invoke_result_t<Fn&, SqliteConnection&>>> {
         return SubmitWithLease(SqliteConnectionKind::Write, std::forward<Fn>(fn), "sqlite-write");
     }
-
+    // Submit a write task that runs a transaction. 
+    // This function accepts a lambda expression as the operation and execution body for SQLiteTransaction.
+    // The passed lambda expression must capture the SqliteConnection and SqliteTransaction objects.
+    /**
+     * @brief Submits a transactional task for execution.
+     * @param fn The task function to execute within the transaction.
+     * @return A future containing the result of the transaction.
+     */
     template <typename Fn>
     auto SubmitTransaction(Fn&& fn) -> std::future<core::Result<std::invoke_result_t<Fn&, SqliteConnection&, SqliteTransaction&>>> {
         using Value = std::invoke_result_t<Fn&, SqliteConnection&, SqliteTransaction&>;
@@ -105,7 +112,16 @@ public:
         }
         return future;
     }
-
+// Submit a task that requires a SQLite connection lease. This is a helper function used by SubmitRead and SubmitWrite to avoid code duplication.
+// The function accepts the type of connection lease required (read or write), the task function to execute, and a name for the task for logging purposes. It returns a future containing the result of the task execution.
+// The task function should accept a SqliteConnection reference as its parameter and return a value or void. The function will attempt to acquire the appropriate connection lease from the pool, execute the task, and set the result in the promise. If any exceptions are thrown during task execution, they will be caught and converted into error statuses.
+ /**
+ * @brief Submits a task that requires a SQLite connection lease.
+ * @param kind The type of connection lease required.
+ * @param fn The task function to execute.
+ * @param task_name The name of the task for logging purposes.
+ * @return A future containing the result of the task.
+ */
 private:
     template <typename Fn>
     auto SubmitWithLease(SqliteConnectionKind kind, Fn&& fn, std::string task_name)

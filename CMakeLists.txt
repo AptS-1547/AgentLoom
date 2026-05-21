@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 project(MultimodalInferenceService VERSION 2.0.0 LANGUAGES CXX)
-
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -374,7 +374,6 @@ target_link_libraries(multimodal_proto PUBLIC protobuf::libprotobuf gRPC::grpc++
 
 add_library(agent_core STATIC
     src/core/blocking_queue.h
-    src/core/error.h
     src/core/exception.h
     src/core/logger_adapter.h
     src/core/memory_pool.cpp
@@ -424,6 +423,76 @@ if(TARGET boost_asio_headers)
     target_link_libraries(agent_net PUBLIC boost_asio_headers)
 endif()
 
+# ──────────── TLS context (reusable for HTTP, WebSocket, SMTP, etc.) ────────────
+add_library(agent_tls STATIC
+    src/net/tls/tls_options.h
+    src/net/tls/tls_context.h
+    src/net/tls/tls_context.cpp
+)
+
+target_include_directories(agent_tls PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/net/tls
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/core
+)
+
+target_link_libraries(agent_tls PUBLIC
+    agent_core
+    boost_asio_headers
+    OpenSSL::SSL
+    OpenSSL::Crypto
+)
+
+if(BERT_BUILD_TESTS)
+    include(GoogleTest)
+    add_executable(tls_tests
+        tests/net/tls/tls_context_test.cpp
+    )
+    target_link_libraries(tls_tests PRIVATE
+        agent_tls
+        GTest::gtest_main
+    )
+    gtest_discover_tests(tls_tests DISCOVERY_MODE PRE_TEST)
+endif()
+
+# ──────────── Outbound HTTP/HTTPS client (reusable for LLM, RAG, webhooks) ────────────
+add_library(agent_http_client STATIC
+    src/net/http_client/http_client.h
+    src/net/http_client/url_parser.h
+    src/net/http_client/url_parser.cpp
+    src/net/http_client/retry_policy.h
+    src/net/http_client/retry_policy.cpp
+    src/net/http_client/beast_http_client.h
+    src/net/http_client/beast_http_client.cpp
+)
+
+target_include_directories(agent_http_client PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/net/http_client
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/net/tls
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/core
+)
+
+target_link_libraries(agent_http_client PUBLIC
+    agent_core
+    agent_tls
+    boost_asio_headers
+    OpenSSL::SSL
+    OpenSSL::Crypto
+)
+
+if(BERT_BUILD_TESTS)
+    add_executable(http_client_tests
+        tests/net/http_client/url_parser_test.cpp
+        tests/net/http_client/retry_policy_test.cpp
+        tests/net/http_client/beast_http_client_test.cpp
+    )
+    target_link_libraries(http_client_tests PRIVATE
+        agent_http_client
+        GTest::gtest_main
+    )
+    gtest_discover_tests(http_client_tests DISCOVERY_MODE PRE_TEST)
+endif()
+
+
 add_library(agent_storage STATIC
     src/storage/sqlite/sqlite_async_executor.cpp
     src/storage/sqlite/sqlite_async_executor.h
@@ -446,6 +515,28 @@ target_include_directories(agent_storage PUBLIC
 target_link_libraries(agent_storage PUBLIC
     agent_core
     sqlite3
+)
+
+add_library(agent_vector_storage STATIC
+    src/storage/vector/vector_metadata.h
+    src/storage/vector/vector_repository.h
+    src/storage/vector/sqlite_vector_repository.h
+    src/storage/vector/sqlite_vector_repository.cpp
+    src/storage/vector/vector_fingerprint.h
+    src/storage/vector/vector_fingerprint.cpp
+    src/storage/vector/vector_partition_registry.h
+    src/storage/vector/vector_partition_registry.cpp
+)
+
+target_include_directories(agent_vector_storage PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/storage
+)
+
+target_link_libraries(agent_vector_storage PUBLIC
+    agent_core
+    agent_storage
+    OpenSSL::SSL
+    OpenSSL::Crypto
 )
 
 if(TARGET gstreamer_core)
@@ -554,6 +645,19 @@ if(BERT_BUILD_TESTS)
 
     gtest_discover_tests(storage_tests DISCOVERY_MODE PRE_TEST)
 
+    add_executable(vector_storage_tests
+        tests/storage/vector/vector_storage_test.cpp
+    )
+
+    target_link_libraries(vector_storage_tests PRIVATE
+        agent_vector_storage
+        GTest::gtest_main
+    )
+
+    copy_runtime_files(vector_storage_tests "${BERT_SQLITE_DLL}")
+
+    gtest_discover_tests(vector_storage_tests DISCOVERY_MODE PRE_TEST)
+
 endif()
 
 add_library(server_runtime STATIC
@@ -627,18 +731,22 @@ add_library(agent_vector STATIC
     src/vector/exact_vector_index.h
     src/vector/faiss_vector_index.cpp
     src/vector/faiss_vector_index.h
+    src/vector/vector_index_manager.cpp
+    src/vector/vector_index_manager.h
 )
 
 target_include_directories(agent_vector PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vector
     ${CMAKE_CURRENT_SOURCE_DIR}/src/core
     ${CMAKE_CURRENT_SOURCE_DIR}/src/models
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/storage
     ${ONNXRUNTIME_ROOT}/include
 )
 
 target_link_libraries(agent_vector PUBLIC
     agent_core
     agent_models
+    agent_vector_storage
     hf_tokenizers_capi
     faiss
     spdlog::spdlog
@@ -650,14 +758,22 @@ if(BERT_BUILD_TESTS)
         tests/vector/tokenizer_pool_test.cpp
         tests/vector/text_embedding_test.cpp
         tests/vector/vector_index_test.cpp
+        tests/vector/vector_index_manager_test.cpp
     )
 
     target_link_libraries(vector_tests PRIVATE
         agent_vector
+        agent_storage
         GTest::gtest_main
     )
 
     copy_runtime_files(vector_tests ${BERT_FAISS_RUNTIME_FILES})
+    copy_runtime_files(vector_tests "${BERT_SQLITE_DLL}")
+
+    file(GLOB VECTOR_TESTS_ONNXRUNTIME_LIBS "${ONNXRUNTIME_ROOT}/${BERT_ONNXRUNTIME_RUNTIME_GLOB}")
+    foreach(_ort_lib ${VECTOR_TESTS_ONNXRUNTIME_LIBS})
+        copy_runtime_files(vector_tests "${_ort_lib}")
+    endforeach()
 
     gtest_discover_tests(vector_tests DISCOVERY_MODE PRE_TEST)
 endif()

@@ -169,7 +169,11 @@ void HttpServer::HttpSession::OnRead(beast::error_code ec, std::size_t) {
 
     OnAccessDecision(AccessDecision::Allow());
 }
-
+// This function is called after the access control decision is made for an incoming HTTP request. It takes the AccessDecision object as a parameter, which indicates whether the request is allowed or denied, along with an optional reason and HTTP status code. If the decision is to deny access, it sends an appropriate HTTP response back to the client with the specified status and reason. If access is allowed, it proceeds to handle the request by checking for WebSocket upgrade, invoking the appropriate request handler, or serving static files based on the server's configuration.
+/**
+ * @brief Handles the access control decision for an incoming HTTP request.
+ * @param decision The access control decision.
+ */
 void HttpServer::HttpSession::OnAccessDecision(AccessDecision decision) {
     if (!decision.allowed()) {
         auto body = decision.reason.empty() ? std::string("access denied") : decision.reason;
@@ -391,12 +395,18 @@ void HttpServer::Stop() {
     listener_.reset();
     connection_pool_.CloseAll(ConnectionCloseInfo::Shutdown("http server stopped"));
 }
-
+/**
+ * @brief Sets the HTTP handler for the server.
+ * @param handler The HTTP handler to set.
+ */
 void HttpServer::SetHttpHandler(HttpGeneratorHandler handler) {
     std::lock_guard lock(handler_mutex_);
     http_handler_ = std::move(handler);
 }
-
+/**
+ * @brief Sets the HTTP request handler for the server.
+ * @param handler The HTTP request handler to set.
+ */
 void HttpServer::SetHttpRequestHandler(IHttpRequestHandler handler) {
     std::lock_guard lock(handler_mutex_);
     http_request_handler_ = std::move(handler);

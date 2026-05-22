@@ -276,3 +276,188 @@ TEST(ConfigOptionParserTest, RejectsInvalidSectionValidation) {
         }),
         std::runtime_error);
 }
+
+// ── LLM section ──────────────────────────────────────────────────────────────
+
+namespace {
+
+void UnsetLlmEnv() {
+#ifdef _WIN32
+    _putenv_s("AGENT_LLM_API_KEY", "");
+    _putenv_s("TEST_LLM_KEY", "");
+#else
+    unsetenv("AGENT_LLM_API_KEY");
+    unsetenv("TEST_LLM_KEY");
+#endif
+}
+
+void SetEnv(const char* name, const char* value) {
+#ifdef _WIN32
+    _putenv_s(name, value);
+#else
+    setenv(name, value, 1);
+#endif
+}
+
+}  // namespace
+
+TEST(ConfigLlmSectionTest, DisabledWhenBaseUrlEmpty) {
+    UnsetLlmEnv();
+    auto opts = Parse({"server", "--llm", "llm.gguf"});
+    EXPECT_TRUE(opts.llm.base_url.empty());
+    EXPECT_TRUE(opts.llm.api_key.empty());
+}
+
+TEST(ConfigLlmSectionTest, ApiKeyResolvedFromEnv) {
+    UnsetLlmEnv();
+    SetEnv("AGENT_LLM_API_KEY", "sk-from-env");
+
+    auto opts = Parse({
+        "server",
+        "--llm", "llm.gguf",
+        "--llm-base-url", "https://api.example.com/v1",
+    });
+    EXPECT_EQ(opts.llm.base_url, "https://api.example.com/v1");
+    EXPECT_EQ(opts.llm.api_key, "sk-from-env");
+
+    UnsetLlmEnv();
+}
+
+TEST(ConfigLlmSectionTest, CustomEnvVarOverridesDefault) {
+    UnsetLlmEnv();
+    SetEnv("TEST_LLM_KEY", "sk-custom-env");
+
+    auto opts = Parse({
+        "server",
+        "--llm", "llm.gguf",
+        "--llm-base-url", "https://api.example.com/v1",
+        "--llm-api-key-env", "TEST_LLM_KEY",
+    });
+    EXPECT_EQ(opts.llm.api_key, "sk-custom-env");
+
+    UnsetLlmEnv();
+}
+
+TEST(ConfigLlmSectionTest, ApiKeyResolvedFromFileWhenEnvMissing) {
+    UnsetLlmEnv();
+    ScopedTempDirectory tmp("llm_key");
+    auto key_file = tmp.path() / "key.txt";
+    WriteFile(key_file, "sk-from-file\n");
+
+    auto opts = Parse({
+        "server",
+        "--llm", "llm.gguf",
+        "--llm-base-url", "https://api.example.com/v1",
+        "--llm-api-key-file", key_file.string(),
+    });
+    EXPECT_EQ(opts.llm.api_key, "sk-from-file");
+}
+
+TEST(ConfigLlmSectionTest, EnvTakesPrecedenceOverFile) {
+    UnsetLlmEnv();
+    SetEnv("AGENT_LLM_API_KEY", "sk-env-wins");
+
+    ScopedTempDirectory tmp("llm_key");
+    auto key_file = tmp.path() / "key.txt";
+    WriteFile(key_file, "sk-from-file");
+
+    auto opts = Parse({
+        "server",
+        "--llm", "llm.gguf",
+        "--llm-base-url", "https://api.example.com/v1",
+        "--llm-api-key-file", key_file.string(),
+    });
+    EXPECT_EQ(opts.llm.api_key, "sk-env-wins");
+
+    UnsetLlmEnv();
+}
+
+TEST(ConfigLlmSectionTest, ThrowsWhenBaseUrlSetButNoKey) {
+    UnsetLlmEnv();
+    EXPECT_THROW(
+        Parse({
+            "server",
+            "--llm", "llm.gguf",
+            "--llm-base-url", "https://api.example.com/v1",
+        }),
+        std::runtime_error);
+}
+
+TEST(ConfigLlmSectionTest, ThrowsWhenKeyFileMissing) {
+    UnsetLlmEnv();
+    EXPECT_THROW(
+        Parse({
+            "server",
+            "--llm", "llm.gguf",
+            "--llm-base-url", "https://api.example.com/v1",
+            "--llm-api-key-file", "/nonexistent/path/key.txt",
+        }),
+        std::runtime_error);
+}
+
+TEST(ConfigLlmSectionTest, JsonConfigLoadsLlmSection) {
+    UnsetLlmEnv();
+    SetEnv("AGENT_LLM_API_KEY", "sk-json-test");
+
+    ScopedTempDirectory tmp("llm_cfg");
+    auto config_file = tmp.path() / "config.json";
+    WriteFile(config_file, R"({
+        "llm": {
+            "base_url": "https://api.deepseek.com/v1",
+            "model": "deepseek-chat",
+            "timeout_ms": 45000,
+            "max_retries": 5,
+            "prompts": {
+                "memory_extraction": "prompts/memory.txt",
+                "fact_distillation": "prompts/fact.txt"
+            }
+        }
+    })");
+
+    auto opts = Parse({
+        "server",
+        "--llm", "llm.gguf",
+        "--config", config_file.string(),
+    });
+
+    EXPECT_EQ(opts.llm.base_url, "https://api.deepseek.com/v1");
+    EXPECT_EQ(opts.llm.model, "deepseek-chat");
+    EXPECT_EQ(opts.llm.timeout_ms, 45000);
+    EXPECT_EQ(opts.llm.max_retries, 5);
+    EXPECT_EQ(opts.llm.api_key, "sk-json-test");
+    EXPECT_EQ(opts.llm.prompts.size(), 2u);
+    EXPECT_EQ(opts.llm.prompts["memory_extraction"].string(), "prompts/memory.txt");
+
+    EXPECT_TRUE(opts.config_file_path.is_absolute());
+
+    UnsetLlmEnv();
+}
+
+TEST(ConfigLlmSectionTest, CliOverridesJson) {
+    UnsetLlmEnv();
+    SetEnv("AGENT_LLM_API_KEY", "sk-test");
+
+    ScopedTempDirectory tmp("llm_cfg");
+    auto config_file = tmp.path() / "config.json";
+    WriteFile(config_file, R"({
+        "llm": {
+            "base_url": "https://json.example.com/v1",
+            "model": "json-model"
+        }
+    })");
+
+    auto opts = Parse({
+        "server",
+        "--llm", "llm.gguf",
+        "--config", config_file.string(),
+        "--llm-model", "cli-model",
+        "--llm-timeout", "12345",
+    });
+
+    EXPECT_EQ(opts.llm.base_url, "https://json.example.com/v1");
+    EXPECT_EQ(opts.llm.model, "cli-model");
+    EXPECT_EQ(opts.llm.timeout_ms, 12345);
+
+    UnsetLlmEnv();
+}
+

@@ -9,7 +9,9 @@
 #include "vlm_cache.h"
 
 #include <cstddef>
+#include <filesystem>
 #include <string>
+#include <unordered_map>
 
 struct VramGuardOptions {
     int monitor_interval_seconds = 10;
@@ -34,11 +36,27 @@ struct EmbeddingModelOptions {
     bool require_token_type_ids = false;
 };
 
+struct LlmOptions {
+    std::string base_url;
+    std::string api_key_env = "AGENT_LLM_API_KEY";
+    std::string api_key_file;
+    /// Resolved at Validate time — do not set in config file.
+    std::string api_key;
+    std::string model = "deepseek-chat";
+    int timeout_ms = 30000;
+    int max_retries = 2;
+    /// Optional CA bundle (PEM) for HTTPS verification.  Relative to config
+    /// file directory.  Leave empty on Linux to use the system trust store.
+    std::string ca_bundle_path;
+    std::unordered_map<std::string, std::filesystem::path> prompts;
+};
+
 struct MultimodalServerOptions {
     server_common::GrpcServerOptions grpc;
     net::HttpServerOptions http;
     bert::ModelRuntimeOptions bert_runtime;
     EmbeddingModelOptions embedding;
+    LlmOptions llm;
     request_validation::AuthOptions auth;
     request_validation::RequestLimits limits;
     VramGuardOptions vram;
@@ -52,4 +70,5 @@ struct MultimodalServerOptions {
     std::string llm_model;
     std::string mmproj;
     int n_gpu_layers = -1;
+    std::filesystem::path config_file_path;
 };

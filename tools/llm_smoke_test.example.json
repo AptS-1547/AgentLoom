@@ -1,0 +1,17 @@
+{
+  "_README": [
+    "Copy this file to llm_smoke_test.json (gitignored) and fill in real values.",
+    "Then run:  .\\build\\x64-Release-Tests\\Release\\llm_smoke_test.exe tools\\llm_smoke_test.json",
+    "Optional 2nd arg overrides the user prompt:  ...exe tools\\llm_smoke_test.json \"你好\""
+  ],
+  "llm": {
+    "base_url": "https://api.deepseek.com/v1",
+    "api_key_file": "tools/llm_smoke_test.key",
+    "model": "deepseek-chat",
+    "timeout_ms": 30000,
+    "max_retries": 1,
+    "prompts": {
+      "smoke": "tools/llm_smoke_prompt.txt"
+    }
+  }
+}

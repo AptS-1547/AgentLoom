@@ -2,7 +2,7 @@
 
 > Working roadmap for the next AgentBackendPredict runtime phase.  
 > Status: active planning note  
-> Date: 2026-05-21
+> Date: 2026-05-22
 
 ## 1. Current Baseline
 
@@ -307,60 +307,67 @@ Validation:
 - Save/load preserves search behavior.
 - Exact index and Faiss flat index agree on reference vectors.
 
-### Phase 4: SQLite Vector Metadata Store — 🔜 Next
+### Phase 4: SQLite Vector Metadata Store + Index Manager — ✅ Completed (2026-05-22)
 
-Goal: separate vector similarity from semantic safety policy.
+Goal: separate vector similarity from semantic safety policy, with SQLite as
+the single source of truth and Faiss as a lazily-hydrated cache.
 
-Faiss returns candidate IDs. SQLite decides whether those candidates are legal
-to reuse.
+Resolved design decisions:
 
-Initial tables:
+- **Fine-grained partitioning**: `memory_level` lives in the partition key
+  alongside `(collection, tenant, user)`. Working memory and knowledge base
+  are physically isolated, eliminating cross-level query pollution.
+- **SQLite as single source of truth**: vectors live as BLOBs in
+  `vector_entries` alongside metadata, payload, and lifecycle fields. Faiss
+  indices are rebuilt from SQLite on first touch per partition, never
+  persisted independently.
+- **Lazy load + LRU**: `VectorIndexManager` hydrates partitions on first
+  Search, caps resident partitions via LRU, and rebuilds on staleness
+  (compares `partition.last_modified_at_ms` against the hydrated snapshot).
+- **Wider scope than originally planned**: schema + repository + fingerprint
+  policy + partition registry + index manager all land in Phase 4 to avoid
+  Phase 5 having to revisit schema decisions.
+- **Additional scope**: a layered C++ outbound HTTP/HTTPS stack
+  (`agent_tls` → `agent_http_client`) and an OpenAI-compatible LLM client
+  (`agent_llm`) are folded into Phase 4 so the new memory system can run
+  maintenance LLM calls (state extraction, fact distillation, profile
+  compaction) in-process without crossing back into Python.
+
+Realized schema (see `src/storage/vector/schema.sql`):
 
 ```sql
-vector_collections(
-  id INTEGER PRIMARY KEY,
-  name TEXT NOT NULL,
-  embedding_model_fingerprint TEXT NOT NULL,
-  tokenizer_fingerprint TEXT NOT NULL,
-  pooling_strategy TEXT NOT NULL,
-  dimension INTEGER NOT NULL,
-  normalization TEXT NOT NULL,
-  corpus_version TEXT NOT NULL,
-  policy_version TEXT NOT NULL,
-  created_at_ms INTEGER NOT NULL
-);
-
-vector_entries(
-  id INTEGER PRIMARY KEY,
-  collection_id INTEGER NOT NULL,
-  tenant_id TEXT,
-  scope TEXT NOT NULL,
-  cache_key TEXT NOT NULL,
-  text_hash TEXT NOT NULL,
-  subject TEXT,
-  grade TEXT,
-  topic TEXT,
-  persona_scope TEXT,
-  memory_scope TEXT,
-  answer_type TEXT,
-  quality_score REAL NOT NULL DEFAULT 0.0,
-  expires_at_ms INTEGER,
-  created_at_ms INTEGER NOT NULL
-);
+vector_collections   -- fingerprint policy per logical group
+vector_partitions    -- (collection_id, tenant_id, user_id, memory_level) unique
+vector_entries       -- entry_id doubles as Faiss IDMap2 id;
+                     -- vector BLOB + lifecycle + payload + extra_metadata JSON
 ```
 
-The exact schema can evolve, but the design rule should remain:
+Realized library layering:
 
 ```text
-Vector index:
-  nearest-neighbor candidates only
-
-SQLite metadata:
-  scope, tenant, policy, corpus, quality, expiry, and cache safety
-
-Payload store:
-  actual response / RAG card / memory content
+agent_vector_storage    (sqlite repository, partition registry, fingerprints)
+agent_vector            (+ index manager, hydrating Faiss/Exact backends)
+agent_tls               (reusable client-side TLS context)
+agent_http_client       (Beast-based http+https with async deadline)
+agent_llm               (pending — pure business logic, OpenAI-compatible)
 ```
+
+Step status:
+
+```text
+Step 1  SQLite schema + EnsureSchema                  ✅
+Step 2  IVectorRepository CRUD                        ✅
+Step 3  VectorFingerprint policy                      ✅
+Step 4  PartitionRegistry                             ✅
+Step 5  VectorIndexManager (LRU + hydrate)            ✅
+Step 6a TLS context abstraction (agent_tls)           ✅
+Step 6b HTTP client (agent_http_client, http+https)   ✅
+Step 7  LLM client (OpenAI-compatible)                ✅ (2026-05-22)
+Step 8  Config sections + server entry integration    ✅ (2026-05-22)
+Step 9  End-to-end integration test                   ✅ (2026-05-22)
+```
+
+Tests landed so far: 33 storage/index manager + 33 net layer + 31 LLM = 97 passing.
 
 ### Phase 5: Semantic Cache Pipeline
 
@@ -535,51 +542,50 @@ into C++.
 
 ## 5. Immediate Next Step
 
-Phases 1-3 are complete (2026-05-20). Phase 4 — SQLite vector metadata
-store — is next. Open design questions to resolve before coding:
+Phase 4 complete (2026-05-22). All 9 steps merged and tested: schema,
+repository, fingerprint policy, partition registry, index manager, TLS
+context, outbound HTTP client, OpenAI-compatible LLM client, config
+integration, and end-to-end tests (mock + real DeepSeek API).
 
-1. **Partition granularity** — coarse `(collection, tenant, user)` with
-   `memory_level` as metadata filter, vs. fine partitioning that includes
-   `memory_level` in the partition key. Working memory and knowledge base
-   have wildly different sizes (~12 vs ~10k entries) so fine partitioning
-   is the leading candidate.
-2. **Data ownership** — vectors live in Faiss files with SQLite holding
-   metadata only (original §4 plan), vs. SQLite holding both metadata and
-   raw vector blobs with in-memory Faiss as a hydrated cache. The second
-   model is stronger for multi-tenant + multi-level memory because there
-   is a single source of truth and TTL eviction stays consistent.
-3. **Hydration policy** — eager load at startup vs. lazy load on first
-   touch per partition. Lazy with an LRU cap on resident partitions is
-   the working assumption.
-4. **Phase 4 scope** — narrow (schema + repository + fingerprint policy)
-   vs. wide (also includes partition registry / index manager). Leaning
-   narrow so the registry can be designed against Phase 5's actual query
-   patterns rather than guessed.
+Phase 5 skeleton landed (2026-05-22): `agent_semantic_cache` library with
+`ISemanticCache`, `IContextRiskDetector`, `IPolicyMatcher`, and
+`SemanticCachePipeline` stub.  Implementation pending.
 
-These will be decided at the start of Phase 4. They do not change the
-Phase 1-3 deliverables already merged.
+Next coding task: **Phase 5 — Semantic Cache Pipeline implementation**,
+starting with `IContextRiskDetector` (keyword-based v1) and
+`IPolicyMatcher` (fail-closed fingerprint + scope + metadata checks).
+Once those are solid, wire them into `SemanticCachePipeline::Lookup`
+with the existing tokenizer → embedding → index manager chain.
 
 ## 6. Discussion Anchors for Next Session
 
-Open questions:
+Open questions for Phase 4 Steps 7-9 and forward:
 
-1. Whether the Rust tokenizer library should be built as a static library or DLL
-   on Windows for the first implementation.
-2. Exact C ABI shape: null-terminated strings vs byte pointer + length. Current
-   recommendation is byte pointer + length.
-3. Tokenizer threading model: shared mutex first vs tokenizer pool from day one.
-4. Where to store tokenizer/model fixtures for C++ tests.
-5. Which embedding model should be the first supported ONNX text embedding
-   model.
-6. Pooling strategy for the first embedding model: model output vs mean pooling.
-7. Whether vector metadata lives first in SQLite only or also writes a filesystem
-   manifest.
-8. Whether `agent_vector` should absorb tokenizer/embedding initially or split
-   into `agent_tokenizer`, `agent_embedding`, and `agent_vector`.
+1. **LLM provider scope for v1** — confirmed OpenAI-compatible only
+   (DeepSeek / vLLM / proxies all fit). Anthropic schema deferred until a
+   real C++-side need appears.
+2. **API key resolution** — env var primary (`api_key_env`), file fallback
+   (`api_key_file`), no plaintext in config. Aligned with the existing
+   `auth.token_env / auth.token_file` pattern.
+3. **Maintenance prompts location** — hard-coded as `inline constexpr
+   std::string_view` in `src/llm/llm_prompts.h`. Versioned with the binary;
+   if Python wants to A/B iterate, they can still rev their own copy and
+   sync once finalized.
+4. **Streaming in v1** — out of scope. Maintenance prompts emit short JSON;
+   SSE parsing is non-trivial and not needed until the conversation hot
+   path lands.
+5. **Memory lifecycle engine port** — Phase 4 only ensures the schema can
+   hold every Python `MemoryLifecycleStore` field. The actual retention
+   weight / bucket-by-weight pruning port to C++ remains a Phase 4.5 or
+   Phase 5 question.
+6. **Where the maintenance worker thread lives** — not in Phase 4.
+   Belongs to the Phase 5 conversation hot path so it can hook into
+   per-turn / per-token / close-session triggers.
+7. **payload storage location** — currently inline in `vector_entries.payload`.
+   Move to a separate `vector_payloads` table only if a future scan pattern
+   genuinely wants vector-without-payload rows.
 
-Recommended next coding task:
-
-```text
-Tokenizer FFI minimal vertical slice:
-  tokenizer.json -> Rust tokenizers -> C ABI -> C++ HfTokenizer -> GTest fixture
-```
+Phase 1-3 anchors (Rust build mode, FFI byte-pointer signatures, tokenizer
+threading model, fixture layout, embedding model choice, pooling strategy,
+filesystem manifest format) have all been answered by the merged
+implementation and are no longer open.

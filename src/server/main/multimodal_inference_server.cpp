@@ -91,6 +91,16 @@ int main(int argc, char** argv) {
              options.grpc.grpc_max_pollers,
              options.grpc.stats_log_interval_seconds,
              options.grpc.slow_request_ms);
+    if (!options.llm.base_url.empty()) {
+        LOG_INFO("[Server] LLM client: base_url={} model={} timeout_ms={} max_retries={} prompts={}",
+                 options.llm.base_url,
+                 options.llm.model,
+                 options.llm.timeout_ms,
+                 options.llm.max_retries,
+                 options.llm.prompts.size());
+    } else {
+        LOG_INFO("[Server] LLM client: disabled");
+    }
 
     server_common::RuntimeStats stats;
     service::MultimodalService multimodal_service(options);

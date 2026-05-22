@@ -36,6 +36,8 @@ void LoadConfigFile(const std::filesystem::path& path, MultimodalServerOptions& 
         throw std::runtime_error("Config file root must be an object");
     }
 
+    options.config_file_path = std::filesystem::absolute(path);
+
     for (const auto& section : BuildConfigSections()) {
         section->LoadJson(root, options);
     }

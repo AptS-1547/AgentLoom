@@ -23,7 +23,7 @@ test/
 # Claude/Codex cache
 .claude/
 .codex/
-
+CLAUDE.md
 # Python cache
 __pycache__/
 *.py[cod]
@@ -31,3 +31,7 @@ __pycache__/
 CMakeFiles/
 # ONNX Model
 onnx_models/
+# LLM smoke test secrets (real API keys / config, never commit)
+tools/llm_smoke_test.json
+tools/llm_smoke_test.key
+tools/llm_smoke_prompt.txt

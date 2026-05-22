@@ -463,6 +463,7 @@ add_library(agent_http_client STATIC
     src/net/http_client/retry_policy.cpp
     src/net/http_client/beast_http_client.h
     src/net/http_client/beast_http_client.cpp
+    src/net/http_client/concurrent_http_client.h
 )
 
 target_include_directories(agent_http_client PUBLIC
@@ -491,6 +492,76 @@ if(BERT_BUILD_TESTS)
     )
     gtest_discover_tests(http_client_tests DISCOVERY_MODE PRE_TEST)
 endif()
+
+# ──────────── LLM client (OpenAI-compatible) ────────────
+add_library(agent_llm STATIC
+    src/llm/openai_llm_client.h
+    src/llm/openai_llm_client.cpp
+)
+
+target_include_directories(agent_llm PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/llm
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/net/http_client
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/core
+)
+
+target_link_libraries(agent_llm PUBLIC
+    agent_http_client
+)
+
+if(BERT_BUILD_TESTS)
+    add_executable(llm_tests
+        tests/llm/openai_llm_client_test.cpp
+    )
+    target_link_libraries(llm_tests PRIVATE
+        agent_llm
+        GTest::gtest_main
+    )
+    gtest_discover_tests(llm_tests DISCOVERY_MODE PRE_TEST)
+
+    add_executable(llm_integration_tests
+        tests/llm/llm_integration_e2e_test.cpp
+    )
+    target_link_libraries(llm_integration_tests PRIVATE
+        agent_llm
+        agent_config
+        GTest::gtest_main
+    )
+    link_whole_archive(llm_integration_tests agent_config)
+    gtest_discover_tests(llm_integration_tests DISCOVERY_MODE PRE_TEST)
+endif()
+
+# ──────────── Manual smoke test against a real LLM API (not part of CTest) ────────────
+add_executable(llm_smoke_test
+    tools/llm_smoke_test.cpp
+)
+target_link_libraries(llm_smoke_test PRIVATE
+    agent_llm
+    agent_config
+    agent_tls
+)
+link_whole_archive(llm_smoke_test agent_config)
+
+# ──────────── Semantic cache pipeline (skeleton — Phase 5) ────────────
+add_library(agent_semantic_cache STATIC
+    src/semantic_cache/semantic_cache_types.h
+    src/semantic_cache/isemantic_cache.h
+    src/semantic_cache/context_risk_detector.h
+    src/semantic_cache/context_risk_detector.cpp
+    src/semantic_cache/semantic_cache_policy.h
+    src/semantic_cache/semantic_cache_policy.cpp
+    src/semantic_cache/semantic_cache_pipeline.h
+    src/semantic_cache/semantic_cache_pipeline.cpp
+)
+
+target_include_directories(agent_semantic_cache PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/semantic_cache
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/core
+)
+
+target_link_libraries(agent_semantic_cache PUBLIC
+    agent_core
+)
 
 
 add_library(agent_storage STATIC
@@ -790,6 +861,7 @@ add_library(agent_config STATIC
     src/config/sections/grpc_config_section.cpp
     src/config/sections/http_config_section.cpp
     src/config/sections/limits_config_section.cpp
+    src/config/sections/llm_config_section.cpp
     src/config/sections/model_config_section.cpp
     src/config/sections/vlm_cache_config_section.cpp
     src/config/sections/vram_config_section.cpp

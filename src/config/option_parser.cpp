@@ -81,5 +81,12 @@ void PrintUsage(const char* program) {
               << "  --vram-reload-after-unload Reload LLM immediately after watchdog unload\n"
               << "  --no-vram-unload-on-oom-error Disable automatic unload after OOM-like VLM errors\n"
               << "  --stats-log-interval-seconds <n>  Stats log interval (default: 30)\n"
-              << "  --slow-request-ms <n> Slow request threshold (default: 250)\n";
+              << "  --slow-request-ms <n> Slow request threshold (default: 250)\n"
+              << "\nLLM client options:\n"
+              << "  --llm-base-url <url>      OpenAI-compatible API base URL\n"
+              << "  --llm-api-key-env <name>  Env var holding the API key (default: AGENT_LLM_API_KEY)\n"
+              << "  --llm-api-key-file <path> File containing the API key\n"
+              << "  --llm-model <name>        Model name (default: deepseek-chat)\n"
+              << "  --llm-timeout <ms>        Request timeout ms (default: 30000)\n"
+              << "  --llm-max-retries <n>     Max retries on 5xx (default: 2)\n";
 }

@@ -3,6 +3,7 @@
 #include <optional>
 #include <string>
 #include <utility>
+#include <type_traits>
 
 namespace core {
 
@@ -63,9 +64,12 @@ class Result {
 public:
     Result() = delete;
 
+    // SFINAE: disable value constructors when T=Status to avoid ambiguity
+    template <typename U = T, typename = std::enable_if_t<!std::is_same_v<std::decay_t<U>, Status>>>
     Result(const T& value)
         : value_(value), status_(Status::Ok()) {}
 
+    template <typename U = T, typename = std::enable_if_t<!std::is_same_v<std::decay_t<U>, Status>>>
     Result(T&& value)
         : value_(std::move(value)), status_(Status::Ok()) {}
 

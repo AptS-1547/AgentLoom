@@ -5,7 +5,7 @@
 
 #include "llama_runner.h"
 #include "llama_handles.h"
-#include <spdlog/spdlog.h>
+#include "../core/logger_adapter.h"
 
 #include <llama.h>
 #include <ggml-backend.h>
@@ -17,6 +17,8 @@
 #include <utility>
 
 namespace llm {
+
+static core::LoggerAdapter logger = core::LoggerAdapter::ForModule("models");
 
 // PIMPL 实现
 struct LlamaRunner::Impl {
@@ -71,12 +73,12 @@ bool LlamaRunner::LoadModel(const std::filesystem::path& model_path,
     std::lock_guard lock(mutex_);
 
     if (loaded_) {
-        spdlog::warn("Model already loaded, unloading first");
+        logger.warn("Model already loaded, unloading first");
         impl_->Cleanup();
         loaded_ = false;
     }
 
-    spdlog::info("Loading model: {}", model_path.string());
+    logger.info("Loading model: {}", model_path.string());
 
     // 加载文本模型
     llama_model_params model_params = llama_model_default_params();
@@ -84,7 +86,7 @@ bool LlamaRunner::LoadModel(const std::filesystem::path& model_path,
 
     impl_->model.reset(llama_load_model_from_file(model_path.string().c_str(), model_params));
     if (!impl_->model) {
-        spdlog::error("Failed to load model: {}", model_path.string());
+        logger.error("Failed to load model: {}", model_path.string());
         return false;
     }
 
@@ -97,7 +99,7 @@ bool LlamaRunner::LoadModel(const std::filesystem::path& model_path,
 
     impl_->ctx.reset(llama_new_context_with_model(impl_->model.get(), ctx_params));
     if (!impl_->ctx) {
-        spdlog::error("Failed to create context");
+        logger.error("Failed to create context");
         impl_->Cleanup();
         return false;
     }

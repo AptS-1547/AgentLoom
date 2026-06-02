@@ -45,6 +45,20 @@ struct SqliteConnectionPoolState {
             return core::Status::Error(core::ErrorCode::InvalidArgument, "at least one SQLite connection is required");
         }
 
+        // Ensure database file exists by opening a write connection first
+        auto init_result = SqliteConnection::Open(options.path, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE |
+                                                   (options.full_mutex ? SQLITE_OPEN_FULLMUTEX : SQLITE_OPEN_NOMUTEX));
+        if (!init_result.ok()) {
+            return init_result.status();
+        }
+        auto init_conn = std::move(init_result).value();
+        auto init_status = init_conn.InitializeForPool(options.busy_timeout_ms, options.enable_wal);
+        if (!init_status.ok()) {
+            return init_status;
+        }
+        // Close init connection - it's just for file creation
+        init_conn = SqliteConnection();
+
         auto status = CreateConnections(SqliteConnectionKind::Read, options.read_connection_count, read_idle);
         if (!status.ok()) {
             CloseLocked();

@@ -1,6 +1,6 @@
 ﻿#include "vlm_cache.h"
 
-#include <spdlog/spdlog.h>
+#include "../core/logger_adapter.h"
 
 #include <algorithm>
 #include <array>
@@ -18,6 +18,8 @@
 
 namespace vlm_cache {
 namespace {
+
+static core::LoggerAdapter logger = core::LoggerAdapter::ForModule("cache");
 
 constexpr uint32_t kRecordMagic = 0x434D4C56;
 constexpr uint32_t kRecordVersion = 1;
@@ -496,7 +498,7 @@ void VLMCache::Put(StoreRecord record) {
         try {
             PersistEntry(entry);
         } catch (const std::exception& e) {
-            spdlog::warn("[VLMCache] persist failed for {}: {}", key, e.what());
+            logger.warn("[VLMCache] persist failed for {}: {}", key, e.what());
         }
     }
     entries_[key] = std::move(entry);
@@ -519,7 +521,7 @@ Result VLMCache::TouchAndMakeResult(Entry& entry, int64_t now_ms) {
         try {
             PersistEntry(entry);
         } catch (const std::exception& e) {
-            spdlog::warn("[VLMCache] persist touch failed for {}: {}", entry.record.key.cache_key, e.what());
+            logger.warn("[VLMCache] persist touch failed for {}: {}", entry.record.key.cache_key, e.what());
         }
     }
     return MakeResult(entry);
@@ -592,7 +594,7 @@ void VLMCache::LoadPersisted() {
         std::filesystem::create_directories(ImagesDir(options_));
         std::filesystem::create_directories(PromptsDir(options_));
     } catch (const std::exception& e) {
-        spdlog::warn("[VLMCache] create cache dirs failed: {}", e.what());
+        logger.warn("[VLMCache] create cache dirs failed: {}", e.what());
         return;
     }
 
@@ -621,10 +623,10 @@ void VLMCache::LoadPersisted() {
         ++loaded;
     }
     if (iter_ec) {
-        spdlog::warn("[VLMCache] directory scan failed for {}: {}", dir.string(), iter_ec.message());
+        logger.warn("[VLMCache] directory scan failed for {}: {}", dir.string(), iter_ec.message());
     }
     EvictLocked();
-    spdlog::info("[VLMCache] loaded {} entries from {}", loaded, options_.cache_dir.string());
+    logger.info("[VLMCache] loaded {} entries from {}", loaded, options_.cache_dir.string());
 }
 
 void VLMCache::PersistEntry(const Entry& entry) {

@@ -1,6 +1,7 @@
 #include "http_server.h"
 
 #include "exception.h"
+#include "trace_context.h"
 #include "websocket_session.h"
 
 #include <algorithm>
@@ -143,6 +144,18 @@ void HttpServer::HttpSession::OnRead(beast::error_code ec, std::size_t) {
                ec.message()});
         return;
     }
+
+    std::string trace_id;
+    auto trace_header = request_.find("X-Trace-Id");
+    if (trace_header != request_.end()) {
+        trace_id = std::string(trace_header->value());
+    } else {
+        trace_id = core::GenerateTraceId();
+    }
+
+    core::TraceContext trace_ctx;
+    trace_ctx.trace_id = std::move(trace_id);
+    core::TraceScope trace_scope(trace_ctx);
 
     if (request_.body().size() > server_.options_.request_body_limit) {
         Send(MakeStatusResponse(request_, http::status::payload_too_large, "payload too large"));

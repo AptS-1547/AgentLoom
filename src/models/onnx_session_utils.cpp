@@ -1,15 +1,17 @@
 #include "onnx_session_utils.h"
 
+#include "../core/logger_adapter.h"
+
 #include <algorithm>
 #include <cctype>
 #include <sstream>
 #include <thread>
 
-#include <spdlog/spdlog.h>
-
 namespace bert {
 
 namespace {
+
+static core::LoggerAdapter logger = core::LoggerAdapter::ForModule("models");
 
 int ResolveDefaultIntraOpThreads(const ModelRuntimeOptions& options, bool use_cuda) {
     if (options.intra_op_num_threads > 0) {
@@ -166,7 +168,7 @@ OnnxSessionBundle CreateOnnxSessionBundle(
     );
     PopulateIoNames(bundle);
 
-    spdlog::info(
+    logger.info(
         "[{}] ONNX session loaded: {} inputs, {} outputs, provider={}, intra_op={}, inter_op={}",
         logger_tag,
         bundle.input_names.size(),
@@ -176,7 +178,7 @@ OnnxSessionBundle CreateOnnxSessionBundle(
         bundle.info.inter_op_num_threads
     );
     if (!bundle.info.provider_note.empty()) {
-        spdlog::warn("[{}] {}", logger_tag, bundle.info.provider_note);
+        logger.warn("[{}] {}", logger_tag, bundle.info.provider_note);
     }
 
     return bundle;

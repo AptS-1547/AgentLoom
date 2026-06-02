@@ -6,7 +6,10 @@
     "grpc",
     "openssl",
     "protobuf",
-    "spdlog"
+    "spdlog",
+    "hiredis",
+    "redis-plus-plus",
+    "nlohmann-json"
   ],
   "features": {
     "tests": {

@@ -44,6 +44,9 @@ find_package(Protobuf CONFIG REQUIRED)
 find_package(gRPC CONFIG REQUIRED)
 find_package(spdlog CONFIG REQUIRED)
 find_package(OpenSSL CONFIG REQUIRED)
+find_package(nlohmann_json CONFIG REQUIRED)
+find_package(hiredis CONFIG REQUIRED)
+find_package(redis++ CONFIG REQUIRED)
 
 function(require_path path label)
     if(NOT EXISTS "${path}")
@@ -542,6 +545,49 @@ target_link_libraries(llm_smoke_test PRIVATE
 )
 link_whole_archive(llm_smoke_test agent_config)
 
+# ──────────── L3 compression E2E test (not part of CTest) ────────────
+add_executable(l3_compression_e2e_test
+    tools/l3_compression_e2e_test.cpp
+)
+target_include_directories(l3_compression_e2e_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/memory
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/storage/sqlite
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/storage/vector
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/semantic_cache
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/vector
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/llm
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/net
+    ${CMAKE_CURRENT_SOURCE_DIR}/tools
+)
+target_link_libraries(l3_compression_e2e_test PRIVATE
+    agent_memory
+    agent_llm
+    agent_semantic_cache
+    agent_storage
+    agent_vector
+    agent_vector_storage
+    agent_config
+    agent_tls
+    nlohmann_json::nlohmann_json
+)
+link_whole_archive(l3_compression_e2e_test agent_config)
+copy_runtime_files(l3_compression_e2e_test "${BERT_SQLITE_DLL}")
+
+# ──────────── Bare boost::redis smoke test (not part of CTest) ────────────
+add_executable(redis_bare_connection_test
+    tools/redis_bare_connection_test.cpp
+)
+target_link_libraries(redis_bare_connection_test PRIVATE
+    agent_semantic_cache
+)
+
+add_executable(redis_stress_test
+    tools/redis_stress_test.cpp
+)
+target_link_libraries(redis_stress_test PRIVATE
+    agent_semantic_cache
+)
+
 # ──────────── Semantic cache pipeline (skeleton — Phase 5) ────────────
 add_library(agent_semantic_cache STATIC
     src/semantic_cache/semantic_cache_types.h
@@ -550,6 +596,8 @@ add_library(agent_semantic_cache STATIC
     src/semantic_cache/context_risk_detector.cpp
     src/semantic_cache/semantic_cache_policy.h
     src/semantic_cache/semantic_cache_policy.cpp
+    src/semantic_cache/redis_connection_pool.h
+    src/semantic_cache/redis_connection_pool.cpp
     src/semantic_cache/semantic_cache_pipeline.h
     src/semantic_cache/semantic_cache_pipeline.cpp
 )
@@ -557,12 +605,93 @@ add_library(agent_semantic_cache STATIC
 target_include_directories(agent_semantic_cache PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src/semantic_cache
     ${CMAKE_CURRENT_SOURCE_DIR}/src/core
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/storage
 )
 
 target_link_libraries(agent_semantic_cache PUBLIC
     agent_core
+    agent_vector
+    agent_vector_storage
+    redis++::redis++
+    hiredis::hiredis
 )
 
+if(BERT_BUILD_TESTS)
+    add_executable(semantic_cache_tests
+        tests/semantic_cache/semantic_cache_pipeline_test.cpp
+        tests/semantic_cache/test_reload_batch_cycle.cpp
+    )
+
+    target_link_libraries(semantic_cache_tests PRIVATE
+        agent_semantic_cache
+        agent_core
+        GTest::gtest_main
+    )
+
+    gtest_discover_tests(semantic_cache_tests DISCOVERY_MODE PRE_TEST)
+
+    add_executable(l0_benchmark
+        tests/semantic_cache/l0_benchmark.cpp
+    )
+
+    target_link_libraries(l0_benchmark PRIVATE
+        agent_semantic_cache
+        agent_vector
+        agent_core
+        nlohmann_json::nlohmann_json
+    )
+
+    add_executable(full_pipeline_benchmark
+        tests/semantic_cache/full_pipeline_benchmark.cpp
+    )
+
+    target_link_libraries(full_pipeline_benchmark PRIVATE
+        agent_semantic_cache
+        agent_vector
+        agent_core
+    )
+
+    add_executable(memory_tests
+        tests/memory/long_term_memory_compressor_test.cpp
+    )
+
+    target_link_libraries(memory_tests PRIVATE
+        agent_memory
+        agent_semantic_cache
+        agent_vector_storage
+        agent_storage
+        agent_llm
+        GTest::gtest_main
+    )
+
+    copy_runtime_files(memory_tests "${BERT_SQLITE_DLL}")
+
+    gtest_discover_tests(memory_tests DISCOVERY_MODE PRE_TEST)
+endif()
+
+# ──────────── Long-term memory (L3 compression) ────────────
+add_library(agent_memory STATIC
+    src/memory/long_term_memory_compressor.h
+    src/memory/long_term_memory_compressor.cpp
+)
+
+target_include_directories(agent_memory PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/memory
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/core
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/llm
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/semantic_cache
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/storage
+)
+
+target_link_libraries(agent_memory PUBLIC
+    agent_core
+    agent_llm
+    agent_semantic_cache
+    agent_vector
+    agent_vector_storage
+    agent_storage
+    nlohmann_json::nlohmann_json
+)
 
 add_library(agent_storage STATIC
     src/storage/sqlite/sqlite_async_executor.cpp
@@ -899,10 +1028,20 @@ endif()
 add_library(agent_service STATIC
     src/service/inference/multimodal_service.cpp
     src/service/inference/multimodal_service.h
+    src/service/persona/persona_algorithm.cpp
+    src/service/persona/persona_algorithm.h
+    src/service/persona/session_manager.cpp
+    src/service/persona/session_manager.h
+    src/service/persona/persona_runtime.cpp
+    src/service/persona/persona_runtime.h
 )
 
 target_include_directories(agent_service PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src/service/inference
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/service/persona
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/llm
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/semantic_cache
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/memory
 )
 
 target_link_libraries(agent_service PUBLIC
@@ -911,9 +1050,27 @@ target_link_libraries(agent_service PUBLIC
     agent_models
     agent_cache
     agent_vector
+    agent_llm
+    agent_semantic_cache
+    agent_memory
     agent_core
     spdlog::spdlog
 )
+
+if(BERT_BUILD_TESTS)
+    add_executable(service_tests
+        tests/service/persona_algorithm_test.cpp
+        tests/service/session_manager_test.cpp
+        tests/service/persona_runtime_test.cpp
+    )
+
+    target_link_libraries(service_tests PRIVATE
+        agent_service
+        GTest::gtest_main
+    )
+
+    gtest_discover_tests(service_tests DISCOVERY_MODE PRE_TEST)
+endif()
 
 # ==================== 统一多模态推理服务端 ====================
 

@@ -1,0 +1,24 @@
+{
+  "_README": [
+    "Config for tools/l3_compression_e2e_test.cpp (gitignored).",
+    "Reuses llm_smoke_test.key from the same directory.",
+    "Run: .\\build\\x64-Release-Tests\\Release\\l3_compression_e2e_test.exe tools\\l3_compression_e2e_test.json"
+  ],
+  "llm": {
+    "base_url": "https://api.deepseek.com/v1",
+    "api_key_file": "llm_smoke_test.key",
+    "model": "deepseek-chat",
+    "timeout_ms": 30000,
+    "max_retries": 1
+  },
+  "redis": {
+    "host": "127.0.0.1",
+    "port": 5000
+  },
+  "embedding": {
+    "tokenizer_path": "onnx_models/minilm/tokenizer.json",
+    "model_path": "onnx_models/minilm/model.onnx",
+    "dimension": 384,
+    "execution_provider": "auto"
+  }
+}

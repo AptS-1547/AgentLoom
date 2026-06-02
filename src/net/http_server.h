@@ -10,7 +10,6 @@
 
 #include <boost/asio.hpp>
 #include <boost/beast.hpp>
-
 #include <atomic>
 #include <chrono>
 #include <cstdint>

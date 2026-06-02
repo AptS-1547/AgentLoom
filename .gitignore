@@ -35,3 +35,7 @@ onnx_models/
 tools/llm_smoke_test.json
 tools/llm_smoke_test.key
 tools/llm_smoke_prompt.txt
+# dev_notes
+dev_note/
+# Test output
+dumps/

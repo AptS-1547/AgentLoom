@@ -6,14 +6,15 @@
 #include "onnx_model.h"
 
 #include "onnx_session_utils.h"
+#include "../core/logger_adapter.h"
 
 #include <algorithm>
 #include <numeric>
 #include <sstream>
 
-#include <spdlog/spdlog.h>
-
 namespace bert {
+
+static core::LoggerAdapter logger = core::LoggerAdapter::ForModule("models");
 
 // 内部实现结构
 struct OnnxBERTModel::Impl {
@@ -84,10 +85,10 @@ bool OnnxBERTModel::LoadModel(const std::filesystem::path& model_path,
         return true;
 
     } catch (const Ort::Exception& e) {
-        spdlog::error("[BERT] ONNX Runtime error: {}", e.what());
+        logger.error("[BERT] ONNX Runtime error: {}", e.what());
         return false;
     } catch (const std::exception& e) {
-        spdlog::error("[BERT] Error loading model: {}", e.what());
+        logger.error("[BERT] Error loading model: {}", e.what());
         return false;
     }
 }
@@ -206,7 +207,7 @@ std::vector<InferenceResult> OnnxBERTModel::PredictBatch(
     if (input_ids.size() != batch_size * seq_len ||
         attention_mask.size() != batch_size * seq_len ||
         personality.size() != batch_size * impl_->personality_dim) {
-        spdlog::error("[BERT] Batch input size mismatch");
+        logger.error("[BERT] Batch input size mismatch");
         return {};
     }
 
@@ -313,10 +314,10 @@ std::vector<InferenceResult> OnnxBERTModel::PredictBatch(
         return results;
 
     } catch (const Ort::Exception& e) {
-        spdlog::error("[BERT] Batch inference error: {}", e.what());
+        logger.error("[BERT] Batch inference error: {}", e.what());
         return {};
     } catch (const std::exception& e) {
-        spdlog::error("[BERT] Batch inference error: {}", e.what());
+        logger.error("[BERT] Batch inference error: {}", e.what());
         return {};
     }
 }

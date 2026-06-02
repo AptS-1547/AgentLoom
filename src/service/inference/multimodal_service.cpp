@@ -4,8 +4,7 @@
 #include "onnx_model.h"
 #include "vector_cache.h"
 #include "vlm_cache.h"
-
-#include <spdlog/spdlog.h>
+#include "../../core/logger_adapter.h"
 
 #include <algorithm>
 #include <chrono>
@@ -24,6 +23,8 @@
 namespace service {
 
 namespace {
+
+static core::LoggerAdapter logger = core::LoggerAdapter::ForModule("service");
 
 using multimodal_inference::EmotionBatchRequest;
 using multimodal_inference::EmotionBatchResponse;
@@ -58,9 +59,9 @@ public:
           model_fingerprint_(BuildModelFingerprint(options.llm_model, options.mmproj, options.n_gpu_layers)),
           n_gpu_layers_(options.n_gpu_layers) {
         if (!options.bert_model.empty()) {
-            spdlog::info("Loading BERT model: {}", options.bert_model);
+            logger.info("Loading BERT model: {}", options.bert_model);
             if (!bert_model_.LoadModel(options.bert_model, options.bert_runtime)) {
-                spdlog::error("Failed to load BERT model");
+                logger.error("Failed to load BERT model");
             }
         }
 
@@ -498,7 +499,7 @@ private:
 
         auto encode_result = llm_runner_.EncodeImageOnly(image_data);
         if (!encode_result.success || encode_result.image_embedding.empty()) {
-            spdlog::debug("[VectorCache] EncodeImageOnly failed: {}", encode_result.error_message);
+            logger.debug("[VectorCache] EncodeImageOnly failed: {}", encode_result.error_message);
             return false;
         }
 
@@ -514,7 +515,7 @@ private:
         auto cached = vlm_cache_.Get(hit->cache_key);
         if (!cached) {
             vector_index_.Evict(key.prompt_sha256, hit->cache_key);
-            spdlog::debug("[VectorCache] hit key {} not in VLMCache, evicted from vector index", hit->cache_key);
+            logger.debug("[VectorCache] hit key {} not in VLMCache, evicted from vector index", hit->cache_key);
             return false;
         }
 

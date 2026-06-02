@@ -10,7 +10,9 @@
       "Bash(ls \"D:/Users/21405/source/repos/MyNeuroLikeSystem/project_src\")",
       "Read(//d/Users/21405/source/repos/MyNeuroLikeSystem/project_src/**)",
       "Bash(Get-ChildItem -Path \"D:\\\\Users\\\\21405\\\\source\\\\repos\\\\AgentBackendPredict\\\\src\" -Recurse -Directory)",
-      "Bash(Select-Object -First 50)"
+      "Bash(Select-Object -First 50)",
+      "Bash(vcpkg search *)",
+      "WebFetch(domain:knightli.com)"
     ]
   }
 }

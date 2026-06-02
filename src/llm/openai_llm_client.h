@@ -6,7 +6,7 @@
 #include <memory>
 #include <string>
 #include <filesystem>
-
+#include <../core/result.h>
 namespace agent::llm {
 
 struct OpenAiLlmClientOptions {

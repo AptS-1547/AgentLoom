@@ -3,6 +3,7 @@
 #include "blocking_queue.h"
 #include "result.h"
 #include "shared_memory_block.h"
+#include "trace_context.h"
 
 #include <atomic>
 #include <cstddef>
@@ -156,6 +157,7 @@ private:
         TaskFunction task;
         SharedMemoryBlock payload;
         std::string name;
+        std::string trace_id;
     };
 
     struct WorkerRuntime {

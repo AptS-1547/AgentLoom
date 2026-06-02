@@ -89,7 +89,13 @@ Status ThreadPool::SubmitTask(TaskFunction task, SharedMemoryBlock payload, std:
         return Status::Error(ErrorCode::Unavailable, "thread pool is not running");
     }
 
-    auto status = queue_.TryPush(QueuedTask{std::move(task), std::move(payload), std::move(name)});
+    std::string trace_id;
+    if (current_trace && !current_trace->trace_id.empty()) {
+        trace_id = current_trace->trace_id;
+    }
+
+    auto status = queue_.TryPush(QueuedTask{
+        std::move(task), std::move(payload), std::move(name), std::move(trace_id)});
     if (!status.ok()) {
         rejected_tasks_.fetch_add(1, std::memory_order_relaxed);
         return status;
@@ -142,6 +148,10 @@ void ThreadPool::WorkerLoop(std::stop_token stop_token, std::size_t worker_index
         active_workers_.fetch_add(1, std::memory_order_relaxed);
         SetWorkerState(worker_index, WorkerState::Running, std::move(queued.name));
         context.set_payload(std::move(queued.payload));
+
+        TraceContext trace_ctx;
+        trace_ctx.trace_id = std::move(queued.trace_id);
+        TraceScope trace_scope(trace_ctx);
 
         Status status = Status::Ok();
         try {

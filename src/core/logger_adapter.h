@@ -3,6 +3,7 @@
 #include <spdlog/spdlog.h>
 
 #include <memory>
+#include <string_view>
 #include <utility>
 
 namespace core {
@@ -12,6 +13,14 @@ public:
     LoggerAdapter() = default;
     explicit LoggerAdapter(std::shared_ptr<spdlog::logger> logger) noexcept
         : logger_(std::move(logger)) {}
+
+    static LoggerAdapter ForModule(std::string_view module_name) {
+        auto logger = spdlog::get(std::string(module_name));
+        if (!logger) {
+            logger = spdlog::default_logger();
+        }
+        return LoggerAdapter(std::move(logger));
+    }
 
     bool valid() const noexcept {
         return static_cast<bool>(logger_);

@@ -1,6 +1,6 @@
 ﻿#include "vector_cache.h"
 
-#include <spdlog/spdlog.h>
+#include "../core/logger_adapter.h"
 
 #include <algorithm>
 #include <chrono>
@@ -9,6 +9,8 @@
 
 namespace vlm_cache {
 namespace {
+
+static core::LoggerAdapter logger = core::LoggerAdapter::ForModule("vector");
 
 int64_t NowMs() {
     const auto now = std::chrono::system_clock::now().time_since_epoch();
@@ -20,7 +22,7 @@ int64_t NowMs() {
 VectorIndex::VectorIndex(VectorOptions options)
     : options_(std::move(options)) {
     if (options_.persist) {
-        spdlog::warn("[VectorIndex] persist=true but persistence is not yet implemented; "
+        logger.warn("[VectorIndex] persist=true but persistence is not yet implemented; "
                  "vector index will be memory-only");
     }
 }
@@ -107,7 +109,7 @@ std::optional<VectorHit> VectorIndex::Query(
     if (!best_entry) return std::nullopt;
 
     if (best_sim >= options_.sim_threshold_high) {
-        spdlog::debug("[VectorIndex] high-confidence hit: sim={:.4f} key={}", best_sim, best_entry->cache_key);
+        logger.debug("[VectorIndex] high-confidence hit: sim={:.4f} key={}", best_sim, best_entry->cache_key);
         return VectorHit{best_entry->cache_key, best_sim, false};
     }
 
@@ -115,11 +117,11 @@ std::optional<VectorHit> VectorIndex::Query(
         const bool saliency_ok = (saliency_hint <= 0.0f) ||
                                   (saliency_hint < options_.max_saliency_for_mid);
         if (saliency_ok) {
-            spdlog::debug("[VectorIndex] tentative hit: sim={:.4f} saliency={:.3f} key={}",
+            logger.debug("[VectorIndex] tentative hit: sim={:.4f} saliency={:.3f} key={}",
                       best_sim, saliency_hint, best_entry->cache_key);
             return VectorHit{best_entry->cache_key, best_sim, true};
         }
-        spdlog::debug("[VectorIndex] mid-band rejected by saliency: sim={:.4f} saliency={:.3f}",
+        logger.debug("[VectorIndex] mid-band rejected by saliency: sim={:.4f} saliency={:.3f}",
                   best_sim, saliency_hint);
     }
 

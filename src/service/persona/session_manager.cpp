@@ -63,6 +63,7 @@ core::Result<SessionSnapshot> SessionManager::CreateSession(CreateSessionRequest
         slot->state.user_uuid = std::move(request.user_uuid);
         slot->state.persona_id = std::move(request.persona_id);
         slot->state.last_trace_id = trace.trace_id;
+        slot->state.status = SessionStatus::Active;
         slot->state.created_at = now;
         slot->state.last_active = now;
         slot->state.emotion_state = EmotionStateTracker(request.emotion_state_config);
@@ -70,6 +71,7 @@ core::Result<SessionSnapshot> SessionManager::CreateSession(CreateSessionRequest
             std::move(request.personality),
             std::move(request.emotion_prompt_config),
             request.time_awareness);
+        slot->state.max_recent_turns = options_.max_recent_turns;
     }
 
     SessionSnapshot snapshot;
@@ -116,6 +118,16 @@ core::Status SessionManager::CloseSession(std::string_view session_id, std::stri
             return core::Status::Error(core::ErrorCode::NotFound, "session not found");
         }
         removed = std::move(it->second);
+        {
+            std::lock_guard slot_lock(removed->mutex);
+            if (removed->state.status == SessionStatus::Closing ||
+                removed->state.status == SessionStatus::Closed) {
+                return core::Status::Ok();
+            }
+            removed->state.status = SessionStatus::Closing;
+            removed->state.close_reason = "client_close";
+            removed->state.last_trace_id = trace.trace_id;
+        }
         sessions_.erase(it);
     }
 
@@ -125,6 +137,7 @@ core::Status SessionManager::CloseSession(std::string_view session_id, std::stri
         std::lock_guard lock(removed->mutex);
         user_uuid = removed->state.user_uuid;
         persona_id = removed->state.persona_id;
+        removed->state.status = SessionStatus::Closed;
     }
 
     logger_.info("[trace={}] [session] closed session={} user={} persona={}",
@@ -143,6 +156,9 @@ core::Status SessionManager::TouchSession(std::string_view session_id, std::stri
     const auto trace = NonEmptyOrGeneratedTrace(std::string(trace_id));
     {
         std::lock_guard lock(slot.value()->mutex);
+        if (slot.value()->state.status != SessionStatus::Active) {
+            return core::Status::Error(core::ErrorCode::FailedPrecondition, "session is not active");
+        }
         slot.value()->state.last_active = std::chrono::steady_clock::now();
         slot.value()->state.last_trace_id = trace;
     }
@@ -159,7 +175,12 @@ std::vector<SessionSnapshot> SessionManager::CleanupExpired() {
             bool remove = false;
             {
                 std::lock_guard slot_lock(it->second->mutex);
-                remove = now - it->second->state.last_active > options_.idle_timeout;
+                remove = it->second->state.status == SessionStatus::Active &&
+                         now - it->second->state.last_active > options_.idle_timeout;
+                if (remove) {
+                    it->second->state.status = SessionStatus::Closing;
+                    it->second->state.close_reason = "idle_timeout";
+                }
             }
             if (remove) {
                 expired.push_back(std::move(it->second));
@@ -175,6 +196,7 @@ std::vector<SessionSnapshot> SessionManager::CleanupExpired() {
     for (const auto& slot : expired) {
         std::lock_guard lock(slot->mutex);
         snapshots.push_back(SnapshotLocked(slot->state));
+        slot->state.status = SessionStatus::Closed;
         logger_.info("[trace={}] [session] expired session={} user={} persona={}",
                      slot->state.last_trace_id.empty() ? "-" : slot->state.last_trace_id,
                      slot->state.session_id,
@@ -199,11 +221,36 @@ core::Status SessionManager::AddTurn(std::string_view session_id,
 
     std::lock_guard lock(slot.value()->mutex);
     auto& state = slot.value()->state;
+    if (state.status != SessionStatus::Active) {
+        return core::Status::Error(core::ErrorCode::FailedPrecondition, "session is not active");
+    }
     state.last_active = std::chrono::steady_clock::now();
     state.last_trace_id = NonEmptyOrGeneratedTrace(std::string(trace_id));
     state.recent_history.push_back(std::move(turn));
-    while (state.recent_history.size() > options_.max_recent_turns) {
+    while (state.recent_history.size() > state.max_recent_turns) {
         state.recent_history.pop_front();
+    }
+    return core::Status::Ok();
+}
+
+core::Status SessionManager::RecordRequestMetrics(std::string_view session_id,
+                                                  std::chrono::milliseconds latency,
+                                                  bool success,
+                                                  std::string_view trace_id) {
+    auto slot = FindSlot(session_id);
+    if (!slot.ok()) {
+        return slot.status();
+    }
+    std::lock_guard lock(slot.value()->mutex);
+    auto& metrics = slot.value()->state.metrics;
+    ++metrics.request_count;
+    if (!success) {
+        ++metrics.failed_request_count;
+    }
+    metrics.last_latency = latency;
+    metrics.total_latency += latency;
+    if (!trace_id.empty()) {
+        slot.value()->state.last_trace_id = std::string(trace_id);
     }
     return core::Status::Ok();
 }
@@ -270,6 +317,9 @@ core::Status SessionManager::Submit(core::ThreadPool& pool,
             }
 
             std::lock_guard lock(slot.value()->mutex);
+            if (slot.value()->state.status != SessionStatus::Active) {
+                return core::Status::Error(core::ErrorCode::FailedPrecondition, "session is not active");
+            }
             slot.value()->state.last_active = std::chrono::steady_clock::now();
             slot.value()->state.last_trace_id = trace_id;
 
@@ -325,16 +375,19 @@ core::Result<std::shared_ptr<SessionManager::SessionSlot>> SessionManager::FindS
 }
 
 SessionSnapshot SessionManager::SnapshotLocked(const SessionState& state) const {
-    return SessionSnapshot{
-        state.session_id,
-        state.user_uuid,
-        state.persona_id,
-        state.last_trace_id,
-        state.created_at,
-        state.last_active,
-        state.recent_history.size(),
-        state.emotion_state.state(),
-    };
+    SessionSnapshot snapshot;
+    snapshot.session_id = state.session_id;
+    snapshot.user_uuid = state.user_uuid;
+    snapshot.persona_id = state.persona_id;
+    snapshot.last_trace_id = state.last_trace_id;
+    snapshot.status = state.status;
+    snapshot.close_reason = state.close_reason;
+    snapshot.created_at = state.created_at;
+    snapshot.last_active = state.last_active;
+    snapshot.recent_turn_count = state.recent_history.size();
+    snapshot.emotion_state = state.emotion_state.state();
+    snapshot.metrics = state.metrics;
+    return snapshot;
 }
 
 core::TraceContext SessionManager::MakeTrace(DispatchOptions options) const {

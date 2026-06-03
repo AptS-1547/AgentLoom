@@ -3,7 +3,9 @@
 #include "../net/http_client/http_client.h"
 #include "../net/http_client/retry_policy.h"
 #include <unordered_map>
+#include <chrono>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <filesystem>
 #include <../core/result.h>
@@ -20,6 +22,8 @@ struct OpenAiLlmClientOptions {
     int timeout_ms = 30000;
     /// Retry policy for transient failures.
     net::RetryPolicy retry_policy;
+    /// Local OpenAI-compatible endpoints normally do not require a bearer key.
+    bool require_api_key = true;
 };
 
 enum class ChatRole {
@@ -90,6 +94,36 @@ private:
 
     OpenAiLlmClientOptions options_;
     net::IHttpClient& http_client_;
+};
+
+struct FallbackLlmClientOptions {
+    int failure_threshold = 3;
+    std::chrono::milliseconds primary_reconnect_interval{30000};
+    bool fallback_on_primary_missing = true;
+    bool fallback_on_auth_failure = true;
+    bool fallback_on_unavailable = true;
+};
+
+class FallbackLlmClient final : public ILlmClient {
+public:
+    FallbackLlmClient(std::shared_ptr<ILlmClient> primary,
+                      std::shared_ptr<ILlmClient> fallback,
+                      FallbackLlmClientOptions options = {});
+
+    core::Result<ChatCompletionResponse> Complete(const ChatCompletionRequest& req) override;
+
+private:
+    bool ShouldTryPrimary(std::chrono::steady_clock::time_point now) const;
+    bool ShouldFallback(const core::Status& status) const;
+    void RecordPrimarySuccess();
+    void RecordPrimaryFailure();
+
+    std::shared_ptr<ILlmClient> primary_;
+    std::shared_ptr<ILlmClient> fallback_;
+    FallbackLlmClientOptions options_;
+    mutable std::mutex mutex_;
+    int consecutive_failures_ = 0;
+    std::chrono::steady_clock::time_point next_primary_probe_{};
 };
 
 

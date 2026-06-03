@@ -20,6 +20,22 @@
 
 namespace agent::service::persona {
 
+enum class SessionStatus {
+    Creating,
+    Active,
+    Disconnected,
+    Closing,
+    Closed,
+};
+
+struct SessionMetrics {
+    std::uint64_t turn_count = 0;
+    std::uint64_t request_count = 0;
+    std::uint64_t failed_request_count = 0;
+    std::chrono::milliseconds total_latency{0};
+    std::chrono::milliseconds last_latency{0};
+};
+
 struct ConversationTurn {
     std::string user_input;
     std::string emotion = "neutral";
@@ -52,10 +68,13 @@ struct SessionSnapshot {
     std::string user_uuid;
     std::string persona_id;
     std::string last_trace_id;
+    SessionStatus status = SessionStatus::Active;
+    std::string close_reason;
     std::chrono::steady_clock::time_point created_at{};
     std::chrono::steady_clock::time_point last_active{};
     std::size_t recent_turn_count = 0;
     EmotionState emotion_state;
+    SessionMetrics metrics;
 };
 
 struct DispatchOptions {
@@ -72,11 +91,15 @@ struct SessionState {
     std::string user_uuid;
     std::string persona_id;
     std::string last_trace_id;
+    SessionStatus status = SessionStatus::Creating;
+    std::string close_reason;
     std::chrono::steady_clock::time_point created_at{};
     std::chrono::steady_clock::time_point last_active{};
     std::deque<ConversationTurn> recent_history;
     EmotionStateTracker emotion_state;
     std::unique_ptr<PromptBuilder> prompt_builder;
+    SessionMetrics metrics;
+    std::size_t max_recent_turns = 20;
 };
 
 class ISessionManager {
@@ -110,6 +133,10 @@ public:
     core::Status AddTurn(std::string_view session_id,
                          ConversationTurn turn,
                          std::string_view trace_id = {});
+    core::Status RecordRequestMetrics(std::string_view session_id,
+                                      std::chrono::milliseconds latency,
+                                      bool success,
+                                      std::string_view trace_id = {});
 
     core::Status SubmitCompute(DispatchOptions options, SessionTask task);
     core::Status SubmitIo(DispatchOptions options, SessionTask task);

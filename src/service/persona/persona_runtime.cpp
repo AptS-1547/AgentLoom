@@ -139,11 +139,13 @@ PersonaRuntime::PersonaRuntime(SessionManager& sessions,
                                std::shared_ptr<IEmotionAnalyzer> emotion_analyzer,
                                std::shared_ptr<llm::ILlmClient> llm_client,
                                PersonaRuntimeOptions options,
+                               std::shared_ptr<IAnswerCacheProvider> answer_cache_provider,
                                core::LoggerAdapter logger)
     : sessions_(sessions),
       memory_provider_(std::move(memory_provider)),
       emotion_analyzer_(std::move(emotion_analyzer)),
       llm_client_(std::move(llm_client)),
+      answer_cache_provider_(std::move(answer_cache_provider)),
       options_(std::move(options)),
       logger_(std::move(logger)) {}
 
@@ -289,23 +291,73 @@ core::Result<std::vector<llm::ChatMessage>> PersonaRuntime::BuildMessages(
 }
 
 void PersonaRuntime::CompleteWithLlm(SessionState& session, PreparedChat prepared, ChatCallback callback) {
-    const auto llm_start = std::chrono::steady_clock::now();
-    llm::ChatCompletionRequest llm_req;
-    llm_req.model = prepared.request.model.empty() ? options_.default_model : prepared.request.model;
-    llm_req.messages = prepared.messages;
-    llm_req.temperature = static_cast<float>(prepared.generation.temperature);
-    llm_req.max_tokens = prepared.generation.max_tokens;
-    llm_req.top_p = static_cast<float>(prepared.generation.top_p);
+    std::optional<AnswerCacheLookupRequest> answer_cache_lookup;
+    std::optional<AnswerCacheLookupResult> answer_cache_hit;
+    if (answer_cache_provider_) {
+        const auto cache_start = std::chrono::steady_clock::now();
+        prepared.answer_cache.enabled = true;
+        AnswerCacheLookupRequest lookup;
+        lookup.session_id = prepared.request.session_id;
+        lookup.user_uuid = session.user_uuid;
+        lookup.persona_id = session.persona_id;
+        lookup.trace_id = prepared.request.trace_id;
+        lookup.query = prepared.request.user_input;
+        lookup.model = prepared.request.model.empty() ? options_.default_model : prepared.request.model;
+        lookup.generation = prepared.generation;
+        lookup.messages = prepared.messages;
 
-    auto llm_result = llm_client_->Complete(llm_req);
-    prepared.latency.llm_total = Since(llm_start);
-    prepared.latency.total = Since(prepared.started_at);
-    if (!llm_result.ok()) {
-        callback(llm_result.status());
-        return;
+        auto cache_result = answer_cache_provider_->Lookup(lookup);
+        prepared.latency.answer_cache = Since(cache_start);
+        if (!cache_result.ok()) {
+            callback(cache_result.status());
+            return;
+        }
+        if (cache_result.value().hit) {
+            prepared.answer_cache.hit = true;
+            prepared.answer_cache.source = cache_result.value().source;
+            prepared.answer_cache.cache_key = cache_result.value().cache_key;
+            prepared.answer_cache.similarity_score = cache_result.value().similarity_score;
+            answer_cache_hit = std::move(cache_result).value();
+        } else {
+            answer_cache_lookup = std::move(lookup);
+        }
     }
 
-    auto ai_emotion = emotion_analyzer_->Analyze(llm_result.value().content, prepared.request.trace_id);
+    const auto llm_start = std::chrono::steady_clock::now();
+    llm::ChatCompletionResponse completion;
+    if (answer_cache_hit) {
+        completion.content = answer_cache_hit->response;
+        completion.model = prepared.request.model.empty() ? options_.default_model : prepared.request.model;
+        prepared.latency.llm_total = std::chrono::milliseconds{0};
+    } else {
+        llm::ChatCompletionRequest llm_req;
+        llm_req.model = prepared.request.model.empty() ? options_.default_model : prepared.request.model;
+        llm_req.messages = prepared.messages;
+        llm_req.temperature = static_cast<float>(prepared.generation.temperature);
+        llm_req.max_tokens = prepared.generation.max_tokens;
+        llm_req.top_p = static_cast<float>(prepared.generation.top_p);
+
+        auto llm_result = llm_client_->Complete(llm_req);
+        prepared.latency.llm_total = Since(llm_start);
+        if (!llm_result.ok()) {
+            callback(llm_result.status());
+            return;
+        }
+        completion = std::move(llm_result).value();
+        if (answer_cache_provider_ && answer_cache_lookup) {
+            AnswerCacheStoreRequest store;
+            store.lookup = std::move(*answer_cache_lookup);
+            store.response = completion.content;
+            auto store_status = answer_cache_provider_->Store(store);
+            if (!store_status.ok()) {
+                callback(store_status);
+                return;
+            }
+        }
+    }
+    prepared.latency.total = Since(prepared.started_at);
+
+    auto ai_emotion = emotion_analyzer_->Analyze(completion.content, prepared.request.trace_id);
     if (!ai_emotion.ok()) {
         callback(ai_emotion.status());
         return;
@@ -317,7 +369,7 @@ void PersonaRuntime::CompleteWithLlm(SessionState& session, PreparedChat prepare
     turn.intensity = prepared.user_emotion.emotion.intensity;
     turn.behavior = prepared.user_emotion.behavior;
     turn.tone = prepared.user_emotion.tone;
-    turn.response = llm_result.value().content;
+    turn.response = completion.content;
     turn.context_id = prepared.request.context_id;
 
     auto admit_status = memory_provider_->AdmitTurn(
@@ -343,18 +395,24 @@ void PersonaRuntime::CompleteWithLlm(SessionState& session, PreparedChat prepare
     session.last_active = std::chrono::steady_clock::now();
     session.last_trace_id = prepared.request.trace_id;
     session.recent_history.push_back(turn);
-    while (session.recent_history.size() > 20) {
+    ++session.metrics.turn_count;
+    ++session.metrics.request_count;
+    session.metrics.last_latency = prepared.latency.total;
+    session.metrics.total_latency += prepared.latency.total;
+    while (session.recent_history.size() > session.max_recent_turns) {
         session.recent_history.pop_front();
     }
 
     ChatResponse response;
     response.session_id = prepared.request.session_id;
     response.trace_id = prepared.request.trace_id;
-    response.response = llm_result.value().content;
+    response.response = completion.content;
     response.user_emotion = prepared.user_emotion;
     response.ai_emotion = std::move(ai_emotion).value();
     response.l0_hit = prepared.memory.l0_hit;
     response.l3_hit = prepared.memory.l3_hit;
+    response.turn_index = session.metrics.turn_count;
+    response.answer_cache = std::move(prepared.answer_cache);
     response.latency = prepared.latency;
     response.messages = std::move(prepared.messages);
     callback(std::move(response));

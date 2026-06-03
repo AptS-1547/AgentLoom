@@ -40,7 +40,15 @@ Json BuildRequestJson(const ChatCompletionRequest& req, const std::string& defau
 
 core::Result<ChatCompletionResponse> ParseResponse(const std::string& body, int status_code) {
     if (status_code != 200) {
-        return core::Status(core::ErrorCode::InternalError,
+        core::ErrorCode code = core::ErrorCode::InternalError;
+        if (status_code == 401 || status_code == 403) {
+            code = core::ErrorCode::PermissionDenied;
+        } else if (status_code == 429) {
+            code = core::ErrorCode::ResourceExhausted;
+        } else if (status_code >= 500 && status_code < 600) {
+            code = core::ErrorCode::Unavailable;
+        }
+        return core::Status(code,
             "LLM API returned status " + std::to_string(status_code) + ": " + body);
     }
 
@@ -154,7 +162,7 @@ core::Result<std::unique_ptr<OpenAiLlmClient>> OpenAiLlmClient::Create(
         return core::Status(core::ErrorCode::InvalidArgument,
             "OpenAI LLM client requires base_url");
     }
-    if (options.api_key.empty()) {
+    if (options.require_api_key && options.api_key.empty()) {
         return core::Status(core::ErrorCode::InvalidArgument,
             "OpenAI LLM client requires api_key");
     }
@@ -190,7 +198,9 @@ core::Result<ChatCompletionResponse> OpenAiLlmClient::ExecuteWithRetry(
     http_req.method = "POST";
     http_req.url = url;
     http_req.headers.push_back({"Content-Type", "application/json"});
-    http_req.headers.push_back({"Authorization", "Bearer " + options_.api_key});
+    if (!options_.api_key.empty()) {
+        http_req.headers.push_back({"Authorization", "Bearer " + options_.api_key});
+    }
     http_req.body = request_body;
     http_req.timeout_ms = options_.timeout_ms;
 
@@ -223,6 +233,87 @@ core::Result<ChatCompletionResponse> OpenAiLlmClient::ExecuteWithRetry(
     }
 
     return last_result_status;
+}
+
+FallbackLlmClient::FallbackLlmClient(std::shared_ptr<ILlmClient> primary,
+                                     std::shared_ptr<ILlmClient> fallback,
+                                     FallbackLlmClientOptions options)
+    : primary_(std::move(primary)),
+      fallback_(std::move(fallback)),
+      options_(options) {}
+
+core::Result<ChatCompletionResponse> FallbackLlmClient::Complete(const ChatCompletionRequest& req) {
+    if (!fallback_) {
+        return core::Status(core::ErrorCode::FailedPrecondition, "fallback llm client is required");
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    if (!primary_) {
+        if (options_.fallback_on_primary_missing) {
+            return fallback_->Complete(req);
+        }
+        return core::Status(core::ErrorCode::FailedPrecondition, "primary llm client is missing");
+    }
+
+    if (!ShouldTryPrimary(now)) {
+        return fallback_->Complete(req);
+    }
+
+    auto primary_result = primary_->Complete(req);
+    if (primary_result.ok()) {
+        RecordPrimarySuccess();
+        return primary_result;
+    }
+
+    RecordPrimaryFailure();
+    if (!ShouldFallback(primary_result.status())) {
+        return primary_result.status();
+    }
+
+    auto fallback_result = fallback_->Complete(req);
+    if (fallback_result.ok()) {
+        return fallback_result;
+    }
+
+    return core::Status(
+        fallback_result.status().code(),
+        "primary llm failed: " + primary_result.status().message() +
+            "; fallback llm failed: " + fallback_result.status().message());
+}
+
+bool FallbackLlmClient::ShouldTryPrimary(std::chrono::steady_clock::time_point now) const {
+    std::lock_guard lock(mutex_);
+    return consecutive_failures_ < options_.failure_threshold || now >= next_primary_probe_;
+}
+
+bool FallbackLlmClient::ShouldFallback(const core::Status& status) const {
+    switch (status.code()) {
+    case core::ErrorCode::InvalidArgument:
+    case core::ErrorCode::FailedPrecondition:
+        return options_.fallback_on_primary_missing;
+    case core::ErrorCode::PermissionDenied:
+        return options_.fallback_on_auth_failure;
+    case core::ErrorCode::Unavailable:
+    case core::ErrorCode::Timeout:
+    case core::ErrorCode::ResourceExhausted:
+        return options_.fallback_on_unavailable;
+    default:
+        return false;
+    }
+}
+
+void FallbackLlmClient::RecordPrimarySuccess() {
+    std::lock_guard lock(mutex_);
+    consecutive_failures_ = 0;
+    next_primary_probe_ = {};
+}
+
+void FallbackLlmClient::RecordPrimaryFailure() {
+    std::lock_guard lock(mutex_);
+    ++consecutive_failures_;
+    if (consecutive_failures_ >= options_.failure_threshold) {
+        next_primary_probe_ = std::chrono::steady_clock::now() + options_.primary_reconnect_interval;
+    }
 }
 
 }  // namespace agent::llm

@@ -500,6 +500,8 @@ endif()
 add_library(agent_llm STATIC
     src/llm/openai_llm_client.h
     src/llm/openai_llm_client.cpp
+    src/llm/local_llm_client.h
+    src/llm/local_llm_client.cpp
 )
 
 target_include_directories(agent_llm PUBLIC
@@ -510,6 +512,8 @@ target_include_directories(agent_llm PUBLIC
 
 target_link_libraries(agent_llm PUBLIC
     agent_http_client
+    multimodal_proto
+    gRPC::grpc++
 )
 
 if(BERT_BUILD_TESTS)
@@ -1034,11 +1038,22 @@ add_library(agent_service STATIC
     src/service/persona/session_manager.h
     src/service/persona/persona_runtime.cpp
     src/service/persona/persona_runtime.h
+    src/service/gateway/gateway_models.h
+    src/service/gateway/classroom_scheduler.cpp
+    src/service/gateway/classroom_scheduler.h
+    src/service/gateway/persona_gateway_service.cpp
+    src/service/gateway/persona_gateway_service.h
+    src/service/gateway/persona_gateway_http_adapter.cpp
+    src/service/gateway/persona_gateway_http_adapter.h
+    src/service/gateway/persona_gateway_server.cpp
+    src/service/gateway/persona_gateway_server.h
 )
 
 target_include_directories(agent_service PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src/service/inference
     ${CMAKE_CURRENT_SOURCE_DIR}/src/service/persona
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/service/gateway
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/net
     ${CMAKE_CURRENT_SOURCE_DIR}/src/llm
     ${CMAKE_CURRENT_SOURCE_DIR}/src/semantic_cache
     ${CMAKE_CURRENT_SOURCE_DIR}/src/memory
@@ -1054,6 +1069,8 @@ target_link_libraries(agent_service PUBLIC
     agent_semantic_cache
     agent_memory
     agent_core
+    agent_net
+    nlohmann_json::nlohmann_json
     spdlog::spdlog
 )
 
@@ -1062,6 +1079,7 @@ if(BERT_BUILD_TESTS)
         tests/service/persona_algorithm_test.cpp
         tests/service/session_manager_test.cpp
         tests/service/persona_runtime_test.cpp
+        tests/service/persona_gateway_service_test.cpp
     )
 
     target_link_libraries(service_tests PRIVATE

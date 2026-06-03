@@ -89,9 +89,51 @@ struct ChatRequest {
 
 struct ChatLatencyBreakdown {
     std::chrono::milliseconds memory_context{0};
+    std::chrono::milliseconds answer_cache{0};
     std::chrono::milliseconds prompt_build{0};
     std::chrono::milliseconds llm_total{0};
     std::chrono::milliseconds total{0};
+};
+
+struct AnswerCacheInfo {
+    bool enabled = false;
+    bool hit = false;
+    bool bypassed = false;
+    std::string source = "llm";
+    std::string cache_key;
+    float similarity_score = 0.0f;
+};
+
+struct AnswerCacheLookupRequest {
+    std::string session_id;
+    std::string user_uuid;
+    std::string persona_id;
+    std::string trace_id;
+    std::string query;
+    std::string model;
+    GenerationParams generation;
+    std::vector<llm::ChatMessage> messages;
+};
+
+struct AnswerCacheLookupResult {
+    bool hit = false;
+    std::string response;
+    std::string cache_key;
+    std::string source = "semantic_cache";
+    float similarity_score = 0.0f;
+};
+
+struct AnswerCacheStoreRequest {
+    AnswerCacheLookupRequest lookup;
+    std::string response;
+};
+
+class IAnswerCacheProvider {
+public:
+    virtual ~IAnswerCacheProvider() = default;
+
+    virtual core::Result<AnswerCacheLookupResult> Lookup(const AnswerCacheLookupRequest& request) = 0;
+    virtual core::Status Store(const AnswerCacheStoreRequest& request) = 0;
 };
 
 struct ChatResponse {
@@ -102,6 +144,8 @@ struct ChatResponse {
     EmotionAnalysis ai_emotion;
     bool l0_hit = false;
     bool l3_hit = false;
+    std::uint64_t turn_index = 0;
+    AnswerCacheInfo answer_cache;
     ChatLatencyBreakdown latency;
     std::vector<llm::ChatMessage> messages;
 };
@@ -120,6 +164,7 @@ public:
                    std::shared_ptr<IEmotionAnalyzer> emotion_analyzer,
                    std::shared_ptr<llm::ILlmClient> llm_client,
                    PersonaRuntimeOptions options = {},
+                   std::shared_ptr<IAnswerCacheProvider> answer_cache_provider = nullptr,
                    core::LoggerAdapter logger = core::LoggerAdapter::ForModule("service"));
 
     core::Status SubmitChat(ChatRequest request, ChatCallback callback);
@@ -131,6 +176,7 @@ private:
         EmotionAnalysis user_emotion;
         GenerationParams generation;
         std::vector<llm::ChatMessage> messages;
+        AnswerCacheInfo answer_cache;
         std::chrono::steady_clock::time_point started_at;
         ChatLatencyBreakdown latency;
     };
@@ -148,6 +194,7 @@ private:
     std::shared_ptr<IMemoryContextProvider> memory_provider_;
     std::shared_ptr<IEmotionAnalyzer> emotion_analyzer_;
     std::shared_ptr<llm::ILlmClient> llm_client_;
+    std::shared_ptr<IAnswerCacheProvider> answer_cache_provider_;
     PersonaRuntimeOptions options_;
     core::LoggerAdapter logger_;
 };

@@ -1,4 +1,5 @@
 #include "../../src/llm/openai_llm_client.h"
+#include "../../src/llm/local_llm_client.h"
 #include "../../src/net/http_client/beast_http_client.h"
 #include <boost/asio.hpp>
 #include <boost/beast.hpp>
@@ -12,8 +13,16 @@
 #include <thread>
 
 using agent::llm::ChatCompletionRequest;
+using agent::llm::ChatCompletionResponse;
 using agent::llm::ChatRole;
+using agent::llm::FallbackLlmClient;
+using agent::llm::FallbackLlmClientOptions;
+using agent::llm::ILlmClient;
+using agent::llm::ILocalLlm;
 using agent::llm::LlmPromptStore;
+using agent::llm::LocalLlmChatClient;
+using agent::llm::LocalLlmRequest;
+using agent::llm::LocalLlmResponse;
 using agent::llm::OpenAiLlmClient;
 using agent::llm::OpenAiLlmClientOptions;
 using agent::net::BeastHttpClient;
@@ -125,6 +134,47 @@ std::string MakeBaseUrl(std::uint16_t port) {
 }
 
 }  // namespace
+
+class ScriptedLlmClient final : public ILlmClient {
+public:
+    explicit ScriptedLlmClient(std::string name, core::Status status = core::Status::Ok())
+        : name_(std::move(name)),
+          status_(std::move(status)) {}
+
+    core::Result<ChatCompletionResponse> Complete(const ChatCompletionRequest&) override {
+        ++call_count;
+        if (!status_.ok()) {
+            return status_;
+        }
+        ChatCompletionResponse response;
+        response.model = name_;
+        response.content = name_ + "-response";
+        return response;
+    }
+
+    int call_count = 0;
+
+private:
+    std::string name_;
+    core::Status status_;
+};
+
+class FakeLocalLlm final : public ILocalLlm {
+public:
+    core::Result<LocalLlmResponse> Generate(const LocalLlmRequest& request) override {
+        ++call_count;
+        last_request = request;
+        LocalLlmResponse response;
+        response.text = "local grpc reply";
+        response.prompt_tokens = 12;
+        response.generated_tokens = 5;
+        response.result_source = "grpc_local";
+        return response;
+    }
+
+    int call_count = 0;
+    LocalLlmRequest last_request;
+};
 
 class OpenAiLlmClientTest : public ::testing::Test {
 protected:
@@ -310,6 +360,94 @@ TEST(OpenAiLlmClientRetryTest, FourXxIsNotRetried) {
 }
 
 // ── unit: LlmPromptStore ─────────────────────────────────────────────────────
+
+TEST(FallbackLlmClientTest, MissingPrimaryFallsBackToLocalClient) {
+    auto local = std::make_shared<ScriptedLlmClient>("local");
+    FallbackLlmClient client(nullptr, local);
+
+    auto result = client.Complete({});
+    ASSERT_TRUE(result.ok()) << result.status().message();
+    EXPECT_EQ(result.value().content, "local-response");
+    EXPECT_EQ(local->call_count, 1);
+}
+
+TEST(FallbackLlmClientTest, AuthFailureFallsBackToLocalClient) {
+    auto cloud = std::make_shared<ScriptedLlmClient>(
+        "cloud",
+        core::Status::Error(core::ErrorCode::PermissionDenied, "missing or invalid api key"));
+    auto local = std::make_shared<ScriptedLlmClient>("local");
+    FallbackLlmClient client(cloud, local);
+
+    auto result = client.Complete({});
+    ASSERT_TRUE(result.ok()) << result.status().message();
+    EXPECT_EQ(result.value().content, "local-response");
+    EXPECT_EQ(cloud->call_count, 1);
+    EXPECT_EQ(local->call_count, 1);
+}
+
+TEST(FallbackLlmClientTest, ConsecutiveCloudFailuresOpenCircuitUntilReconnectProbe) {
+    auto cloud = std::make_shared<ScriptedLlmClient>(
+        "cloud",
+        core::Status::Error(core::ErrorCode::Unavailable, "cloud unavailable"));
+    auto local = std::make_shared<ScriptedLlmClient>("local");
+
+    FallbackLlmClientOptions options;
+    options.failure_threshold = 2;
+    options.primary_reconnect_interval = std::chrono::milliseconds(1000);
+    FallbackLlmClient client(cloud, local, options);
+
+    auto first = client.Complete({});
+    auto second = client.Complete({});
+    auto third = client.Complete({});
+    ASSERT_TRUE(first.ok()) << first.status().message();
+    ASSERT_TRUE(second.ok()) << second.status().message();
+    ASSERT_TRUE(third.ok()) << third.status().message();
+
+    EXPECT_EQ(cloud->call_count, 2);
+    EXPECT_EQ(local->call_count, 3);
+}
+
+TEST(OpenAiLlmClientCreateTest, AllowsLocalOpenAiCompatibleEndpointWithoutApiKey) {
+    BeastHttpClientOptions http_opts;
+    auto http = BeastHttpClient::Create(http_opts).value();
+
+    OpenAiLlmClientOptions opts;
+    opts.base_url = "http://127.0.0.1:8080/v1";
+    opts.api_key = "";
+    opts.require_api_key = false;
+    auto r = OpenAiLlmClient::Create(opts, *http);
+    EXPECT_TRUE(r.ok()) << r.status().message();
+}
+
+TEST(LocalLlmChatClientTest, AdaptsChatCompletionToLocalGrpcContract) {
+    auto local = std::make_shared<FakeLocalLlm>();
+    LocalLlmChatClient client(local, {.default_model = "local-model", .task_type = "persona_chat"});
+
+    ChatCompletionRequest req;
+    req.messages.push_back({ChatRole::System, "you are a tutor"});
+    req.messages.push_back({ChatRole::User, "hello"});
+    req.max_tokens = 128;
+    req.temperature = 0.5f;
+    req.top_p = 0.8f;
+
+    auto result = client.Complete(req);
+    ASSERT_TRUE(result.ok()) << result.status().message();
+    EXPECT_EQ(result.value().content, "local grpc reply");
+    EXPECT_EQ(result.value().model, "local-model");
+    EXPECT_EQ(result.value().prompt_tokens, 12);
+    EXPECT_EQ(result.value().completion_tokens, 5);
+    EXPECT_EQ(result.value().total_tokens, 17);
+
+    EXPECT_EQ(local->call_count, 1);
+    EXPECT_EQ(local->last_request.task_type, "persona_chat");
+    EXPECT_EQ(local->last_request.max_tokens, 128);
+    EXPECT_FLOAT_EQ(local->last_request.temperature, 0.5f);
+    EXPECT_FLOAT_EQ(local->last_request.top_p, 0.8f);
+    EXPECT_NE(local->last_request.prompt.find("<system>"), std::string::npos);
+    EXPECT_NE(local->last_request.prompt.find("you are a tutor"), std::string::npos);
+    EXPECT_NE(local->last_request.prompt.find("<user>"), std::string::npos);
+    EXPECT_NE(local->last_request.prompt.find("hello"), std::string::npos);
+}
 
 TEST(LlmPromptStoreTest, LoadAndGet) {
     // Write a temp file

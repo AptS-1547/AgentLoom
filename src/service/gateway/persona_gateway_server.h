@@ -17,6 +17,7 @@ namespace agent::service::gateway {
 
 struct PersonaGatewayServerOptions {
     ::net::HttpServerOptions http;
+    GatewayAuthOptions auth;
     core::ThreadPoolOptions compute_pool;
     core::ThreadPoolOptions io_pool;
     persona::SessionOptions session;
@@ -55,6 +56,7 @@ private:
     void HandleHttp(std::shared_ptr<::net::IHttpRequest> request);
     void HandleWebSocket(std::shared_ptr<::net::IWebSocketStreamRequest> request);
     core::Status ValidateDependencies() const;
+    core::Status EnsureAuthSessionStore();
 
     PersonaGatewayServerOptions options_;
     PersonaGatewayServerDependencies dependencies_;
@@ -65,6 +67,9 @@ private:
     persona::PersonaRuntime runtime_;
     ClassroomScheduler classroom_scheduler_;
     PersonaGatewayService service_;
+    std::shared_ptr<IAuthSessionStore> auth_session_store_;
+    std::shared_ptr<IGatewayAuthenticator> authenticator_;
+    std::shared_ptr<IAuthRegistrationService> auth_registration_;
     PersonaGatewayHttpAdapter adapter_;
     ::net::HttpServer http_server_;
     std::shared_ptr<::net::StaticFileHandler> static_files_;

@@ -105,6 +105,9 @@ The new frontend should call first-party business APIs. These API shapes should 
 Recommended route groups:
 
 ```text
+GET  /api/auth/me
+POST /api/auth/register
+
 POST /api/session/create
 POST /api/session/close
 GET  /api/session/{sessionId}
@@ -115,6 +118,7 @@ POST /api/chat/message
 
 POST /api/classroom/message
 POST /api/classroom/proactive
+POST /api/classroom/poll
 
 POST /api/report/training
 
@@ -126,8 +130,12 @@ GET  /api/document/{documentId}/analysis
 WebSocket routes:
 
 ```text
-/ws/session?session_id=...&token=...
+/ws/session
 ```
+
+WebSocket authentication uses the same same-origin `agent_auth` Cookie or `Authorization: Bearer <jwt>` header as HTTP during the upgrade handshake. Frontend code should not put JWTs in the WebSocket query string.
+
+`POST /api/auth/register` is the E2E/local SSO bootstrap endpoint. It is intentionally unauthenticated, creates a backend-local auth session row, signs an RS256 JWT, and returns `Set-Cookie: agent_auth=<jwt>; Path=/; HttpOnly; SameSite=Lax` by default. Production deployment should place this endpoint behind the intended registration policy, rate limit, and WAF boundary.
 
 Long-term real-time interactions should converge on WebSocket for streaming replies, emotion updates, proactive events, and future multimodal events. HTTP chat endpoints may remain useful for initial migration, E2E, fallback, and debugging, but they should not permanently compete with WebSocket as a separate real-time protocol.
 

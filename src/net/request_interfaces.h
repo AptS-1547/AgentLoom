@@ -31,6 +31,7 @@ class IWebSocketStreamRequest {
 public:
     virtual ~IWebSocketStreamRequest() = default;
 
+    virtual const BeastHttpRequest& handshake_request() const noexcept = 0;
     virtual const ConnectionContext& connection() const noexcept = 0;
     virtual WebSocketMessage& message() noexcept = 0;
     virtual const WebSocketMessage& message() const noexcept = 0;

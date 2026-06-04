@@ -126,6 +126,130 @@ TLS deployment
 
 ## 5. Gateway API Contract
 
+All HTTP API responses use this envelope:
+
+```json
+{
+  "ok": true,
+  "traceId": "...",
+  "sessionId": "...",
+  "latencyMs": 0,
+  "data": {}
+}
+```
+
+Error responses use:
+
+```json
+{
+  "ok": false,
+  "traceId": "...",
+  "error": {
+    "code": "PERMISSION_DENIED",
+    "message": "..."
+  }
+}
+```
+
+Known error code strings currently include:
+
+```text
+INVALID_ARGUMENT
+NOT_FOUND
+ALREADY_EXISTS
+PERMISSION_DENIED
+FAILED_PRECONDITION
+RESOURCE_EXHAUSTED
+UNAVAILABLE
+TIMEOUT
+INTERNAL_ERROR
+UNKNOWN
+```
+
+The backend also returns `X-Trace-Id` in HTTP responses.
+
+### 5.0 Auth Identity
+
+```http
+POST /api/auth/register
+Content-Type: application/json
+X-Trace-Id: <trace-id>
+```
+
+Request:
+
+```json
+{
+  "userUuid": "optional-client-or-test-user-uuid",
+  "tenantId": "default",
+  "subject": "optional-login-subject",
+  "ttlSeconds": 28800
+}
+```
+
+Response:
+
+```json
+{
+  "ok": true,
+  "traceId": "...",
+  "data": {
+    "authenticated": true,
+    "userUuid": "e2e-user-001",
+    "tenantId": "default",
+    "subject": "e2e-user-001",
+    "tokenId": "jwt-session-id",
+    "issuedAt": 1234560000,
+    "expiresAt": 1234567890,
+    "token": "<jwt>"
+  }
+}
+```
+
+Headers:
+
+```http
+Set-Cookie: agent_auth=<jwt>; Path=/; Max-Age=<seconds>; HttpOnly; SameSite=Lax
+```
+
+Notes:
+
+```text
+This endpoint bypasses normal JWT authentication so a browser E2E flow can create its first login state.
+The backend signs an RS256 JWT and stores tokenId -> userUuid/tenantId in SQLite.
+The returned token is useful for Playwright and non-browser tests; browser code should rely on the Set-Cookie header.
+```
+
+```http
+GET /api/auth/me
+X-Trace-Id: <trace-id>
+Cookie: agent_auth=<jwt>
+```
+
+Response:
+
+```json
+{
+  "ok": true,
+  "traceId": "...",
+  "data": {
+    "authenticated": true,
+    "userUuid": "e2e-user-001",
+    "tenantId": "default",
+    "subject": "e2e-user-001"
+  }
+}
+```
+
+Frontend usage:
+
+```text
+Call this endpoint during app bootstrap.
+If authenticated=false in dev mode, the UI may continue as anonymous local_user.
+If SSO is required and the backend returns 401/403, show the unauthorized state.
+Do not let UI state override userUuid or tenantId.
+```
+
 ### 5.1 Create Session
 
 ```http
@@ -152,6 +276,26 @@ Notes:
 ```text
 userUuid should come from auth/JWT on the backend when SSO is enabled.
 body.userUuid may exist for local dev, but backend auth context should override it.
+```
+
+Additional session creation fields now supported by the gateway:
+
+```json
+{
+  "classroomId": "optional-classroom-id",
+  "contextIds": ["group_1"],
+  "contextPatterns": ["private_*"],
+  "proactiveLevel": "off",
+  "defaultPersona": true
+}
+```
+
+Notes:
+
+```text
+classroomId/contextIds/contextPatterns/defaultPersona register this session in the classroom scheduler.
+proactiveLevel accepts "off", "low", or "medium".
+The frontend should include classroomId when creating classroom simulation persona sessions.
 ```
 
 Response:
@@ -320,6 +464,154 @@ Request:
 
 After close, the frontend must prevent further sends for that session.
 
+### 5.6 Classroom Message
+
+```http
+POST /api/classroom/message
+Content-Type: application/json
+X-Trace-Id: <trace-id>
+```
+
+Request:
+
+```json
+{
+  "classroomId": "classroom-a",
+  "sessionId": "",
+  "targetPersonaId": "xiaozhi",
+  "contextId": "group_2",
+  "message": "please answer",
+  "broadcast": false,
+  "model": ""
+}
+```
+
+Routing semantics:
+
+```text
+If sessionId is present, route directly to that session.
+Else if targetPersonaId/personaId is present, route to that persona in classroomId.
+Else if contextId is present, scheduler resolves exact contextIds, then contextPatterns.
+Else scheduler uses default persona fallback.
+```
+
+Response:
+
+```json
+{
+  "ok": true,
+  "traceId": "...",
+  "sessionId": "session-b",
+  "latencyMs": 0,
+  "data": {
+    "classroomId": "classroom-a",
+    "speakerPersonaId": "xiaozhi",
+    "content": "...",
+    "shouldSpeak": true,
+    "turnIndex": 1,
+    "userEmotion": {
+      "primary": "neutral",
+      "intensity": 0.0,
+      "behavior": "unknown",
+      "tone": "neutral"
+    },
+    "aiEmotion": {
+      "primary": "neutral",
+      "intensity": 0.0,
+      "behavior": "unknown",
+      "tone": "neutral"
+    }
+  }
+}
+```
+
+### 5.7 Classroom Proactive
+
+```http
+POST /api/classroom/proactive
+Content-Type: application/json
+X-Trace-Id: <trace-id>
+```
+
+Request:
+
+```json
+{
+  "classroomId": "classroom-a",
+  "sessionId": "",
+  "personaId": "xiaozhi",
+  "contextId": "group_2",
+  "model": ""
+}
+```
+
+This endpoint forces a proactive generation request for the resolved persona. It is useful for manual UI controls and debugging. For normal classroom simulation polling, prefer `/api/classroom/poll`.
+
+Response shape is the same as `/api/classroom/message`.
+
+### 5.8 Classroom Poll
+
+```http
+POST /api/classroom/poll
+Content-Type: application/json
+X-Trace-Id: <trace-id>
+```
+
+Request:
+
+```json
+{
+  "classroomId": "classroom-a",
+  "personaId": "xiaozhi",
+  "contextId": "group_2",
+  "systemEvent": false,
+  "systemEventContent": "",
+  "model": ""
+}
+```
+
+Semantics:
+
+```text
+off: never proactive.
+low: only systemEvent can trigger proactive speech.
+medium: idle trigger can produce proactive speech.
+WAITING_RESPONSE state: poll returns shouldSpeak=false until timeout or user reply.
+DORMANT state: poll returns shouldSpeak=false until user message resets state.
+```
+
+No-speech response:
+
+```json
+{
+  "ok": true,
+  "traceId": "...",
+  "sessionId": "session-b",
+  "latencyMs": 0,
+  "data": {
+    "classroomId": "classroom-a",
+    "speakerPersonaId": "xiaozhi",
+    "content": "",
+    "shouldSpeak": false,
+    "turnIndex": 0,
+    "userEmotion": {
+      "primary": "",
+      "intensity": 0.0,
+      "behavior": "",
+      "tone": ""
+    },
+    "aiEmotion": {
+      "primary": "",
+      "intensity": 0.0,
+      "behavior": "",
+      "tone": ""
+    }
+  }
+}
+```
+
+Speech response uses the same response shape as classroom message, with `shouldSpeak=true`.
+
 ## 6. WebSocket Contract
 
 HTTP should be used for the first E2E. WS should be kept as a second path.
@@ -328,6 +620,14 @@ Endpoint:
 
 ```text
 WS /ws/session
+```
+
+Auth:
+
+```text
+The WebSocket upgrade request uses the same Cookie/Bearer JWT auth as HTTP.
+Browsers automatically send same-origin agent_auth cookies during WS upgrade.
+If auth fails, the backend sends a type=error frame.
 ```
 
 Send:
@@ -355,7 +655,50 @@ Receive:
     "ok": true,
     "traceId": "...",
     "sessionId": "...",
-    "data": {}
+    "latencyMs": 0,
+    "data": {
+      "personaId": "lidazhi",
+      "turnIndex": 1,
+      "reply": {
+        "role": "assistant",
+        "content": "..."
+      },
+      "memory": {
+        "l0Hit": false,
+        "l3Hit": false
+      },
+      "answerCache": {
+        "enabled": false,
+        "hit": false,
+        "bypassed": false,
+        "source": "llm",
+        "cacheKey": "",
+        "similarityScore": 0.0
+      },
+      "pipelineLatency": {
+        "memoryContextMs": 0,
+        "answerCacheMs": 0,
+        "promptBuildMs": 0,
+        "llmTotalMs": 0,
+        "totalMs": 0
+      }
+    }
+  }
+}
+```
+
+Error:
+
+```json
+{
+  "type": "error",
+  "payload": {
+    "ok": false,
+    "traceId": "...",
+    "error": {
+      "code": "PERMISSION_DENIED",
+      "message": "..."
+    }
   }
 }
 ```
@@ -484,8 +827,9 @@ Recommended JWT claims:
   "sub": "e2e-user-001",
   "uuid": "e2e-user-001",
   "tenant": "default",
+  "jti": "e2e-session-001",
   "role": "student",
-  "iss": "competition-sso",
+  "iss": "agent-e2e",
   "aud": "agent-gateway",
   "exp": 1234567890
 }
@@ -501,6 +845,63 @@ Development mode may allow anonymous fallback:
 uuid = local_user
 tenant = default
 role = student
+```
+
+Backend-local login state:
+
+```text
+When gateway_auth.session_database_path is configured, JWT jti/sid maps to SQLite table gateway_auth_sessions.
+The backend may auto-provision this record for externally issued JWTs, require a pre-existing record in stricter mode, or create it through POST /api/auth/register.
+SQLite can revoke a login session independently of JWT expiry.
+```
+
+Registration/signing config:
+
+```json
+{
+  "gateway_auth": {
+    "enabled": true,
+    "allow_dev_identity": false,
+    "require_auth_for_api": true,
+    "cookie_name": "agent_auth",
+    "public_key_file": "jwt_public.pem",
+    "private_key_file": "jwt_private.pem",
+    "issuer": "agent-e2e",
+    "audience": "agent-gateway",
+    "clock_skew_seconds": 60,
+    "token_ttl_seconds": 28800,
+    "cookie_http_only": true,
+    "cookie_secure": false,
+    "cookie_same_site": "Lax",
+    "require_session_record": false,
+    "auto_provision_session": true,
+    "session_database_path": "gateway_auth.db"
+  }
+}
+```
+
+Current auth session table:
+
+```sql
+CREATE TABLE IF NOT EXISTS gateway_auth_sessions (
+    token_id TEXT PRIMARY KEY,
+    user_uuid TEXT NOT NULL,
+    tenant_id TEXT NOT NULL,
+    subject TEXT,
+    issued_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    revoked INTEGER NOT NULL DEFAULT 0,
+    revoked_reason TEXT,
+    updated_at INTEGER NOT NULL
+);
+```
+
+Frontend impact:
+
+```text
+The frontend only manages the browser cookie.
+It should not persist or edit token_id/user_uuid mappings.
+Logout should clear the cookie client-side; server-side revocation can be added as a future endpoint.
 ```
 
 ## 10. WAF Boundary
@@ -608,6 +1009,7 @@ Steps:
 1. Start C++ Gateway with static dist.
 2. Open frontend page.
 3. Inject JWT cookie or use dev anonymous mode.
+3a. Call `GET /api/auth/me` and assert identity.
 4. Create session.
 5. Send first chat message.
 6. Wait for assistant reply.
@@ -643,9 +1045,20 @@ C++ Gateway should not see blocked request
 
 ```text
 connect /ws/session
+same-origin agent_auth cookie is sent during upgrade
 send chat.message
 receive chat.final
 assert same UI rendering path as HTTP
+```
+
+### 12.5 Classroom Poll Path
+
+```text
+Create two sessions with the same classroomId.
+Register contextIds or targetPersonaId for each persona.
+POST /api/classroom/message with contextId and assert routed speakerPersonaId.
+POST /api/classroom/poll and assert shouldSpeak=false for off/low without systemEvent.
+POST /api/classroom/poll with systemEvent=true for low/medium and assert optional proactive reply.
 ```
 
 ## 13. Backend Test Responsibility
@@ -694,8 +1107,12 @@ Backend:
 [x] Gateway HTTP chat is async.
 [x] Gateway WS chat is async final-response.
 [x] Answer cache schema is exposed in chat response.
+[x] Add /api/auth/me.
+[x] Add competition JWT cookie auth.
+[x] Add SQLite auth session store.
+[x] Add classroom poll endpoint.
+[x] Add gateway E2E config sections.
 [ ] Add /api/health.
-[ ] Add competition JWT cookie auth.
 [ ] Add SQLite persona config repository.
 [ ] Add config import tool for Python persona JSON.
 [ ] Add E2E server startup fixture or script.

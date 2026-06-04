@@ -992,10 +992,12 @@ add_library(agent_config STATIC
     src/config/sections/config_path_section.cpp
     src/config/sections/embedding_config_section.cpp
     src/config/sections/grpc_config_section.cpp
+    src/config/sections/gateway_auth_config_section.cpp
     src/config/sections/http_config_section.cpp
     src/config/sections/limits_config_section.cpp
     src/config/sections/llm_config_section.cpp
     src/config/sections/model_config_section.cpp
+    src/config/sections/persona_gateway_config_section.cpp
     src/config/sections/vlm_cache_config_section.cpp
     src/config/sections/vram_config_section.cpp
     src/config/server_config.cpp
@@ -1039,6 +1041,8 @@ add_library(agent_service STATIC
     src/service/persona/persona_runtime.cpp
     src/service/persona/persona_runtime.h
     src/service/gateway/gateway_models.h
+    src/service/gateway/gateway_auth.cpp
+    src/service/gateway/gateway_auth.h
     src/service/gateway/classroom_scheduler.cpp
     src/service/gateway/classroom_scheduler.h
     src/service/gateway/persona_gateway_service.cpp
@@ -1057,6 +1061,7 @@ target_include_directories(agent_service PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src/llm
     ${CMAKE_CURRENT_SOURCE_DIR}/src/semantic_cache
     ${CMAKE_CURRENT_SOURCE_DIR}/src/memory
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/storage
 )
 
 target_link_libraries(agent_service PUBLIC
@@ -1068,9 +1073,12 @@ target_link_libraries(agent_service PUBLIC
     agent_llm
     agent_semantic_cache
     agent_memory
+    agent_storage
     agent_core
     agent_net
     nlohmann_json::nlohmann_json
+    OpenSSL::SSL
+    OpenSSL::Crypto
     spdlog::spdlog
 )
 

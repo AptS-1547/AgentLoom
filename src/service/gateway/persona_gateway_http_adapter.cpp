@@ -3,6 +3,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <sstream>
 #include <string_view>
 #include <unordered_map>
@@ -253,6 +254,23 @@ void SendJson(const std::shared_ptr<::net::IHttpRequest>& request,
     request->Respond(std::move(response));
 }
 
+void SendJsonWithHeaders(const std::shared_ptr<::net::IHttpRequest>& request,
+                         ::net::http::status status,
+                         const Json& body,
+                         std::string_view trace_id,
+                         const std::vector<std::pair<std::string, std::string>>& headers) {
+    auto response = ::net::HttpResponse::Json(status, body.dump()).message;
+    response.set("X-Trace-Id", trace_id);
+    for (const auto& [key, value] : headers) {
+        response.set(key, value);
+    }
+    request->Respond(std::move(response));
+}
+
+std::int64_t ToUnixSeconds(std::chrono::system_clock::time_point time) {
+    return std::chrono::duration_cast<std::chrono::seconds>(time.time_since_epoch()).count();
+}
+
 template <typename T, typename Fn>
 void SendResult(const std::shared_ptr<::net::IHttpRequest>& request,
                 core::Result<T> result,
@@ -301,9 +319,11 @@ std::string MessagePayloadToString(const ::net::WebSocketMessage& message) {
 
 struct HttpRouteContext {
     PersonaGatewayService& service;
+    IAuthRegistrationService* auth_registration;
     std::shared_ptr<::net::IHttpRequest> request;
     const ::net::BeastHttpRequest& message;
     const Json& body;
+    const AuthIdentity& identity;
     std::string trace_id;
     std::vector<std::string> path_parts;
     std::unordered_map<std::string, std::string> path_params;
@@ -314,6 +334,7 @@ public:
     virtual ~IHttpRoute() = default;
     virtual ::net::http::verb Method() const noexcept = 0;
     virtual std::vector<std::string_view> Pattern() const = 0;
+    virtual bool RequiresAuth() const noexcept { return true; }
     virtual void Handle(HttpRouteContext& context) const = 0;
 
     bool Matches(::net::http::verb method,
@@ -404,12 +425,79 @@ public: \
 static const HttpRouteRegistrar<ClassName> g_##ClassName##_registrar; \
 void ClassName::Handle(HttpRouteContext& context) const
 
+DECLARE_HTTP_ROUTE(AuthMeRoute, ::net::http::verb::get, "api", "auth", "me") {
+    Json body{
+        {"ok", true},
+        {"traceId", context.trace_id},
+        {"data", {
+            {"authenticated", context.identity.authenticated},
+            {"userUuid", context.identity.user_uuid},
+            {"tenantId", context.identity.tenant_id},
+            {"subject", context.identity.subject},
+        }},
+    };
+    SendJson(context.request, ::net::http::status::ok, body, context.trace_id);
+}
+
+class AuthRegisterRoute final : public IHttpRoute {
+public:
+    static constexpr std::string_view kRouteName = "AuthRegisterRoute";
+    ::net::http::verb Method() const noexcept override { return ::net::http::verb::post; }
+    std::vector<std::string_view> Pattern() const override { return {"api", "auth", "register"}; }
+    bool RequiresAuth() const noexcept override { return false; }
+    void Handle(HttpRouteContext& context) const override {
+        if (!context.auth_registration) {
+            const auto status = core::Status::Error(core::ErrorCode::FailedPrecondition, "auth registration service is not configured");
+            SendJson(context.request, HttpStatusFor(status.code()), ErrorEnvelope(context.trace_id, status), context.trace_id);
+            return;
+        }
+
+        AuthRegistrationRequest req;
+        req.user_uuid = context.body.value("userUuid", context.body.value("user_uuid", std::string{}));
+        req.tenant_id = context.body.value("tenantId", context.body.value("tenant_id", std::string{"default"}));
+        req.subject = context.body.value("subject", std::string{});
+        const auto ttl_seconds = context.body.value("ttlSeconds", context.body.value("ttl_seconds", 0));
+        if (ttl_seconds > 0) {
+            req.ttl = std::chrono::seconds(ttl_seconds);
+        }
+
+        auto result = context.auth_registration->Register(req);
+        if (!result.ok()) {
+            SendJson(context.request, HttpStatusFor(result.status().code()), ErrorEnvelope(context.trace_id, result.status()), context.trace_id);
+            return;
+        }
+
+        const auto& value = result.value();
+        Json body{
+            {"ok", true},
+            {"traceId", context.trace_id},
+            {"data", {
+                {"authenticated", value.identity.authenticated},
+                {"userUuid", value.identity.user_uuid},
+                {"tenantId", value.identity.tenant_id},
+                {"subject", value.identity.subject},
+                {"tokenId", value.identity.token_id},
+                {"issuedAt", ToUnixSeconds(value.issued_at)},
+                {"expiresAt", ToUnixSeconds(value.identity.expires_at)},
+                {"token", value.token},
+            }},
+        };
+        SendJsonWithHeaders(
+            context.request,
+            ::net::http::status::ok,
+            body,
+            context.trace_id,
+            {{"Set-Cookie", value.cookie_header}});
+    }
+};
+static const HttpRouteRegistrar<AuthRegisterRoute> g_AuthRegisterRoute_registrar;
+
 DECLARE_HTTP_ROUTE(CreateSessionRoute, ::net::http::verb::post, "api", "session", "create") {
     CreateSessionGatewayRequest req;
     req.trace_id = context.trace_id;
     req.session_id = context.body.value("sessionId", std::string{});
-    req.user_uuid = context.body.value("userUuid", context.body.value("user_uuid", std::string{"local_user"}));
-    req.tenant_id = context.body.value("tenantId", std::string{"default"});
+    req.user_uuid = context.identity.user_uuid;
+    req.tenant_id = context.identity.tenant_id;
     req.classroom_id = context.body.value("classroomId", std::string{});
     req.persona_id = context.body.value("personaId", std::string{});
     req.context_ids = context.body.value("contextIds", std::vector<std::string>{});
@@ -562,8 +650,12 @@ DECLARE_HTTP_ROUTE(TrainingReportRoute, ::net::http::verb::post, "api", "report"
 
 } // namespace
 
-PersonaGatewayHttpAdapter::PersonaGatewayHttpAdapter(PersonaGatewayService& service)
-    : service_(service) {}
+PersonaGatewayHttpAdapter::PersonaGatewayHttpAdapter(PersonaGatewayService& service,
+                                                     std::shared_ptr<IGatewayAuthenticator> authenticator,
+                                                     std::shared_ptr<IAuthRegistrationService> auth_registration)
+    : service_(service),
+      authenticator_(std::move(authenticator)),
+      auth_registration_(std::move(auth_registration)) {}
 
 bool PersonaGatewayHttpAdapter::IsApiRequest(std::string_view target) noexcept {
     const auto q = target.find('?');
@@ -597,11 +689,22 @@ void PersonaGatewayHttpAdapter::HandleHttp(std::shared_ptr<::net::IHttpRequest> 
         if (!route->Matches(msg.method(), parts, params)) {
             continue;
         }
+        AuthIdentity identity;
+        if (authenticator_ && route->RequiresAuth()) {
+            auto auth = authenticator_->Authenticate(msg);
+            if (!auth.ok()) {
+                SendJson(request, HttpStatusFor(auth.status().code()), ErrorEnvelope(trace_id, auth.status()), trace_id);
+                return;
+            }
+            identity = std::move(auth).value();
+        }
         HttpRouteContext context{
             service_,
+            auth_registration_.get(),
             std::move(request),
             msg,
             body,
+            identity,
             trace_id,
             parts,
             std::move(params),
@@ -633,6 +736,16 @@ void PersonaGatewayHttpAdapter::HandleWebSocket(std::shared_ptr<::net::IWebSocke
 
     const auto type = body.value("type", std::string{});
     const auto trace_id = body.value("traceId", core::GenerateTraceId());
+    AuthIdentity identity;
+    if (authenticator_) {
+        auto auth = authenticator_->Authenticate(request->handshake_request());
+        if (!auth.ok()) {
+            Json out{{"type", "error"}, {"payload", ErrorEnvelope(trace_id, auth.status())}};
+            request->Send(TextFrame(request->memory_pool(), out.dump()));
+            return;
+        }
+        identity = std::move(auth).value();
+    }
     if (type == "chat.message") {
         const auto payload = body.value("payload", Json::object());
         ChatGatewayRequest req;

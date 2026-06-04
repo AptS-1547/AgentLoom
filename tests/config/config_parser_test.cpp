@@ -461,3 +461,220 @@ TEST(ConfigLlmSectionTest, CliOverridesJson) {
     UnsetLlmEnv();
 }
 
+TEST(ConfigGatewayAuthSectionTest, JsonLoadsGatewayAuthAndResolvesRelativeFiles) {
+    ScopedTempDirectory tmp("gateway_auth_cfg");
+    auto key_file = tmp.path() / "jwt_public.pem";
+    auto private_key_file = tmp.path() / "jwt_private.pem";
+    WriteFile(key_file, "-----BEGIN PUBLIC KEY-----\nTEST\n-----END PUBLIC KEY-----\n");
+    WriteFile(private_key_file, "-----BEGIN PRIVATE KEY-----\nTEST\n-----END PRIVATE KEY-----\n");
+    auto config_file = tmp.path() / "config.json";
+    WriteFile(config_file, R"({
+        "gateway_auth": {
+            "enabled": true,
+            "allow_dev_identity": false,
+            "require_auth_for_api": true,
+            "cookie_name": "agent_auth",
+            "public_key_file": "jwt_public.pem",
+            "private_key_file": "jwt_private.pem",
+            "issuer": "agent-e2e",
+            "audience": "agent-gateway",
+            "clock_skew_seconds": 120,
+            "token_ttl_seconds": 7200,
+            "cookie_secure": true,
+            "cookie_same_site": "Strict",
+            "require_session_record": true,
+            "auto_provision_session": false,
+            "session_database_path": "gateway_auth.db"
+        }
+    })");
+
+    auto opts = Parse({
+        "server",
+        "--llm", "llm.gguf",
+        "--config", config_file.string(),
+    });
+
+    EXPECT_TRUE(opts.gateway_auth.enabled);
+    EXPECT_FALSE(opts.gateway_auth.allow_dev_identity);
+    EXPECT_TRUE(opts.gateway_auth.require_auth_for_api);
+    EXPECT_EQ(opts.gateway_auth.cookie_name, "agent_auth");
+    EXPECT_NE(opts.gateway_auth.public_key_pem.find("BEGIN PUBLIC KEY"), std::string::npos);
+    EXPECT_NE(opts.gateway_auth.private_key_pem.find("BEGIN PRIVATE KEY"), std::string::npos);
+    EXPECT_EQ(opts.gateway_auth.issuer, "agent-e2e");
+    EXPECT_EQ(opts.gateway_auth.audience, "agent-gateway");
+    EXPECT_EQ(opts.gateway_auth.clock_skew_seconds, 120);
+    EXPECT_EQ(opts.gateway_auth.token_ttl_seconds, 7200);
+    EXPECT_TRUE(opts.gateway_auth.cookie_secure);
+    EXPECT_EQ(opts.gateway_auth.cookie_same_site, "Strict");
+    EXPECT_TRUE(opts.gateway_auth.require_session_record);
+    EXPECT_FALSE(opts.gateway_auth.auto_provision_session);
+    EXPECT_EQ(opts.gateway_auth.session_database_path, (tmp.path() / "gateway_auth.db").string());
+}
+
+TEST(ConfigGatewayAuthSectionTest, CliOverridesGatewayAuthJson) {
+    ScopedTempDirectory tmp("gateway_auth_cli");
+    auto key_file = tmp.path() / "jwt_public.pem";
+    auto private_key_file = tmp.path() / "jwt_private.pem";
+    WriteFile(key_file, "public-key");
+    WriteFile(private_key_file, "private-key");
+    auto config_file = tmp.path() / "config.json";
+    WriteFile(config_file, R"({
+        "gateway_auth": {
+            "enabled": false,
+            "cookie_name": "json_cookie"
+        }
+    })");
+
+    auto opts = Parse({
+        "server",
+        "--llm", "llm.gguf",
+        "--config", config_file.string(),
+        "--gateway-auth-required",
+        "--gateway-auth-cookie", "cli_cookie",
+        "--gateway-auth-public-key-file", key_file.string(),
+        "--gateway-auth-private-key-file", private_key_file.string(),
+        "--gateway-auth-issuer", "cli-issuer",
+        "--gateway-auth-audience", "cli-aud",
+        "--gateway-auth-token-ttl", "600",
+        "--gateway-auth-cookie-secure",
+        "--gateway-auth-session-db", (tmp.path() / "auth.db").string(),
+        "--gateway-auth-require-session"
+    });
+
+    EXPECT_TRUE(opts.gateway_auth.enabled);
+    EXPECT_TRUE(opts.gateway_auth.require_auth_for_api);
+    EXPECT_FALSE(opts.gateway_auth.allow_dev_identity);
+    EXPECT_EQ(opts.gateway_auth.cookie_name, "cli_cookie");
+    EXPECT_EQ(opts.gateway_auth.public_key_pem, "public-key");
+    EXPECT_EQ(opts.gateway_auth.private_key_pem, "private-key");
+    EXPECT_EQ(opts.gateway_auth.issuer, "cli-issuer");
+    EXPECT_EQ(opts.gateway_auth.audience, "cli-aud");
+    EXPECT_EQ(opts.gateway_auth.token_ttl_seconds, 600);
+    EXPECT_TRUE(opts.gateway_auth.cookie_secure);
+    EXPECT_TRUE(opts.gateway_auth.require_session_record);
+    EXPECT_FALSE(opts.gateway_auth.auto_provision_session);
+}
+
+TEST(ConfigGatewayAuthSectionTest, RejectsStrictSessionWithoutDatabase) {
+    EXPECT_THROW(
+        Parse({
+            "server",
+            "--llm", "llm.gguf",
+            "--gateway-auth-enabled",
+            "--gateway-auth-require-session",
+        }),
+        std::runtime_error);
+}
+
+TEST(ConfigPersonaGatewaySectionTest, JsonLoadsE2EGatewayOptionsAndResolvesStaticRoot) {
+    ScopedTempDirectory tmp("persona_gateway_cfg");
+    auto config_file = tmp.path() / "config.json";
+    WriteFile(config_file, R"({
+        "persona_gateway": {
+            "websocket_path": "/ws/session",
+            "static_files": {
+                "enabled": true,
+                "root": "dist",
+                "index_file": "index.html",
+                "spa_fallback": true
+            },
+            "compute_pool": {
+                "worker_count": 4,
+                "queue_capacity": 256
+            },
+            "io_pool": {
+                "worker_count": 2,
+                "queue_capacity": 128
+            },
+            "session_idle_timeout_minutes": 30,
+            "session_max_recent_turns": 24,
+            "runtime_recent_raw_turns": 10,
+            "runtime_default_model": "e2e-model",
+            "request_filter": {
+                "enabled": true,
+                "reject_control_chars": true,
+                "reject_suspicious_patterns": true
+            }
+        }
+    })");
+
+    auto opts = Parse({
+        "server",
+        "--llm", "llm.gguf",
+        "--config", config_file.string(),
+    });
+
+    EXPECT_EQ(opts.persona_gateway.websocket_path, "/ws/session");
+    EXPECT_TRUE(opts.persona_gateway.static_files.enabled);
+    EXPECT_EQ(opts.persona_gateway.static_files.root, tmp.path() / "dist");
+    EXPECT_EQ(opts.persona_gateway.static_files.index_file, "index.html");
+    EXPECT_TRUE(opts.persona_gateway.static_files.spa_fallback);
+    EXPECT_EQ(opts.persona_gateway.compute_pool.worker_count, 4u);
+    EXPECT_EQ(opts.persona_gateway.compute_pool.queue_capacity, 256u);
+    EXPECT_EQ(opts.persona_gateway.io_pool.worker_count, 2u);
+    EXPECT_EQ(opts.persona_gateway.io_pool.queue_capacity, 128u);
+    EXPECT_EQ(opts.persona_gateway.session_idle_timeout_minutes, 30);
+    EXPECT_EQ(opts.persona_gateway.session_max_recent_turns, 24u);
+    EXPECT_EQ(opts.persona_gateway.runtime_recent_raw_turns, 10u);
+    EXPECT_EQ(opts.persona_gateway.runtime_default_model, "e2e-model");
+    EXPECT_TRUE(opts.persona_gateway.request_filter_enabled);
+}
+
+TEST(ConfigPersonaGatewaySectionTest, CliOverridesGatewayJson) {
+    ScopedTempDirectory tmp("persona_gateway_cli");
+    auto config_file = tmp.path() / "config.json";
+    WriteFile(config_file, R"({
+        "persona_gateway": {
+            "websocket_path": "/ws/json",
+            "request_filter": { "enabled": true }
+        }
+    })");
+
+    auto opts = Parse({
+        "server",
+        "--llm", "llm.gguf",
+        "--config", config_file.string(),
+        "--gateway-ws-path", "/ws/cli",
+        "--gateway-static-root", (tmp.path() / "dist").string(),
+        "--gateway-compute-workers", "3",
+        "--gateway-compute-queue", "300",
+        "--gateway-io-workers", "2",
+        "--gateway-io-queue", "200",
+        "--gateway-session-idle-minutes", "45",
+        "--gateway-session-max-recent-turns", "32",
+        "--gateway-runtime-recent-raw-turns", "12",
+        "--gateway-runtime-model", "cli-model",
+        "--gateway-filter-disabled"
+    });
+
+    EXPECT_EQ(opts.persona_gateway.websocket_path, "/ws/cli");
+    EXPECT_TRUE(opts.persona_gateway.static_files.enabled);
+    EXPECT_EQ(opts.persona_gateway.static_files.root, tmp.path() / "dist");
+    EXPECT_EQ(opts.persona_gateway.compute_pool.worker_count, 3u);
+    EXPECT_EQ(opts.persona_gateway.compute_pool.queue_capacity, 300u);
+    EXPECT_EQ(opts.persona_gateway.io_pool.worker_count, 2u);
+    EXPECT_EQ(opts.persona_gateway.io_pool.queue_capacity, 200u);
+    EXPECT_EQ(opts.persona_gateway.session_idle_timeout_minutes, 45);
+    EXPECT_EQ(opts.persona_gateway.session_max_recent_turns, 32u);
+    EXPECT_EQ(opts.persona_gateway.runtime_recent_raw_turns, 12u);
+    EXPECT_EQ(opts.persona_gateway.runtime_default_model, "cli-model");
+    EXPECT_FALSE(opts.persona_gateway.request_filter_enabled);
+}
+
+TEST(ConfigPersonaGatewaySectionTest, RejectsInvalidWebSocketPath) {
+    ScopedTempDirectory tmp("persona_gateway_bad");
+    auto config_file = tmp.path() / "config.json";
+    WriteFile(config_file, R"({
+        "persona_gateway": {
+            "websocket_path": "ws/no-leading-slash"
+        }
+    })");
+
+    EXPECT_THROW(
+        Parse({
+            "server",
+            "--llm", "llm.gguf",
+            "--config", config_file.string(),
+        }),
+        std::runtime_error);
+}

@@ -17,10 +17,22 @@ core::ThreadPoolOptions WithDefaultPoolName(core::ThreadPoolOptions options, std
 
 ::net::HttpServerOptions ResolveHttpOptions(const PersonaGatewayServerOptions& options) {
     auto http = options.http;
+    if (!http.request_filter.enabled) {
+        http.request_filter.enabled = true;
+        http.request_filter.reject_control_chars = true;
+        http.request_filter.reject_suspicious_patterns = true;
+    }
     if (options.static_files) {
         http.static_files = std::nullopt;
     }
     return http;
+}
+
+std::shared_ptr<IAuthSessionStore> MakeAuthSessionStore(const GatewayAuthOptions& options) {
+    if (options.session_database_path.empty()) {
+        return nullptr;
+    }
+    return std::make_shared<SqliteAuthSessionStore>(options.session_database_path);
 }
 
 } // namespace
@@ -43,7 +55,10 @@ PersonaGatewayServer::PersonaGatewayServer(PersonaGatewayServerOptions options,
                logger_),
       classroom_scheduler_({}, core::LoggerAdapter::ForModule("classroom")),
       service_(sessions_, runtime_, &classroom_scheduler_, logger_),
-      adapter_(service_),
+      auth_session_store_(MakeAuthSessionStore(options_.auth)),
+      authenticator_(std::make_shared<JwtCookieAuthenticator>(options_.auth, auth_session_store_)),
+      auth_registration_(std::make_shared<JwtAuthRegistrationService>(options_.auth, auth_session_store_)),
+      adapter_(service_, authenticator_, auth_registration_),
       http_server_(ResolveHttpOptions(options_)) {
     if (options_.static_files) {
         static_files_ = std::make_shared<::net::StaticFileHandler>(*options_.static_files);
@@ -69,6 +84,10 @@ core::Status PersonaGatewayServer::Start() {
     if (!dependency_status.ok()) {
         return dependency_status;
     }
+    auto auth_store_status = EnsureAuthSessionStore();
+    if (!auth_store_status.ok()) {
+        return auth_store_status;
+    }
 
     auto compute_status = compute_pool_.Start();
     if (!compute_status.ok()) {
@@ -91,6 +110,13 @@ core::Status PersonaGatewayServer::Start() {
     started_ = true;
     logger_.info("[gateway] started http_port={} ws_path={}", http_server_.port(), options_.websocket_path);
     return core::Status::Ok();
+}
+
+core::Status PersonaGatewayServer::EnsureAuthSessionStore() {
+    if (!auth_session_store_) {
+        return core::Status::Ok();
+    }
+    return auth_session_store_->EnsureSchema();
 }
 
 void PersonaGatewayServer::Stop() {

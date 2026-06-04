@@ -23,6 +23,10 @@ public:
         : session_(std::move(session)),
           message_(std::move(message)) {}
 
+    const BeastHttpRequest& handshake_request() const noexcept override {
+        return session_->request_;
+    }
+
     const ConnectionContext& connection() const noexcept override {
         return session_->lease_.context();
     }

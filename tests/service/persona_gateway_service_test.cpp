@@ -17,6 +17,9 @@
 namespace {
 
 using agent::service::gateway::ChatGatewayRequest;
+using agent::service::gateway::AuthIdentity;
+using agent::service::gateway::AuthRegistrationRequest;
+using agent::service::gateway::AuthRegistrationResult;
 using agent::service::gateway::ClassroomMessageGatewayRequest;
 using agent::service::gateway::ClassroomProactiveGatewayRequest;
 using agent::service::gateway::ClassroomPollGatewayRequest;
@@ -28,6 +31,10 @@ using agent::service::gateway::PersonaGatewayServer;
 using agent::service::gateway::PersonaGatewayServerDependencies;
 using agent::service::gateway::PersonaGatewayServerOptions;
 using agent::service::gateway::PersonaGatewayService;
+using agent::service::gateway::IGatewayAuthenticator;
+using agent::service::gateway::IAuthRegistrationService;
+using agent::service::gateway::SqliteAuthSessionStore;
+using agent::service::gateway::AuthSessionRecord;
 using agent::service::gateway::TrainingReportGatewayRequest;
 using agent::service::persona::NeutralEmotionAnalyzer;
 using agent::service::persona::PersonaRuntime;
@@ -76,6 +83,46 @@ public:
 
     std::mutex mutex_;
     agent::llm::ChatCompletionRequest last_request;
+};
+
+class FixedAuthenticator final : public IGatewayAuthenticator {
+public:
+    explicit FixedAuthenticator(AuthIdentity identity)
+        : identity_(std::move(identity)) {}
+
+    core::Result<AuthIdentity> Authenticate(const ::net::BeastHttpRequest&) const override {
+        return identity_;
+    }
+
+private:
+    AuthIdentity identity_;
+};
+
+class RejectingAuthenticator final : public IGatewayAuthenticator {
+public:
+    core::Result<AuthIdentity> Authenticate(const ::net::BeastHttpRequest&) const override {
+        return core::Status::Error(core::ErrorCode::PermissionDenied, "auth token is missing");
+    }
+};
+
+class FixedAuthRegistrationService final : public IAuthRegistrationService {
+public:
+    core::Result<AuthRegistrationResult> Register(const AuthRegistrationRequest& request) override {
+        last_request = request;
+        AuthRegistrationResult result;
+        result.identity.user_uuid = request.user_uuid.empty() ? "generated-user-001" : request.user_uuid;
+        result.identity.tenant_id = request.tenant_id.empty() ? "default" : request.tenant_id;
+        result.identity.subject = request.subject.empty() ? result.identity.user_uuid : request.subject;
+        result.identity.token_id = "token-001";
+        result.identity.authenticated = true;
+        result.issued_at = std::chrono::system_clock::now();
+        result.identity.expires_at = result.issued_at + std::chrono::hours(1);
+        result.token = "jwt-token";
+        result.cookie_header = "agent_auth=jwt-token; Path=/; HttpOnly; SameSite=Lax";
+        return result;
+    }
+
+    AuthRegistrationRequest last_request;
 };
 
 struct GatewayFixture {
@@ -292,6 +339,131 @@ TEST(PersonaGatewayHttpAdapterTest, HandlesSessionCreateAndChatJsonRoutes) {
     EXPECT_EQ(chat_body["data"]["reply"]["content"], "student reply");
     EXPECT_EQ(chat_body["data"]["turnIndex"], 1);
     server.Stop();
+}
+
+TEST(PersonaGatewayHttpAdapterTest, AuthIdentityOverridesCreateSessionUserUuid) {
+    GatewayFixture f;
+    AuthIdentity identity;
+    identity.authenticated = true;
+    identity.user_uuid = "jwt-user-001";
+    identity.tenant_id = "tenant-a";
+    PersonaGatewayHttpAdapter adapter(f.gateway, std::make_shared<FixedAuthenticator>(identity));
+    ::net::HttpServer server({.address = "127.0.0.1", .port = 0, .io_threads = 1});
+    server.SetHttpRequestHandler([&adapter](std::shared_ptr<::net::IHttpRequest> request) {
+        adapter.HandleHttp(std::move(request));
+    });
+    ASSERT_TRUE(server.Start().ok());
+
+    auto create = SendJsonRequest(
+        server.port(),
+        ::net::http::verb::post,
+        "/api/session/create",
+        Json{
+            {"traceId", "trace-auth-create"},
+            {"sessionId", "session-auth"},
+            {"userUuid", "forged-body-user"},
+            {"personaId", "dazhi"},
+            {"personality", {{"name", "dazhi"}, {"description", "student"}}},
+        });
+    EXPECT_EQ(create.result(), ::net::http::status::ok);
+    auto create_body = Json::parse(create.body());
+    EXPECT_EQ(create_body["data"]["userUuid"], "jwt-user-001");
+    server.Stop();
+}
+
+TEST(PersonaGatewayHttpAdapterTest, RejectsApiWhenAuthenticatorRejects) {
+    GatewayFixture f;
+    PersonaGatewayHttpAdapter adapter(f.gateway, std::make_shared<RejectingAuthenticator>());
+    ::net::HttpServer server({.address = "127.0.0.1", .port = 0, .io_threads = 1});
+    server.SetHttpRequestHandler([&adapter](std::shared_ptr<::net::IHttpRequest> request) {
+        adapter.HandleHttp(std::move(request));
+    });
+    ASSERT_TRUE(server.Start().ok());
+
+    auto create = SendJsonRequest(
+        server.port(),
+        ::net::http::verb::post,
+        "/api/session/create",
+        Json{
+            {"traceId", "trace-auth-reject"},
+            {"sessionId", "session-auth-reject"},
+            {"personaId", "dazhi"},
+            {"personality", {{"name", "dazhi"}, {"description", "student"}}},
+        });
+    EXPECT_EQ(create.result(), ::net::http::status::forbidden);
+    auto body = Json::parse(create.body());
+    EXPECT_FALSE(body["ok"].get<bool>());
+    EXPECT_EQ(body["error"]["code"], "PERMISSION_DENIED");
+    server.Stop();
+}
+
+TEST(PersonaGatewayHttpAdapterTest, RegisterRouteBypassesAuthenticatorAndSetsCookie) {
+    GatewayFixture f;
+    auto registration = std::make_shared<FixedAuthRegistrationService>();
+    PersonaGatewayHttpAdapter adapter(f.gateway, std::make_shared<RejectingAuthenticator>(), registration);
+    ::net::HttpServer server({.address = "127.0.0.1", .port = 0, .io_threads = 1});
+    server.SetHttpRequestHandler([&adapter](std::shared_ptr<::net::IHttpRequest> request) {
+        adapter.HandleHttp(std::move(request));
+    });
+    ASSERT_TRUE(server.Start().ok());
+
+    auto response = SendJsonRequest(
+        server.port(),
+        ::net::http::verb::post,
+        "/api/auth/register",
+        Json{
+            {"traceId", "trace-register"},
+            {"userUuid", "e2e-user-001"},
+            {"tenantId", "default"},
+            {"subject", "student@example.test"},
+            {"ttlSeconds", 600},
+        });
+    EXPECT_EQ(response.result(), ::net::http::status::ok);
+    EXPECT_NE(std::string(response[::net::http::field::set_cookie]).find("agent_auth=jwt-token"), std::string::npos);
+    auto body = Json::parse(response.body());
+    EXPECT_TRUE(body["ok"].get<bool>());
+    EXPECT_EQ(body["data"]["authenticated"], true);
+    EXPECT_EQ(body["data"]["userUuid"], "e2e-user-001");
+    EXPECT_EQ(body["data"]["tenantId"], "default");
+    EXPECT_EQ(body["data"]["subject"], "student@example.test");
+    EXPECT_EQ(body["data"]["token"], "jwt-token");
+    EXPECT_EQ(registration->last_request.ttl.count(), 600);
+    server.Stop();
+}
+
+TEST(GatewayAuthSessionStoreTest, PersistsResolvesAndRevokesSessions) {
+    const auto path = std::filesystem::temp_directory_path() / "agent_gateway_auth_sessions_test.db";
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    std::filesystem::remove(path.string() + "-wal", ec);
+    std::filesystem::remove(path.string() + "-shm", ec);
+
+    SqliteAuthSessionStore store(path.string());
+    ASSERT_TRUE(store.EnsureSchema().ok());
+
+    AuthSessionRecord record;
+    record.token_id = "token-001";
+    record.user_uuid = "uuid-001";
+    record.tenant_id = "tenant-a";
+    record.subject = "subject-001";
+    record.issued_at = std::chrono::system_clock::now();
+    record.expires_at = record.issued_at + std::chrono::hours(1);
+    ASSERT_TRUE(store.UpsertSession(record).ok());
+
+    auto resolved = store.ResolveSession("token-001");
+    ASSERT_TRUE(resolved.ok()) << resolved.status().message();
+    EXPECT_EQ(resolved.value().user_uuid, "uuid-001");
+    EXPECT_EQ(resolved.value().tenant_id, "tenant-a");
+    EXPECT_FALSE(resolved.value().revoked);
+
+    ASSERT_TRUE(store.RevokeSession("token-001", "logout").ok());
+    auto revoked = store.ResolveSession("token-001");
+    ASSERT_TRUE(revoked.ok()) << revoked.status().message();
+    EXPECT_TRUE(revoked.value().revoked);
+
+    std::filesystem::remove(path, ec);
+    std::filesystem::remove(path.string() + "-wal", ec);
+    std::filesystem::remove(path.string() + "-shm", ec);
 }
 
 TEST(PersonaGatewayServerTest, HostsApiWebSocketAdapterAndStaticDistOnOneHttpServer) {

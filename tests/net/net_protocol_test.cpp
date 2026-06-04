@@ -563,6 +563,9 @@ TEST(HttpServerRuntimeTest, DispatchesTypedWebSocketStreamRequestAndTracksConnec
 
     server.SetWebSocketStreamHandler("/stream", [&](std::shared_ptr<net::IWebSocketStreamRequest> request) {
         EXPECT_NE(request->connection().connection_id, 0u);
+        EXPECT_EQ(request->handshake_request().target(), "/stream");
+        EXPECT_EQ(request->handshake_request()["Cookie"], "agent_auth=ws-token");
+        EXPECT_EQ(request->handshake_request()["Authorization"], "Bearer ws-token");
         EXPECT_EQ(request->message().kind, net::WebSocketMessageKind::Text);
         ASSERT_EQ(request->message().fragments.size(), 1u);
         EXPECT_EQ(request->message().fragments.front().view(), "frame");
@@ -585,6 +588,10 @@ TEST(HttpServerRuntimeTest, DispatchesTypedWebSocketStreamRequestAndTracksConnec
     asio::io_context io;
     tcp::resolver resolver(io);
     beast::websocket::stream<tcp::socket> ws(io);
+    ws.set_option(beast::websocket::stream_base::decorator([](auto& req) {
+        req.set(net::http::field::cookie, "agent_auth=ws-token");
+        req.set(net::http::field::authorization, "Bearer ws-token");
+    }));
     asio::connect(ws.next_layer(), resolver.resolve("127.0.0.1", std::to_string(server.port())));
     ws.handshake("127.0.0.1", "/stream");
     ws.text(true);

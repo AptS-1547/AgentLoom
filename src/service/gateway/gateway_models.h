@@ -30,6 +30,7 @@ struct CreateSessionGatewayRequest {
     std::string classroom_id;
     std::string persona_id;
     persona::PersonalityConfig personality;
+    std::optional<persona::EmotionPromptConfig> emotion_prompt_config;
     persona::EmotionStateConfig emotion_state_config;
     std::vector<std::string> context_ids;
     std::vector<std::string> context_patterns;
@@ -120,6 +121,11 @@ struct TrainingReportGatewayResponse : GatewayEnvelopeBase {
     std::uint64_t total_turns = 0;
     std::string summary;
     persona::SessionMetrics metrics;
+};
+
+struct SystemStatsGatewayResponse : GatewayEnvelopeBase {
+    std::size_t session_count = 0;
+    persona::SessionThreadPoolStats pools;
 };
 
 } // namespace agent::service::gateway

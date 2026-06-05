@@ -86,6 +86,11 @@ struct DispatchOptions {
     std::string operation;
 };
 
+struct SessionThreadPoolStats {
+    core::ThreadPoolStats compute;
+    core::ThreadPoolStats io;
+};
+
 struct SessionState {
     std::string session_id;
     std::string user_uuid;
@@ -140,6 +145,7 @@ public:
 
     core::Status SubmitCompute(DispatchOptions options, SessionTask task);
     core::Status SubmitIo(DispatchOptions options, SessionTask task);
+    SessionThreadPoolStats PoolStats() const;
 
 private:
     struct SessionSlot {

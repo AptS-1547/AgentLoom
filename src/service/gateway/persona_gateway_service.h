@@ -30,6 +30,7 @@ public:
     core::Result<ClassroomGatewayResponse> ClassroomProactive(ClassroomProactiveGatewayRequest request);
     core::Result<ClassroomGatewayResponse> ClassroomPoll(ClassroomPollGatewayRequest request);
     core::Result<TrainingReportGatewayResponse> TrainingReport(TrainingReportGatewayRequest request);
+    core::Result<SystemStatsGatewayResponse> SystemStats(std::string trace_id);
 
     core::Status SubmitChat(ChatGatewayRequest request, ChatCallback callback);
     core::Status SubmitClassroomMessage(ClassroomMessageGatewayRequest request, ClassroomCallback callback);

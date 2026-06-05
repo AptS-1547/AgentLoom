@@ -1,6 +1,8 @@
 #include "persona_runtime.h"
 
 #include <algorithm>
+#include <cmath>
+#include <map>
 #include <sstream>
 #include <utility>
 
@@ -30,6 +32,33 @@ std::chrono::milliseconds Since(std::chrono::steady_clock::time_point start) {
         std::chrono::steady_clock::now() - start);
 }
 
+GenerationParams ApplyEmotionAdaptiveGeneration(const GenerationParams& base,
+                                                const EmotionAnalysis& emotion) {
+    static const std::map<std::string, double> token_weights{
+        {"neutral", 0.0125},
+        {"joy", 0.02},
+        {"excitement", 0.025},
+        {"sadness", 0.03},
+        {"fear", 0.03},
+        {"anger", 0.025},
+        {"disgust", 0.02},
+        {"surprise", 0.025},
+        {"tenderness", 0.025},
+        {"curiosity", 0.0375},
+    };
+
+    auto adjusted = base;
+    const auto weight_it = token_weights.find(emotion.emotion.primary);
+    double weight = weight_it == token_weights.end() ? 0.02 : weight_it->second;
+    if (emotion.emotion.intensity >= 0.7) {
+        weight *= 1.5;
+    }
+
+    const int adaptive_tokens = std::max(100, static_cast<int>(base.max_tokens * weight));
+    adjusted.max_tokens = std::min(base.max_tokens, std::max(1, adaptive_tokens));
+    return adjusted;
+}
+
 std::vector<ConversationTurn> TakeRecent(std::span<const ConversationTurn> turns, std::size_t limit) {
     std::vector<ConversationTurn> out;
     const auto count = std::min<std::size_t>(turns.size(), limit);
@@ -39,6 +68,45 @@ std::vector<ConversationTurn> TakeRecent(std::span<const ConversationTurn> turns
         out.push_back(turns[i]);
     }
     return out;
+}
+
+bool IsProactiveInput(std::string_view input) {
+    return input.rfind("[proactive]", 0) == 0 ||
+           input.rfind("[proactive_decision]", 0) == 0 ||
+           input.rfind("conversation idle for ", 0) == 0 ||
+           input.rfind("[system_event]", 0) == 0;
+}
+
+double TopProbabilityMargin(const EmotionInfo& emotion) {
+    if (emotion.probabilities.size() < 2) {
+        return 1.0;
+    }
+    double first = -1.0;
+    double second = -1.0;
+    for (const auto& [_, probability] : emotion.probabilities) {
+        if (probability > first) {
+            second = first;
+            first = probability;
+        } else if (probability > second) {
+            second = probability;
+        }
+    }
+    if (first < 0.0 || second < 0.0) {
+        return 1.0;
+    }
+    return first - second;
+}
+
+std::optional<std::string> EmotionCalibrationReason(const EmotionAnalysis& emotion,
+                                                    const EmotionCalibrationOptions& options) {
+    if (emotion.emotion.primary_prob < options.low_confidence_threshold) {
+        return "low_confidence";
+    }
+    const double margin = TopProbabilityMargin(emotion.emotion);
+    if (margin < options.top_margin_threshold) {
+        return "low_top_margin";
+    }
+    return std::nullopt;
 }
 
 } // namespace
@@ -140,12 +208,14 @@ PersonaRuntime::PersonaRuntime(SessionManager& sessions,
                                std::shared_ptr<llm::ILlmClient> llm_client,
                                PersonaRuntimeOptions options,
                                std::shared_ptr<IAnswerCacheProvider> answer_cache_provider,
-                               core::LoggerAdapter logger)
+                               core::LoggerAdapter logger,
+                               std::shared_ptr<IEmotionCalibrationSampleSink> emotion_calibration_sink)
     : sessions_(sessions),
       memory_provider_(std::move(memory_provider)),
       emotion_analyzer_(std::move(emotion_analyzer)),
       llm_client_(std::move(llm_client)),
       answer_cache_provider_(std::move(answer_cache_provider)),
+      emotion_calibration_sink_(std::move(emotion_calibration_sink)),
       options_(std::move(options)),
       logger_(std::move(logger)) {}
 
@@ -164,6 +234,7 @@ core::Status PersonaRuntime::SubmitChat(ChatRequest request, ChatCallback callba
     }
 
     const auto trace_id = request.trace_id;
+    const auto compute_submitted_at = std::chrono::steady_clock::now();
     DispatchOptions compute_dispatch;
     compute_dispatch.session_id = request.session_id;
     compute_dispatch.trace_id = request.trace_id;
@@ -171,14 +242,17 @@ core::Status PersonaRuntime::SubmitChat(ChatRequest request, ChatCallback callba
     compute_dispatch.operation = "prepare_chat";
     return sessions_.SubmitCompute(
         std::move(compute_dispatch),
-        [this, request = std::move(request), callback = std::move(callback), trace_id](
+        [this, request = std::move(request), callback = std::move(callback), trace_id, compute_submitted_at](
             SessionState& session,
             core::ThreadPoolContext&) mutable -> core::Status {
+            const auto compute_started_at = std::chrono::steady_clock::now();
             auto prepared = PrepareChat(session, std::move(request));
             if (!prepared.ok()) {
                 callback(prepared.status());
                 return prepared.status();
             }
+            prepared.value().started_at = compute_submitted_at;
+            prepared.value().latency.compute_queue_wait = Since(prepared.value().started_at);
 
             DispatchOptions io_dispatch;
             io_dispatch.session_id = prepared.value().request.session_id;
@@ -186,11 +260,14 @@ core::Status PersonaRuntime::SubmitChat(ChatRequest request, ChatCallback callba
             io_dispatch.user_uuid = session.user_uuid;
             io_dispatch.module = "persona_runtime";
             io_dispatch.operation = "llm_complete";
+            prepared.value().latency.compute_stage = Since(compute_started_at);
+            prepared.value().io_submitted_at = std::chrono::steady_clock::now();
             auto status = sessions_.SubmitIo(
                 std::move(io_dispatch),
                 [this, prepared = std::move(prepared).value(), callback = std::move(callback)](
                     SessionState& session,
                     core::ThreadPoolContext&) mutable -> core::Status {
+                    prepared.latency.io_queue_wait = Since(prepared.io_submitted_at);
                     CompleteWithLlm(session, std::move(prepared), std::move(callback));
                     return core::Status::Ok();
                 });
@@ -218,20 +295,57 @@ core::Result<PersonaRuntime::PreparedChat> PersonaRuntime::PrepareChat(SessionSt
     memory_req.trace_id = prepared.request.trace_id;
     memory_req.current_session_recent = std::span<const ConversationTurn>(recent_copy.data(), recent_copy.size());
     memory_req.max_recent_turns = options_.recent_raw_turns;
+    logger_.info("[trace={}] [persona_runtime] memory context start session={} user={} recent={}",
+                 prepared.request.trace_id,
+                 session.session_id,
+                 session.user_uuid,
+                 recent_copy.size());
     auto memory = memory_provider_->BuildContext(memory_req);
     if (!memory.ok()) {
+        logger_.warn("[trace={}] [persona_runtime] memory context failed session={} code={} reason={}",
+                     prepared.request.trace_id,
+                     session.session_id,
+                     static_cast<int>(memory.status().code()),
+                     memory.status().message());
         return memory.status();
     }
     prepared.memory = std::move(memory).value();
     prepared.latency.memory_context = Since(memory_start);
+    logger_.info("[trace={}] [persona_runtime] memory context done session={} latency_ms={} l0_hit={} l3_hit={}",
+                 prepared.request.trace_id,
+                 session.session_id,
+                 prepared.latency.memory_context.count(),
+                 prepared.memory.l0_hit,
+                 prepared.memory.l3_hit);
 
     auto emotion = emotion_analyzer_->Analyze(prepared.request.user_input, prepared.request.trace_id);
     if (!emotion.ok()) {
+        logger_.warn("[trace={}] [persona_runtime] user emotion failed session={} code={} reason={}",
+                     prepared.request.trace_id,
+                     session.session_id,
+                     static_cast<int>(emotion.status().code()),
+                     emotion.status().message());
         return emotion.status();
     }
     prepared.user_emotion = std::move(emotion).value();
+    logger_.info("[trace={}] [persona_runtime] user emotion done session={}",
+                 prepared.request.trace_id,
+                 session.session_id);
 
-    auto adjusted = session.emotion_state.GetParamAdjustments(prepared.request.base_generation);
+    auto calibration_status = MaybeRecordEmotionCalibrationSample(
+        session,
+        prepared.request,
+        prepared.user_emotion,
+        recent_copy);
+    if (!calibration_status.ok()) {
+        logger_.warn("[trace={}] [persona_runtime] emotion calibration sample skipped session={} reason={}",
+                     prepared.request.trace_id,
+                     session.session_id,
+                     calibration_status.message());
+    }
+
+    auto adjusted = ApplyEmotionAdaptiveGeneration(prepared.request.base_generation, prepared.user_emotion);
+    adjusted = session.emotion_state.GetParamAdjustments(adjusted);
     prepared.generation = adjusted;
     auto hint = session.emotion_state.GetPromptHint();
 
@@ -242,10 +356,20 @@ core::Result<PersonaRuntime::PreparedChat> PersonaRuntime::PrepareChat(SessionSt
                                   prepared.request.user_input,
                                   hint);
     if (!messages.ok()) {
+        logger_.warn("[trace={}] [persona_runtime] prompt build failed session={} code={} reason={}",
+                     prepared.request.trace_id,
+                     session.session_id,
+                     static_cast<int>(messages.status().code()),
+                     messages.status().message());
         return messages.status();
     }
     prepared.messages = std::move(messages).value();
     prepared.latency.prompt_build = Since(prompt_start);
+    logger_.info("[trace={}] [persona_runtime] prompt build done session={} latency_ms={} messages={}",
+                 prepared.request.trace_id,
+                 session.session_id,
+                 prepared.latency.prompt_build.count(),
+                 prepared.messages.size());
 
     logger_.info("[trace={}] [persona_runtime] prepared chat session={} user={} recent={} l0_hit={} l3_hit={}",
                  prepared.request.trace_id,
@@ -275,9 +399,18 @@ core::Result<std::vector<llm::ChatMessage>> PersonaRuntime::BuildMessages(
         return system.status();
     }
 
+    auto system_prompt = std::move(system).value();
+    const bool proactive = IsProactiveInput(user_input);
+    if (proactive) {
+        system_prompt += "\n<proactive_trigger>";
+        system_prompt.append(user_input);
+        system_prompt += "</proactive_trigger>";
+        system_prompt += "\n你可以主动找话题聊，或者接上之前的对话继续说。如果实在没什么好说的，回复空字符串即可。";
+    }
+
     std::vector<llm::ChatMessage> messages;
     messages.reserve(2 + memory.recent_turns.size() * 2);
-    messages.push_back(llm::ChatMessage{llm::ChatRole::System, std::move(system).value()});
+    messages.push_back(llm::ChatMessage{llm::ChatRole::System, std::move(system_prompt)});
     for (const auto& turn : memory.recent_turns) {
         if (!turn.user_input.empty()) {
             messages.push_back(llm::ChatMessage{llm::ChatRole::User, turn.user_input});
@@ -286,11 +419,44 @@ core::Result<std::vector<llm::ChatMessage>> PersonaRuntime::BuildMessages(
             messages.push_back(llm::ChatMessage{llm::ChatRole::Assistant, turn.response});
         }
     }
-    messages.push_back(llm::ChatMessage{llm::ChatRole::User, std::string(user_input)});
+    messages.push_back(llm::ChatMessage{llm::ChatRole::User, proactive ? std::string("...") : std::string(user_input)});
     return messages;
 }
 
+core::Status PersonaRuntime::MaybeRecordEmotionCalibrationSample(
+    const SessionState& session,
+    const ChatRequest& request,
+    const EmotionAnalysis& emotion,
+    const std::vector<ConversationTurn>& recent_turns) const {
+    if (!options_.emotion_calibration.enabled || !emotion_calibration_sink_) {
+        return core::Status::Ok();
+    }
+    if (request.user_input.size() < options_.emotion_calibration.min_text_length) {
+        return core::Status::Ok();
+    }
+    if (!std::isfinite(emotion.emotion.primary_prob)) {
+        return core::Status::Ok();
+    }
+    auto reason = EmotionCalibrationReason(emotion, options_.emotion_calibration);
+    if (!reason) {
+        return core::Status::Ok();
+    }
+
+    EmotionCalibrationSample sample;
+    sample.trace_id = request.trace_id;
+    sample.session_id = session.session_id;
+    sample.user_uuid = session.user_uuid;
+    sample.persona_id = session.persona_id;
+    sample.text = request.user_input;
+    sample.bert_result = emotion;
+    sample.state_snapshot = session.emotion_state.state();
+    sample.recent_turns = recent_turns;
+    sample.reason = std::move(*reason);
+    return emotion_calibration_sink_->Record(sample);
+}
+
 void PersonaRuntime::CompleteWithLlm(SessionState& session, PreparedChat prepared, ChatCallback callback) {
+    const auto io_stage_start = std::chrono::steady_clock::now();
     std::optional<AnswerCacheLookupRequest> answer_cache_lookup;
     std::optional<AnswerCacheLookupResult> answer_cache_hit;
     if (answer_cache_provider_) {
@@ -356,6 +522,7 @@ void PersonaRuntime::CompleteWithLlm(SessionState& session, PreparedChat prepare
         }
     }
     prepared.latency.total = Since(prepared.started_at);
+    prepared.latency.io_stage = Since(io_stage_start);
 
     auto ai_emotion = emotion_analyzer_->Analyze(completion.content, prepared.request.trace_id);
     if (!ai_emotion.ok()) {
@@ -415,6 +582,7 @@ void PersonaRuntime::CompleteWithLlm(SessionState& session, PreparedChat prepare
     response.answer_cache = std::move(prepared.answer_cache);
     response.latency = prepared.latency;
     response.messages = std::move(prepared.messages);
+    response.latency.callback_to_response = Since(prepared.started_at) - response.latency.total;
     callback(std::move(response));
 }
 

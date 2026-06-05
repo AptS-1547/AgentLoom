@@ -64,6 +64,7 @@ core::Result<SessionGatewayResponse> PersonaGatewayService::CreateSession(Create
     create.session_id = std::move(request.session_id);
     create.trace_id = request.trace_id;
     create.personality = std::move(request.personality);
+    create.emotion_prompt_config = std::move(request.emotion_prompt_config);
     create.emotion_state_config = request.emotion_state_config;
     create.time_awareness = true;
 
@@ -223,6 +224,16 @@ core::Result<TrainingReportGatewayResponse> PersonaGatewayService::TrainingRepor
     response.total_turns = snapshot.value().metrics.turn_count;
     response.metrics = snapshot.value().metrics;
     response.summary = "Training report evaluation pipeline is pending; session metrics are available.";
+    return response;
+}
+
+core::Result<SystemStatsGatewayResponse> PersonaGatewayService::SystemStats(std::string trace_id) {
+    const auto started = std::chrono::steady_clock::now();
+    SystemStatsGatewayResponse response;
+    response.trace_id = EnsureTrace(std::move(trace_id));
+    response.latency = Since(started);
+    response.session_count = sessions_.SessionCount();
+    response.pools = sessions_.PoolStats();
     return response;
 }
 

@@ -577,6 +577,33 @@ target_link_libraries(l3_compression_e2e_test PRIVATE
 link_whole_archive(l3_compression_e2e_test agent_config)
 copy_runtime_files(l3_compression_e2e_test "${BERT_SQLITE_DLL}")
 
+# ──────────── Persona Gateway frontend E2E server (not part of CTest) ────────────
+add_executable(persona_gateway_e2e_server
+    tools/persona_gateway_e2e_server.cpp
+)
+target_include_directories(persona_gateway_e2e_server PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/storage/sqlite
+)
+target_link_libraries(persona_gateway_e2e_server PRIVATE
+    server_runtime
+    agent_service
+    agent_llm
+    agent_tls
+    agent_config
+    nlohmann_json::nlohmann_json
+    OpenSSL::SSL
+    OpenSSL::Crypto
+)
+link_whole_archive(persona_gateway_e2e_server agent_config)
+copy_runtime_files(persona_gateway_e2e_server "${BERT_SQLITE_DLL}")
+
+add_executable(persona_config_migration
+    tools/persona_config_migration.cpp
+)
+target_link_libraries(persona_config_migration PRIVATE
+    nlohmann_json::nlohmann_json
+)
+
 # ──────────── Bare boost::redis smoke test (not part of CTest) ────────────
 add_executable(redis_bare_connection_test
     tools/redis_bare_connection_test.cpp
@@ -604,6 +631,8 @@ add_library(agent_semantic_cache STATIC
     src/semantic_cache/redis_connection_pool.cpp
     src/semantic_cache/semantic_cache_pipeline.h
     src/semantic_cache/semantic_cache_pipeline.cpp
+    src/semantic_cache/l0_memory_cache_adapter.h
+    src/semantic_cache/l0_memory_cache_adapter.cpp
 )
 
 target_include_directories(agent_semantic_cache PUBLIC
@@ -653,6 +682,17 @@ if(BERT_BUILD_TESTS)
         agent_semantic_cache
         agent_vector
         agent_core
+    )
+
+    add_executable(l0_long_context_benchmark
+        tests/semantic_cache/l0_long_context_benchmark.cpp
+    )
+
+    target_link_libraries(l0_long_context_benchmark PRIVATE
+        agent_semantic_cache
+        agent_vector
+        agent_core
+        nlohmann_json::nlohmann_json
     )
 
     add_executable(memory_tests

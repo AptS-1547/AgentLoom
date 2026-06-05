@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <map>
+#include <optional>
 #include <sstream>
 #include <string_view>
 #include <unordered_map>
@@ -167,10 +169,15 @@ Json ChatEnvelope(const ChatGatewayResponse& response) {
                 {"similarityScore", response.answer_cache.similarity_score},
             }},
             {"pipelineLatency", {
+                {"computeQueueWaitMs", response.pipeline_latency.compute_queue_wait.count()},
+                {"computeStageMs", response.pipeline_latency.compute_stage.count()},
+                {"ioQueueWaitMs", response.pipeline_latency.io_queue_wait.count()},
+                {"ioStageMs", response.pipeline_latency.io_stage.count()},
                 {"memoryContextMs", response.pipeline_latency.memory_context.count()},
                 {"answerCacheMs", response.pipeline_latency.answer_cache.count()},
                 {"promptBuildMs", response.pipeline_latency.prompt_build.count()},
                 {"llmTotalMs", response.pipeline_latency.llm_total.count()},
+                {"callbackToResponseMs", response.pipeline_latency.callback_to_response.count()},
                 {"totalMs", response.pipeline_latency.total.count()},
             }},
         }},
@@ -207,6 +214,33 @@ Json ReportEnvelope(const TrainingReportGatewayResponse& response) {
             {"summary", response.summary},
             {"metrics", MetricsToJson(response.metrics)},
             {"schemaVersion", "training_report.v1"},
+        }},
+    };
+}
+
+Json ThreadPoolStatsToJson(const core::ThreadPoolStats& stats) {
+    return Json{
+        {"workerCount", stats.worker_count},
+        {"queuedTasks", stats.queued_tasks},
+        {"activeWorkers", stats.active_workers},
+        {"submittedTasks", stats.submitted_tasks},
+        {"completedTasks", stats.completed_tasks},
+        {"failedTasks", stats.failed_tasks},
+        {"rejectedTasks", stats.rejected_tasks},
+    };
+}
+
+Json SystemStatsEnvelope(const SystemStatsGatewayResponse& response) {
+    return Json{
+        {"ok", true},
+        {"traceId", response.trace_id},
+        {"latencyMs", response.latency.count()},
+        {"data", {
+            {"sessionCount", response.session_count},
+            {"pools", {
+                {"compute", ThreadPoolStatsToJson(response.pools.compute)},
+                {"io", ThreadPoolStatsToJson(response.pools.io)},
+            }},
         }},
     };
 }
@@ -297,6 +331,32 @@ persona::PersonalityConfig PersonalityFromJson(const Json& body) {
     personality.curiosity_level = persona_obj.value("curiosityLevel", personality.curiosity_level);
     personality.formality = persona_obj.value("formality", personality.formality);
     return personality;
+}
+
+std::optional<persona::EmotionPromptConfig> EmotionPromptConfigFromJson(const Json& body) {
+    const auto it = body.find("emotionPrompts");
+    if (it == body.end() || !it->is_object()) {
+        return std::nullopt;
+    }
+
+    persona::EmotionPromptConfig config;
+    config.emotion_map = it->value("emotionMap", std::map<std::string, std::string>{});
+    if (config.emotion_map.empty()) {
+        config.emotion_map = it->value("emotion_map", std::map<std::string, std::string>{});
+    }
+    config.emotion_reliability = it->value("emotionReliability", std::map<std::string, double>{});
+    if (config.emotion_reliability.empty()) {
+        config.emotion_reliability = it->value("emotion_reliability", std::map<std::string, double>{});
+    }
+    config.confidence_thresholds = it->value("confidenceThresholds", config.confidence_thresholds);
+    if (!it->contains("confidenceThresholds")) {
+        config.confidence_thresholds = it->value("confidence_thresholds", config.confidence_thresholds);
+    }
+    config.intensity_levels = it->value("intensityLevels", config.intensity_levels);
+    if (!it->contains("intensityLevels")) {
+        config.intensity_levels = it->value("intensity_levels", config.intensity_levels);
+    }
+    return config;
 }
 
 std::string MessagePayloadToString(const ::net::WebSocketMessage& message) {
@@ -505,6 +565,7 @@ DECLARE_HTTP_ROUTE(CreateSessionRoute, ::net::http::verb::post, "api", "session"
     req.proactive_level = context.body.value("proactiveLevel", std::string{"off"});
     req.default_persona = context.body.value("defaultPersona", false);
     req.personality = PersonalityFromJson(context.body);
+    req.emotion_prompt_config = EmotionPromptConfigFromJson(context.body);
     SendResult(context.request, context.service.CreateSession(std::move(req)), context.trace_id, SessionEnvelope);
 }
 
@@ -647,6 +708,42 @@ DECLARE_HTTP_ROUTE(TrainingReportRoute, ::net::http::verb::post, "api", "report"
     req.include_raw_turns = context.body.value("includeRawTurns", true);
     SendResult(context.request, context.service.TrainingReport(std::move(req)), context.trace_id, ReportEnvelope);
 }
+
+DECLARE_HTTP_ROUTE(SystemStatsRoute, ::net::http::verb::get, "api", "system", "stats") {
+    SendResult(context.request, context.service.SystemStats(context.trace_id), context.trace_id, SystemStatsEnvelope);
+}
+
+class HealthRoute final : public IHttpRoute {
+public:
+    static constexpr std::string_view kRouteName = "HealthRoute";
+    ::net::http::verb Method() const noexcept override { return ::net::http::verb::get; }
+    std::vector<std::string_view> Pattern() const override { return {"api", "health"}; }
+    bool RequiresAuth() const noexcept override { return false; }
+
+    void Handle(HttpRouteContext& context) const override {
+        auto stats = context.service.SystemStats(context.trace_id);
+        if (!stats.ok()) {
+            SendJson(context.request, HttpStatusFor(stats.status().code()), ErrorEnvelope(context.trace_id, stats.status()), context.trace_id);
+            return;
+        }
+
+        Json body{
+            {"ok", true},
+            {"traceId", context.trace_id},
+            {"latencyMs", stats.value().latency.count()},
+            {"data", {
+                {"status", "ok"},
+                {"sessionCount", stats.value().session_count},
+                {"pools", {
+                    {"compute", ThreadPoolStatsToJson(stats.value().pools.compute)},
+                    {"io", ThreadPoolStatsToJson(stats.value().pools.io)},
+                }},
+            }},
+        };
+        SendJson(context.request, ::net::http::status::ok, body, context.trace_id);
+    }
+};
+static const HttpRouteRegistrar<HealthRoute> g_HealthRoute_registrar;
 
 } // namespace
 

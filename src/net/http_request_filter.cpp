@@ -12,7 +12,7 @@ namespace {
 constexpr std::array<std::string_view, 12> kDefaultSuspiciousPatterns = {
     R"((\bunion\b\s+(?:all\s+)?\bselect\b))",
     R"((?:\bor\b|\band\b)\s+['"]?\d+['"]?\s*=\s*['"]?\d+)",
-    R"((?:--|#|/\*))",
+    R"((?:\b(?:select|union|where|from|or|and)\b.{0,64}(?:--|#|/\*)))",
     R"((\bdrop\b\s+\btable\b|\binsert\b\s+\binto\b|\bdelete\b\s+\bfrom\b|\bupdate\b\s+\w+\s+\bset\b))",
     R"((\bxp_cmdshell\b|\binformation_schema\b))",
     R"(<\s*script\b)",

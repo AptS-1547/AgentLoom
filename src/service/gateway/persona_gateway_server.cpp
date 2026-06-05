@@ -1,6 +1,7 @@
 #include "persona_gateway_server.h"
 
 #include "http_types.h"
+#include "redis_connection_pool.h"
 
 #include <utility>
 
@@ -28,7 +29,19 @@ core::ThreadPoolOptions WithDefaultPoolName(core::ThreadPoolOptions options, std
     return http;
 }
 
-std::shared_ptr<IAuthSessionStore> MakeAuthSessionStore(const GatewayAuthOptions& options) {
+std::shared_ptr<IAuthSessionStore> MakeAuthSessionStore(
+    const GatewayAuthOptions& options,
+    std::shared_ptr<agent::semantic_cache::RedisConnectionPool>& auth_redis) {
+    if (options.session_store_backend == "redis") {
+        agent::semantic_cache::RedisPoolOptions redis_options;
+        redis_options.host = options.redis_host;
+        redis_options.port = options.redis_port;
+        redis_options.password = options.redis_password;
+        redis_options.pool_size = options.redis_pool_size;
+        redis_options.command_timeout = options.redis_command_timeout;
+        auth_redis = std::make_shared<agent::semantic_cache::RedisConnectionPool>(redis_options);
+        return std::make_shared<RedisAuthSessionStore>(auth_redis, options.redis_key_prefix);
+    }
     if (options.session_database_path.empty()) {
         return nullptr;
     }
@@ -55,7 +68,7 @@ PersonaGatewayServer::PersonaGatewayServer(PersonaGatewayServerOptions options,
                logger_),
       classroom_scheduler_({}, core::LoggerAdapter::ForModule("classroom")),
       service_(sessions_, runtime_, &classroom_scheduler_, logger_),
-      auth_session_store_(MakeAuthSessionStore(options_.auth)),
+      auth_session_store_(MakeAuthSessionStore(options_.auth, auth_redis_)),
       authenticator_(std::make_shared<JwtCookieAuthenticator>(options_.auth, auth_session_store_)),
       auth_registration_(std::make_shared<JwtAuthRegistrationService>(options_.auth, auth_session_store_)),
       adapter_(service_, authenticator_, auth_registration_),
@@ -113,6 +126,12 @@ core::Status PersonaGatewayServer::Start() {
 }
 
 core::Status PersonaGatewayServer::EnsureAuthSessionStore() {
+    if (auth_redis_ && !auth_redis_->running()) {
+        auto start = auth_redis_->Start();
+        if (!start.ok()) {
+            return start;
+        }
+    }
     if (!auth_session_store_) {
         return core::Status::Ok();
     }
@@ -127,6 +146,9 @@ void PersonaGatewayServer::Stop() {
     sessions_.CleanupExpired();
     io_pool_.Shutdown(true);
     compute_pool_.Shutdown(true);
+    if (auth_redis_) {
+        auth_redis_->Shutdown();
+    }
     started_ = false;
     logger_.info("[gateway] stopped");
 }

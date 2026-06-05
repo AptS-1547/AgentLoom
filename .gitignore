@@ -39,3 +39,7 @@ tools/llm_smoke_prompt.txt
 dev_note/
 # Test output
 dumps/
+# frontend build output
+dist/
+# test output
+data/

@@ -13,6 +13,10 @@
 #include <optional>
 #include <string>
 
+namespace agent::semantic_cache {
+class RedisConnectionPool;
+}
+
 namespace agent::service::gateway {
 
 struct PersonaGatewayServerOptions {
@@ -67,6 +71,7 @@ private:
     persona::PersonaRuntime runtime_;
     ClassroomScheduler classroom_scheduler_;
     PersonaGatewayService service_;
+    std::shared_ptr<agent::semantic_cache::RedisConnectionPool> auth_redis_;
     std::shared_ptr<IAuthSessionStore> auth_session_store_;
     std::shared_ptr<IGatewayAuthenticator> authenticator_;
     std::shared_ptr<IAuthRegistrationService> auth_registration_;

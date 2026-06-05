@@ -71,7 +71,14 @@ struct GatewayAuthConfigOptions {
     std::string cookie_same_site = "Lax";
     bool require_session_record = false;
     bool auto_provision_session = true;
+    std::string session_store_backend = "sqlite";
     std::string session_database_path;
+    std::string redis_host = "127.0.0.1";
+    std::string redis_port = "6379";
+    std::string redis_password;
+    int redis_pool_size = 8;
+    int redis_command_timeout_ms = 5000;
+    std::string redis_key_prefix = "agent:gateway:auth";
 };
 
 struct GatewayStaticFilesConfigOptions {
@@ -118,7 +125,14 @@ GatewayAuthOptionsT ToGatewayAuthOptions(const GatewayAuthConfigOptions& config)
     options.cookie_same_site = config.cookie_same_site;
     options.require_session_record = config.require_session_record;
     options.auto_provision_session = config.auto_provision_session;
+    options.session_store_backend = config.session_store_backend;
     options.session_database_path = config.session_database_path;
+    options.redis_host = config.redis_host;
+    options.redis_port = config.redis_port;
+    options.redis_password = config.redis_password;
+    options.redis_pool_size = static_cast<std::size_t>(config.redis_pool_size);
+    options.redis_command_timeout = std::chrono::milliseconds(config.redis_command_timeout_ms);
+    options.redis_key_prefix = config.redis_key_prefix;
     return options;
 }
 

@@ -144,6 +144,7 @@ void HttpServer::HttpSession::OnRead(beast::error_code ec, std::size_t) {
                ec.message()});
         return;
     }
+    stream_.expires_never();
 
     std::string trace_id;
     auto trace_header = request_.find("X-Trace-Id");

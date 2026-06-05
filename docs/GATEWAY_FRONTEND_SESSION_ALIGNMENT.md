@@ -159,12 +159,54 @@ Error responses:
 {
   "ok": false,
   "traceId": "trace_xxx",
+  "sessionId": "optional-session-id",
   "error": {
-    "code": "SESSION_NOT_FOUND",
-    "message": "session not found"
+    "code": "NOT_FOUND",
+    "message": "session not found",
+    "details": {}
   }
 }
 ```
+
+Frontend error-display contract:
+
+- `ok=false` is the authoritative error signal.
+- `error.code` is stable enough for coarse UI routing, such as unauthorized, missing session, unavailable backend, or validation failure.
+- `error.message` is the user-visible fallback text for the frontend error panel.
+- `error.details` is optional diagnostic metadata; frontend code must not require it.
+- `traceId` should be visible or copyable in E2E/debug UI because backend logs and WAF logs use it for correlation.
+
+Current gateway status-code mapping:
+
+```text
+400 INVALID_ARGUMENT
+403 PERMISSION_DENIED
+404 NOT_FOUND
+409 ALREADY_EXISTS or FAILED_PRECONDITION
+429 RESOURCE_EXHAUSTED
+503 UNAVAILABLE
+504 TIMEOUT
+500 INTERNAL_ERROR or UNKNOWN
+```
+
+Temporarily exposed but not fully implemented features should return a non-fatal default response when the frontend can still proceed:
+
+```json
+{
+  "ok": true,
+  "traceId": "trace_xxx",
+  "sessionId": "optional-session-id",
+  "latencyMs": 0,
+  "data": {
+    "implemented": false,
+    "status": "placeholder",
+    "message": "This feature is not implemented yet.",
+    "result": {}
+  }
+}
+```
+
+The frontend should render `implemented=false` as an available-but-basic feature result, not as a global error. Use an actual error envelope only for invalid input, authentication failure, missing state, unsafe uploads, backend unavailability, or any operation that would corrupt or misrepresent session state.
 
 Each business response should carry enough data for E2E and production diagnostics:
 

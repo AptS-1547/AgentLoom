@@ -8,6 +8,7 @@
 
 #include "sqlite/sqlite_connection.h"
 #include "sqlite/sqlite_statement.h"
+#include "redis_connection_pool.h"
 
 #include <algorithm>
 #include <array>
@@ -260,6 +261,48 @@ std::int64_t ToUnixSeconds(std::chrono::system_clock::time_point time) {
 
 std::chrono::system_clock::time_point FromUnixSeconds(std::int64_t seconds) {
     return std::chrono::system_clock::time_point(std::chrono::seconds(seconds));
+}
+
+Json AuthSessionRecordToJson(const AuthSessionRecord& record) {
+    return Json{
+        {"token_id", record.token_id},
+        {"user_uuid", record.user_uuid},
+        {"tenant_id", record.tenant_id.empty() ? "default" : record.tenant_id},
+        {"subject", record.subject},
+        {"issued_at", ToUnixSeconds(record.issued_at)},
+        {"expires_at", ToUnixSeconds(record.expires_at)},
+        {"revoked", record.revoked},
+    };
+}
+
+core::Result<AuthSessionRecord> AuthSessionRecordFromJson(std::string_view payload) {
+    Json json;
+    try {
+        json = Json::parse(payload);
+    } catch (const Json::exception& e) {
+        return core::Status::Error(core::ErrorCode::InvalidArgument, e.what());
+    }
+
+    AuthSessionRecord record;
+    record.token_id = json.value("token_id", std::string{});
+    record.user_uuid = json.value("user_uuid", std::string{});
+    record.tenant_id = json.value("tenant_id", std::string{"default"});
+    record.subject = json.value("subject", std::string{});
+    record.issued_at = FromUnixSeconds(json.value("issued_at", std::int64_t{0}));
+    record.expires_at = FromUnixSeconds(json.value("expires_at", std::int64_t{0}));
+    record.revoked = json.value("revoked", false);
+    if (record.token_id.empty() || record.user_uuid.empty()) {
+        return core::Status::Error(core::ErrorCode::InvalidArgument, "invalid auth session record");
+    }
+    return record;
+}
+
+std::chrono::seconds RemainingTtl(std::chrono::system_clock::time_point expires_at) {
+    const auto now = std::chrono::system_clock::now();
+    if (expires_at <= now) {
+        return std::chrono::seconds(1);
+    }
+    return std::max(std::chrono::seconds(1), std::chrono::duration_cast<std::chrono::seconds>(expires_at - now));
 }
 
 bool AudienceMatches(const Json& payload, std::string_view expected) {
@@ -697,6 +740,60 @@ core::Status SqliteAuthSessionStore::RevokeSession(std::string_view token_id, st
     return connection.Changes() == 0
         ? core::Status::Error(core::ErrorCode::NotFound, "auth session not found")
         : core::Status::Ok();
+}
+
+RedisAuthSessionStore::RedisAuthSessionStore(std::shared_ptr<semantic_cache::RedisConnectionPool> redis,
+                                             std::string key_prefix)
+    : redis_(std::move(redis)),
+      key_prefix_(std::move(key_prefix)) {
+    if (key_prefix_.empty()) {
+        key_prefix_ = "agent:gateway:auth";
+    }
+}
+
+core::Status RedisAuthSessionStore::EnsureSchema() {
+    if (!redis_) {
+        return core::Status::Error(core::ErrorCode::FailedPrecondition, "redis auth session store is not configured");
+    }
+    return redis_->running()
+        ? core::Status::Ok()
+        : core::Status::Error(core::ErrorCode::FailedPrecondition, "redis auth session store is not running");
+}
+
+core::Result<AuthSessionRecord> RedisAuthSessionStore::ResolveSession(std::string_view token_id) {
+    if (token_id.empty()) {
+        return core::Status::Error(core::ErrorCode::InvalidArgument, "token_id is required");
+    }
+    auto payload = redis_->Get(SessionKey(token_id));
+    if (!payload.ok()) {
+        return payload.status();
+    }
+    return AuthSessionRecordFromJson(payload.value());
+}
+
+core::Status RedisAuthSessionStore::UpsertSession(const AuthSessionRecord& record) {
+    if (record.token_id.empty() || record.user_uuid.empty()) {
+        return core::Status::Error(core::ErrorCode::InvalidArgument, "token_id and user_uuid are required");
+    }
+    return redis_->Set(SessionKey(record.token_id),
+                       AuthSessionRecordToJson(record).dump(),
+                       RemainingTtl(record.expires_at));
+}
+
+core::Status RedisAuthSessionStore::RevokeSession(std::string_view token_id, std::string_view) {
+    auto resolved = ResolveSession(token_id);
+    if (!resolved.ok()) {
+        return resolved.status();
+    }
+    auto record = resolved.value();
+    record.revoked = true;
+    return redis_->Set(SessionKey(token_id),
+                       AuthSessionRecordToJson(record).dump(),
+                       RemainingTtl(record.expires_at));
+}
+
+std::string RedisAuthSessionStore::SessionKey(std::string_view token_id) const {
+    return key_prefix_ + ":session:" + std::string(token_id);
 }
 
 std::optional<std::string> ExtractCookieValue(std::string_view cookie_header, std::string_view name) {

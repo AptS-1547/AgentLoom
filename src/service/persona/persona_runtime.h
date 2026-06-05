@@ -78,6 +78,31 @@ public:
                                           std::string_view trace_id) override;
 };
 
+struct EmotionCalibrationOptions {
+    bool enabled = false;
+    double low_confidence_threshold = 0.45;
+    double top_margin_threshold = 0.15;
+    std::size_t min_text_length = 8;
+};
+
+struct EmotionCalibrationSample {
+    std::string trace_id;
+    std::string session_id;
+    std::string user_uuid;
+    std::string persona_id;
+    std::string text;
+    EmotionAnalysis bert_result;
+    EmotionState state_snapshot;
+    std::vector<ConversationTurn> recent_turns;
+    std::string reason;
+};
+
+class IEmotionCalibrationSampleSink {
+public:
+    virtual ~IEmotionCalibrationSampleSink() = default;
+    virtual core::Status Record(const EmotionCalibrationSample& sample) = 0;
+};
+
 struct ChatRequest {
     std::string session_id;
     std::string user_input;
@@ -88,10 +113,15 @@ struct ChatRequest {
 };
 
 struct ChatLatencyBreakdown {
+    std::chrono::milliseconds compute_queue_wait{0};
+    std::chrono::milliseconds compute_stage{0};
+    std::chrono::milliseconds io_queue_wait{0};
+    std::chrono::milliseconds io_stage{0};
     std::chrono::milliseconds memory_context{0};
     std::chrono::milliseconds answer_cache{0};
     std::chrono::milliseconds prompt_build{0};
     std::chrono::milliseconds llm_total{0};
+    std::chrono::milliseconds callback_to_response{0};
     std::chrono::milliseconds total{0};
 };
 
@@ -155,6 +185,7 @@ using ChatCallback = std::function<void(core::Result<ChatResponse>)>;
 struct PersonaRuntimeOptions {
     std::size_t recent_raw_turns = 10;
     std::string default_model;
+    EmotionCalibrationOptions emotion_calibration;
 };
 
 class PersonaRuntime {
@@ -165,7 +196,8 @@ public:
                    std::shared_ptr<llm::ILlmClient> llm_client,
                    PersonaRuntimeOptions options = {},
                    std::shared_ptr<IAnswerCacheProvider> answer_cache_provider = nullptr,
-                   core::LoggerAdapter logger = core::LoggerAdapter::ForModule("service"));
+                   core::LoggerAdapter logger = core::LoggerAdapter::ForModule("service"),
+                   std::shared_ptr<IEmotionCalibrationSampleSink> emotion_calibration_sink = nullptr);
 
     core::Status SubmitChat(ChatRequest request, ChatCallback callback);
 
@@ -178,6 +210,7 @@ private:
         std::vector<llm::ChatMessage> messages;
         AnswerCacheInfo answer_cache;
         std::chrono::steady_clock::time_point started_at;
+        std::chrono::steady_clock::time_point io_submitted_at;
         ChatLatencyBreakdown latency;
     };
 
@@ -188,6 +221,10 @@ private:
         const EmotionAnalysis& emotion,
         std::string_view user_input,
         const std::optional<std::string>& emotion_hint) const;
+    core::Status MaybeRecordEmotionCalibrationSample(const SessionState& session,
+                                                     const ChatRequest& request,
+                                                     const EmotionAnalysis& emotion,
+                                                     const std::vector<ConversationTurn>& recent_turns) const;
     void CompleteWithLlm(SessionState& session, PreparedChat prepared, ChatCallback callback);
 
     SessionManager& sessions_;
@@ -195,6 +232,7 @@ private:
     std::shared_ptr<IEmotionAnalyzer> emotion_analyzer_;
     std::shared_ptr<llm::ILlmClient> llm_client_;
     std::shared_ptr<IAnswerCacheProvider> answer_cache_provider_;
+    std::shared_ptr<IEmotionCalibrationSampleSink> emotion_calibration_sink_;
     PersonaRuntimeOptions options_;
     core::LoggerAdapter logger_;
 };

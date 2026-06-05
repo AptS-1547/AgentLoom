@@ -1,0 +1,106 @@
+{
+  "_README": [
+    "Config for tools/persona_gateway_e2e_server.cpp.",
+    "The server hosts ./dist and first-party gateway APIs on one HTTP port.",
+    "Run: .\\build\\Release\\persona_gateway_e2e_server.exe tools\\persona_gateway_e2e_server.json",
+    "API key resolution follows l3_compression_e2e_test style: env first, then api_key_file relative to this config.",
+    "Crash dumps are always written to the repository-root dumps directory."
+  ],
+  "logging": {
+    "log_dir": "../logs/persona_gateway_e2e",
+    "logger_name": "persona_gateway_e2e_server",
+    "file_name": "persona_gateway_e2e_server.log",
+    "enable_console": true,
+    "use_daily_rotation": true,
+    "max_file_size_bytes": 10485760,
+    "max_files": 5
+  },
+  "persona_gateway": {
+    "address": "127.0.0.1",
+    "port": 18080,
+    "http_io_threads": 8,
+    "websocket_path": "/ws/session",
+    "static_files": {
+      "enabled": true,
+      "root": "../dist",
+      "index_file": "index.html",
+      "spa_fallback": true
+    },
+    "compute_pool": {
+      "worker_count": 2,
+      "queue_capacity": 256
+    },
+    "io_pool": {
+      "worker_count": 32,
+      "queue_capacity": 1024
+    },
+    "session_idle_timeout_minutes": 15,
+    "session_max_recent_turns": 20,
+    "runtime_recent_raw_turns": 10,
+    "runtime_default_model": "deepseek-chat",
+    "request_filter": {
+      "enabled": true,
+      "reject_control_chars": true,
+      "reject_suspicious_patterns": true
+    }
+  },
+  "gateway_auth": {
+    "enabled": true,
+    "allow_dev_identity": false,
+    "require_auth_for_api": true,
+    "cookie_name": "agent_auth",
+    "generate_dev_keys": true,
+    "issuer": "agent-e2e",
+    "audience": "agent-gateway",
+    "clock_skew_seconds": 60,
+    "token_ttl_seconds": 28800,
+    "cookie_http_only": true,
+    "cookie_secure": false,
+    "cookie_same_site": "Lax",
+    "require_session_record": false,
+    "auto_provision_session": true,
+    "session_store_backend": "redis",
+    "session_database_path": "../data/persona_gateway_e2e/persona_gateway_e2e_auth.db",
+    "redis_host": "127.0.0.1",
+    "redis_port": "5000",
+    "redis_pool_size": 32,
+    "redis_command_timeout_ms": 5000,
+    "redis_key_prefix": "agent:e2e:gateway:auth"
+  },
+  "llm": {
+    "enabled": true,
+    "base_url": "https://api.deepseek.com/v1",
+    "api_key_env": "AGENT_LLM_API_KEY",
+    "api_key_file": "llm_smoke_test.key",
+    "model": "deepseek-chat",
+    "timeout_ms": 30000,
+    "max_retries": 1,
+    "require_api_key": true,
+    "disable_tls_verify_on_windows": true,
+    "allow_placeholder": false
+  },
+  "embedding": {
+    "tokenizer_path": "../onnx_models/minilm/tokenizer.json",
+    "model_path": "../onnx_models/minilm/model.onnx",
+    "dimension": 384,
+    "execution_provider": "auto"
+  },
+  "l0_memory": {
+    "enabled": true,
+    "redis_host": "127.0.0.1",
+    "redis_port": 5000,
+    "sqlite_path": "../data/persona_gateway_e2e/l0_memory.db",
+    "user_uuid": "e2e-l0",
+    "max_cached_records": 1000,
+    "top_k": 5,
+    "neighbors_per_hit": 1,
+    "similarity_floor": 0.78
+  },
+  "local_llm": {
+    "enabled": false,
+    "target": "127.0.0.1:50051",
+    "deadline_ms": 30000,
+    "auth_token": "",
+    "auth_metadata_key": "authorization"
+  }
+}

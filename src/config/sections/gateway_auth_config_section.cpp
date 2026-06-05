@@ -20,7 +20,10 @@ DECLARE_CONFIG_SECTION(GatewayAuthConfigSection, "gateway_auth")
     CONFIG_CLI_STRING(kAudience, "--gateway-auth-audience");
     CONFIG_CLI_STRING(kClockSkew, "--gateway-auth-clock-skew");
     CONFIG_CLI_STRING(kTokenTtl, "--gateway-auth-token-ttl");
+    CONFIG_CLI_STRING(kSessionStoreBackend, "--gateway-auth-session-store");
     CONFIG_CLI_STRING(kSessionDb, "--gateway-auth-session-db");
+    CONFIG_CLI_STRING(kRedisHost, "--gateway-auth-redis-host");
+    CONFIG_CLI_STRING(kRedisPort, "--gateway-auth-redis-port");
     CONFIG_CLI_STRING(kRequireSessionRecord, "--gateway-auth-require-session");
     CONFIG_CLI_STRING(kAutoProvisionSession, "--gateway-auth-auto-provision");
     CONFIG_CLI_STRING(kCookieSecure, "--gateway-auth-cookie-secure");
@@ -65,7 +68,14 @@ void GatewayAuthConfigSection::LoadJson(const Json& root, MultimodalServerOption
     SetString(*section, Name(), "cookie_same_site", options.gateway_auth.cookie_same_site);
     SetBool(*section, Name(), "require_session_record", options.gateway_auth.require_session_record);
     SetBool(*section, Name(), "auto_provision_session", options.gateway_auth.auto_provision_session);
+    SetString(*section, Name(), "session_store_backend", options.gateway_auth.session_store_backend);
     SetString(*section, Name(), "session_database_path", options.gateway_auth.session_database_path);
+    SetString(*section, Name(), "redis_host", options.gateway_auth.redis_host);
+    SetString(*section, Name(), "redis_port", options.gateway_auth.redis_port);
+    SetString(*section, Name(), "redis_password", options.gateway_auth.redis_password);
+    SetInt(*section, Name(), "redis_pool_size", options.gateway_auth.redis_pool_size, 1, 1024);
+    SetInt(*section, Name(), "redis_command_timeout_ms", options.gateway_auth.redis_command_timeout_ms, 1, 60000);
+    SetString(*section, Name(), "redis_key_prefix", options.gateway_auth.redis_key_prefix);
 }
 
 bool GatewayAuthConfigSection::LoadCli(CliCursor& cursor, MultimodalServerOptions& options) const {
@@ -89,7 +99,10 @@ bool GatewayAuthConfigSection::LoadCli(CliCursor& cursor, MultimodalServerOption
     CONFIG_VALUE_ARG(kTokenTtl, value, {
         options.gateway_auth.token_ttl_seconds = ParseNonNegativeOption(kTokenTtl, *value);
     })
+    CONFIG_VALUE_ARG(kSessionStoreBackend, value, options.gateway_auth.session_store_backend = *value;)
     CONFIG_VALUE_ARG(kSessionDb, value, options.gateway_auth.session_database_path = *value;)
+    CONFIG_VALUE_ARG(kRedisHost, value, options.gateway_auth.redis_host = *value;)
+    CONFIG_VALUE_ARG(kRedisPort, value, options.gateway_auth.redis_port = *value;)
     CONFIG_FLAG_ARG(kRequireSessionRecord, {
         options.gateway_auth.require_session_record = true;
         options.gateway_auth.auto_provision_session = false;
@@ -125,7 +138,22 @@ void GatewayAuthConfigSection::Validate(MultimodalServerOptions& options) const 
     if (auth.enabled && auth.private_key_pem.empty()) {
         throw std::runtime_error("gateway_auth.private_key_pem or private_key_file is required when gateway auth is enabled");
     }
-    if (auth.require_session_record && auth.session_database_path.empty()) {
+    if (auth.session_store_backend.empty()) {
+        auth.session_store_backend = "sqlite";
+    }
+    if (auth.session_store_backend != "sqlite" && auth.session_store_backend != "redis") {
+        throw std::runtime_error("gateway_auth.session_store_backend must be sqlite or redis");
+    }
+    if (auth.redis_pool_size <= 0) {
+        throw std::runtime_error("gateway_auth.redis_pool_size must be positive");
+    }
+    if (auth.redis_command_timeout_ms <= 0) {
+        throw std::runtime_error("gateway_auth.redis_command_timeout_ms must be positive");
+    }
+    if (auth.session_store_backend == "redis" && auth.redis_key_prefix.empty()) {
+        throw std::runtime_error("gateway_auth.redis_key_prefix must not be empty when Redis auth store is used");
+    }
+    if (auth.require_session_record && auth.session_store_backend == "sqlite" && auth.session_database_path.empty()) {
         throw std::runtime_error("gateway_auth.session_database_path is required when require_session_record is true");
     }
     if (!auth.session_database_path.empty()) {

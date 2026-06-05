@@ -144,11 +144,37 @@ Error responses use:
 {
   "ok": false,
   "traceId": "...",
+  "sessionId": "optional-session-id",
   "error": {
     "code": "PERMISSION_DENIED",
-    "message": "..."
+    "message": "...",
+    "details": {}
   }
 }
+```
+
+Error response rules for the frontend:
+
+```text
+ok=false is the authoritative signal for rendering an error state.
+traceId must be shown or made copyable in developer/E2E diagnostics.
+error.code should drive coarse UI behavior.
+error.message is safe to display in the frontend error panel unless the endpoint explicitly documents otherwise.
+error.details is optional and may be omitted; frontend code must tolerate its absence.
+sessionId may be absent for auth, registration, document upload, and early request validation failures.
+```
+
+Current HTTP status mapping:
+
+```text
+400 -> INVALID_ARGUMENT
+403 -> PERMISSION_DENIED
+404 -> NOT_FOUND
+409 -> ALREADY_EXISTS or FAILED_PRECONDITION
+429 -> RESOURCE_EXHAUSTED
+503 -> UNAVAILABLE
+504 -> TIMEOUT
+500 -> INTERNAL_ERROR or UNKNOWN
 ```
 
 Known error code strings currently include:
@@ -168,7 +194,61 @@ UNKNOWN
 
 The backend also returns `X-Trace-Id` in HTTP responses.
 
-### 5.0 Auth Identity
+### 5.0 Default Response for Temporarily Unimplemented Features
+
+Some competition E2E screens may exist before the full backend business algorithm is migrated. If the endpoint is intentionally exposed for frontend integration but the algorithm is not finished, prefer a successful default response over an error when the frontend can continue the flow.
+
+Default successful placeholder shape:
+
+```json
+{
+  "ok": true,
+  "traceId": "...",
+  "sessionId": "optional-session-id",
+  "latencyMs": 0,
+  "data": {
+    "implemented": false,
+    "status": "placeholder",
+    "message": "This feature is not implemented yet.",
+    "result": {}
+  }
+}
+```
+
+Frontend handling:
+
+```text
+Render this as an available-but-basic result, not as a fatal error.
+Show data.message only in the feature result area, not in the global error panel.
+Do not block the rest of the E2E flow when implemented=false and ok=true.
+Preserve traceId for diagnostics.
+```
+
+Use an error only when the request cannot be accepted or the UI must stop the flow:
+
+```json
+{
+  "ok": false,
+  "traceId": "...",
+  "error": {
+    "code": "UNAVAILABLE",
+    "message": "Document analysis pipeline is not available in this build.",
+    "details": {
+      "feature": "document_analysis",
+      "implemented": false
+    }
+  }
+}
+```
+
+Recommended boundary:
+
+```text
+Return ok=true + implemented=false for report/document/classroom helper data that can be displayed as a default result.
+Return ok=false for auth failures, invalid input, missing session, unsafe upload, unavailable LLM/local inference, or any action that would make later state inconsistent.
+```
+
+### 5.1 Auth Identity
 
 ```http
 POST /api/auth/register
@@ -250,7 +330,7 @@ If SSO is required and the backend returns 401/403, show the unauthorized state.
 Do not let UI state override userUuid or tenantId.
 ```
 
-### 5.1 Create Session
+### 5.2 Create Session
 
 ```http
 POST /api/session/create
@@ -323,7 +403,7 @@ Response:
 }
 ```
 
-### 5.2 Send Chat Message
+### 5.3 Send Chat Message
 
 ```http
 POST /api/chat/message
@@ -405,7 +485,7 @@ pipelineLatency.llmTotalMs >= 0
 
 When semantic answer cache is later implemented, the frontend should not need schema changes.
 
-### 5.3 Get Session
+### 5.4 Get Session
 
 ```http
 GET /api/session/{sessionId}
@@ -415,7 +495,7 @@ GET /api/session/{sessionId}/emotion
 
 These endpoints are used for polling session state and E2E assertions.
 
-### 5.4 Training Report
+### 5.5 Training Report
 
 ```http
 POST /api/report/training
@@ -447,7 +527,7 @@ Current response may contain a pending/default summary:
 
 This is acceptable for the first E2E. The frontend should render it as an available-but-basic report, not as an error.
 
-### 5.5 Close Session
+### 5.6 Close Session
 
 ```http
 POST /api/session/close
@@ -464,7 +544,7 @@ Request:
 
 After close, the frontend must prevent further sends for that session.
 
-### 5.6 Classroom Message
+### 5.7 Classroom Message
 
 ```http
 POST /api/classroom/message
@@ -525,7 +605,7 @@ Response:
 }
 ```
 
-### 5.7 Classroom Proactive
+### 5.8 Classroom Proactive
 
 ```http
 POST /api/classroom/proactive
@@ -549,7 +629,7 @@ This endpoint forces a proactive generation request for the resolved persona. It
 
 Response shape is the same as `/api/classroom/message`.
 
-### 5.8 Classroom Poll
+### 5.9 Classroom Poll
 
 ```http
 POST /api/classroom/poll

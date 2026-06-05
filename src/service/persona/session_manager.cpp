@@ -263,6 +263,13 @@ core::Status SessionManager::SubmitIo(DispatchOptions options, SessionTask task)
     return Submit(io_pool_, "io", std::move(options), std::move(task));
 }
 
+SessionThreadPoolStats SessionManager::PoolStats() const {
+    SessionThreadPoolStats stats;
+    stats.compute = compute_pool_.Stats();
+    stats.io = io_pool_.Stats();
+    return stats;
+}
+
 core::Status SessionManager::Submit(core::ThreadPool& pool,
                                     std::string_view pool_role,
                                     DispatchOptions options,

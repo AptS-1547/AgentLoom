@@ -484,7 +484,13 @@ TEST(ConfigGatewayAuthSectionTest, JsonLoadsGatewayAuthAndResolvesRelativeFiles)
             "cookie_same_site": "Strict",
             "require_session_record": true,
             "auto_provision_session": false,
-            "session_database_path": "gateway_auth.db"
+            "session_store_backend": "redis",
+            "session_database_path": "gateway_auth.db",
+            "redis_host": "127.0.0.1",
+            "redis_port": "5000",
+            "redis_pool_size": 16,
+            "redis_command_timeout_ms": 2500,
+            "redis_key_prefix": "agent:test:auth"
         }
     })");
 
@@ -508,7 +514,13 @@ TEST(ConfigGatewayAuthSectionTest, JsonLoadsGatewayAuthAndResolvesRelativeFiles)
     EXPECT_EQ(opts.gateway_auth.cookie_same_site, "Strict");
     EXPECT_TRUE(opts.gateway_auth.require_session_record);
     EXPECT_FALSE(opts.gateway_auth.auto_provision_session);
+    EXPECT_EQ(opts.gateway_auth.session_store_backend, "redis");
     EXPECT_EQ(opts.gateway_auth.session_database_path, (tmp.path() / "gateway_auth.db").string());
+    EXPECT_EQ(opts.gateway_auth.redis_host, "127.0.0.1");
+    EXPECT_EQ(opts.gateway_auth.redis_port, "5000");
+    EXPECT_EQ(opts.gateway_auth.redis_pool_size, 16);
+    EXPECT_EQ(opts.gateway_auth.redis_command_timeout_ms, 2500);
+    EXPECT_EQ(opts.gateway_auth.redis_key_prefix, "agent:test:auth");
 }
 
 TEST(ConfigGatewayAuthSectionTest, CliOverridesGatewayAuthJson) {
@@ -537,6 +549,9 @@ TEST(ConfigGatewayAuthSectionTest, CliOverridesGatewayAuthJson) {
         "--gateway-auth-audience", "cli-aud",
         "--gateway-auth-token-ttl", "600",
         "--gateway-auth-cookie-secure",
+        "--gateway-auth-session-store", "redis",
+        "--gateway-auth-redis-host", "127.0.0.1",
+        "--gateway-auth-redis-port", "5000",
         "--gateway-auth-session-db", (tmp.path() / "auth.db").string(),
         "--gateway-auth-require-session"
     });
@@ -553,6 +568,9 @@ TEST(ConfigGatewayAuthSectionTest, CliOverridesGatewayAuthJson) {
     EXPECT_TRUE(opts.gateway_auth.cookie_secure);
     EXPECT_TRUE(opts.gateway_auth.require_session_record);
     EXPECT_FALSE(opts.gateway_auth.auto_provision_session);
+    EXPECT_EQ(opts.gateway_auth.session_store_backend, "redis");
+    EXPECT_EQ(opts.gateway_auth.redis_host, "127.0.0.1");
+    EXPECT_EQ(opts.gateway_auth.redis_port, "5000");
 }
 
 TEST(ConfigGatewayAuthSectionTest, RejectsStrictSessionWithoutDatabase) {

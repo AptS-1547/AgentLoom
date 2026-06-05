@@ -9,7 +9,9 @@
     "spdlog",
     "hiredis",
     "redis-plus-plus",
-    "nlohmann-json"
+    "nlohmann-json",
+    "libzip",
+    "pugixml"
   ],
   "features": {
     "tests": {

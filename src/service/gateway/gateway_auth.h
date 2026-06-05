@@ -10,6 +10,10 @@
 #include <string>
 #include <string_view>
 
+namespace agent::semantic_cache {
+class RedisConnectionPool;
+}
+
 namespace agent::service::gateway {
 
 struct AuthIdentity {
@@ -39,7 +43,14 @@ struct GatewayAuthOptions {
     std::string cookie_same_site = "Lax";
     bool require_session_record = false;
     bool auto_provision_session = true;
+    std::string session_store_backend = "sqlite";
     std::string session_database_path;
+    std::string redis_host = "127.0.0.1";
+    std::string redis_port = "6379";
+    std::string redis_password;
+    std::size_t redis_pool_size = 8;
+    std::chrono::milliseconds redis_command_timeout{5000};
+    std::string redis_key_prefix = "agent:gateway:auth";
 };
 
 struct AuthSessionRecord {
@@ -135,6 +146,23 @@ public:
 
 private:
     std::string database_path_;
+};
+
+class RedisAuthSessionStore final : public IAuthSessionStore {
+public:
+    RedisAuthSessionStore(std::shared_ptr<semantic_cache::RedisConnectionPool> redis,
+                          std::string key_prefix = "agent:gateway:auth");
+
+    core::Status EnsureSchema() override;
+    core::Result<AuthSessionRecord> ResolveSession(std::string_view token_id) override;
+    core::Status UpsertSession(const AuthSessionRecord& record) override;
+    core::Status RevokeSession(std::string_view token_id, std::string_view reason) override;
+
+private:
+    std::string SessionKey(std::string_view token_id) const;
+
+    std::shared_ptr<semantic_cache::RedisConnectionPool> redis_;
+    std::string key_prefix_;
 };
 
 std::optional<std::string> ExtractCookieValue(std::string_view cookie_header, std::string_view name);

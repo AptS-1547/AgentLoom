@@ -2,6 +2,7 @@
 #include "persona_gateway_server.h"
 #include "persona_gateway_service.h"
 #include "http_server.h"
+#include "redis_connection_pool.h"
 
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
@@ -34,6 +35,7 @@ using agent::service::gateway::PersonaGatewayService;
 using agent::service::gateway::IGatewayAuthenticator;
 using agent::service::gateway::IAuthRegistrationService;
 using agent::service::gateway::SqliteAuthSessionStore;
+using agent::service::gateway::RedisAuthSessionStore;
 using agent::service::gateway::AuthSessionRecord;
 using agent::service::gateway::TrainingReportGatewayRequest;
 using agent::service::persona::NeutralEmotionAnalyzer;
@@ -341,6 +343,53 @@ TEST(PersonaGatewayHttpAdapterTest, HandlesSessionCreateAndChatJsonRoutes) {
     server.Stop();
 }
 
+TEST(PersonaGatewayHttpAdapterTest, PassesEmotionPromptsIntoSessionPromptBuilder) {
+    GatewayFixture f;
+    PersonaGatewayHttpAdapter adapter(f.gateway);
+    ::net::HttpServer server({.address = "127.0.0.1", .port = 0, .io_threads = 1});
+    server.SetHttpRequestHandler([&adapter](std::shared_ptr<::net::IHttpRequest> request) {
+        adapter.HandleHttp(std::move(request));
+    });
+    ASSERT_TRUE(server.Start().ok());
+
+    auto create = SendJsonRequest(
+        server.port(),
+        ::net::http::verb::post,
+        "/api/session/create",
+        Json{
+            {"traceId", "trace-emotion-prompt-create"},
+            {"sessionId", "session-emotion-prompt"},
+            {"userUuid", "user-emotion-prompt"},
+            {"personaId", "dazhi"},
+            {"personality", {{"name", "dazhi"}, {"description", "student"}}},
+            {"emotionPrompts", {
+                {"emotionMap", {{"neutral", "用户状态平稳，保持自然教学节奏"}}},
+                {"emotionReliability", {{"neutral", 1.0}}},
+                {"confidenceThresholds", {{"strong", 0.5}, {"weak", 0.3}}},
+                {"intensityLevels", {{"high_min", 0.7}}},
+            }},
+        });
+    ASSERT_EQ(create.result(), ::net::http::status::ok);
+
+    auto chat = SendJsonRequest(
+        server.port(),
+        ::net::http::verb::post,
+        "/api/chat/message",
+        Json{
+            {"traceId", "trace-emotion-prompt-chat"},
+            {"sessionId", "session-emotion-prompt"},
+            {"personaId", "dazhi"},
+            {"message", "hello"},
+        });
+    ASSERT_EQ(chat.result(), ::net::http::status::ok);
+    {
+        std::lock_guard lock(f.llm->mutex_);
+        ASSERT_FALSE(f.llm->last_request.messages.empty());
+        EXPECT_NE(f.llm->last_request.messages.front().content.find("用户状态平稳"), std::string::npos);
+    }
+    server.Stop();
+}
+
 TEST(PersonaGatewayHttpAdapterTest, AuthIdentityOverridesCreateSessionUserUuid) {
     GatewayFixture f;
     AuthIdentity identity;
@@ -394,6 +443,32 @@ TEST(PersonaGatewayHttpAdapterTest, RejectsApiWhenAuthenticatorRejects) {
     auto body = Json::parse(create.body());
     EXPECT_FALSE(body["ok"].get<bool>());
     EXPECT_EQ(body["error"]["code"], "PERMISSION_DENIED");
+    server.Stop();
+}
+
+TEST(PersonaGatewayHttpAdapterTest, HealthRouteBypassesAuthenticatorAndReportsReadiness) {
+    GatewayFixture f;
+    PersonaGatewayHttpAdapter adapter(f.gateway, std::make_shared<RejectingAuthenticator>());
+    ::net::HttpServer server({.address = "127.0.0.1", .port = 0, .io_threads = 1});
+    server.SetHttpRequestHandler([&adapter](std::shared_ptr<::net::IHttpRequest> request) {
+        adapter.HandleHttp(std::move(request));
+    });
+    ASSERT_TRUE(server.Start().ok());
+
+    auto response = SendJsonRequest(
+        server.port(),
+        ::net::http::verb::get,
+        "/api/health",
+        Json{{"traceId", "trace-health"}});
+    EXPECT_EQ(response.result(), ::net::http::status::ok);
+    EXPECT_EQ(std::string(response["X-Trace-Id"]), "trace-health");
+    auto body = Json::parse(response.body());
+    EXPECT_TRUE(body["ok"].get<bool>());
+    EXPECT_EQ(body["traceId"], "trace-health");
+    EXPECT_EQ(body["data"]["status"], "ok");
+    EXPECT_TRUE(body["data"].contains("sessionCount"));
+    EXPECT_TRUE(body["data"]["pools"].contains("compute"));
+    EXPECT_TRUE(body["data"]["pools"].contains("io"));
     server.Stop();
 }
 
@@ -464,6 +539,47 @@ TEST(GatewayAuthSessionStoreTest, PersistsResolvesAndRevokesSessions) {
     std::filesystem::remove(path, ec);
     std::filesystem::remove(path.string() + "-wal", ec);
     std::filesystem::remove(path.string() + "-shm", ec);
+}
+
+TEST(GatewayAuthSessionStoreTest, RedisPersistsResolvesAndRevokesSessionsWhenAvailable) {
+    agent::semantic_cache::RedisPoolOptions options;
+    options.host = "127.0.0.1";
+    options.port = "5000";
+    options.pool_size = 4;
+    options.connect_timeout = std::chrono::seconds(1);
+    options.command_timeout = std::chrono::milliseconds(1000);
+    auto redis = std::make_shared<agent::semantic_cache::RedisConnectionPool>(options);
+    auto started = redis->Start();
+    if (!started.ok()) {
+        GTEST_SKIP() << started.message();
+    }
+
+    RedisAuthSessionStore store(redis, "agent:test:gateway:auth");
+    ASSERT_TRUE(store.EnsureSchema().ok());
+
+    AuthSessionRecord record;
+    record.token_id = "redis-token-001";
+    record.user_uuid = "redis-uuid-001";
+    record.tenant_id = "tenant-a";
+    record.subject = "subject-001";
+    record.issued_at = std::chrono::system_clock::now();
+    record.expires_at = record.issued_at + std::chrono::hours(1);
+    ASSERT_TRUE(store.UpsertSession(record).ok());
+
+    auto resolved = store.ResolveSession("redis-token-001");
+    ASSERT_TRUE(resolved.ok()) << resolved.status().message();
+    EXPECT_EQ(resolved.value().user_uuid, "redis-uuid-001");
+    EXPECT_EQ(resolved.value().tenant_id, "tenant-a");
+    EXPECT_FALSE(resolved.value().revoked);
+
+    ASSERT_TRUE(store.RevokeSession("redis-token-001", "logout").ok());
+    auto revoked = store.ResolveSession("redis-token-001");
+    ASSERT_TRUE(revoked.ok()) << revoked.status().message();
+    EXPECT_TRUE(revoked.value().revoked);
+
+    auto del = redis->Del({"agent:test:gateway:auth:session:redis-token-001"});
+    EXPECT_TRUE(del.ok()) << del.status().message();
+    redis->Shutdown();
 }
 
 TEST(PersonaGatewayServerTest, HostsApiWebSocketAdapterAndStaticDistOnOneHttpServer) {

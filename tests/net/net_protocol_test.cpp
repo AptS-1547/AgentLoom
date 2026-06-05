@@ -21,6 +21,7 @@
 #include <fstream>
 #include <future>
 #include <mutex>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -288,6 +289,49 @@ TEST(HttpServerRuntimeTest, DispatchesTypedHttpRequestInterface) {
     EXPECT_EQ(server.ConnectionStats().active_connections, 0u);
 }
 
+TEST(HttpServerRuntimeTest, AllowsTypedHandlerToRespondAfterReadTimeoutWindow) {
+    net::HttpServerOptions options;
+    options.address = "127.0.0.1";
+    options.port = 0;
+    options.io_threads = 1;
+    options.request_timeout = 1s;
+    net::HttpServer server(options);
+
+    server.SetHttpRequestHandler([](std::shared_ptr<net::IHttpRequest> request) {
+        std::thread([request = std::move(request)]() mutable {
+            std::this_thread::sleep_for(1500ms);
+            request->Respond(net::HttpResponse::Json(net::http::status::ok, R"({"delayed":true})").message);
+        }).detach();
+    });
+
+    auto start_status = server.Start();
+    ASSERT_TRUE(start_status.ok()) << start_status.message();
+
+    asio::io_context io;
+    tcp::resolver resolver(io);
+    beast::tcp_stream stream(io);
+    stream.expires_after(5s);
+    stream.connect(resolver.resolve("127.0.0.1", std::to_string(server.port())));
+
+    net::BeastHttpRequest request{net::http::verb::post, "/api/delayed", 11};
+    request.set(net::http::field::host, "127.0.0.1");
+    request.body() = R"({"wait":true})";
+    request.prepare_payload();
+    net::http::write(stream, request);
+
+    beast::flat_buffer buffer;
+    net::BeastHttpResponse response;
+    net::http::read(stream, buffer, response);
+
+    EXPECT_EQ(response.result(), net::http::status::ok);
+    EXPECT_EQ(response.body(), R"({"delayed":true})");
+
+    beast::error_code ec;
+    stream.socket().shutdown(tcp::socket::shutdown_both, ec);
+    stream.socket().close(ec);
+    server.Stop();
+}
+
 TEST(HttpServerRuntimeTest, ServesStaticFileWithBeastFileBody) {
     ScopedTempDirectory temp_dir("agent_net_static_test");
     const auto& root = temp_dir.path();
@@ -470,6 +514,45 @@ TEST(HttpServerRuntimeTest, FiltersSuspiciousHttpRequestBeforeHandler) {
     EXPECT_EQ(response.result(), net::http::status::forbidden);
     EXPECT_NE(response.body().find("security filter"), std::string::npos);
     EXPECT_EQ(handler_calls.load(std::memory_order_relaxed), 0u);
+
+    server.Stop();
+}
+
+TEST(HttpServerRuntimeTest, AllowsBrowserAcceptWildcardHeaderThroughFilter) {
+    net::HttpServerOptions options;
+    options.address = "127.0.0.1";
+    options.port = 0;
+    options.io_threads = 1;
+    options.request_filter.enabled = true;
+
+    net::HttpServer server(options);
+    std::atomic_size_t handler_calls{0};
+    server.SetHttpHandler([&](net::HttpRequest, net::HttpGeneratorCallback respond) {
+        handler_calls.fetch_add(1, std::memory_order_relaxed);
+        respond(net::HttpResponse::Text(net::http::status::ok, "index").message);
+    });
+
+    auto start_status = server.Start();
+    ASSERT_TRUE(start_status.ok()) << start_status.message();
+
+    asio::io_context io;
+    tcp::resolver resolver(io);
+    beast::tcp_stream stream(io);
+    stream.connect(resolver.resolve("127.0.0.1", std::to_string(server.port())));
+
+    net::BeastHttpRequest request{net::http::verb::get, "/", 11};
+    request.set(net::http::field::host, "127.0.0.1");
+    request.set(net::http::field::accept, "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+    request.prepare_payload();
+    net::http::write(stream, request);
+
+    beast::flat_buffer buffer;
+    net::BeastHttpResponse response;
+    net::http::read(stream, buffer, response);
+
+    EXPECT_EQ(response.result(), net::http::status::ok);
+    EXPECT_EQ(response.body(), "index");
+    EXPECT_EQ(handler_calls.load(std::memory_order_relaxed), 1u);
 
     server.Stop();
 }

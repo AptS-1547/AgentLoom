@@ -22,6 +22,8 @@ jobs:
     env:
       BUILD_DIR: build/gha-linux-tests
       VCPKG_TRIPLET: x64-linux
+      VCPKG_MAX_CONCURRENCY: 2
+      CMAKE_BUILD_PARALLEL_LEVEL: 2
       ONNXRUNTIME_URL: https://github.com/microsoft/onnxruntime/releases/download/v1.17.1/onnxruntime-linux-x64-1.17.1.tgz
       ONNXRUNTIME_ARCHIVE: deps/onnxruntime-linux-x64-1.17.1.tgz
       ONNXRUNTIME_ROOT: deps/onnxruntime-linux-x64-1.17.1
@@ -118,6 +120,15 @@ jobs:
           ).strip()
           manifest.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
           PY
+          mkdir -p triplets/ci
+          cat > triplets/ci/x64-linux-release.cmake <<'EOF'
+          set(VCPKG_TARGET_ARCHITECTURE x64)
+          set(VCPKG_CRT_LINKAGE dynamic)
+          set(VCPKG_LIBRARY_LINKAGE dynamic)
+          set(VCPKG_CMAKE_SYSTEM_NAME Linux)
+          set(VCPKG_BUILD_TYPE release)
+          EOF
+          echo "VCPKG_TRIPLET=x64-linux-release" >> "$GITHUB_ENV"
 
       - name: Install vcpkg dependencies
         shell: bash
@@ -126,10 +137,12 @@ jobs:
             --triplet "$VCPKG_TRIPLET" \
             --x-manifest-root="$GITHUB_WORKSPACE" \
             --x-install-root="$GITHUB_WORKSPACE/vcpkg_installed" \
+            --overlay-triplets="$GITHUB_WORKSPACE/triplets/ci" \
             --clean-after-build
           ./vcpkg/vcpkg install gtest \
             --triplet "$VCPKG_TRIPLET" \
             --x-install-root="$GITHUB_WORKSPACE/vcpkg_installed" \
+            --overlay-triplets="$GITHUB_WORKSPACE/triplets/ci" \
             --clean-after-build
 
       - name: Download ONNX Runtime

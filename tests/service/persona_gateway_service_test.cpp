@@ -3,9 +3,13 @@
 #include "persona_gateway_service.h"
 #include "http_server.h"
 #include "redis_connection_pool.h"
+#include "document_analysis_service.h"
+#include "document_file_store.h"
+#include "sqlite/sqlite_connection_pool.h"
 
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
+#include <zip.h>
 
 #include <boost/asio.hpp>
 #include <boost/beast.hpp>
@@ -38,6 +42,9 @@ using agent::service::gateway::SqliteAuthSessionStore;
 using agent::service::gateway::RedisAuthSessionStore;
 using agent::service::gateway::AuthSessionRecord;
 using agent::service::gateway::TrainingReportGatewayRequest;
+using agent::document::DocumentAnalysisService;
+using agent::document::DocumentFileStore;
+using agent::document::DocumentFileStoreOptions;
 using agent::service::persona::NeutralEmotionAnalyzer;
 using agent::service::persona::PersonaRuntime;
 using agent::service::persona::PersonaRuntimeOptions;
@@ -201,6 +208,110 @@ CreateSessionGatewayRequest MakeCreateRequest() {
     return response;
 }
 
+Json SendWebSocketJson(std::uint16_t port, std::string target, Json body) {
+    asio::io_context io;
+    tcp::resolver resolver(io);
+    beast::websocket::stream<tcp::socket> ws(io);
+    auto endpoints = resolver.resolve("127.0.0.1", std::to_string(port));
+    asio::connect(ws.next_layer(), endpoints);
+    ws.handshake("127.0.0.1", target);
+    ws.text(true);
+    ws.write(asio::buffer(body.dump()));
+
+    beast::flat_buffer buffer;
+    ws.read(buffer);
+    auto response = Json::parse(beast::buffers_to_string(buffer.data()));
+    beast::error_code ec;
+    ws.close(beast::websocket::close_code::normal, ec);
+    return response;
+}
+
+std::string Base64Encode(std::string_view input) {
+    static constexpr char kTable[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve((input.size() + 2) / 3 * 4);
+    std::size_t i = 0;
+    while (i + 3 <= input.size()) {
+        const auto b0 = static_cast<unsigned char>(input[i++]);
+        const auto b1 = static_cast<unsigned char>(input[i++]);
+        const auto b2 = static_cast<unsigned char>(input[i++]);
+        out.push_back(kTable[b0 >> 2]);
+        out.push_back(kTable[((b0 & 0x03) << 4) | (b1 >> 4)]);
+        out.push_back(kTable[((b1 & 0x0f) << 2) | (b2 >> 6)]);
+        out.push_back(kTable[b2 & 0x3f]);
+    }
+    const auto remaining = input.size() - i;
+    if (remaining == 1) {
+        const auto b0 = static_cast<unsigned char>(input[i]);
+        out.push_back(kTable[b0 >> 2]);
+        out.push_back(kTable[(b0 & 0x03) << 4]);
+        out.push_back('=');
+        out.push_back('=');
+    } else if (remaining == 2) {
+        const auto b0 = static_cast<unsigned char>(input[i++]);
+        const auto b1 = static_cast<unsigned char>(input[i]);
+        out.push_back(kTable[b0 >> 2]);
+        out.push_back(kTable[((b0 & 0x03) << 4) | (b1 >> 4)]);
+        out.push_back(kTable[(b1 & 0x0f) << 2]);
+        out.push_back('=');
+    }
+    return out;
+}
+
+std::string ReadBinaryFile(const std::filesystem::path& path) {
+    std::ifstream input(path, std::ios::binary);
+    std::string data;
+    input.seekg(0, std::ios::end);
+    data.resize(static_cast<std::size_t>(input.tellg()));
+    input.seekg(0, std::ios::beg);
+    if (!data.empty()) {
+        input.read(data.data(), static_cast<std::streamsize>(data.size()));
+    }
+    return data;
+}
+
+void AddZipText(zip_t* archive, const char* name, const std::string& text) {
+    auto* source = zip_source_buffer(archive, text.data(), text.size(), 0);
+    ASSERT_NE(source, nullptr);
+    ASSERT_GE(zip_file_add(archive, name, source, ZIP_FL_OVERWRITE | ZIP_FL_ENC_UTF_8), 0);
+}
+
+std::filesystem::path TempPath(const std::string& name) {
+    return std::filesystem::temp_directory_path() / name;
+}
+
+std::string PathUtf8(const std::filesystem::path& path) {
+    const auto value = path.u8string();
+    return std::string(value.begin(), value.end());
+}
+
+void WriteMinimalDocx(const std::filesystem::path& path) {
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    int error = 0;
+    zip_t* archive = zip_open(path.string().c_str(), ZIP_CREATE | ZIP_TRUNCATE, &error);
+    ASSERT_NE(archive, nullptr);
+    AddZipText(archive, "[Content_Types].xml", R"(<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+</Types>)");
+    const std::string document_xml = R"(<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p>
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>函数基础</w:t></w:r>
+    </w:p>
+    <w:p>
+      <w:r><w:t>目标：理解函数输入与输出之间的对应关系。例题：根据图像判断函数单调性。练习：完成课后检测题。</w:t></w:r>
+    </w:p>
+  </w:body>
+</w:document>)";
+    AddZipText(archive, "word/document.xml", document_xml);
+    ASSERT_EQ(zip_close(archive), 0);
+}
+
 TEST(PersonaGatewayServiceTest, RunsCreateChatReportAndCloseLifecycle) {
     GatewayFixture f;
 
@@ -341,6 +452,170 @@ TEST(PersonaGatewayHttpAdapterTest, HandlesSessionCreateAndChatJsonRoutes) {
     EXPECT_EQ(chat_body["data"]["reply"]["content"], "student reply");
     EXPECT_EQ(chat_body["data"]["turnIndex"], 1);
     server.Stop();
+}
+
+TEST(PersonaGatewayHttpAdapterTest, RoutesWebSocketMessagesThroughRegistry) {
+    GatewayFixture f;
+    PersonaGatewayHttpAdapter adapter(f.gateway);
+    ::net::HttpServer server({.address = "127.0.0.1", .port = 0, .io_threads = 1});
+    server.SetWebSocketStreamHandler("/ws/session", [&adapter](std::shared_ptr<::net::IWebSocketStreamRequest> request) {
+        adapter.HandleWebSocket(std::move(request));
+    });
+    ASSERT_TRUE(server.Start().ok());
+
+    auto created = f.gateway.CreateSession(MakeCreateRequest());
+    ASSERT_TRUE(created.ok()) << created.status().message();
+
+    auto chat = SendWebSocketJson(
+        server.port(),
+        "/ws/session",
+        Json{
+            {"type", "chat.message"},
+            {"traceId", "trace-ws-chat"},
+            {"payload", {
+                {"sessionId", "session-gateway"},
+                {"personaId", "dazhi"},
+                {"message", "hello ws"},
+            }},
+        });
+    EXPECT_EQ(chat["type"], "chat.final");
+    EXPECT_EQ(chat["payload"]["traceId"], "trace-ws-chat");
+    EXPECT_EQ(chat["payload"]["data"]["reply"]["content"], "student reply");
+
+    auto unknown = SendWebSocketJson(
+        server.port(),
+        "/ws/session",
+        Json{
+            {"type", "unknown.message"},
+            {"traceId", "trace-ws-unknown"},
+        });
+    EXPECT_EQ(unknown["type"], "error");
+    EXPECT_EQ(unknown["payload"]["error"]["code"], "INVALID_ARGUMENT");
+
+    server.Stop();
+}
+
+TEST(PersonaGatewayHttpAdapterTest, HandlesDocumentAnalyzeRoute) {
+    GatewayFixture f;
+    auto document_service = std::make_shared<DocumentAnalysisService>(f.compute, f.io);
+    PersonaGatewayHttpAdapter adapter(f.gateway, nullptr, nullptr, document_service, f.llm);
+    ::net::HttpServer server({.address = "127.0.0.1", .port = 0, .io_threads = 1});
+    server.SetHttpRequestHandler([&adapter](std::shared_ptr<::net::IHttpRequest> request) {
+        adapter.HandleHttp(std::move(request));
+    });
+    ASSERT_TRUE(server.Start().ok());
+
+    const auto path = TempPath("agent_gateway_document_route.docx");
+    WriteMinimalDocx(path);
+
+    auto response = SendJsonRequest(
+        server.port(),
+        ::net::http::verb::post,
+        "/api/document/analyze",
+        Json{
+            {"traceId", "trace-document-http"},
+            {"documentId", "doc-http-1"},
+            {"path", path.string()},
+            {"fileName", "gateway-doc.docx"},
+            {"maxChunkSlices", 3},
+        });
+    EXPECT_EQ(response.result(), ::net::http::status::ok);
+    auto body = Json::parse(response.body());
+    EXPECT_TRUE(body["ok"].get<bool>());
+    EXPECT_EQ(body["traceId"], "trace-document-http");
+    EXPECT_EQ(body["documentId"], "doc-http-1");
+    EXPECT_EQ(body["data"]["schemaVersion"], "document_analysis.v1");
+    EXPECT_EQ(body["data"]["fileName"], "gateway-doc.docx");
+    EXPECT_TRUE(body["data"].contains("mindmap"));
+    EXPECT_TRUE(body["data"].contains("diagnosis"));
+    EXPECT_GE(body["data"]["chunks"].size(), 1u);
+
+    server.Stop();
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+}
+
+TEST(PersonaGatewayHttpAdapterTest, RegistersManagedDocumentAndAnalyzesByDocumentId) {
+    GatewayFixture f;
+    const auto source_path = TempPath("agent_gateway_document_register.docx");
+    const auto db_path = TempPath("agent_gateway_document_register.sqlite");
+    const auto store_root = TempPath("agent_gateway_document_register_store");
+    WriteMinimalDocx(source_path);
+    std::error_code ec;
+    std::filesystem::remove(db_path, ec);
+    std::filesystem::remove_all(store_root, ec);
+
+    storage::sqlite::SqliteConnectionPoolOptions pool_options;
+    pool_options.path = db_path.string();
+    pool_options.read_connection_count = 1;
+    pool_options.write_connection_count = 1;
+    pool_options.busy_timeout_ms = 250;
+    auto repository = std::make_shared<storage::sqlite::SqliteConnectionPool>(pool_options);
+    ASSERT_TRUE(repository->Start().ok());
+
+    auto document_service = std::make_shared<DocumentAnalysisService>(f.compute, f.io);
+    ASSERT_TRUE(document_service->SetRepository(repository).ok());
+    ASSERT_TRUE(document_service->SetFileStore(std::make_shared<DocumentFileStore>(DocumentFileStoreOptions{store_root})).ok());
+
+    AuthIdentity identity;
+    identity.authenticated = true;
+    identity.user_uuid = "doc-user-001";
+    identity.tenant_id = "default";
+    PersonaGatewayHttpAdapter adapter(
+        f.gateway,
+        std::make_shared<FixedAuthenticator>(identity),
+        nullptr,
+        document_service,
+        f.llm);
+    ::net::HttpServer server({.address = "127.0.0.1", .port = 0, .io_threads = 1});
+    server.SetHttpRequestHandler([&adapter](std::shared_ptr<::net::IHttpRequest> request) {
+        adapter.HandleHttp(std::move(request));
+    });
+    ASSERT_TRUE(server.Start().ok());
+
+    auto registered = SendJsonRequest(
+        server.port(),
+        ::net::http::verb::post,
+        "/api/document/register",
+        Json{
+            {"traceId", "trace-document-register"},
+            {"path", PathUtf8(source_path)},
+            {"fileName", "registered-doc.docx"},
+            {"sessionId", "doc-session-001"},
+        });
+    ASSERT_EQ(registered.result(), ::net::http::status::ok);
+    auto registered_body = Json::parse(registered.body());
+    ASSERT_TRUE(registered_body["ok"].get<bool>());
+    const auto document_id = registered_body["documentId"].get<std::string>();
+    EXPECT_FALSE(document_id.empty());
+    EXPECT_EQ(registered_body["data"]["ownerUserUuid"], "doc-user-001");
+    EXPECT_EQ(registered_body["data"]["sessionId"], "doc-session-001");
+    EXPECT_EQ(registered_body["data"]["analysisStatus"], "uploaded");
+
+    auto analyzed = SendJsonRequest(
+        server.port(),
+        ::net::http::verb::post,
+        "/api/document/analyze",
+        Json{
+            {"traceId", "trace-document-id-analyze"},
+            {"documentId", document_id},
+            {"maxChunkSlices", 3},
+        });
+    EXPECT_EQ(analyzed.result(), ::net::http::status::ok);
+    auto analyzed_body = Json::parse(analyzed.body());
+    EXPECT_TRUE(analyzed_body["ok"].get<bool>());
+    EXPECT_EQ(analyzed_body["documentId"], document_id);
+    EXPECT_EQ(analyzed_body["data"]["fileName"], "registered-doc.docx");
+    EXPECT_EQ(analyzed_body["data"]["fileType"], "docx");
+    EXPECT_TRUE(analyzed_body["data"].contains("mindmap"));
+
+    server.Stop();
+    repository->Close();
+    std::filesystem::remove(source_path, ec);
+    std::filesystem::remove_all(store_root, ec);
+    std::filesystem::remove(db_path, ec);
+    std::filesystem::remove(db_path.string() + "-wal", ec);
+    std::filesystem::remove(db_path.string() + "-shm", ec);
 }
 
 TEST(PersonaGatewayHttpAdapterTest, PassesEmotionPromptsIntoSessionPromptBuilder) {
@@ -636,6 +911,319 @@ TEST(PersonaGatewayServerTest, HostsApiWebSocketAdapterAndStaticDistOnOneHttpSer
    }
     std::error_code cleanup_error;
     std::filesystem::remove_all(static_root, cleanup_error);
+}
+
+TEST(PersonaGatewayServerTest, EnablesConfiguredDocumentStoreForRegisterAndAnalyze) {
+    const auto source_path = TempPath("agent_gateway_server_document.docx");
+    const auto db_path = TempPath("agent_gateway_server_document.sqlite");
+    const auto store_root = TempPath("agent_gateway_server_document_store");
+    WriteMinimalDocx(source_path);
+    std::error_code ec;
+    std::filesystem::remove(db_path, ec);
+    std::filesystem::remove_all(store_root, ec);
+
+    auto cache = std::make_shared<FakeSemanticCache>();
+    auto memory = std::make_shared<SemanticMemoryContextProvider>(cache);
+    auto emotion = std::make_shared<NeutralEmotionAnalyzer>();
+    auto llm = std::make_shared<FakeLlmClient>();
+
+    PersonaGatewayServerOptions options;
+    options.http.address = "127.0.0.1";
+    options.http.port = 0;
+    options.http.io_threads = 1;
+    options.compute_pool.worker_count = 1;
+    options.compute_pool.queue_capacity = 64;
+    options.io_pool.worker_count = 1;
+    options.io_pool.queue_capacity = 64;
+    options.runtime.default_model = "test-model";
+    options.document_store.enabled = true;
+    options.document_store.root = store_root;
+    options.document_store.database_path = db_path;
+    options.document_store.read_connection_count = 1;
+    options.document_store.write_connection_count = 1;
+    options.document_store.busy_timeout_ms = 250;
+
+    PersonaGatewayServerDependencies dependencies;
+    dependencies.memory_provider = memory;
+    dependencies.emotion_analyzer = emotion;
+    dependencies.llm_client = llm;
+
+    {
+        PersonaGatewayServer server(std::move(options), std::move(dependencies));
+        ASSERT_TRUE(server.Start().ok());
+
+        auto registered = SendJsonRequest(
+            server.port(),
+            ::net::http::verb::post,
+            "/api/document/register",
+            Json{
+                {"traceId", "trace-server-document-register"},
+                {"path", PathUtf8(source_path)},
+                {"fileName", "server-managed.docx"},
+            });
+        ASSERT_EQ(registered.result(), ::net::http::status::ok);
+        auto registered_body = Json::parse(registered.body());
+        ASSERT_TRUE(registered_body["ok"].get<bool>());
+        const auto document_id = registered_body["documentId"].get<std::string>();
+
+        auto analyzed = SendJsonRequest(
+            server.port(),
+            ::net::http::verb::post,
+            "/api/document/analyze",
+            Json{
+                {"traceId", "trace-server-document-analyze"},
+                {"documentId", document_id},
+            });
+        ASSERT_EQ(analyzed.result(), ::net::http::status::ok);
+        auto analyzed_body = Json::parse(analyzed.body());
+        EXPECT_TRUE(analyzed_body["ok"].get<bool>());
+        EXPECT_EQ(analyzed_body["documentId"], document_id);
+        EXPECT_EQ(analyzed_body["data"]["fileName"], "server-managed.docx");
+
+        server.Stop();
+    }
+
+    std::filesystem::remove(source_path, ec);
+    std::filesystem::remove_all(store_root, ec);
+    std::filesystem::remove(db_path, ec);
+    std::filesystem::remove(db_path.string() + "-wal", ec);
+    std::filesystem::remove(db_path.string() + "-shm", ec);
+}
+
+TEST(PersonaGatewayServerTest, UploadsDocumentOverWebSocketAndAnalyzesByDocumentId) {
+    const auto source_path = TempPath("agent_gateway_server_ws_upload.docx");
+    const auto db_path = TempPath("agent_gateway_server_ws_upload.sqlite");
+    const auto store_root = TempPath("agent_gateway_server_ws_upload_store");
+    WriteMinimalDocx(source_path);
+    const auto file_bytes = ReadBinaryFile(source_path);
+    std::error_code ec;
+    std::filesystem::remove(db_path, ec);
+    std::filesystem::remove_all(store_root, ec);
+
+    auto cache = std::make_shared<FakeSemanticCache>();
+    auto memory = std::make_shared<SemanticMemoryContextProvider>(cache);
+    auto emotion = std::make_shared<NeutralEmotionAnalyzer>();
+    auto llm = std::make_shared<FakeLlmClient>();
+
+    PersonaGatewayServerOptions options;
+    options.http.address = "127.0.0.1";
+    options.http.port = 0;
+    options.http.io_threads = 1;
+    options.compute_pool.worker_count = 1;
+    options.compute_pool.queue_capacity = 64;
+    options.io_pool.worker_count = 1;
+    options.io_pool.queue_capacity = 64;
+    options.runtime.default_model = "test-model";
+    options.document_store.enabled = true;
+    options.document_store.root = store_root;
+    options.document_store.database_path = db_path;
+    options.document_store.read_connection_count = 1;
+    options.document_store.write_connection_count = 1;
+    options.document_store.busy_timeout_ms = 250;
+
+    PersonaGatewayServerDependencies dependencies;
+    dependencies.memory_provider = memory;
+    dependencies.emotion_analyzer = emotion;
+    dependencies.llm_client = llm;
+
+    {
+        PersonaGatewayServer server(std::move(options), std::move(dependencies));
+        ASSERT_TRUE(server.Start().ok());
+
+        asio::io_context io;
+        tcp::resolver resolver(io);
+        beast::websocket::stream<tcp::socket> ws(io);
+        auto endpoints = resolver.resolve("127.0.0.1", std::to_string(server.port()));
+        asio::connect(ws.next_layer(), endpoints);
+        ws.handshake("127.0.0.1", "/ws/session");
+        ws.text(true);
+
+        auto send_ws = [&](Json body) {
+            ws.write(asio::buffer(body.dump()));
+            beast::flat_buffer buffer;
+            ws.read(buffer);
+            return Json::parse(beast::buffers_to_string(buffer.data()));
+        };
+
+        auto started = send_ws(Json{
+            {"type", "document.upload.start"},
+            {"traceId", "trace-ws-upload-start"},
+            {"payload", {
+                {"fileName", "ws-upload.docx"},
+                {"totalBytes", file_bytes.size()},
+                {"sessionId", "ws-upload-session"},
+            }},
+        });
+        ASSERT_EQ(started["type"], "document.upload.started");
+        const auto upload_id = started["payload"]["uploadId"].get<std::string>();
+
+        auto ack = send_ws(Json{
+            {"type", "document.upload.chunk"},
+            {"traceId", "trace-ws-upload-chunk"},
+            {"payload", {
+                {"uploadId", upload_id},
+                {"offset", 0},
+                {"data", Base64Encode(file_bytes)},
+            }},
+        });
+        ASSERT_EQ(ack["type"], "document.upload.chunk_ack");
+        EXPECT_EQ(ack["payload"]["receivedBytes"], file_bytes.size());
+
+        auto finished = send_ws(Json{
+            {"type", "document.upload.finish"},
+            {"traceId", "trace-ws-upload-finish"},
+            {"payload", {
+                {"uploadId", upload_id},
+            }},
+        });
+        ASSERT_EQ(finished["type"], "document.upload.finished");
+        ASSERT_TRUE(finished["payload"]["ok"].get<bool>());
+        const auto document_id = finished["payload"]["documentId"].get<std::string>();
+        EXPECT_EQ(finished["payload"]["data"]["fileName"], "ws-upload.docx");
+        EXPECT_EQ(finished["payload"]["data"]["sessionId"], "ws-upload-session");
+
+        beast::error_code ws_ec;
+        ws.close(beast::websocket::close_code::normal, ws_ec);
+
+        auto analyzed = SendJsonRequest(
+            server.port(),
+            ::net::http::verb::post,
+            "/api/document/analyze",
+            Json{
+                {"traceId", "trace-ws-upload-analyze"},
+                {"documentId", document_id},
+            });
+        ASSERT_EQ(analyzed.result(), ::net::http::status::ok);
+        auto analyzed_body = Json::parse(analyzed.body());
+        EXPECT_TRUE(analyzed_body["ok"].get<bool>());
+        EXPECT_EQ(analyzed_body["data"]["fileName"], "ws-upload.docx");
+
+        server.Stop();
+    }
+
+    std::filesystem::remove(source_path, ec);
+    std::filesystem::remove_all(store_root, ec);
+    std::filesystem::remove(db_path, ec);
+    std::filesystem::remove(db_path.string() + "-wal", ec);
+    std::filesystem::remove(db_path.string() + "-shm", ec);
+}
+
+TEST(PersonaGatewayServerTest, UploadsBinaryDocumentOverWebSocketAndAnalyzesByDocumentId) {
+    const auto source_path = TempPath("agent_gateway_server_ws_binary_upload.docx");
+    const auto db_path = TempPath("agent_gateway_server_ws_binary_upload.sqlite");
+    const auto store_root = TempPath("agent_gateway_server_ws_binary_upload_store");
+    WriteMinimalDocx(source_path);
+    const auto file_bytes = ReadBinaryFile(source_path);
+    std::error_code ec;
+    std::filesystem::remove(db_path, ec);
+    std::filesystem::remove_all(store_root, ec);
+
+    auto cache = std::make_shared<FakeSemanticCache>();
+    auto memory = std::make_shared<SemanticMemoryContextProvider>(cache);
+    auto emotion = std::make_shared<NeutralEmotionAnalyzer>();
+    auto llm = std::make_shared<FakeLlmClient>();
+
+    PersonaGatewayServerOptions options;
+    options.http.address = "127.0.0.1";
+    options.http.port = 0;
+    options.http.io_threads = 1;
+    options.websocket_path = "/ws/session";
+    options.compute_pool.worker_count = 1;
+    options.compute_pool.queue_capacity = 64;
+    options.io_pool.worker_count = 1;
+    options.io_pool.queue_capacity = 64;
+    options.runtime.default_model = "test-model";
+    options.document_store.enabled = true;
+    options.document_store.root = store_root;
+    options.document_store.database_path = db_path;
+    options.document_store.read_connection_count = 1;
+    options.document_store.write_connection_count = 1;
+    options.document_store.busy_timeout_ms = 250;
+
+    PersonaGatewayServerDependencies dependencies;
+    dependencies.memory_provider = memory;
+    dependencies.emotion_analyzer = emotion;
+    dependencies.llm_client = llm;
+
+    {
+        PersonaGatewayServer server(std::move(options), std::move(dependencies));
+        ASSERT_TRUE(server.Start().ok());
+
+        asio::io_context io;
+        tcp::resolver resolver(io);
+        beast::websocket::stream<tcp::socket> ws(io);
+        auto endpoints = resolver.resolve("127.0.0.1", std::to_string(server.port()));
+        asio::connect(ws.next_layer(), endpoints);
+        ws.handshake("127.0.0.1", "/ws/session");
+
+        auto read_json = [&]() {
+            beast::flat_buffer buffer;
+            ws.read(buffer);
+            EXPECT_TRUE(ws.got_text());
+            return Json::parse(beast::buffers_to_string(buffer.data()));
+        };
+
+        ws.text(true);
+        ws.write(asio::buffer(Json{
+            {"type", "document.upload.start"},
+            {"traceId", "trace-ws-binary-start"},
+            {"payload", {
+                {"fileName", "ws-binary-upload.docx"},
+                {"totalBytes", file_bytes.size()},
+                {"mode", "binary"},
+            }},
+        }.dump()));
+        auto started = read_json();
+        ASSERT_EQ(started["type"], "document.upload.started");
+        ASSERT_EQ(started["payload"]["mode"], "binary");
+        const auto upload_id = started["payload"]["uploadId"].get<std::string>();
+
+        ws.binary(true);
+        ws.write(asio::buffer(file_bytes));
+        auto ack = read_json();
+        ASSERT_EQ(ack["type"], "document.upload.chunk_ack");
+        EXPECT_EQ(ack["payload"]["mode"], "binary");
+        EXPECT_EQ(ack["payload"]["uploadId"], upload_id);
+        EXPECT_EQ(ack["payload"]["receivedBytes"], file_bytes.size());
+
+        ws.text(true);
+        ws.write(asio::buffer(Json{
+            {"type", "document.upload.finish"},
+            {"traceId", "trace-ws-binary-finish"},
+            {"payload", {
+                {"uploadId", upload_id},
+            }},
+        }.dump()));
+        auto finished = read_json();
+        ASSERT_EQ(finished["type"], "document.upload.finished");
+        ASSERT_TRUE(finished["payload"]["ok"].get<bool>());
+        const auto document_id = finished["payload"]["documentId"].get<std::string>();
+        EXPECT_EQ(finished["payload"]["data"]["fileName"], "ws-binary-upload.docx");
+
+        beast::error_code ws_ec;
+        ws.close(beast::websocket::close_code::normal, ws_ec);
+
+        auto analyzed = SendJsonRequest(
+            server.port(),
+            ::net::http::verb::post,
+            "/api/document/analyze",
+            Json{
+                {"traceId", "trace-ws-binary-analyze"},
+                {"documentId", document_id},
+            });
+        ASSERT_EQ(analyzed.result(), ::net::http::status::ok);
+        auto analyzed_body = Json::parse(analyzed.body());
+        EXPECT_TRUE(analyzed_body["ok"].get<bool>());
+        EXPECT_EQ(analyzed_body["data"]["fileName"], "ws-binary-upload.docx");
+
+        server.Stop();
+    }
+
+    std::filesystem::remove(source_path, ec);
+    std::filesystem::remove_all(store_root, ec);
+    std::filesystem::remove(db_path, ec);
+    std::filesystem::remove(db_path.string() + "-wal", ec);
+    std::filesystem::remove(db_path.string() + "-shm", ec);
 }
 
 } // namespace

@@ -1,7 +1,9 @@
 #include "persona_gateway_server.h"
 
+#include "document_file_store.h"
 #include "http_types.h"
 #include "redis_connection_pool.h"
+#include "sqlite/sqlite_connection_pool.h"
 
 #include <utility>
 
@@ -68,10 +70,20 @@ PersonaGatewayServer::PersonaGatewayServer(PersonaGatewayServerOptions options,
                logger_),
       classroom_scheduler_({}, core::LoggerAdapter::ForModule("classroom")),
       service_(sessions_, runtime_, &classroom_scheduler_, logger_),
+      document_service_(std::make_shared<document::DocumentAnalysisService>(
+          compute_pool_,
+          io_pool_,
+          core::LoggerAdapter::ForModule("document"))),
       auth_session_store_(MakeAuthSessionStore(options_.auth, auth_redis_)),
       authenticator_(std::make_shared<JwtCookieAuthenticator>(options_.auth, auth_session_store_)),
       auth_registration_(std::make_shared<JwtAuthRegistrationService>(options_.auth, auth_session_store_)),
-      adapter_(service_, authenticator_, auth_registration_),
+      adapter_(service_,
+               authenticator_,
+               auth_registration_,
+               document_service_,
+               dependencies_.llm_client,
+               dependencies_.document_embedding_provider,
+               dependencies_.document_llm_chunk_cache),
       http_server_(ResolveHttpOptions(options_)) {
     if (options_.static_files) {
         static_files_ = std::make_shared<::net::StaticFileHandler>(*options_.static_files);
@@ -101,20 +113,27 @@ core::Status PersonaGatewayServer::Start() {
     if (!auth_store_status.ok()) {
         return auth_store_status;
     }
+    auto document_store_status = EnsureDocumentStore();
+    if (!document_store_status.ok()) {
+        return document_store_status;
+    }
 
     auto compute_status = compute_pool_.Start();
     if (!compute_status.ok()) {
+        ShutdownDocumentStore();
         return compute_status;
     }
 
     auto io_status = io_pool_.Start();
     if (!io_status.ok()) {
+        ShutdownDocumentStore();
         compute_pool_.Shutdown(false);
         return io_status;
     }
 
     auto http_status = http_server_.Start();
     if (!http_status.ok()) {
+        ShutdownDocumentStore();
         io_pool_.Shutdown(false);
         compute_pool_.Shutdown(false);
         return http_status;
@@ -138,6 +157,63 @@ core::Status PersonaGatewayServer::EnsureAuthSessionStore() {
     return auth_session_store_->EnsureSchema();
 }
 
+core::Status PersonaGatewayServer::EnsureDocumentStore() {
+    if (!options_.document_store.enabled) {
+        return core::Status::Ok();
+    }
+    if (options_.document_store.root.empty()) {
+        return core::Status::Error(core::ErrorCode::InvalidArgument, "gateway document store root is required");
+    }
+    if (options_.document_store.database_path.empty()) {
+        return core::Status::Error(core::ErrorCode::InvalidArgument, "gateway document store database_path is required");
+    }
+
+    storage::sqlite::SqliteConnectionPoolOptions pool_options;
+    pool_options.path = options_.document_store.database_path.string();
+    pool_options.read_connection_count = options_.document_store.read_connection_count;
+    pool_options.write_connection_count = options_.document_store.write_connection_count;
+    pool_options.busy_timeout_ms = options_.document_store.busy_timeout_ms;
+    document_repository_pool_ = std::make_shared<storage::sqlite::SqliteConnectionPool>(pool_options);
+    auto start = document_repository_pool_->Start();
+    if (!start.ok()) {
+        return start;
+    }
+    auto repository_status = document_service_->SetRepository(document_repository_pool_);
+    if (!repository_status.ok()) {
+        document_repository_pool_->Close();
+        document_repository_pool_.reset();
+        return repository_status;
+    }
+
+    auto file_store = std::make_shared<document::DocumentFileStore>(
+        document::DocumentFileStoreOptions{
+            options_.document_store.root,
+            std::chrono::hours(options_.document_store.retention_hours)});
+    auto file_store_status = document_service_->SetFileStore(std::move(file_store));
+    if (!file_store_status.ok()) {
+        ShutdownDocumentStore();
+        return file_store_status;
+    }
+    document_service_->SetRetentionCleanupOptions(
+        std::chrono::hours(options_.document_store.retention_hours),
+        std::chrono::seconds(options_.document_store.cleanup_interval_seconds));
+    logger_.info("[gateway] document store enabled root={} db={}",
+                 options_.document_store.root.string(),
+                 options_.document_store.database_path.string());
+    return core::Status::Ok();
+}
+
+void PersonaGatewayServer::ShutdownDocumentStore() {
+    if (document_service_) {
+        static_cast<void>(document_service_->SetFileStore(nullptr));
+        static_cast<void>(document_service_->SetRepository(nullptr));
+    }
+    if (document_repository_pool_) {
+        document_repository_pool_->Close();
+        document_repository_pool_.reset();
+    }
+}
+
 void PersonaGatewayServer::Stop() {
     if (!started_ && !http_server_.running()) {
         return;
@@ -149,6 +225,7 @@ void PersonaGatewayServer::Stop() {
     if (auth_redis_) {
         auth_redis_->Shutdown();
     }
+    ShutdownDocumentStore();
     started_ = false;
     logger_.info("[gateway] stopped");
 }

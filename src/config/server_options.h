@@ -93,9 +93,21 @@ struct GatewayThreadPoolConfigOptions {
     std::size_t queue_capacity = 0;
 };
 
+struct GatewayDocumentStoreConfigOptions {
+    bool enabled = false;
+    std::filesystem::path root;
+    std::filesystem::path database_path;
+    std::size_t read_connection_count = 2;
+    std::size_t write_connection_count = 1;
+    int busy_timeout_ms = 5000;
+    int retention_hours = 24 * 7;
+    int cleanup_interval_seconds = 60;
+};
+
 struct PersonaGatewayConfigOptions {
     std::string websocket_path = "/ws/session";
     GatewayStaticFilesConfigOptions static_files;
+    GatewayDocumentStoreConfigOptions document_store;
     GatewayThreadPoolConfigOptions compute_pool;
     GatewayThreadPoolConfigOptions io_pool;
     int session_idle_timeout_minutes = 15;
@@ -186,5 +198,13 @@ PersonaGatewayServerOptionsT ToPersonaGatewayServerOptions(const MultimodalServe
         static_files.spa_fallback = config.persona_gateway.static_files.spa_fallback;
         options.static_files = std::move(static_files);
     }
+    options.document_store.enabled = config.persona_gateway.document_store.enabled;
+    options.document_store.root = config.persona_gateway.document_store.root;
+    options.document_store.database_path = config.persona_gateway.document_store.database_path;
+    options.document_store.read_connection_count = config.persona_gateway.document_store.read_connection_count;
+    options.document_store.write_connection_count = config.persona_gateway.document_store.write_connection_count;
+    options.document_store.busy_timeout_ms = config.persona_gateway.document_store.busy_timeout_ms;
+    options.document_store.retention_hours = config.persona_gateway.document_store.retention_hours;
+    options.document_store.cleanup_interval_seconds = config.persona_gateway.document_store.cleanup_interval_seconds;
     return options;
 }

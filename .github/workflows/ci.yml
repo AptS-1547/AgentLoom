@@ -16,21 +16,23 @@ permissions:
   contents: read
 
 jobs:
-  build:
-    name: ${{ matrix.name }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: Ubuntu Release
-            os: ubuntu-latest
-            triplet: x64-linux
-            build_dir: build/gha-linux
-            artifact_dir: build/gha-linux
-            ort_url: https://github.com/microsoft/onnxruntime/releases/download/v1.17.1/onnxruntime-linux-x64-1.17.1.tgz
-            ort_archive: deps/onnxruntime-linux-x64-1.17.1.tgz
-            ort_root: deps/onnxruntime-linux-x64-1.17.1
+  linux-tests:
+    name: Linux Release Tests
+    runs-on: ubuntu-latest
+    env:
+      BUILD_DIR: build/gha-linux-tests
+      VCPKG_TRIPLET: x64-linux
+      ONNXRUNTIME_URL: https://github.com/microsoft/onnxruntime/releases/download/v1.17.1/onnxruntime-linux-x64-1.17.1.tgz
+      ONNXRUNTIME_ARCHIVE: deps/onnxruntime-linux-x64-1.17.1.tgz
+      ONNXRUNTIME_ROOT: deps/onnxruntime-linux-x64-1.17.1
+      LLAMA_CPP_TAG: b9360
+      LLAMA_CPP_SOURCE_ARCHIVE: deps/llama.cpp-b9360.tar.gz
+      LLAMA_CPP_BINARY_ARCHIVE: deps/llama-b9360-bin-ubuntu-x64.tar.gz
+      LLAMA_CPP_ROOT: deps/llama.cpp
+      LLAMA_CPP_BUILD: deps/llama.cpp/build
+      SQLITE_AMALGAMATION_URL: https://www.sqlite.org/2025/sqlite-amalgamation-3530100.zip
+      FAISS_CONDA_URL: https://conda.anaconda.org/pytorch/linux-64/faiss-cpu-1.14.2-py3.12_hf65b397_0_cpu.conda
+      MKL_CONDA_URL: https://conda.anaconda.org/conda-forge/linux-64/mkl-2023.1.0-h84fe81f_48680.conda
 
     steps:
       - name: Checkout
@@ -39,14 +41,14 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.12"
           cache: "pip"
           cache-dependency-path: .github/workflows/ci.yml
 
       - name: Install Python tools
         run: |
           python -m pip install --upgrade pip
-          python -m pip install onnx grpcio protobuf
+          python -m pip install zstandard
 
       - name: Free disk space
         shell: bash
@@ -61,32 +63,41 @@ jobs:
           sudo apt-get clean
           df -h
 
+      - name: Install build tools and prebuilt small packages
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            ccache \
+            curl \
+            ninja-build \
+            pkg-config \
+            tar \
+            unzip \
+            zip \
+            libopencv-dev
+
       - name: Cache vcpkg install root
         uses: actions/cache@v4
         with:
           path: vcpkg_installed
-          key: ${{ runner.os }}-${{ matrix.triplet }}-vcpkg-${{ hashFiles('vcpkg.json', 'triplets/**') }}
+          key: ${{ runner.os }}-${{ env.VCPKG_TRIPLET }}-vcpkg-${{ hashFiles('vcpkg.json', 'triplets/**') }}
           restore-keys: |
-            ${{ runner.os }}-${{ matrix.triplet }}-vcpkg-
+            ${{ runner.os }}-${{ env.VCPKG_TRIPLET }}-vcpkg-
 
-      - name: Cache ONNX Runtime archive
+      - name: Cache binary dependency archives
         uses: actions/cache@v4
         with:
-          path: ${{ matrix.ort_archive }}
-          key: ${{ runner.os }}-ort-${{ hashFiles('.github/workflows/ci.yml') }}-${{ matrix.ort_archive }}
-
-      - name: Install build tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ninja-build pkg-config curl tar unzip zip ccache
-
-      - name: Cache ccache
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/ccache
-          key: ${{ runner.os }}-${{ matrix.triplet }}-ccache-${{ hashFiles('CMakeLists.txt', 'src/**', 'proto/**') }}
+          path: |
+            deps/*.tgz
+            deps/*.tar.gz
+            deps/*.zip
+            deps/*.conda
+            ~/.cache/ccache
+          key: ${{ runner.os }}-ci-deps-${{ hashFiles('.github/workflows/ci.yml', 'CMakeLists.txt', 'vcpkg.json') }}
           restore-keys: |
-            ${{ runner.os }}-${{ matrix.triplet }}-ccache-
+            ${{ runner.os }}-ci-deps-
 
       - name: Bootstrap vcpkg
         shell: bash
@@ -96,22 +107,193 @@ jobs:
           fi
           ./vcpkg/bootstrap-vcpkg.sh -disableMetrics
 
-      - name: Install dependencies
+      - name: Install vcpkg dependencies
         shell: bash
         run: |
-          ./vcpkg/vcpkg install --triplet ${{ matrix.triplet }} --x-manifest-root="$GITHUB_WORKSPACE" --x-install-root="$GITHUB_WORKSPACE/vcpkg_installed" --clean-after-build
+          ./vcpkg/vcpkg install \
+            --triplet "$VCPKG_TRIPLET" \
+            --x-manifest-root="$GITHUB_WORKSPACE" \
+            --x-install-root="$GITHUB_WORKSPACE/vcpkg_installed" \
+            --clean-after-build \
+            --features=tests
 
       - name: Download ONNX Runtime
         shell: bash
         run: |
           chmod +x .github/scripts/download-onnxruntime.sh
           ./.github/scripts/download-onnxruntime.sh \
-            "${{ matrix.ort_url }}" \
-            "${{ github.workspace }}/${{ matrix.ort_archive }}" \
-            "${{ github.workspace }}/deps" \
-            "${{ github.workspace }}/${{ matrix.ort_root }}"
+            "$ONNXRUNTIME_URL" \
+            "$GITHUB_WORKSPACE/$ONNXRUNTIME_ARCHIVE" \
+            "$GITHUB_WORKSPACE/deps" \
+            "$GITHUB_WORKSPACE/$ONNXRUNTIME_ROOT"
 
-      - name: Configure
+      - name: Prepare Linux binary dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p deps
+
+          if [[ ! -d deps/sqlite-amalgamation-3530100 ]]; then
+            curl -L "$SQLITE_AMALGAMATION_URL" -o deps/sqlite-amalgamation-3530100.zip
+            unzip -q deps/sqlite-amalgamation-3530100.zip -d deps
+          fi
+
+          if [[ ! -d deps/eigen-5.0.1 ]]; then
+            curl -L https://gitlab.com/libeigen/eigen/-/archive/5.0.1/eigen-5.0.1.zip -o deps/eigen-5.0.1.zip
+            unzip -q deps/eigen-5.0.1.zip -d deps
+          fi
+
+          if [[ ! -d deps/boost_1_85_0 ]]; then
+            curl -L https://archives.boost.io/release/1.85.0/source/boost_1_85_0.tar.gz -o deps/boost_1_85_0.tar.gz
+            tar -xzf deps/boost_1_85_0.tar.gz -C deps
+          fi
+
+          if [[ ! -d "$LLAMA_CPP_ROOT" ]]; then
+            curl -L "https://github.com/ggml-org/llama.cpp/archive/refs/tags/$LLAMA_CPP_TAG.tar.gz" -o "$LLAMA_CPP_SOURCE_ARCHIVE"
+            mkdir -p deps/llama-source
+            tar -xzf "$LLAMA_CPP_SOURCE_ARCHIVE" -C deps/llama-source --strip-components=1
+            mv deps/llama-source "$LLAMA_CPP_ROOT"
+          fi
+
+          if [[ ! -f "$LLAMA_CPP_BUILD/src/libllama.so" ]]; then
+            curl -L "https://github.com/ggml-org/llama.cpp/releases/download/$LLAMA_CPP_TAG/llama-$LLAMA_CPP_TAG-bin-ubuntu-x64.tar.gz" -o "$LLAMA_CPP_BINARY_ARCHIVE"
+            rm -rf deps/llama-bin
+            mkdir -p deps/llama-bin
+            tar -xzf "$LLAMA_CPP_BINARY_ARCHIVE" -C deps/llama-bin
+            mkdir -p \
+              "$LLAMA_CPP_BUILD/src" \
+              "$LLAMA_CPP_BUILD/common" \
+              "$LLAMA_CPP_BUILD/tools/mtmd" \
+              "$LLAMA_CPP_BUILD/ggml/src" \
+              "$LLAMA_CPP_BUILD/bin"
+            cp "$(find deps/llama-bin -name 'libllama.so*' -type f | head -n 1)" "$LLAMA_CPP_BUILD/src/libllama.so"
+            cp "$(find deps/llama-bin -name 'libmtmd.so*' -type f | head -n 1)" "$LLAMA_CPP_BUILD/tools/mtmd/libmtmd.so"
+            cp "$(find deps/llama-bin -name 'libggml.so*' -type f | head -n 1)" "$LLAMA_CPP_BUILD/ggml/src/libggml.so"
+            cp "$(find deps/llama-bin -name 'libggml-base.so*' -type f | head -n 1)" "$LLAMA_CPP_BUILD/ggml/src/libggml-base.so"
+            cp deps/llama-bin/*.so* "$LLAMA_CPP_BUILD/bin/" || true
+            ar rcs "$LLAMA_CPP_BUILD/common/libllama-common.a"
+          fi
+
+          if [[ ! -d deps/faiss-1.14.1-cpu-linux ]]; then
+            curl -L "$FAISS_CONDA_URL" -o deps/faiss-cpu-linux.conda
+            python - <<'PY'
+          import pathlib, shutil, subprocess, tarfile, zipfile
+          archive = pathlib.Path("deps/faiss-cpu-linux.conda")
+          work = pathlib.Path("deps/faiss-conda-extract")
+          out = pathlib.Path("deps/faiss-1.14.1-cpu-linux")
+          if work.exists():
+              shutil.rmtree(work)
+          work.mkdir(parents=True)
+          with zipfile.ZipFile(archive) as zf:
+              zf.extractall(work)
+          pkg = next(work.glob("pkg-*.tar.zst"))
+          subprocess.run(["python", "-m", "zstandard", "-d", str(pkg), "-o", str(work / "pkg.tar")], check=True)
+          with tarfile.open(work / "pkg.tar") as tf:
+              tf.extractall(out)
+          PY
+            if [[ ! -f deps/faiss-1.14.1-cpu-linux/lib/libfaiss.so ]]; then
+              found="$(find deps/faiss-1.14.1-cpu-linux -name 'libfaiss.so*' -type f | head -n 1)"
+              test -n "$found"
+              mkdir -p deps/faiss-1.14.1-cpu-linux/lib
+              cp "$found" deps/faiss-1.14.1-cpu-linux/lib/libfaiss.so
+            fi
+          fi
+
+          if [[ ! -d deps/mkl-2023.1.0-linux ]]; then
+            curl -L "$MKL_CONDA_URL" -o deps/mkl-linux.conda
+            python - <<'PY'
+          import pathlib, shutil, subprocess, tarfile, zipfile
+          archive = pathlib.Path("deps/mkl-linux.conda")
+          work = pathlib.Path("deps/mkl-conda-extract")
+          out = pathlib.Path("deps/mkl-2023.1.0-linux")
+          if work.exists():
+              shutil.rmtree(work)
+          work.mkdir(parents=True)
+          with zipfile.ZipFile(archive) as zf:
+              zf.extractall(work)
+          pkg = next(work.glob("pkg-*.tar.zst"))
+          subprocess.run(["python", "-m", "zstandard", "-d", str(pkg), "-o", str(work / "pkg.tar")], check=True)
+          with tarfile.open(work / "pkg.tar") as tf:
+              tf.extractall(out)
+          PY
+            if [[ ! -f deps/mkl-2023.1.0-linux/lib/libmkl_rt.so ]]; then
+              found="$(find deps/mkl-2023.1.0-linux -name 'libmkl_rt.so*' -type f | head -n 1)"
+              test -n "$found"
+              mkdir -p deps/mkl-2023.1.0-linux/lib
+              cp "$found" deps/mkl-2023.1.0-linux/lib/libmkl_rt.so
+            fi
+          fi
+
+      - name: Apply Linux CI CMake dependency shim
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path("CMakeLists.txt")
+          s = p.read_text(encoding="utf-8")
+          s = s.replace(
+              'require_path("${BERT_SQLITE_DLL}" "SQLite runtime")\n'
+              'require_path("${BERT_SQLITE_DEF}" "SQLite module definition")\n\n'
+              'if(WIN32)',
+              'if(WIN32)\n'
+              '    require_path("${BERT_SQLITE_DLL}" "SQLite runtime")\n'
+              '    require_path("${BERT_SQLITE_DEF}" "SQLite module definition")'
+          )
+          s = s.replace(
+              'else()\n'
+              '    message(FATAL_ERROR "SQLite prebuilt dependency currently expects the Windows package")\n'
+              'endif()\n\n'
+              'set(BERT_FAISS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/deps/faiss-1.14.1-cpu-win64" CACHE PATH "Path to Faiss CPU package")\n'
+              'set(BERT_MKL_RUNTIME_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/deps/mkl-2023.1.0-win64" CACHE PATH "Path to MKL runtime package")\n\n'
+              'require_path("${BERT_FAISS_ROOT}/include/faiss/IndexFlat.h" "Faiss headers")\n'
+              'require_path("${BERT_FAISS_ROOT}/lib/faiss.lib" "Faiss import library")\n'
+              'require_path("${BERT_FAISS_ROOT}/bin/faiss.dll" "Faiss runtime")\n'
+              'require_path("${BERT_MKL_RUNTIME_ROOT}/Library/bin/mkl_rt.2.dll" "MKL runtime")\n\n'
+              'set(faiss_DIR "${BERT_FAISS_ROOT}/share/faiss" CACHE PATH "Path to Faiss config package")\n'
+              'find_package(faiss CONFIG REQUIRED)\n'
+              'set(BERT_FAISS_RUNTIME_FILES\n'
+              '    "${BERT_FAISS_ROOT}/bin/faiss.dll"\n'
+              '    "${BERT_MKL_RUNTIME_ROOT}/Library/bin/mkl_rt.2.dll"\n'
+              ')\n',
+              'elseif(UNIX AND NOT APPLE)\n'
+              '    require_path("${BERT_SQLITE_INCLUDE_DIR}/sqlite3.c" "SQLite amalgamation source")\n'
+              '    add_library(sqlite3 STATIC "${BERT_SQLITE_INCLUDE_DIR}/sqlite3.c")\n'
+              '    target_include_directories(sqlite3 PUBLIC "${BERT_SQLITE_INCLUDE_DIR}")\n'
+              '    target_link_libraries(sqlite3 PUBLIC dl pthread)\n'
+              'endif()\n\n'
+              'if(WIN32)\n'
+              '    set(BERT_DEFAULT_FAISS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/deps/faiss-1.14.1-cpu-win64")\n'
+              '    set(BERT_DEFAULT_MKL_RUNTIME_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/deps/mkl-2023.1.0-win64")\n'
+              '    set(BERT_FAISS_RUNTIME_FILES\n'
+              '        "${BERT_DEFAULT_FAISS_ROOT}/bin/faiss.dll"\n'
+              '        "${BERT_DEFAULT_MKL_RUNTIME_ROOT}/Library/bin/mkl_rt.2.dll"\n'
+              '    )\n'
+              'elseif(UNIX AND NOT APPLE)\n'
+              '    set(BERT_DEFAULT_FAISS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/deps/faiss-1.14.1-cpu-linux")\n'
+              '    set(BERT_DEFAULT_MKL_RUNTIME_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/deps/mkl-2023.1.0-linux")\n'
+              '    set(BERT_FAISS_RUNTIME_FILES\n'
+              '        "${BERT_DEFAULT_FAISS_ROOT}/lib/libfaiss.so"\n'
+              '        "${BERT_DEFAULT_MKL_RUNTIME_ROOT}/lib/libmkl_rt.so"\n'
+              '    )\n'
+              'endif()\n\n'
+              'set(BERT_FAISS_ROOT "${BERT_DEFAULT_FAISS_ROOT}" CACHE PATH "Path to Faiss CPU package")\n'
+              'set(BERT_MKL_RUNTIME_ROOT "${BERT_DEFAULT_MKL_RUNTIME_ROOT}" CACHE PATH "Path to MKL runtime package")\n\n'
+              'require_path("${BERT_FAISS_ROOT}/include/faiss/IndexFlat.h" "Faiss headers")\n'
+              'if(WIN32)\n'
+              '    set(faiss_DIR "${BERT_FAISS_ROOT}/share/faiss" CACHE PATH "Path to Faiss config package")\n'
+              '    find_package(faiss CONFIG REQUIRED)\n'
+              'elseif(UNIX AND NOT APPLE)\n'
+              '    add_library(faiss SHARED IMPORTED)\n'
+              '    set_target_properties(faiss PROPERTIES\n'
+              '        IMPORTED_LOCATION "${BERT_FAISS_ROOT}/lib/libfaiss.so"\n'
+              '        INTERFACE_INCLUDE_DIRECTORIES "${BERT_FAISS_ROOT}/include"\n'
+              '    )\n'
+              'endif()\n'
+          )
+          p.write_text(s, encoding="utf-8", newline="\n")
+          PY
+
+      - name: Configure tests
         shell: bash
         env:
           CCACHE_BASEDIR: ${{ github.workspace }}
@@ -120,54 +302,41 @@ jobs:
         run: |
           ccache --set-config=max_size=500M
           ccache --zero-stats || true
-          cmake -S . -B "${{ matrix.build_dir }}" \
+          cmake -S . -B "$BUILD_DIR" \
             -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
-            -DBERT_VCPKG_TRIPLET=${{ matrix.triplet }} \
+            -DBERT_BUILD_TESTS=ON \
+            -DBERT_VCPKG_TRIPLET="$VCPKG_TRIPLET" \
             -DBERT_USE_ONNXRUNTIME_GPU=OFF \
-            -DONNXRUNTIME_CPU_ROOT="${{ github.workspace }}/${{ matrix.ort_root }}"
+            -DONNXRUNTIME_CPU_ROOT="$GITHUB_WORKSPACE/$ONNXRUNTIME_ROOT" \
+            -DLLAMA_CPP_ROOT="$GITHUB_WORKSPACE/$LLAMA_CPP_ROOT" \
+            -DLLAMA_CPP_BUILD="$GITHUB_WORKSPACE/$LLAMA_CPP_BUILD" \
+            -DOpenCV_DIR=/usr/lib/x86_64-linux-gnu/cmake/opencv4
 
-      - name: Build
+      - name: Build test targets
         shell: bash
         env:
           CCACHE_BASEDIR: ${{ github.workspace }}
           CCACHE_COMPILERCHECK: content
           CCACHE_DIR: ~/.cache/ccache
         run: |
-          cmake --build "${{ matrix.build_dir }}" --parallel
+          cmake --build "$BUILD_DIR" --target \
+            core_tests \
+            net_tests \
+            http_client_tests \
+            tls_tests \
+            storage_tests \
+            semantic_cache_tests \
+            document_tests \
+            config_tests \
+            service_tests \
+            --parallel
           ccache --show-stats || true
 
-      - name: Verify build outputs
+      - name: Run tests
         shell: bash
         run: |
-          test -x "${{ github.workspace }}/${{ matrix.artifact_dir }}/bert_inference_server"
-          ls -la "${{ github.workspace }}/${{ matrix.artifact_dir }}"
-
-      - name: Generate smoke-test model
-        run: |
-          python .github/scripts/create_smoke_test_model.py --output build/smoke/bert_smoke_test.onnx
-
-      - name: Run smoke test
-        shell: bash
-        run: |
-          python .github/scripts/run_smoke_test.py \
-            --server "${{ github.workspace }}/${{ matrix.artifact_dir }}/bert_inference_server" \
-            --client "${{ github.workspace }}/${{ matrix.artifact_dir }}/bert_inference_client" \
-            --model "${{ github.workspace }}/build/smoke/bert_smoke_test.onnx" \
-            --health-probe "${{ github.workspace }}/tools/grpc_health_probe.py" \
-            --target 127.0.0.1:50051
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: bert-inference-${{ matrix.triplet }}
-          if-no-files-found: error
-          path: |
-            ${{ matrix.artifact_dir }}/bert_inference_server*
-            ${{ matrix.artifact_dir }}/bert_inference_client*
-            ${{ matrix.artifact_dir }}/bert_benchmark_client*
-            ${{ matrix.artifact_dir }}/onnxruntime*.dll
-            ${{ matrix.artifact_dir }}/libonnxruntime*.so*
-            ${{ matrix.artifact_dir }}/*.dll
-            ${{ matrix.artifact_dir }}/*.so*
+          ctest --test-dir "$BUILD_DIR" -C Release \
+            -R "(Core|Net|HttpClient|Tls|Storage|SemanticCache|Document|Config|PersonaGateway|SessionManager|PersonaRuntime|PersonaAlgorithm)" \
+            --output-on-failure

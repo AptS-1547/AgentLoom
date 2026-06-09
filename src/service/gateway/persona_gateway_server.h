@@ -3,11 +3,13 @@
 #include "persona_gateway_http_adapter.h"
 #include "persona_gateway_service.h"
 #include "persona_runtime.h"
+#include "document_analysis_service.h"
 #include "http_server.h"
 #include "static_file_handler.h"
 #include "thread_pool.h"
 
 #include <chrono>
+#include <cstddef>
 #include <filesystem>
 #include <memory>
 #include <optional>
@@ -17,7 +19,22 @@ namespace agent::semantic_cache {
 class RedisConnectionPool;
 }
 
+namespace storage::sqlite {
+class SqliteConnectionPool;
+}
+
 namespace agent::service::gateway {
+
+struct GatewayDocumentStoreOptions {
+    bool enabled = false;
+    std::filesystem::path root;
+    std::filesystem::path database_path;
+    std::size_t read_connection_count = 2;
+    std::size_t write_connection_count = 1;
+    int busy_timeout_ms = 5000;
+    int retention_hours = 24 * 7;
+    int cleanup_interval_seconds = 60;
+};
 
 struct PersonaGatewayServerOptions {
     ::net::HttpServerOptions http;
@@ -27,6 +44,7 @@ struct PersonaGatewayServerOptions {
     persona::SessionOptions session;
     persona::PersonaRuntimeOptions runtime;
     std::optional<::net::StaticFileOptions> static_files;
+    GatewayDocumentStoreOptions document_store;
     std::string websocket_path = "/ws/session";
 };
 
@@ -34,6 +52,8 @@ struct PersonaGatewayServerDependencies {
     std::shared_ptr<persona::IMemoryContextProvider> memory_provider;
     std::shared_ptr<persona::IEmotionAnalyzer> emotion_analyzer;
     std::shared_ptr<llm::ILlmClient> llm_client;
+    std::shared_ptr<document::IDocumentEmbeddingProvider> document_embedding_provider;
+    std::shared_ptr<document::IDocumentLlmChunkCache> document_llm_chunk_cache;
 };
 
 class PersonaGatewayServer final {
@@ -61,6 +81,8 @@ private:
     void HandleWebSocket(std::shared_ptr<::net::IWebSocketStreamRequest> request);
     core::Status ValidateDependencies() const;
     core::Status EnsureAuthSessionStore();
+    core::Status EnsureDocumentStore();
+    void ShutdownDocumentStore();
 
     PersonaGatewayServerOptions options_;
     PersonaGatewayServerDependencies dependencies_;
@@ -71,6 +93,8 @@ private:
     persona::PersonaRuntime runtime_;
     ClassroomScheduler classroom_scheduler_;
     PersonaGatewayService service_;
+    std::shared_ptr<document::DocumentAnalysisService> document_service_;
+    std::shared_ptr<storage::sqlite::SqliteConnectionPool> document_repository_pool_;
     std::shared_ptr<agent::semantic_cache::RedisConnectionPool> auth_redis_;
     std::shared_ptr<IAuthSessionStore> auth_session_store_;
     std::shared_ptr<IGatewayAuthenticator> authenticator_;

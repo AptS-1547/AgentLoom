@@ -47,6 +47,12 @@ find_package(OpenSSL CONFIG REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
 find_package(hiredis CONFIG REQUIRED)
 find_package(redis++ CONFIG REQUIRED)
+find_package(libzip CONFIG REQUIRED)
+find_package(pugixml CONFIG REQUIRED)
+
+if(WIN32 AND BERT_VCPKG_TRIPLET)
+    file(GLOB VCPKG_RUNTIME_DLLS "${CMAKE_CURRENT_SOURCE_DIR}/vcpkg_installed/${BERT_VCPKG_TRIPLET}/bin/*.dll")
+endif()
 
 function(require_path path label)
     if(NOT EXISTS "${path}")
@@ -578,6 +584,35 @@ link_whole_archive(l3_compression_e2e_test agent_config)
 copy_runtime_files(l3_compression_e2e_test "${BERT_SQLITE_DLL}")
 
 # ──────────── Persona Gateway frontend E2E server (not part of CTest) ────────────
+add_executable(document_analysis_e2e_test
+    tools/document_analysis_e2e_test.cpp
+)
+target_include_directories(document_analysis_e2e_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/document
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/document/ooxml
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/service/gateway
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/service/persona
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/semantic_cache
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/vector
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/llm
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/net
+    ${CMAKE_CURRENT_SOURCE_DIR}/tools
+)
+target_link_libraries(document_analysis_e2e_test PRIVATE
+    agent_service
+    agent_document
+    agent_vector
+    agent_llm
+    agent_tls
+    agent_config
+    nlohmann_json::nlohmann_json
+    OpenSSL::SSL
+    OpenSSL::Crypto
+)
+link_whole_archive(document_analysis_e2e_test agent_config)
+copy_runtime_files(document_analysis_e2e_test "${BERT_SQLITE_DLL}")
+copy_runtime_files(document_analysis_e2e_test ${VCPKG_RUNTIME_DLLS})
+
 add_executable(persona_gateway_e2e_server
     tools/persona_gateway_e2e_server.cpp
 )
@@ -649,6 +684,42 @@ target_link_libraries(agent_semantic_cache PUBLIC
     hiredis::hiredis
 )
 
+# ──────────── Document analysis infrastructure ────────────
+add_library(agent_document STATIC
+    src/document/chunk_builder.cpp
+    src/document/document_file_store.h
+    src/document/document_file_store.cpp
+    src/document/document_analysis_service.h
+    src/document/document_metadata_repository.h
+    src/document/document_metadata_repository.cpp
+    src/document/document_types.h
+    src/document/document_llm_chunk_cache.h
+    src/document/document_llm_chunk_cache.cpp
+    src/document/document_pipeline.cpp
+    src/document/diagnosis_builder.cpp
+    src/document/mindmap_builder.cpp
+    src/document/ooxml/ooxml_utils.cpp
+    src/document/ooxml/ooxml_extractor.h
+    src/document/ooxml/ooxml_extractor.cpp
+)
+
+target_include_directories(agent_document PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/document
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/document/ooxml
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/core
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/llm
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/semantic_cache
+)
+
+target_link_libraries(agent_document PUBLIC
+    agent_core
+    agent_storage
+    agent_llm
+    agent_semantic_cache
+    libzip::zip
+    pugixml::pugixml
+)
+
 if(BERT_BUILD_TESTS)
     add_executable(semantic_cache_tests
         tests/semantic_cache/semantic_cache_pipeline_test.cpp
@@ -662,6 +733,21 @@ if(BERT_BUILD_TESTS)
     )
 
     gtest_discover_tests(semantic_cache_tests DISCOVERY_MODE PRE_TEST)
+
+    add_executable(document_tests
+        tests/document/ooxml_extractor_test.cpp
+    )
+
+    target_link_libraries(document_tests PRIVATE
+        agent_document
+        agent_storage
+        GTest::gtest_main
+    )
+
+    copy_runtime_files(document_tests "${BERT_SQLITE_DLL}")
+    copy_runtime_files(document_tests ${VCPKG_RUNTIME_DLLS})
+
+    gtest_discover_tests(document_tests DISCOVERY_MODE PRE_TEST)
 
     add_executable(l0_benchmark
         tests/semantic_cache/l0_benchmark.cpp
@@ -1094,6 +1180,8 @@ add_library(agent_service STATIC
 )
 
 target_include_directories(agent_service PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/document
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/document/ooxml
     ${CMAKE_CURRENT_SOURCE_DIR}/src/service/inference
     ${CMAKE_CURRENT_SOURCE_DIR}/src/service/persona
     ${CMAKE_CURRENT_SOURCE_DIR}/src/service/gateway
@@ -1114,6 +1202,7 @@ target_link_libraries(agent_service PUBLIC
     agent_semantic_cache
     agent_memory
     agent_storage
+    agent_document
     agent_core
     agent_net
     nlohmann_json::nlohmann_json
@@ -1134,6 +1223,13 @@ if(BERT_BUILD_TESTS)
         agent_service
         GTest::gtest_main
     )
+
+    target_include_directories(service_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/tools
+    )
+
+    copy_runtime_files(service_tests "${BERT_SQLITE_DLL}")
+    copy_runtime_files(service_tests ${VCPKG_RUNTIME_DLLS})
 
     gtest_discover_tests(service_tests DISCOVERY_MODE PRE_TEST)
 endif()
@@ -1223,7 +1319,7 @@ foreach(ONNXRUNTIME_RUNTIME_LIB ${ONNXRUNTIME_RUNTIME_LIBS})
 endforeach()
 
 # 复制 vcpkg 动态库依赖
-if(WIN32 AND BERT_VCPKG_TRIPLET)
+if(WIN32 AND BERT_VCPKG_TRIPLET AND NOT VCPKG_RUNTIME_DLLS)
     file(GLOB VCPKG_RUNTIME_DLLS "${CMAKE_CURRENT_SOURCE_DIR}/vcpkg_installed/${BERT_VCPKG_TRIPLET}/bin/*.dll")
     set(BERT_RUNTIME_COPY_TARGETS multimodal_inference_server bert_inference_client bert_benchmark_client)
     if(TARGET static_site_test_server)

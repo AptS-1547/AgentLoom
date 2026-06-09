@@ -11,6 +11,11 @@ DECLARE_CONFIG_SECTION(PersonaGatewayConfigSection, "persona_gateway")
     CONFIG_CLI_STRING(kStaticRoot, "--gateway-static-root");
     CONFIG_CLI_STRING(kStaticIndex, "--gateway-static-index");
     CONFIG_CLI_STRING(kStaticSpa, "--gateway-static-spa");
+    CONFIG_CLI_STRING(kDocumentStoreEnabled, "--gateway-document-store-enabled");
+    CONFIG_CLI_STRING(kDocumentStoreRoot, "--gateway-document-store-root");
+    CONFIG_CLI_STRING(kDocumentStoreDb, "--gateway-document-store-db");
+    CONFIG_CLI_STRING(kDocumentStoreRetentionHours, "--gateway-document-store-retention-hours");
+    CONFIG_CLI_STRING(kDocumentStoreCleanupSeconds, "--gateway-document-store-cleanup-seconds");
     CONFIG_CLI_STRING(kComputeWorkers, "--gateway-compute-workers");
     CONFIG_CLI_STRING(kComputeQueue, "--gateway-compute-queue");
     CONFIG_CLI_STRING(kIoWorkers, "--gateway-io-workers");
@@ -63,6 +68,19 @@ void PersonaGatewayConfigSection::LoadJson(const Json& root, MultimodalServerOpt
         SetString(*static_files, "static_files", "index_file", options.persona_gateway.static_files.index_file);
         SetBool(*static_files, "static_files", "spa_fallback", options.persona_gateway.static_files.spa_fallback);
     }
+    if (const Json* document_store = FindField(*section, Name(), "document_store")) {
+        if (!document_store->is_object()) {
+            throw std::runtime_error("persona_gateway.document_store must be an object");
+        }
+        SetBool(*document_store, "document_store", "enabled", options.persona_gateway.document_store.enabled);
+        SetPath(*document_store, "document_store", "root", options.persona_gateway.document_store.root);
+        SetPath(*document_store, "document_store", "database_path", options.persona_gateway.document_store.database_path);
+        SetSize(*document_store, "document_store", "read_connection_count", options.persona_gateway.document_store.read_connection_count, 1);
+        SetSize(*document_store, "document_store", "write_connection_count", options.persona_gateway.document_store.write_connection_count, 1);
+        SetInt(*document_store, "document_store", "busy_timeout_ms", options.persona_gateway.document_store.busy_timeout_ms, 1, 60000);
+        SetInt(*document_store, "document_store", "retention_hours", options.persona_gateway.document_store.retention_hours, 1, 24 * 365);
+        SetInt(*document_store, "document_store", "cleanup_interval_seconds", options.persona_gateway.document_store.cleanup_interval_seconds, 1, 24 * 3600);
+    }
     LoadThreadPoolJson(*section, Name(), "compute_pool", options.persona_gateway.compute_pool);
     LoadThreadPoolJson(*section, Name(), "io_pool", options.persona_gateway.io_pool);
     SetInt(*section, Name(), "session_idle_timeout_minutes", options.persona_gateway.session_idle_timeout_minutes, 1, 1440);
@@ -92,6 +110,23 @@ bool PersonaGatewayConfigSection::LoadCli(CliCursor& cursor, MultimodalServerOpt
         options.persona_gateway.static_files.enabled = true;
         options.persona_gateway.static_files.spa_fallback = true;
     })
+    CONFIG_FLAG_ARG(kDocumentStoreEnabled, options.persona_gateway.document_store.enabled = true;)
+    CONFIG_VALUE_ARG(kDocumentStoreRoot, value, {
+        options.persona_gateway.document_store.enabled = true;
+        options.persona_gateway.document_store.root = *value;
+    })
+    CONFIG_VALUE_ARG(kDocumentStoreDb, value, {
+        options.persona_gateway.document_store.enabled = true;
+        options.persona_gateway.document_store.database_path = *value;
+    })
+    CONFIG_VALUE_ARG(kDocumentStoreRetentionHours, value, {
+        options.persona_gateway.document_store.enabled = true;
+        options.persona_gateway.document_store.retention_hours = ParsePositiveOption(kDocumentStoreRetentionHours, *value);
+    })
+    CONFIG_VALUE_ARG(kDocumentStoreCleanupSeconds, value, {
+        options.persona_gateway.document_store.enabled = true;
+        options.persona_gateway.document_store.cleanup_interval_seconds = ParsePositiveOption(kDocumentStoreCleanupSeconds, *value);
+    })
     CONFIG_VALUE_ARG(kComputeWorkers, value, options.persona_gateway.compute_pool.worker_count = ParseNonNegativeOption(kComputeWorkers, *value);)
     CONFIG_VALUE_ARG(kComputeQueue, value, options.persona_gateway.compute_pool.queue_capacity = ParseNonNegativeOption(kComputeQueue, *value);)
     CONFIG_VALUE_ARG(kIoWorkers, value, options.persona_gateway.io_pool.worker_count = ParseNonNegativeOption(kIoWorkers, *value);)
@@ -119,6 +154,16 @@ void PersonaGatewayConfigSection::Validate(MultimodalServerOptions& options) con
         if (gateway.static_files.index_file.empty()) {
             throw std::runtime_error("persona_gateway.static_files.index_file must not be empty");
         }
+    }
+    if (gateway.document_store.enabled) {
+        if (gateway.document_store.root.empty()) {
+            throw std::runtime_error("persona_gateway.document_store.root is required when document store is enabled");
+        }
+        if (gateway.document_store.database_path.empty()) {
+            throw std::runtime_error("persona_gateway.document_store.database_path is required when document store is enabled");
+        }
+        gateway.document_store.root = ResolveRelativeToConfig(gateway.document_store.root, options.config_file_path);
+        gateway.document_store.database_path = ResolveRelativeToConfig(gateway.document_store.database_path, options.config_file_path);
     }
 }
 

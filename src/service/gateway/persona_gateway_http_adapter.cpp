@@ -4,6 +4,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cctype>
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <optional>
 #include <sstream>
@@ -58,6 +61,19 @@ std::string HeaderValue(const ::net::BeastHttpRequest& req, std::string_view fie
         return {};
     }
     return std::string(it->value());
+}
+
+std::filesystem::path PathFromUtf8(std::string_view path) {
+#ifdef _WIN32
+    std::u8string utf8;
+    utf8.reserve(path.size());
+    for (const auto ch : path) {
+        utf8.push_back(static_cast<char8_t>(ch));
+    }
+    return std::filesystem::path(std::move(utf8));
+#else
+    return std::filesystem::path(std::string(path));
+#endif
 }
 
 std::string TraceFrom(const ::net::BeastHttpRequest& req, const Json* body = nullptr) {
@@ -245,6 +261,44 @@ Json SystemStatsEnvelope(const SystemStatsGatewayResponse& response) {
     };
 }
 
+Json DocumentAnalyzeEnvelope(const document::DocumentAnalyzeResponse& response) {
+    return Json{
+        {"ok", true},
+        {"traceId", response.trace_id},
+        {"documentId", response.document_id},
+        {"latencyMs", response.latency.total.count()},
+        {"data", response.result},
+        {"pipelineLatency", {
+            {"computeQueueWaitMs", response.latency.compute_queue_wait.count()},
+            {"computeStageMs", response.latency.compute_stage.count()},
+            {"totalMs", response.latency.total.count()},
+        }},
+    };
+}
+
+Json DocumentMetadataEnvelope(std::string trace_id, const document::DocumentMetadataRecord& record) {
+    return Json{
+        {"ok", true},
+        {"traceId", std::move(trace_id)},
+        {"documentId", record.document_id},
+        {"data", {
+            {"documentId", record.document_id},
+            {"contentHash", record.content_hash},
+            {"ownerUserUuid", record.owner_user_uuid},
+            {"sessionId", record.session_id},
+            {"fileName", record.file_name},
+            {"fileType", record.file_type},
+            {"uploadedAtMs", record.uploaded_at_ms},
+            {"lastAnalyzedAtMs", record.last_analyzed_at_ms},
+            {"lastAccessedAtMs", record.last_accessed_at_ms},
+            {"analysisStatus", record.analysis_status},
+            {"analysisTraceId", record.analysis_trace_id},
+            {"sizeBytes", record.size_bytes},
+            {"schemaVersion", record.schema_version},
+        }},
+    };
+}
+
 core::Result<Json> ParseJsonBody(const ::net::BeastHttpRequest& req) {
     if (req.body().empty()) {
         return Json::object();
@@ -283,7 +337,9 @@ void SendJson(const std::shared_ptr<::net::IHttpRequest>& request,
               ::net::http::status status,
               const Json& body,
               std::string_view trace_id) {
-    auto response = ::net::HttpResponse::Json(status, body.dump()).message;
+    auto response = ::net::HttpResponse::Json(
+        status,
+        body.dump(-1, ' ', false, Json::error_handler_t::replace)).message;
     response.set("X-Trace-Id", trace_id);
     request->Respond(std::move(response));
 }
@@ -293,7 +349,9 @@ void SendJsonWithHeaders(const std::shared_ptr<::net::IHttpRequest>& request,
                          const Json& body,
                          std::string_view trace_id,
                          const std::vector<std::pair<std::string, std::string>>& headers) {
-    auto response = ::net::HttpResponse::Json(status, body.dump()).message;
+    auto response = ::net::HttpResponse::Json(
+        status,
+        body.dump(-1, ' ', false, Json::error_handler_t::replace)).message;
     response.set("X-Trace-Id", trace_id);
     for (const auto& [key, value] : headers) {
         response.set(key, value);
@@ -367,6 +425,46 @@ std::string MessagePayloadToString(const ::net::WebSocketMessage& message) {
     return out;
 }
 
+int Base64Value(char ch) {
+    if (ch >= 'A' && ch <= 'Z') return ch - 'A';
+    if (ch >= 'a' && ch <= 'z') return ch - 'a' + 26;
+    if (ch >= '0' && ch <= '9') return ch - '0' + 52;
+    if (ch == '+') return 62;
+    if (ch == '/') return 63;
+    return -1;
+}
+
+core::Result<std::string> Base64Decode(std::string_view input) {
+    std::string out;
+    out.reserve(input.size() * 3 / 4);
+    int value = 0;
+    int bits = -8;
+    bool padding = false;
+    for (char ch : input) {
+        if (ch == '\r' || ch == '\n' || ch == ' ' || ch == '\t') {
+            continue;
+        }
+        if (ch == '=') {
+            padding = true;
+            continue;
+        }
+        if (padding) {
+            return core::Status::Error(core::ErrorCode::InvalidArgument, "invalid base64 padding");
+        }
+        const int decoded = Base64Value(ch);
+        if (decoded < 0) {
+            return core::Status::Error(core::ErrorCode::InvalidArgument, "invalid base64 character");
+        }
+        value = (value << 6) | decoded;
+        bits += 6;
+        if (bits >= 0) {
+            out.push_back(static_cast<char>((value >> bits) & 0xff));
+            bits -= 8;
+        }
+    }
+    return out;
+}
+
 ::net::WebSocketFrame TextFrame(core::RawMemoryPool& pool, std::string_view text) {
     ::net::WebSocketFrame frame;
     frame.kind = ::net::WebSocketMessageKind::Text;
@@ -377,9 +475,111 @@ std::string MessagePayloadToString(const ::net::WebSocketMessage& message) {
     return frame;
 }
 
+void SendWsError(const std::shared_ptr<::net::IWebSocketStreamRequest>& request,
+                 std::string_view trace_id,
+                 const core::Status& status) {
+    Json out{{"type", "error"}, {"payload", ErrorEnvelope(std::string(trace_id), status)}};
+    request->Send(TextFrame(request->memory_pool(), out.dump()));
+}
+
+std::filesystem::path UploadTempPath(std::string_view upload_id) {
+    std::string file_name = "agent_document_upload_";
+    for (char ch : upload_id) {
+        const auto safe = std::isalnum(static_cast<unsigned char>(ch)) || ch == '-' || ch == '_';
+        file_name.push_back(safe ? ch : '_');
+    }
+    file_name += ".tmp";
+    return std::filesystem::temp_directory_path() / file_name;
+}
+
+core::Status WriteUploadChunk(const std::filesystem::path& path,
+                              std::string_view data,
+                              std::uint64_t offset) {
+    std::fstream file;
+    if (offset == 0) {
+        file.open(path, std::ios::binary | std::ios::out | std::ios::trunc);
+    } else {
+        file.open(path, std::ios::binary | std::ios::in | std::ios::out);
+    }
+    if (!file) {
+        return core::Status::Error(core::ErrorCode::InternalError, "failed to open upload temp file");
+    }
+    file.seekp(static_cast<std::streamoff>(offset), std::ios::beg);
+    if (!file) {
+        return core::Status::Error(core::ErrorCode::InternalError, "failed to seek upload temp file");
+    }
+    file.write(data.data(), static_cast<std::streamsize>(data.size()));
+    if (!file) {
+        return core::Status::Error(core::ErrorCode::InternalError, "failed to write upload chunk");
+    }
+    return core::Status::Ok();
+}
+
+void RemoveFileQuietly(const std::filesystem::path& path) {
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+}
+
+core::Status AppendBinaryUploadFrame(
+    std::unordered_map<std::string, PersonaGatewayHttpAdapter::DocumentUploadSession>& uploads,
+    std::uint64_t connection_id,
+    const ::net::WebSocketMessage& message,
+    std::string* upload_id,
+    std::uint64_t* received_size,
+    std::uint64_t* expected_size) {
+    auto it = std::find_if(
+        uploads.begin(),
+        uploads.end(),
+        [connection_id](const auto& entry) {
+            return entry.second.binary_mode && entry.second.connection_id == connection_id;
+        });
+    if (it == uploads.end()) {
+        return core::Status::Error(core::ErrorCode::FailedPrecondition, "no active binary upload for websocket connection");
+    }
+
+    auto& session = it->second;
+    if (message.fragments.empty()) {
+        return core::Status::Ok();
+    }
+    std::uint64_t frame_bytes = 0;
+    for (const auto& fragment : message.fragments) {
+        frame_bytes += fragment.size();
+    }
+    if (session.received_size + frame_bytes > session.expected_size) {
+        const auto temp_path = session.temp_path;
+        uploads.erase(it);
+        RemoveFileQuietly(temp_path);
+        return core::Status::Error(core::ErrorCode::ResourceExhausted, "binary upload exceeds declared totalBytes");
+    }
+
+    auto offset = session.received_size;
+    for (const auto& fragment : message.fragments) {
+        auto status = WriteUploadChunk(session.temp_path, fragment.view(), offset);
+        if (!status.ok()) {
+            return status;
+        }
+        offset += fragment.size();
+    }
+    session.received_size += frame_bytes;
+    if (upload_id) {
+        *upload_id = session.upload_id;
+    }
+    if (received_size) {
+        *received_size = session.received_size;
+    }
+    if (expected_size) {
+        *expected_size = session.expected_size;
+    }
+    return core::Status::Ok();
+}
+
 struct HttpRouteContext {
     PersonaGatewayService& service;
-    IAuthRegistrationService* auth_registration;
+    std::shared_ptr<document::DocumentAnalysisService> document_service;
+    std::shared_ptr<llm::ILlmClient> llm_client;
+    std::shared_ptr<document::IDocumentEmbeddingProvider> embedding_provider;
+    std::shared_ptr<document::IDocumentLlmChunkCache> llm_chunk_cache;
+    std::shared_ptr<IAuthRegistrationService> auth_registration;
     std::shared_ptr<::net::IHttpRequest> request;
     const ::net::BeastHttpRequest& message;
     const Json& body;
@@ -387,6 +587,20 @@ struct HttpRouteContext {
     std::string trace_id;
     std::vector<std::string> path_parts;
     std::unordered_map<std::string, std::string> path_params;
+};
+
+struct WsRouteContext {
+    PersonaGatewayService& service;
+    std::shared_ptr<document::DocumentAnalysisService> document_service;
+    std::shared_ptr<llm::ILlmClient> llm_client;
+    std::shared_ptr<document::IDocumentEmbeddingProvider> embedding_provider;
+    std::shared_ptr<document::IDocumentLlmChunkCache> llm_chunk_cache;
+    std::shared_ptr<::net::IWebSocketStreamRequest> request;
+    const Json& body;
+    const AuthIdentity& identity;
+    std::string trace_id;
+    std::mutex& upload_mutex;
+    std::unordered_map<std::string, PersonaGatewayHttpAdapter::DocumentUploadSession>& document_uploads;
 };
 
 class IHttpRoute {
@@ -423,6 +637,20 @@ public:
 };
 
 using HttpRouteFactory = std::unique_ptr<IHttpRoute> (*)();
+
+class IWsRoute {
+public:
+    virtual ~IWsRoute() = default;
+    virtual std::string_view Type() const noexcept = 0;
+    virtual bool RequiresAuth() const noexcept { return true; }
+    virtual void Handle(WsRouteContext& context) const = 0;
+
+    bool Matches(std::string_view type) const noexcept {
+        return Type() == type;
+    }
+};
+
+using WsRouteFactory = std::unique_ptr<IWsRoute> (*)();
 
 class HttpRouteRegistry {
 public:
@@ -462,6 +690,44 @@ private:
     std::vector<Entry> entries_;
 };
 
+class WsRouteRegistry {
+public:
+    static WsRouteRegistry& Instance() {
+        static WsRouteRegistry registry;
+        return registry;
+    }
+
+    bool Register(std::string_view name, WsRouteFactory factory) {
+        auto duplicate = std::find_if(
+            entries_.begin(),
+            entries_.end(),
+            [name](const Entry& entry) {
+                return entry.name == name;
+            });
+        if (duplicate == entries_.end()) {
+            entries_.push_back({name, factory});
+        }
+        return true;
+    }
+
+    std::vector<std::unique_ptr<IWsRoute>> CreateRoutes() const {
+        std::vector<std::unique_ptr<IWsRoute>> routes;
+        routes.reserve(entries_.size());
+        for (const auto& entry : entries_) {
+            routes.push_back(entry.factory());
+        }
+        return routes;
+    }
+
+private:
+    struct Entry {
+        std::string_view name;
+        WsRouteFactory factory = nullptr;
+    };
+
+    std::vector<Entry> entries_;
+};
+
 template <typename T>
 class HttpRouteRegistrar {
 public:
@@ -469,6 +735,18 @@ public:
         HttpRouteRegistry::Instance().Register(
             T::kRouteName,
             []() -> std::unique_ptr<IHttpRoute> {
+                return std::make_unique<T>();
+            });
+    }
+};
+
+template <typename T>
+class WsRouteRegistrar {
+public:
+    WsRouteRegistrar() {
+        WsRouteRegistry::Instance().Register(
+            T::kRouteName,
+            []() -> std::unique_ptr<IWsRoute> {
                 return std::make_unique<T>();
             });
     }
@@ -484,6 +762,16 @@ public: \
 }; \
 static const HttpRouteRegistrar<ClassName> g_##ClassName##_registrar; \
 void ClassName::Handle(HttpRouteContext& context) const
+
+#define DECLARE_WS_ROUTE(ClassName, TypeValue) \
+class ClassName final : public IWsRoute { \
+public: \
+    static constexpr std::string_view kRouteName = #ClassName; \
+    std::string_view Type() const noexcept override { return TypeValue; } \
+    void Handle(WsRouteContext& context) const override; \
+}; \
+static const WsRouteRegistrar<ClassName> g_##ClassName##_registrar; \
+void ClassName::Handle(WsRouteContext& context) const
 
 DECLARE_HTTP_ROUTE(AuthMeRoute, ::net::http::verb::get, "api", "auth", "me") {
     Json body{
@@ -713,6 +1001,82 @@ DECLARE_HTTP_ROUTE(SystemStatsRoute, ::net::http::verb::get, "api", "system", "s
     SendResult(context.request, context.service.SystemStats(context.trace_id), context.trace_id, SystemStatsEnvelope);
 }
 
+DECLARE_HTTP_ROUTE(DocumentRegisterRoute, ::net::http::verb::post, "api", "document", "register") {
+    if (!context.document_service) {
+        const auto status = core::Status::Error(core::ErrorCode::FailedPrecondition, "document analysis service is not configured");
+        SendJson(context.request, HttpStatusFor(status.code()), ErrorEnvelope(context.trace_id, status), context.trace_id);
+        return;
+    }
+    const auto path_text = context.body.value("path", std::string{});
+    if (path_text.empty()) {
+        const auto status = core::Status::Error(core::ErrorCode::InvalidArgument, "document path is required");
+        SendJson(context.request, HttpStatusFor(status.code()), ErrorEnvelope(context.trace_id, status), context.trace_id);
+        return;
+    }
+    auto imported = context.document_service->ImportManagedFile(
+        PathFromUtf8(path_text),
+        context.body.value("fileName", context.body.value("file_name", std::string{})),
+        context.identity.user_uuid,
+        context.body.value("sessionId", context.body.value("session_id", std::string{})));
+    if (!imported.ok()) {
+        SendJson(context.request, HttpStatusFor(imported.status().code()), ErrorEnvelope(context.trace_id, imported.status()), context.trace_id);
+        return;
+    }
+    SendJson(
+        context.request,
+        ::net::http::status::ok,
+        DocumentMetadataEnvelope(context.trace_id, imported.value()),
+        context.trace_id);
+}
+
+DECLARE_HTTP_ROUTE(DocumentAnalyzeRoute, ::net::http::verb::post, "api", "document", "analyze") {
+    if (!context.document_service) {
+        const auto status = core::Status::Error(core::ErrorCode::FailedPrecondition, "document analysis service is not configured");
+        SendJson(context.request, HttpStatusFor(status.code()), ErrorEnvelope(context.trace_id, status), context.trace_id);
+        return;
+    }
+
+    document::DocumentAnalyzeRequest req;
+    req.trace_id = context.trace_id;
+    req.path = PathFromUtf8(context.body.value("path", std::string{}));
+    req.file_name = context.body.value("fileName", context.body.value("file_name", std::string{}));
+    req.document_id = context.body.value("documentId", context.body.value("document_id", std::string{}));
+    req.options.enable_embedding_clustering = context.body.value("enableEmbeddingClustering", true);
+    req.options.chunk_similarity_threshold = context.body.value("chunkSimilarityThreshold", req.options.chunk_similarity_threshold);
+    req.options.max_chunk_slices = context.body.value("maxChunkSlices", req.options.max_chunk_slices);
+    req.options.enable_llm_chunk_fallback = context.body.value("enableLlmChunkFallback", false);
+    req.options.chunk_llm_model = context.body.value("chunkLlmModel", std::string{});
+    req.options.chunk_llm_max_tokens = context.body.value("chunkLlmMaxTokens", req.options.chunk_llm_max_tokens);
+    if (req.options.enable_llm_chunk_fallback) {
+        req.llm_client = context.llm_client;
+    }
+    req.embedding_provider = context.embedding_provider;
+    req.llm_chunk_cache = context.llm_chunk_cache;
+
+    auto trace_id = context.trace_id;
+    auto request = context.request;
+    auto status = context.document_service->SubmitAnalyze(
+        std::move(req),
+        [request = std::move(request), trace_id](core::Result<document::DocumentAnalyzeResponse> result) mutable {
+            try {
+                SendResult(request, std::move(result), trace_id, DocumentAnalyzeEnvelope);
+            } catch (const std::exception& e) {
+                const auto status = core::Status::Error(
+                    core::ErrorCode::InternalError,
+                    std::string("document analyze response serialization failed: ") + e.what());
+                SendJson(request, HttpStatusFor(status.code()), ErrorEnvelope(trace_id, status), trace_id);
+            } catch (...) {
+                const auto status = core::Status::Error(
+                    core::ErrorCode::InternalError,
+                    "document analyze response serialization failed");
+                SendJson(request, HttpStatusFor(status.code()), ErrorEnvelope(trace_id, status), trace_id);
+            }
+        });
+    if (!status.ok()) {
+        SendJson(context.request, HttpStatusFor(status.code()), ErrorEnvelope(trace_id, status), trace_id);
+    }
+}
+
 class HealthRoute final : public IHttpRoute {
 public:
     static constexpr std::string_view kRouteName = "HealthRoute";
@@ -745,14 +1109,287 @@ public:
 };
 static const HttpRouteRegistrar<HealthRoute> g_HealthRoute_registrar;
 
+DECLARE_WS_ROUTE(ChatMessageWsRoute, "chat.message") {
+    const auto payload = context.body.value("payload", Json::object());
+    ChatGatewayRequest req;
+    req.trace_id = context.trace_id;
+    req.session_id = payload.value("sessionId", std::string{});
+    req.persona_id = payload.value("personaId", std::string{});
+    req.mode = payload.value("mode", std::string{"ws_chat"});
+    req.message = payload.value("message", std::string{});
+    req.model = payload.value("model", std::string{});
+    auto ws_request = context.request;
+    auto status = context.service.SubmitChat(
+        std::move(req),
+        [request = std::move(ws_request), trace_id = context.trace_id](core::Result<ChatGatewayResponse> result) mutable {
+            Json out = result.ok()
+                ? Json{{"type", "chat.final"}, {"payload", ChatEnvelope(result.value())}}
+                : Json{{"type", "error"}, {"payload", ErrorEnvelope(trace_id, result.status())}};
+            request->Send(TextFrame(request->memory_pool(), out.dump()));
+        });
+    if (!status.ok()) {
+        Json out{{"type", "error"}, {"payload", ErrorEnvelope(context.trace_id, status)}};
+        context.request->Send(TextFrame(context.request->memory_pool(), out.dump()));
+    }
+}
+
+DECLARE_WS_ROUTE(SessionCloseWsRoute, "session.close") {
+    const auto payload = context.body.value("payload", Json::object());
+    CloseSessionGatewayRequest req;
+    req.trace_id = context.trace_id;
+    req.session_id = payload.value("sessionId", std::string{});
+    req.reason = payload.value("reason", std::string{"client_close"});
+    auto result = context.service.CloseSession(std::move(req));
+    Json out = result.ok()
+        ? Json{{"type", "session.closed"}, {"payload", SessionEnvelope(result.value())}}
+        : Json{{"type", "error"}, {"payload", ErrorEnvelope(context.trace_id, result.status())}};
+    context.request->Send(TextFrame(context.request->memory_pool(), out.dump()));
+}
+
+DECLARE_WS_ROUTE(DocumentUploadStartWsRoute, "document.upload.start") {
+    if (!context.document_service) {
+        SendWsError(
+            context.request,
+            context.trace_id,
+            core::Status::Error(core::ErrorCode::FailedPrecondition, "document analysis service is not configured"));
+        return;
+    }
+    const auto payload = context.body.value("payload", Json::object());
+    const auto file_name = payload.value("fileName", payload.value("file_name", std::string{}));
+    if (file_name.empty()) {
+        SendWsError(
+            context.request,
+            context.trace_id,
+            core::Status::Error(core::ErrorCode::InvalidArgument, "fileName is required"));
+        return;
+    }
+    const auto expected_size = payload.value("totalBytes", payload.value("total_bytes", std::uint64_t{0}));
+    if (expected_size == 0) {
+        SendWsError(
+            context.request,
+            context.trace_id,
+            core::Status::Error(core::ErrorCode::InvalidArgument, "totalBytes is required"));
+        return;
+    }
+
+    PersonaGatewayHttpAdapter::DocumentUploadSession session;
+    session.upload_id = core::GenerateTraceId();
+    session.file_name = file_name;
+    session.owner_user_uuid = context.identity.user_uuid;
+    session.session_id = payload.value("sessionId", payload.value("session_id", std::string{}));
+    session.temp_path = UploadTempPath(session.upload_id);
+    session.expected_size = expected_size;
+    session.received_size = 0;
+    session.connection_id = context.request->connection().connection_id;
+    session.binary_mode = payload.value("mode", std::string{}) == "binary" ||
+                          payload.value("encoding", std::string{}) == "binary";
+
+    {
+        std::lock_guard lock(context.upload_mutex);
+        if (session.binary_mode) {
+            const auto duplicate = std::find_if(
+                context.document_uploads.begin(),
+                context.document_uploads.end(),
+                [connection_id = session.connection_id](const auto& entry) {
+                    return entry.second.binary_mode && entry.second.connection_id == connection_id;
+                });
+            if (duplicate != context.document_uploads.end()) {
+                SendWsError(
+                    context.request,
+                    context.trace_id,
+                    core::Status::Error(core::ErrorCode::FailedPrecondition, "binary upload is already active on this websocket connection"));
+                return;
+            }
+        }
+        context.document_uploads.emplace(session.upload_id, session);
+    }
+
+    Json out{
+        {"type", "document.upload.started"},
+        {"payload", {
+            {"ok", true},
+            {"traceId", context.trace_id},
+            {"uploadId", session.upload_id},
+            {"mode", session.binary_mode ? "binary" : "base64"},
+            {"receivedBytes", session.received_size},
+            {"totalBytes", session.expected_size},
+        }},
+    };
+    context.request->Send(TextFrame(context.request->memory_pool(), out.dump()));
+}
+
+DECLARE_WS_ROUTE(DocumentUploadChunkWsRoute, "document.upload.chunk") {
+    const auto payload = context.body.value("payload", Json::object());
+    const auto upload_id = payload.value("uploadId", payload.value("upload_id", std::string{}));
+    const auto offset = payload.value("offset", std::uint64_t{0});
+    const auto encoded = payload.value("data", std::string{});
+    if (upload_id.empty() || encoded.empty()) {
+        SendWsError(
+            context.request,
+            context.trace_id,
+            core::Status::Error(core::ErrorCode::InvalidArgument, "uploadId and data are required"));
+        return;
+    }
+    auto decoded = Base64Decode(encoded);
+    if (!decoded.ok()) {
+        SendWsError(context.request, context.trace_id, decoded.status());
+        return;
+    }
+
+    PersonaGatewayHttpAdapter::DocumentUploadSession session;
+    {
+        std::lock_guard lock(context.upload_mutex);
+        auto it = context.document_uploads.find(upload_id);
+        if (it == context.document_uploads.end()) {
+            SendWsError(
+                context.request,
+                context.trace_id,
+                core::Status::Error(core::ErrorCode::NotFound, "upload session not found"));
+            return;
+        }
+        if (offset != it->second.received_size) {
+            SendWsError(
+                context.request,
+                context.trace_id,
+                core::Status::Error(core::ErrorCode::InvalidArgument, "upload chunk offset does not match received size"));
+            return;
+        }
+        if (it->second.received_size + decoded.value().size() > it->second.expected_size) {
+            SendWsError(
+                context.request,
+                context.trace_id,
+                core::Status::Error(core::ErrorCode::ResourceExhausted, "upload exceeds declared totalBytes"));
+            return;
+        }
+        session = it->second;
+    }
+
+    auto write_status = WriteUploadChunk(session.temp_path, decoded.value(), offset);
+    if (!write_status.ok()) {
+        SendWsError(context.request, context.trace_id, write_status);
+        return;
+    }
+
+    std::uint64_t received = 0;
+    {
+        std::lock_guard lock(context.upload_mutex);
+        auto it = context.document_uploads.find(upload_id);
+        if (it == context.document_uploads.end()) {
+            RemoveFileQuietly(session.temp_path);
+            SendWsError(
+                context.request,
+                context.trace_id,
+                core::Status::Error(core::ErrorCode::NotFound, "upload session not found"));
+            return;
+        }
+        it->second.received_size += decoded.value().size();
+        received = it->second.received_size;
+    }
+
+    Json out{
+        {"type", "document.upload.chunk_ack"},
+        {"payload", {
+            {"ok", true},
+            {"traceId", context.trace_id},
+            {"uploadId", upload_id},
+            {"receivedBytes", received},
+        }},
+    };
+    context.request->Send(TextFrame(context.request->memory_pool(), out.dump()));
+}
+
+DECLARE_WS_ROUTE(DocumentUploadFinishWsRoute, "document.upload.finish") {
+    if (!context.document_service) {
+        SendWsError(
+            context.request,
+            context.trace_id,
+            core::Status::Error(core::ErrorCode::FailedPrecondition, "document analysis service is not configured"));
+        return;
+    }
+    const auto payload = context.body.value("payload", Json::object());
+    const auto upload_id = payload.value("uploadId", payload.value("upload_id", std::string{}));
+    PersonaGatewayHttpAdapter::DocumentUploadSession session;
+    {
+        std::lock_guard lock(context.upload_mutex);
+        auto it = context.document_uploads.find(upload_id);
+        if (it == context.document_uploads.end()) {
+            SendWsError(
+                context.request,
+                context.trace_id,
+                core::Status::Error(core::ErrorCode::NotFound, "upload session not found"));
+            return;
+        }
+        session = it->second;
+        if (session.received_size != session.expected_size) {
+            SendWsError(
+                context.request,
+                context.trace_id,
+                core::Status::Error(core::ErrorCode::FailedPrecondition, "upload is incomplete"));
+            return;
+        }
+        context.document_uploads.erase(it);
+    }
+
+    auto imported = context.document_service->ImportManagedFile(
+        session.temp_path,
+        session.file_name,
+        session.owner_user_uuid,
+        session.session_id);
+    RemoveFileQuietly(session.temp_path);
+    if (!imported.ok()) {
+        SendWsError(context.request, context.trace_id, imported.status());
+        return;
+    }
+
+    Json out{
+        {"type", "document.upload.finished"},
+        {"payload", DocumentMetadataEnvelope(context.trace_id, imported.value())},
+    };
+    context.request->Send(TextFrame(context.request->memory_pool(), out.dump()));
+}
+
+DECLARE_WS_ROUTE(DocumentUploadAbortWsRoute, "document.upload.abort") {
+    const auto payload = context.body.value("payload", Json::object());
+    const auto upload_id = payload.value("uploadId", payload.value("upload_id", std::string{}));
+    std::filesystem::path temp_path;
+    {
+        std::lock_guard lock(context.upload_mutex);
+        auto it = context.document_uploads.find(upload_id);
+        if (it != context.document_uploads.end()) {
+            temp_path = it->second.temp_path;
+            context.document_uploads.erase(it);
+        }
+    }
+    if (!temp_path.empty()) {
+        RemoveFileQuietly(temp_path);
+    }
+    Json out{
+        {"type", "document.upload.aborted"},
+        {"payload", {
+            {"ok", true},
+            {"traceId", context.trace_id},
+            {"uploadId", upload_id},
+        }},
+    };
+    context.request->Send(TextFrame(context.request->memory_pool(), out.dump()));
+}
+
 } // namespace
 
 PersonaGatewayHttpAdapter::PersonaGatewayHttpAdapter(PersonaGatewayService& service,
                                                      std::shared_ptr<IGatewayAuthenticator> authenticator,
-                                                     std::shared_ptr<IAuthRegistrationService> auth_registration)
+                                                     std::shared_ptr<IAuthRegistrationService> auth_registration,
+                                                     std::shared_ptr<document::DocumentAnalysisService> document_service,
+                                                     std::shared_ptr<llm::ILlmClient> llm_client,
+                                                     std::shared_ptr<document::IDocumentEmbeddingProvider> embedding_provider,
+                                                     std::shared_ptr<document::IDocumentLlmChunkCache> llm_chunk_cache)
     : service_(service),
       authenticator_(std::move(authenticator)),
-      auth_registration_(std::move(auth_registration)) {}
+      auth_registration_(std::move(auth_registration)),
+      document_service_(std::move(document_service)),
+      llm_client_(std::move(llm_client)),
+      embedding_provider_(std::move(embedding_provider)),
+      llm_chunk_cache_(std::move(llm_chunk_cache)) {}
 
 bool PersonaGatewayHttpAdapter::IsApiRequest(std::string_view target) noexcept {
     const auto q = target.find('?');
@@ -797,7 +1434,11 @@ void PersonaGatewayHttpAdapter::HandleHttp(std::shared_ptr<::net::IHttpRequest> 
         }
         HttpRouteContext context{
             service_,
-            auth_registration_.get(),
+            document_service_,
+            llm_client_,
+            embedding_provider_,
+            llm_chunk_cache_,
+            auth_registration_,
             std::move(request),
             msg,
             body,
@@ -821,6 +1462,41 @@ void PersonaGatewayHttpAdapter::HandleWebSocket(std::shared_ptr<::net::IWebSocke
         return;
     }
 
+    if (request->message().kind == ::net::WebSocketMessageKind::Binary) {
+        std::string upload_id;
+        std::uint64_t received = 0;
+        std::uint64_t total = 0;
+        core::Status status;
+        {
+            std::lock_guard lock(document_upload_mutex_);
+            status = AppendBinaryUploadFrame(
+                document_uploads_,
+                request->connection().connection_id,
+                request->message(),
+                &upload_id,
+                &received,
+                &total);
+        }
+        if (!status.ok()) {
+            SendWsError(request, core::GenerateTraceId(), status);
+            return;
+        }
+        Json out{
+            {"type", "document.upload.chunk_ack"},
+            {"payload", {
+                {"ok", true},
+                {"traceId", core::GenerateTraceId()},
+                {"uploadId", upload_id},
+                {"mode", "binary"},
+                {"receivedBytes", received},
+                {"totalBytes", total},
+                {"finalFragment", request->message().final_fragment},
+            }},
+        };
+        request->Send(TextFrame(request->memory_pool(), out.dump()));
+        return;
+    }
+
     const auto text = MessagePayloadToString(request->message());
     Json body;
     try {
@@ -833,52 +1509,35 @@ void PersonaGatewayHttpAdapter::HandleWebSocket(std::shared_ptr<::net::IWebSocke
 
     const auto type = body.value("type", std::string{});
     const auto trace_id = body.value("traceId", core::GenerateTraceId());
-    AuthIdentity identity;
-    if (authenticator_) {
-        auto auth = authenticator_->Authenticate(request->handshake_request());
-        if (!auth.ok()) {
-            Json out{{"type", "error"}, {"payload", ErrorEnvelope(trace_id, auth.status())}};
-            request->Send(TextFrame(request->memory_pool(), out.dump()));
-            return;
+    auto routes = WsRouteRegistry::Instance().CreateRoutes();
+    for (const auto& route : routes) {
+        if (!route->Matches(type)) {
+            continue;
         }
-        identity = std::move(auth).value();
-    }
-    if (type == "chat.message") {
-        const auto payload = body.value("payload", Json::object());
-        ChatGatewayRequest req;
-        req.trace_id = trace_id;
-        req.session_id = payload.value("sessionId", std::string{});
-        req.persona_id = payload.value("personaId", std::string{});
-        req.mode = payload.value("mode", std::string{"ws_chat"});
-        req.message = payload.value("message", std::string{});
-        req.model = payload.value("model", std::string{});
-        auto ws_request = request;
-        auto status = service_.SubmitChat(
-            std::move(req),
-            [request = std::move(ws_request), trace_id](core::Result<ChatGatewayResponse> result) mutable {
-                Json out = result.ok()
-                    ? Json{{"type", "chat.final"}, {"payload", ChatEnvelope(result.value())}}
-                    : Json{{"type", "error"}, {"payload", ErrorEnvelope(trace_id, result.status())}};
+        AuthIdentity identity;
+        if (authenticator_ && route->RequiresAuth()) {
+            auto auth = authenticator_->Authenticate(request->handshake_request());
+            if (!auth.ok()) {
+                Json out{{"type", "error"}, {"payload", ErrorEnvelope(trace_id, auth.status())}};
                 request->Send(TextFrame(request->memory_pool(), out.dump()));
-            });
-        if (!status.ok()) {
-            Json out{{"type", "error"}, {"payload", ErrorEnvelope(trace_id, status)}};
-            request->Send(TextFrame(request->memory_pool(), out.dump()));
+                return;
+            }
+            identity = std::move(auth).value();
         }
-        return;
-    }
-
-    if (type == "session.close") {
-        const auto payload = body.value("payload", Json::object());
-        CloseSessionGatewayRequest req;
-        req.trace_id = trace_id;
-        req.session_id = payload.value("sessionId", std::string{});
-        req.reason = payload.value("reason", std::string{"client_close"});
-        auto result = service_.CloseSession(std::move(req));
-        Json out = result.ok()
-            ? Json{{"type", "session.closed"}, {"payload", SessionEnvelope(result.value())}}
-            : Json{{"type", "error"}, {"payload", ErrorEnvelope(trace_id, result.status())}};
-        request->Send(TextFrame(request->memory_pool(), out.dump()));
+        WsRouteContext context{
+            service_,
+            document_service_,
+            llm_client_,
+            embedding_provider_,
+            llm_chunk_cache_,
+            std::move(request),
+            body,
+            identity,
+            trace_id,
+            document_upload_mutex_,
+            document_uploads_,
+        };
+        route->Handle(context);
         return;
     }
 

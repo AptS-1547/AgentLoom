@@ -596,6 +596,16 @@ TEST(ConfigPersonaGatewaySectionTest, JsonLoadsE2EGatewayOptionsAndResolvesStati
                 "index_file": "index.html",
                 "spa_fallback": true
             },
+            "document_store": {
+                "enabled": true,
+                "root": "document",
+                "database_path": "document/document_store.sqlite",
+                "read_connection_count": 3,
+                "write_connection_count": 1,
+                "busy_timeout_ms": 1500,
+                "retention_hours": 72,
+                "cleanup_interval_seconds": 30
+            },
             "compute_pool": {
                 "worker_count": 4,
                 "queue_capacity": 256
@@ -627,6 +637,14 @@ TEST(ConfigPersonaGatewaySectionTest, JsonLoadsE2EGatewayOptionsAndResolvesStati
     EXPECT_EQ(opts.persona_gateway.static_files.root, tmp.path() / "dist");
     EXPECT_EQ(opts.persona_gateway.static_files.index_file, "index.html");
     EXPECT_TRUE(opts.persona_gateway.static_files.spa_fallback);
+    EXPECT_TRUE(opts.persona_gateway.document_store.enabled);
+    EXPECT_EQ(opts.persona_gateway.document_store.root, tmp.path() / "document");
+    EXPECT_EQ(opts.persona_gateway.document_store.database_path, tmp.path() / "document/document_store.sqlite");
+    EXPECT_EQ(opts.persona_gateway.document_store.read_connection_count, 3u);
+    EXPECT_EQ(opts.persona_gateway.document_store.write_connection_count, 1u);
+    EXPECT_EQ(opts.persona_gateway.document_store.busy_timeout_ms, 1500);
+    EXPECT_EQ(opts.persona_gateway.document_store.retention_hours, 72);
+    EXPECT_EQ(opts.persona_gateway.document_store.cleanup_interval_seconds, 30);
     EXPECT_EQ(opts.persona_gateway.compute_pool.worker_count, 4u);
     EXPECT_EQ(opts.persona_gateway.compute_pool.queue_capacity, 256u);
     EXPECT_EQ(opts.persona_gateway.io_pool.worker_count, 2u);
@@ -654,6 +672,10 @@ TEST(ConfigPersonaGatewaySectionTest, CliOverridesGatewayJson) {
         "--config", config_file.string(),
         "--gateway-ws-path", "/ws/cli",
         "--gateway-static-root", (tmp.path() / "dist").string(),
+        "--gateway-document-store-root", (tmp.path() / "document").string(),
+        "--gateway-document-store-db", (tmp.path() / "document/document_store.sqlite").string(),
+        "--gateway-document-store-retention-hours", "96",
+        "--gateway-document-store-cleanup-seconds", "45",
         "--gateway-compute-workers", "3",
         "--gateway-compute-queue", "300",
         "--gateway-io-workers", "2",
@@ -668,6 +690,11 @@ TEST(ConfigPersonaGatewaySectionTest, CliOverridesGatewayJson) {
     EXPECT_EQ(opts.persona_gateway.websocket_path, "/ws/cli");
     EXPECT_TRUE(opts.persona_gateway.static_files.enabled);
     EXPECT_EQ(opts.persona_gateway.static_files.root, tmp.path() / "dist");
+    EXPECT_TRUE(opts.persona_gateway.document_store.enabled);
+    EXPECT_EQ(opts.persona_gateway.document_store.root, tmp.path() / "document");
+    EXPECT_EQ(opts.persona_gateway.document_store.database_path, tmp.path() / "document/document_store.sqlite");
+    EXPECT_EQ(opts.persona_gateway.document_store.retention_hours, 96);
+    EXPECT_EQ(opts.persona_gateway.document_store.cleanup_interval_seconds, 45);
     EXPECT_EQ(opts.persona_gateway.compute_pool.worker_count, 3u);
     EXPECT_EQ(opts.persona_gateway.compute_pool.queue_capacity, 300u);
     EXPECT_EQ(opts.persona_gateway.io_pool.worker_count, 2u);

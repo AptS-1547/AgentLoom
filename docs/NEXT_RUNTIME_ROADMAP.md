@@ -842,3 +842,471 @@ Open questions for Phase 6+ continuation:
 
 Phase 1-4 anchors have all been answered by merged implementations and
 are no longer open.
+
+## 7. Document Analysis Runtime Roadmap
+
+> Status: active implementation track  
+> Scope: C++ Gateway document analysis path, Office OOXML extraction, chunking,
+> mindmap/diagnosis generation, LLM fallback, embedding clustering, result
+> persistence, cache integration, and E2E quality evaluation.
+
+### 7.1 Current Baseline
+
+The document analysis path is now usable for real DOCX inputs and is wired into
+the Gateway HTTP route:
+
+```text
+POST /api/document/analyze
+  -> PersonaGatewayHttpAdapter
+  -> DocumentAnalysisService
+  -> compute pool: OOXML extraction + chunk/mindmap/diagnosis pipeline
+  -> IO pool: optional SQLite result persistence
+  -> response JSON + E2E quality report
+```
+
+Completed baseline:
+
+- `agent_document` owns the C++ document analysis runtime.
+- DOCX/PPTX OOXML extraction is implemented through `libzip` + `pugixml`.
+- File/path/text/report handling uses UTF-8 explicitly.
+- `DocumentAnalysisService` follows the existing Gateway three-pool model:
+  - main/request pool handles HTTP routing and callback orchestration.
+  - compute pool handles extraction, chunking, embedding, and local graph work.
+  - IO pool handles SQLite result write-back.
+- `/api/document/analyze` is connected through the Gateway HTTP adapter.
+- Result schema includes blocks, chunks, mindmap, diagnosis, run nodes, warnings,
+  token estimate, and schema version.
+- SQLite result repository stores `document_analysis_results` asynchronously.
+- Real 384-dim embedding path is supported through the existing ONNX embedding
+  pipeline.
+- Embedding similarity uses the existing L0 SIMD kernel
+  `dot_product_unrolled<384>`.
+- The local 128-dim hash embedding path has been removed.
+- LLM chunk fallback is implemented for weak natural-language chunks that lack
+  explicit title signals.
+- Explicit Office headings, numbered headings, and title-like local structure
+  are not overridden by LLM output.
+- Redis-backed exact LLM chunk cache is implemented:
+  - key: `prompt_version:model:text_hash`
+  - role: deterministic repeat-analysis cache and same-text error fallback
+  - TTL: default 7 days in E2E config
+- E2E tool `document_analysis_e2e_test` runs the real Gateway HTTP route with
+  real LLM, real embedding, Redis cache, and quality report output.
+- E2E quality reports compare source text against generated summaries and
+  indexed chunk text using ASCII term recall and UTF-8 non-ASCII unit recall.
+- Embedding warmup is performed before E2E request timing so cold ONNX/CUDA
+  first-inference cost is not counted as document request latency.
+- Mindmap separator-only nodes such as `---`, `===`, `***`, and `___` are
+  filtered.
+
+Recent real-document E2E observations:
+
+```text
+大创文本降AI率版本.docx
+  chunks=15
+  blocks=20
+  llm_chunks=7
+  Redis exact cache hits=7/7 after warm cache
+  request latency after embedding warmup: ~100-120 ms
+  indexedTextAsciiTermRecall=1
+  indexedTextUtf8NonAsciiUnitRecall=1
+
+项目特色与创新.docx
+  chunks=9
+  blocks=13
+  llm_chunks=4
+  Redis exact cache hits=4/4 after warm cache
+  request latency after embedding warmup: ~50-70 ms
+  indexedTextAsciiTermRecall=1
+  indexedTextUtf8NonAsciiUnitRecall=1
+```
+
+Important interpretation:
+
+- The exact Redis LLM chunk cache is useful, but it only handles byte-identical
+  natural-language chunks.
+- Natural-language reuse across documents needs semantic cache integration,
+  because exact text overlap probability is low.
+- The current exact cache should remain as a low-risk fallback layer and
+  deterministic E2E stabilizer.
+- Document `diagnosis` remains aligned with the education intelligent-agent
+  product domain even when ad-hoc test documents are project proposals.
+
+### 7.2 Design Rules
+
+Document analysis should continue to follow the existing runtime rules:
+
+1. Keep C++ as the Gateway hot-path runtime.
+2. Keep Python as the algorithm prototype and offline evaluation source.
+3. Avoid platform-only APIs; do not rely on Win32 text conversion in runtime or
+   CI tests.
+4. Treat all file reads, test inputs, report outputs, and path/text display as
+   UTF-8.
+5. Avoid raw pointer ownership and raw pointer dependency flow. Use RAII,
+   `std::shared_ptr`, `std::unique_ptr`, `std::optional`, and typed result
+   objects.
+6. Keep file/module granularity cohesive. Do not split document analysis into
+   many tiny files unless a boundary is genuinely reusable.
+7. Use existing Gateway pools and async callback strategy instead of adding a
+   separate synchronization model.
+8. Use existing L0/vector/semantic-cache infrastructure where possible.
+9. LLM output supplements weak natural-language chunks; it must not replace
+   original-text indexing or explicit Office structure.
+10. Redis failures in optional cache layers must be non-fatal.
+
+### 7.3 Planned Request and File Lifecycle
+
+The final user-facing design should split upload from analysis:
+
+```text
+WebSocket upload
+  -> Gateway receives file stream
+  -> file stored in managed document cache directory
+  -> metadata persisted in SQLite
+  -> document_id generated from content hash / UUID
+
+POST /api/document/analyze
+  -> request carries document_id or explicit path in test/dev mode
+  -> Gateway resolves metadata
+  -> DocumentAnalysisService reads file
+  -> analysis result persisted by document_id
+```
+
+Planned metadata model:
+
+```text
+document_id          stable hash / UUID
+content_hash         content digest for deduplication
+owner_user_uuid      optional user scope
+session_id           optional session scope
+file_name            original UTF-8 display name
+file_type            docx / pptx / later xlsx/pdf/image
+storage_path         internal resolved path
+uploaded_at_ms
+last_analyzed_at_ms
+last_accessed_at_ms
+analysis_status      uploaded / analyzing / completed / failed
+analysis_trace_id
+size_bytes
+schema_version
+```
+
+Retention policy:
+
+- Maintain recent uploaded files through a timestamp/LRU queue.
+- Persist lifecycle metadata in SQLite.
+- Evict physical files whose latest analysis/access timestamp is older than
+  one week by default.
+- Expose recent documents so the frontend can analyze recently uploaded files
+  and re-open historical parse results while the file remains retained.
+- Deletion must verify resolved paths stay inside the managed document cache
+  directory before physical removal.
+
+### 7.4 Office Format Expansion
+
+DOCX is the current strongest path. PPTX should be the next real-file test
+target because slide boundaries are natural scope boundaries.
+
+PPTX next work:
+
+- Run real PPTX files through `document_analysis_e2e_test`.
+- Validate slide ordering against `ppt/slides/slideN.xml`.
+- Validate title placeholder extraction.
+- Validate body text box ordering within each slide.
+- Preserve `slide` on blocks, chunks, slices, and mindmap nodes.
+- Use slide equality as a strong parent-selection signal for chunk attachment.
+- Treat bullet level and placeholder type as heading/title features.
+- Ensure separator-only shapes and decorative text do not become nodes.
+- Add quality report fields grouped by slide:
+  - blocks per slide
+  - chunks per slide
+  - title coverage per slide
+  - weak chunk count per slide
+
+DOCX next work:
+
+- Improve handling of tables:
+  - preserve row/column text order
+  - mark table-derived blocks in metadata
+  - avoid merging unrelated table cells into one weak paragraph
+- Improve handling of headers/footers:
+  - default skip or mark as low-priority metadata
+  - avoid repeated header/footer text polluting chunks
+- Improve list/numbering extraction:
+  - parse numbering definitions from `word/numbering.xml`
+  - map abstract numbering to levels when present
+  - preserve list scope in metadata
+- Improve style heuristics:
+  - stronger Chinese heading style detection
+  - avoid treating short bold body fragments as top-level headings when they are
+    table labels or inline emphasis
+
+Future Office targets:
+
+- XLSX: useful for structured education data, but should be separate from the
+  DOCX/PPTX narrative parser. Sheet/table semantics are different enough to
+  require a dedicated extraction policy.
+- PDF: defer until Office path is stable. PDF needs layout/OCR handling and has
+  a much higher false-structure risk.
+
+### 7.5 Chunking and Semantic Structure Plan
+
+Current chunking uses:
+
+```text
+Office explicit heading / inferred title
+  -> deterministic local chunk
+
+weak paragraph group
+  -> embedding similarity clustering
+  -> exact LLM chunk cache lookup
+  -> LLM title/summary/slice fallback when cache misses
+```
+
+Planned improvements:
+
+- Add stronger title/body grouping around numbered short titles and weak body
+  paragraphs.
+- Avoid fixed byte/character title splitting. Title extraction should stop at
+  real body-feature boundaries, not arbitrary length thresholds.
+- Keep title truncation only for display labels such as mindmap leaves.
+- Continue preserving full indexed chunk text for retrieval and quality checks.
+- Add chunk-level reason metadata:
+  - `group_reason`
+  - `title_source`
+  - `fallback_reason`
+  - `embedding_attached`
+  - `explicit_title`
+- Add per-group diagnostics for E2E:
+  - source block ids
+  - source block kinds
+  - title candidate
+  - whether LLM fallback was attempted
+  - whether exact cache or semantic cache was used
+- Introduce batch embedding for chunk grouping if per-document block count
+  becomes large.
+- Keep deterministic parser as the source of original-text indexing. LLM can
+  produce labels and summaries, but should not remove source evidence.
+
+### 7.6 Document Semantic Cache Integration
+
+Exact LLM chunk cache should remain, but the main cross-document reuse path
+should use the existing semantic cache infrastructure.
+
+Recommended lookup order:
+
+```text
+explicit heading / numbered local structure
+  -> deterministic local chunk
+
+weak natural-language chunk
+  -> exact Redis LLM chunk cache
+  -> document semantic cache lookup
+  -> real LLM fallback
+  -> store exact cache
+  -> store semantic cache
+```
+
+Exact cache role:
+
+- Same document / same text repeat analysis.
+- Deterministic E2E replay.
+- Same-text LLM failure fallback.
+- Low-risk cache layer with no semantic false-positive risk.
+
+Semantic cache role:
+
+- Similar chunk reuse across documents.
+- OCR/layout/paragraph-break tolerant reuse.
+- Natural-language title/summary/slice reuse when text differs but meaning is
+  close.
+
+Recommended semantic-cache namespace:
+
+```text
+collection: document_chunk_title
+memory_level / scope: document_runtime_cache
+payload: title, summary, slices, source evidence, model, prompt_version
+embedding: normalized 384-dim text embedding
+similarity: high threshold, initially 0.92-0.96
+```
+
+Semantic cache safety checks:
+
+- `prompt_version` must be equal or explicitly compatible.
+- embedding model, tokenizer, pooling, normalization, and dimension must match.
+- document type should be compatible unless the cached item is format-agnostic.
+- source text keyword/UTF-8 unit recall must exceed a minimum threshold.
+- cached slice evidence should be present in or close to the current chunk text.
+- confidence should be downgraded when evidence alignment is weak.
+- semantic hits must not override explicit Office headings.
+
+Implementation choices:
+
+- Prefer adapting existing `ISemanticCache` / L0 storage over creating an
+  independent document vector-cache implementation.
+- Keep document-specific payload encoding in a thin adapter.
+- Reuse Redis connection pool and vector infrastructure already used by Gateway
+  E2E.
+- Keep all cache failures non-fatal and visible in run-node metrics.
+
+### 7.7 LLM Fallback and Prompt Cache
+
+Current LLM fallback extracts strict JSON:
+
+```json
+{
+  "title": "short title",
+  "summary": "one sentence",
+  "slices": [
+    {
+      "title": "slice title",
+      "summary": "slice summary",
+      "text": "source evidence",
+      "kind": "concept|example|practice|objective|paragraph",
+      "confidence": 0.8
+    }
+  ]
+}
+```
+
+Planned improvements:
+
+- Store and report explicit fallback reasons:
+  - no explicit title feature
+  - weak chunk after separator filtering
+  - natural-language paragraph group lacks heading boundary
+  - local parser confidence below threshold
+- Add prompt version migration policy.
+- Add model-version compatibility policy for cached payloads.
+- Add stale-cache fallback mode:
+  - only same text hash for exact cache
+  - semantic cache only if evidence checks pass
+  - metadata must mark `stale_fallback=true`
+- Add bounded retry policy for malformed JSON.
+- Keep LLM fallback less strict than deterministic parser. The parser should
+  prefer original text and explicit structure; LLM should fill weak labels.
+
+### 7.8 Quality Evaluation and E2E Coverage
+
+Current E2E report already records:
+
+- chunk count
+- block count
+- LLM chunk count
+- local chunk count
+- diagnosis score
+- token count
+- summary ASCII term recall
+- summary UTF-8 non-ASCII unit recall
+- indexed text ASCII term recall
+- indexed text UTF-8 non-ASCII unit recall
+- run nodes
+- source sample
+- summary sample
+- indexed text sample
+- chunks
+- mindmap
+- diagnosis
+
+Planned E2E additions:
+
+- Full block list in report, or a bounded block diagnostic section.
+- Per-slide PPTX quality summary.
+- Per-chunk fallback/caching explanation.
+- Exact cache hit/miss summary.
+- Future semantic cache hit/miss summary.
+- LLM fallback failure reasons.
+- Separator filtering count.
+- Heading extraction accuracy notes:
+  - explicit Office heading
+  - inferred heading
+  - numbered title
+  - LLM title
+- Latency percentiles across repeated runs:
+  - cold model startup
+  - warmed request
+  - exact cache hit
+  - semantic cache hit
+  - real LLM fallback
+- Golden-document corpus:
+  - real DOCX teaching material
+  - real project proposal DOCX
+  - real PPTX classroom slides
+  - PPTX with multiple text boxes per slide
+  - DOCX with tables
+  - DOCX with heavy numbering/list styles
+  - Chinese filename/path cases
+  - mixed Chinese/English technical terms
+
+### 7.9 Runtime Warmup and Observability
+
+The E2E tool has shown that ONNX/CUDA first inference can dominate the first
+document request if the embedding model is not warmed.
+
+Planned runtime behavior:
+
+- Add optional Gateway startup warmup for document embedding provider.
+- Warmup should run before readiness reports healthy for document analysis.
+- Report warmup latency separately from request latency.
+- Keep warmup failure configurable:
+  - fail startup in strict production mode
+  - degrade document semantic clustering in development mode
+- Add document-analysis metrics:
+  - extraction latency
+  - chunk grouping latency
+  - embedding request count / total ms
+  - exact cache lookup count / hit count / ms
+  - future semantic cache lookup count / hit count / ms
+  - LLM direct count / ms
+  - SQLite write-back ms
+  - end-to-end latency
+
+### 7.10 Open Implementation Checklist
+
+Near-term:
+
+- [ ] Test real PPTX files through `/api/document/analyze`.
+- [ ] Add PPTX per-slide E2E report fields.
+- [ ] Add full or bounded block diagnostics to quality reports.
+- [ ] Add document file metadata repository for uploaded files.
+- [ ] Add managed upload directory and safe physical eviction.
+- [ ] Add WebSocket upload path or upload adapter compatible with existing
+      Gateway WS design.
+- [ ] Add document-id based analyze request path in addition to dev/test path.
+- [ ] Add runtime embedding warmup to Gateway startup, not only E2E.
+
+Cache track:
+
+- [ ] Keep exact Redis LLM chunk cache as fallback/stability layer.
+- [ ] Add document semantic cache adapter over existing L0 semantic cache.
+- [ ] Add semantic-cache evidence alignment checks.
+- [ ] Add semantic-cache metrics to `SemanticChunkQueue`.
+- [ ] Store semantic cache entries after successful real LLM fallback.
+- [ ] Define prompt/model compatibility policy for cache reuse.
+
+Parser quality track:
+
+- [ ] Improve DOCX table extraction.
+- [ ] Improve DOCX numbering definition parsing.
+- [ ] Improve repeated header/footer filtering.
+- [ ] Improve inline bold/large-font false-heading suppression.
+- [ ] Add separator filtering counters.
+- [ ] Add fallback reason metadata per chunk.
+
+Reliability track:
+
+- [ ] Add corruption/unsupported-file tests for DOCX/PPTX.
+- [ ] Add zip bomb / oversized XML tests.
+- [ ] Add malformed XML recovery tests.
+- [ ] Add Redis unavailable E2E for exact cache degradation.
+- [ ] Add LLM unavailable E2E for local-only degradation.
+- [ ] Add crash dump registration to standalone document E2E tools when running
+      Windows debugging builds.
+
+Deferred:
+
+- [ ] XLSX extraction policy.
+- [ ] PDF extraction/OCR policy.
+- [ ] Visual OCR through existing LLM client protocol extension.
+- [ ] Offline Python-generated document analysis evaluation corpus importer.

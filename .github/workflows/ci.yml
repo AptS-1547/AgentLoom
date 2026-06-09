@@ -114,8 +114,11 @@ jobs:
             --triplet "$VCPKG_TRIPLET" \
             --x-manifest-root="$GITHUB_WORKSPACE" \
             --x-install-root="$GITHUB_WORKSPACE/vcpkg_installed" \
-            --clean-after-build \
-            --features=tests
+            --clean-after-build
+          ./vcpkg/vcpkg install gtest \
+            --triplet "$VCPKG_TRIPLET" \
+            --x-install-root="$GITHUB_WORKSPACE/vcpkg_installed" \
+            --clean-after-build
 
       - name: Download ONNX Runtime
         shell: bash

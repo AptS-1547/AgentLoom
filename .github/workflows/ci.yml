@@ -118,6 +118,9 @@ jobs:
               ["git", "-C", "vcpkg", "rev-parse", "HEAD"],
               text=True,
           ).strip()
+          deps = data.setdefault("dependencies", [])
+          if "gtest" not in deps:
+              deps.append("gtest")
           manifest.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
           PY
           mkdir -p triplets/ci
@@ -136,11 +139,6 @@ jobs:
           ./vcpkg/vcpkg install \
             --triplet "$VCPKG_TRIPLET" \
             --x-manifest-root="$GITHUB_WORKSPACE" \
-            --x-install-root="$GITHUB_WORKSPACE/vcpkg_installed" \
-            --overlay-triplets="$GITHUB_WORKSPACE/triplets/ci" \
-            --clean-after-build
-          ./vcpkg/vcpkg install gtest \
-            --triplet "$VCPKG_TRIPLET" \
             --x-install-root="$GITHUB_WORKSPACE/vcpkg_installed" \
             --overlay-triplets="$GITHUB_WORKSPACE/triplets/ci" \
             --clean-after-build

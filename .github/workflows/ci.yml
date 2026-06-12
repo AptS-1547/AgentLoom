@@ -158,31 +158,72 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p deps
+          download_file() {
+            local url="$1"
+            local path="$2"
+            if [[ -s "$path" ]]; then
+              return 0
+            fi
+            rm -f "$path" "$path.tmp"
+            curl --fail --location --retry 5 --retry-delay 5 --connect-timeout 30 "$url" -o "$path.tmp"
+            test -s "$path.tmp"
+            mv "$path.tmp" "$path"
+          }
+          ensure_zip() {
+            local url="$1"
+            local path="$2"
+            if [[ -s "$path" ]] && ! unzip -tq "$path" >/dev/null; then
+              rm -f "$path"
+            fi
+            download_file "$url" "$path"
+            unzip -tq "$path"
+          }
+          ensure_tgz() {
+            local url="$1"
+            local path="$2"
+            if [[ -s "$path" ]] && ! tar -tzf "$path" >/dev/null; then
+              rm -f "$path"
+            fi
+            download_file "$url" "$path"
+            tar -tzf "$path" >/dev/null
+          }
+          ensure_conda() {
+            local url="$1"
+            local path="$2"
+            if [[ -s "$path" ]] && ! python - "$path" <<'PY'
+          import sys, zipfile
+          raise SystemExit(0 if zipfile.is_zipfile(sys.argv[1]) else 1)
+          PY
+            then
+              rm -f "$path"
+            fi
+            download_file "$url" "$path"
+          }
 
           if [[ ! -d deps/sqlite-amalgamation-3530100 ]]; then
-            curl -L "$SQLITE_AMALGAMATION_URL" -o deps/sqlite-amalgamation-3530100.zip
+            ensure_zip "$SQLITE_AMALGAMATION_URL" deps/sqlite-amalgamation-3530100.zip
             unzip -q deps/sqlite-amalgamation-3530100.zip -d deps
           fi
 
           if [[ ! -d deps/eigen-5.0.1 ]]; then
-            curl -L https://gitlab.com/libeigen/eigen/-/archive/5.0.1/eigen-5.0.1.zip -o deps/eigen-5.0.1.zip
+            ensure_zip https://gitlab.com/libeigen/eigen/-/archive/5.0.1/eigen-5.0.1.zip deps/eigen-5.0.1.zip
             unzip -q deps/eigen-5.0.1.zip -d deps
           fi
 
           if [[ ! -d deps/boost_1_85_0 ]]; then
-            curl -L https://archives.boost.io/release/1.85.0/source/boost_1_85_0.tar.gz -o deps/boost_1_85_0.tar.gz
+            ensure_tgz https://archives.boost.io/release/1.85.0/source/boost_1_85_0.tar.gz deps/boost_1_85_0.tar.gz
             tar -xzf deps/boost_1_85_0.tar.gz -C deps
           fi
 
           if [[ ! -d "$LLAMA_CPP_ROOT" ]]; then
-            curl -L "https://github.com/ggml-org/llama.cpp/archive/refs/tags/$LLAMA_CPP_TAG.tar.gz" -o "$LLAMA_CPP_SOURCE_ARCHIVE"
+            ensure_tgz "https://github.com/ggml-org/llama.cpp/archive/refs/tags/$LLAMA_CPP_TAG.tar.gz" "$LLAMA_CPP_SOURCE_ARCHIVE"
             mkdir -p deps/llama-source
             tar -xzf "$LLAMA_CPP_SOURCE_ARCHIVE" -C deps/llama-source --strip-components=1
             mv deps/llama-source "$LLAMA_CPP_ROOT"
           fi
 
           if [[ ! -f "$LLAMA_CPP_BUILD/src/libllama.so" ]]; then
-            curl -L "https://github.com/ggml-org/llama.cpp/releases/download/$LLAMA_CPP_TAG/llama-$LLAMA_CPP_TAG-bin-ubuntu-x64.tar.gz" -o "$LLAMA_CPP_BINARY_ARCHIVE"
+            ensure_tgz "https://github.com/ggml-org/llama.cpp/releases/download/$LLAMA_CPP_TAG/llama-$LLAMA_CPP_TAG-bin-ubuntu-x64.tar.gz" "$LLAMA_CPP_BINARY_ARCHIVE"
             rm -rf deps/llama-bin
             mkdir -p deps/llama-bin
             tar -xzf "$LLAMA_CPP_BINARY_ARCHIVE" -C deps/llama-bin
@@ -201,7 +242,7 @@ jobs:
           fi
 
           if [[ ! -d deps/faiss-1.14.1-cpu-linux ]]; then
-            curl -L "$FAISS_CONDA_URL" -o deps/faiss-cpu-linux.conda
+            ensure_conda "$FAISS_CONDA_URL" deps/faiss-cpu-linux.conda
             python - <<'PY'
           import pathlib, shutil, subprocess, tarfile, zipfile
           archive = pathlib.Path("deps/faiss-cpu-linux.conda")
@@ -226,7 +267,7 @@ jobs:
           fi
 
           if [[ ! -d deps/mkl-2023.1.0-linux ]]; then
-            curl -L "$MKL_CONDA_URL" -o deps/mkl-linux.conda
+            ensure_conda "$MKL_CONDA_URL" deps/mkl-linux.conda
             python - <<'PY'
           import pathlib, shutil, subprocess, tarfile, zipfile
           archive = pathlib.Path("deps/mkl-linux.conda")

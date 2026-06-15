@@ -2,13 +2,19 @@
 #include "../../src/vector/hf_tokenizer.h"
 #include "../../src/vector/onnx_text_embedding_model.h"
 #include "../../src/core/result.h"
+#include <algorithm>
 #include <iostream>
 #include <chrono>
+#include <functional>
+#include <limits>
 #include <vector>
 #include <string>
 #include <random>
 #include <cmath>
 #include <fstream>
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #include <psapi.h>
 

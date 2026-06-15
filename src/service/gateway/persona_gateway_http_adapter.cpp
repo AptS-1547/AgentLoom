@@ -579,6 +579,7 @@ struct HttpRouteContext {
     std::shared_ptr<llm::ILlmClient> llm_client;
     std::shared_ptr<document::IDocumentEmbeddingProvider> embedding_provider;
     std::shared_ptr<document::IDocumentLlmChunkCache> llm_chunk_cache;
+    std::shared_ptr<semantic_cache::ISemanticCache> document_semantic_cache;
     std::shared_ptr<IAuthRegistrationService> auth_registration;
     std::shared_ptr<::net::IHttpRequest> request;
     const ::net::BeastHttpRequest& message;
@@ -595,6 +596,7 @@ struct WsRouteContext {
     std::shared_ptr<llm::ILlmClient> llm_client;
     std::shared_ptr<document::IDocumentEmbeddingProvider> embedding_provider;
     std::shared_ptr<document::IDocumentLlmChunkCache> llm_chunk_cache;
+    std::shared_ptr<semantic_cache::ISemanticCache> document_semantic_cache;
     std::shared_ptr<::net::IWebSocketStreamRequest> request;
     const Json& body;
     const AuthIdentity& identity;
@@ -1052,6 +1054,7 @@ DECLARE_HTTP_ROUTE(DocumentAnalyzeRoute, ::net::http::verb::post, "api", "docume
     }
     req.embedding_provider = context.embedding_provider;
     req.llm_chunk_cache = context.llm_chunk_cache;
+    req.semantic_cache = context.document_semantic_cache;
 
     auto trace_id = context.trace_id;
     auto request = context.request;
@@ -1382,14 +1385,16 @@ PersonaGatewayHttpAdapter::PersonaGatewayHttpAdapter(PersonaGatewayService& serv
                                                      std::shared_ptr<document::DocumentAnalysisService> document_service,
                                                      std::shared_ptr<llm::ILlmClient> llm_client,
                                                      std::shared_ptr<document::IDocumentEmbeddingProvider> embedding_provider,
-                                                     std::shared_ptr<document::IDocumentLlmChunkCache> llm_chunk_cache)
+                                                     std::shared_ptr<document::IDocumentLlmChunkCache> llm_chunk_cache,
+                                                     std::shared_ptr<semantic_cache::ISemanticCache> document_semantic_cache)
     : service_(service),
       authenticator_(std::move(authenticator)),
       auth_registration_(std::move(auth_registration)),
       document_service_(std::move(document_service)),
       llm_client_(std::move(llm_client)),
       embedding_provider_(std::move(embedding_provider)),
-      llm_chunk_cache_(std::move(llm_chunk_cache)) {}
+      llm_chunk_cache_(std::move(llm_chunk_cache)),
+      document_semantic_cache_(std::move(document_semantic_cache)) {}
 
 bool PersonaGatewayHttpAdapter::IsApiRequest(std::string_view target) noexcept {
     const auto q = target.find('?');
@@ -1438,6 +1443,7 @@ void PersonaGatewayHttpAdapter::HandleHttp(std::shared_ptr<::net::IHttpRequest> 
             llm_client_,
             embedding_provider_,
             llm_chunk_cache_,
+            document_semantic_cache_,
             auth_registration_,
             std::move(request),
             msg,
@@ -1530,6 +1536,7 @@ void PersonaGatewayHttpAdapter::HandleWebSocket(std::shared_ptr<::net::IWebSocke
             llm_client_,
             embedding_provider_,
             llm_chunk_cache_,
+            document_semantic_cache_,
             std::move(request),
             body,
             identity,

@@ -1,17 +1,57 @@
 #include "context_risk_detector.h"
 
+#include <algorithm>
+#include <cctype>
+#include <utility>
+
 namespace agent::semantic_cache {
 
-// TODO(orange): implement KeywordContextRiskDetector.
-//
-// First-pass design ideas:
-//   - configurable list of Chinese / English markers
-//     ("这个/那个/上面/刚才/前面/上一步/this/that/above/previous step")
-//   - any non-empty recent_turns + a marker → block
-//   - has_image_reference + image-deictic markers → block
-//   - answer_type == Personalized → always block global
-//
-// Constructor should accept a config struct so tests can override the
-// marker list without recompiling.
+namespace {
+
+std::string LowerAscii(std::string text) {
+    std::transform(text.begin(), text.end(), text.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return text;
+}
+
+bool ContainsMarker(const std::string& lowered_text, const std::vector<std::string>& markers) {
+    for (const auto& marker : markers) {
+        if (!marker.empty() && lowered_text.find(LowerAscii(marker)) != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+} // namespace
+
+KeywordContextRiskDetector::KeywordContextRiskDetector(KeywordContextRiskDetectorOptions options)
+    : options_(std::move(options)) {}
+
+core::Result<ContextRiskAssessment> KeywordContextRiskDetector::Assess(const CacheLookupRequest& req) {
+    ContextRiskAssessment assessment;
+    if (req.scope != CacheScope::Global) {
+        return assessment;
+    }
+    if (req.answer_type == AnswerType::Personalized) {
+        assessment.blocks_global_cache = true;
+        assessment.reason = "personalized answer";
+        return assessment;
+    }
+    if (req.has_image_reference) {
+        assessment.blocks_global_cache = true;
+        assessment.reason = "image-local reference";
+        return assessment;
+    }
+
+    const auto lowered = LowerAscii(req.text);
+    if (!req.recent_turns.empty() && ContainsMarker(lowered, options_.markers)) {
+        assessment.blocks_global_cache = true;
+        assessment.reason = "recent-turn context marker";
+        return assessment;
+    }
+    return assessment;
+}
 
 }  // namespace agent::semantic_cache

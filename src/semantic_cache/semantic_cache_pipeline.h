@@ -123,6 +123,13 @@ namespace storage {
         std::vector<float> embedding;
         std::string input;
         std::string response;
+        agent::semantic_cache::CacheEntryMetadata metadata;
+        std::string payload_type;
+        std::string prompt_version;
+        std::string model_version;
+        std::string corpus_version;
+        std::string policy_version;
+        std::unordered_map<std::string, std::string> extra_metadata;
     };
 
     class IVectorRepository{
@@ -171,6 +178,11 @@ namespace cache_vector {
         std::vector<storage::CacheRecord> context;
     };
 
+    struct ScoredCacheRecord {
+        storage::CacheRecord record;
+        float score = 0.0f;
+    };
+
     class VectorIndexManager : storage::IVectorRepository {
         public:
             VectorIndexManager(std::string user_uuid,
@@ -182,6 +194,9 @@ namespace cache_vector {
 
             core::Status AddRecord(const storage::CacheRecord& record);
             core::Result<std::vector<storage::CacheRecord>> Search(const std::vector<float>& embedding, std::size_t top_k) override;
+            core::Result<std::vector<ScoredCacheRecord>> SearchAllBatches(
+                const std::vector<float>& embedding,
+                std::size_t top_k);
             core::Result<std::vector<SearchWithContextResult>> SearchWithContext(
                 const std::vector<float>& embedding,
                 std::size_t top_k,
@@ -230,6 +245,7 @@ struct SemanticCachePipelineOptions {
     std::size_t top_k = 8;
     float similarity_floor = 0.85f;
     bool enable_global_scope = true;
+    vector::EncodeOptions tokenizer_options;
 };
 
 /// Pipeline implementation of ISemanticCache.

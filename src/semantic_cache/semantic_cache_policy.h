@@ -3,6 +3,7 @@
 #include "semantic_cache_types.h"
 #include "result.h"
 
+#include <chrono>
 #include <string>
 
 namespace agent::semantic_cache {
@@ -58,6 +59,23 @@ public:
     /// Implementations should fail closed: when in doubt, return `false`.
     virtual core::Result<bool> Matches(const CacheLookupRequest& req,
                                         const CacheEntryMetadata& entry) = 0;
+};
+
+struct DefaultPolicyMatcherOptions {
+    CacheEntryFingerprint expected_fingerprint;
+    float min_quality_score = 0.0f;
+    bool require_fingerprint = false;
+};
+
+class DefaultPolicyMatcher final : public IPolicyMatcher {
+public:
+    explicit DefaultPolicyMatcher(DefaultPolicyMatcherOptions options = {});
+
+    core::Result<bool> Matches(const CacheLookupRequest& req,
+                               const CacheEntryMetadata& entry) override;
+
+private:
+    DefaultPolicyMatcherOptions options_;
 };
 
 }  // namespace agent::semantic_cache

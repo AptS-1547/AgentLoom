@@ -2,14 +2,11 @@
 
 #include <chrono>
 #include "http_server.h"
-#include "onnx_model.h"
 #include "request_options.h"
 #include "server_common.h"
-#include "text_embedding_model.h"
-#include "vector_cache.h"
-#include "vlm_cache.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <optional>
 #include <string>
@@ -36,6 +33,40 @@ struct EmbeddingModelOptions {
     bool normalize = true;
     int expected_dimension = 0;
     bool require_token_type_ids = false;
+};
+
+struct BertRuntimeConfigOptions {
+    std::string execution_provider = "auto";
+    bool allow_cpu_fallback = true;
+    int cuda_device_id = 0;
+    int intra_op_num_threads = 0;
+    int inter_op_num_threads = 0;
+    bool enable_cpu_mem_arena = true;
+    bool enable_mem_pattern = true;
+};
+
+struct VlmCacheConfigOptions {
+    bool enabled = false;
+    bool persist = false;
+    std::filesystem::path cache_dir = "cache/vlm";
+    std::size_t max_entries = 512;
+    std::size_t max_bytes = 1024ULL * 1024ULL * 1024ULL;
+    std::int64_t ttl_seconds = 3600;
+    bool store_images = true;
+    bool store_prompts = true;
+    bool allow_stale_on_failure = true;
+    bool default_allow_cache = true;
+};
+
+struct VlmCacheVectorOptions {
+    bool enabled = false;
+    float sim_threshold_high = 0.97f;
+    float sim_threshold_mid = 0.93f;
+    float max_saliency_for_mid = 0.15f;
+    std::size_t max_entries_per_bucket = 256;
+    std::int64_t ttl_seconds = 3600;
+    bool persist = false;
+    std::filesystem::path vector_dir = "cache/vlm/vectors";
 };
 
 struct LlmOptions {
@@ -151,7 +182,7 @@ GatewayAuthOptionsT ToGatewayAuthOptions(const GatewayAuthConfigOptions& config)
 struct MultimodalServerOptions {
     server_common::GrpcServerOptions grpc;
     net::HttpServerOptions http;
-    bert::ModelRuntimeOptions bert_runtime;
+    BertRuntimeConfigOptions bert_runtime;
     EmbeddingModelOptions embedding;
     LlmOptions llm;
     request_validation::AuthOptions auth;
@@ -159,8 +190,8 @@ struct MultimodalServerOptions {
     PersonaGatewayConfigOptions persona_gateway;
     request_validation::RequestLimits limits;
     VramGuardOptions vram;
-    vlm_cache::Options vlm_cache;
-    vlm_cache::VectorOptions vlm_cache_vector;
+    VlmCacheConfigOptions vlm_cache;
+    VlmCacheVectorOptions vlm_cache_vector;
     std::string auth_token_file;
     std::string auth_token_env = "AGENT_BACKEND_AUTH_TOKEN";
     std::string auth_source;

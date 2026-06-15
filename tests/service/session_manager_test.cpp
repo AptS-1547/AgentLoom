@@ -1,10 +1,13 @@
 #include "session_manager.h"
+#include "runtime_maintenance_service.h"
 
 #include <gtest/gtest.h>
 
 #include <atomic>
 #include <chrono>
 #include <future>
+#include <string_view>
+#include <thread>
 
 namespace {
 
@@ -15,6 +18,32 @@ using agent::service::persona::DispatchOptions;
 using agent::service::persona::PersonalityConfig;
 using agent::service::persona::SessionManager;
 using agent::service::persona::SessionOptions;
+using agent::service::gateway::IRuntimeMaintenanceTask;
+using agent::service::gateway::RuntimeMaintenanceService;
+using agent::service::gateway::SessionMaintenanceTask;
+
+class CountingMaintenanceTask final : public IRuntimeMaintenanceTask {
+public:
+    explicit CountingMaintenanceTask(std::atomic<int>& ticks) : ticks_(ticks) {}
+
+    std::string_view Name() const noexcept override {
+        return "counting_task";
+    }
+
+    std::chrono::milliseconds Interval() const noexcept override {
+        return 10ms;
+    }
+
+    core::Status Tick(std::stop_token stop_token) override {
+        if (!stop_token.stop_requested()) {
+            ticks_.fetch_add(1, std::memory_order_relaxed);
+        }
+        return core::Status::Ok();
+    }
+
+private:
+    std::atomic<int>& ticks_;
+};
 
 CreateSessionRequest MakeCreateRequest(std::string session_id = "session-a") {
     PersonalityConfig personality;
@@ -144,6 +173,55 @@ TEST(SessionManagerTest, DispatchReportsNotFoundWhenSessionWasClosedBeforeExecut
     io.Shutdown(true);
     EXPECT_FALSE(ran.load(std::memory_order_relaxed));
     EXPECT_EQ(compute.Stats().failed_tasks, 1u);
+}
+
+TEST(RuntimeMaintenanceServiceTest, RunsRegisteredTaskOnDedicatedWorker) {
+    std::atomic<int> ticks{0};
+    RuntimeMaintenanceService maintenance;
+    ASSERT_TRUE(maintenance.RegisterTask(std::make_shared<CountingMaintenanceTask>(ticks)).ok());
+    ASSERT_TRUE(maintenance.Start().ok());
+
+    const auto deadline = std::chrono::steady_clock::now() + 1s;
+    while (ticks.load(std::memory_order_relaxed) < 2 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(10ms);
+    }
+    maintenance.Stop();
+
+    EXPECT_GE(ticks.load(std::memory_order_relaxed), 2);
+    auto health = maintenance.SnapshotHealth();
+    ASSERT_EQ(health.size(), 1u);
+    EXPECT_EQ(health.front().name, "counting_task");
+    EXPECT_GE(health.front().success_count, 1u);
+    EXPECT_EQ(health.front().failure_count, 0u);
+}
+
+TEST(RuntimeMaintenanceServiceTest, SessionCleanupTaskExpiresIdleSessions) {
+    core::ThreadPool compute({1, 8, "test-compute"});
+    core::ThreadPool io({1, 8, "test-io"});
+    ASSERT_TRUE(compute.Start().ok());
+    ASSERT_TRUE(io.Start().ok());
+
+    SessionOptions options;
+    options.idle_timeout = std::chrono::minutes(0);
+    SessionManager manager(compute, io, options);
+    ASSERT_TRUE(manager.CreateSession(MakeCreateRequest("session-maintenance-expire")).ok());
+
+    RuntimeMaintenanceService maintenance;
+    ASSERT_TRUE(maintenance.RegisterTask(std::make_shared<SessionMaintenanceTask>(
+                    manager,
+                    10ms))
+                    .ok());
+    ASSERT_TRUE(maintenance.Start().ok());
+
+    const auto deadline = std::chrono::steady_clock::now() + 1s;
+    while (manager.SessionCount() != 0 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(10ms);
+    }
+    maintenance.Stop();
+
+    EXPECT_EQ(manager.SessionCount(), 0u);
+    compute.Shutdown(true);
+    io.Shutdown(true);
 }
 
 } // namespace

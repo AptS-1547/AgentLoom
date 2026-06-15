@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+set -euo pipefail
+source "$(dirname "$0")/common.sh"
+
+require_linux
+require_command cmake
+[[ -f "$BUILD_DIR/CMakeCache.txt" ]] || fail "build is not configured; run linux/scripts/configure.sh first"
+
+targets=(
+    core_tests
+    net_tests
+    http_client_tests
+    tls_tests
+    storage_tests
+    vector_storage_tests
+    semantic_cache_tests
+    document_tests
+    memory_tests
+    vector_tests
+    config_tests
+    service_tests
+    llm_tests
+    llm_integration_tests
+    l3_compression_e2e_test
+    document_analysis_e2e_test
+    persona_gateway_e2e_server
+    agent_gateway_server
+    emotion_inference_server
+)
+
+if [[ "${1:-}" == "--inference" ]]; then
+    has_cuda_llama_binary || fail "--inference requires a prepared CUDA llama.cpp binary"
+    targets+=(multimodal_inference_server)
+fi
+
+cmake --build "$BUILD_DIR" --target "${targets[@]}" --parallel "$BUILD_JOBS"
+log "built targets: ${targets[*]}"

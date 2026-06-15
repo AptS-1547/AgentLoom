@@ -69,13 +69,15 @@ class IEmotionAnalyzer {
 public:
     virtual ~IEmotionAnalyzer() = default;
     virtual core::Result<EmotionAnalysis> Analyze(std::string_view text,
-                                                  std::string_view trace_id) = 0;
+                                                  std::string_view trace_id,
+                                                  std::shared_ptr<const PersonalityConfig> personality = nullptr) = 0;
 };
 
 class NeutralEmotionAnalyzer final : public IEmotionAnalyzer {
 public:
     core::Result<EmotionAnalysis> Analyze(std::string_view text,
-                                          std::string_view trace_id) override;
+                                          std::string_view trace_id,
+                                          std::shared_ptr<const PersonalityConfig> personality = nullptr) override;
 };
 
 struct EmotionCalibrationOptions {

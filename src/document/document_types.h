@@ -2,6 +2,7 @@
 
 #include "result.h"
 #include "openai_llm_client.h"
+#include "isemantic_cache.h"
 
 #include <cstdint>
 #include <filesystem>
@@ -94,6 +95,11 @@ struct DocumentChunkBuildMetrics {
     std::uint64_t llm_cache_lookup_ms = 0;
     std::size_t llm_cache_store_count = 0;
     std::uint64_t llm_cache_store_ms = 0;
+    std::size_t semantic_cache_lookup_count = 0;
+    std::size_t semantic_cache_hit_count = 0;
+    std::uint64_t semantic_cache_lookup_ms = 0;
+    std::size_t semantic_cache_store_count = 0;
+    std::uint64_t semantic_cache_store_ms = 0;
     std::size_t llm_direct_count = 0;
     std::uint64_t llm_direct_ms = 0;
     std::vector<std::uint64_t> embedding_sample_ms;
@@ -124,6 +130,7 @@ std::vector<ChunkTrunk> BuildLocalChunks(const std::vector<DocumentBlock>& block
                                          std::shared_ptr<llm::ILlmClient> llm_client = {},
                                          std::shared_ptr<IDocumentEmbeddingProvider> embedding_provider = {},
                                          std::shared_ptr<IDocumentLlmChunkCache> llm_chunk_cache = {},
+                                         std::shared_ptr<semantic_cache::ISemanticCache> semantic_cache = {},
                                          DocumentChunkBuildMetrics* metrics = nullptr);
 nlohmann::json BuildMindmap(const std::vector<DocumentBlock>& blocks,
                             std::string_view file_name,
@@ -138,6 +145,7 @@ core::Result<nlohmann::json> AnalyzeDocument(const std::filesystem::path& path,
                                              const DocumentAnalysisOptions& options = {},
                                              std::shared_ptr<llm::ILlmClient> llm_client = {},
                                              std::shared_ptr<IDocumentEmbeddingProvider> embedding_provider = {},
-                                             std::shared_ptr<IDocumentLlmChunkCache> llm_chunk_cache = {});
+                                             std::shared_ptr<IDocumentLlmChunkCache> llm_chunk_cache = {},
+                                             std::shared_ptr<semantic_cache::ISemanticCache> semantic_cache = {});
 
 } // namespace agent::document

@@ -4,7 +4,7 @@
     {
       "name": "x64-Release",
       "displayName": "x64 Release",
-      "generator": "Visual Studio 18 2026",
+      "generator": "Visual Studio 17 2022",
       "binaryDir": "${sourceDir}/build/x64-Release",
       "installDir": "${sourceDir}/install",
       "architecture": {
@@ -13,7 +13,7 @@
       },
       "cacheVariables": {
         "CMAKE_CONFIGURATION_TYPES": "Release",
-        "CMAKE_GENERATOR_INSTANCE": "C:/Program Files/Microsoft Visual Studio/18/Community",
+        "CMAKE_GENERATOR_INSTANCE": "D:/VS2022",
         "BERT_VCPKG_TRIPLET": "x64-windows",
         "BERT_USE_ONNXRUNTIME_GPU": "OFF",
         "LLAMA_CPP_ROOT": "D:/Users/21405/source/repos/LocalLLMPredict/llama.cpp"
@@ -22,7 +22,7 @@
     {
       "name": "x64-Debug",
       "displayName": "x64 Debug",
-      "generator": "Visual Studio 18 2026",
+      "generator": "Visual Studio 17 2022",
       "binaryDir": "${sourceDir}/build/x64-Debug",
       "installDir": "${sourceDir}/install",
       "architecture": {
@@ -31,7 +31,7 @@
       },
       "cacheVariables": {
         "CMAKE_CONFIGURATION_TYPES": "Debug",
-        "CMAKE_GENERATOR_INSTANCE": "C:/Program Files/Microsoft Visual Studio/18/Community",
+        "CMAKE_GENERATOR_INSTANCE": "D:/VS2022",
         "BERT_VCPKG_TRIPLET": "x64-windows",
         "BERT_USE_ONNXRUNTIME_GPU": "OFF",
         "LLAMA_CPP_ROOT": "D:/Users/21405/source/repos/LocalLLMPredict/llama.cpp"
@@ -41,7 +41,7 @@
       "name": "x64-Release-Tests",
       "displayName": "x64 Release Tests",
       "inherits": "x64-Release",
-      "binaryDir": "${sourceDir}/build/x64-Release-Tests-v145",
+      "binaryDir": "${sourceDir}/build/x64-Release-Tests",
       "cacheVariables": {
         "BERT_BUILD_TESTS": "ON"
       }
@@ -53,20 +53,6 @@
       "binaryDir": "${sourceDir}/build/x64-Debug-Tests",
       "cacheVariables": {
         "BERT_BUILD_TESTS": "ON"
-      }
-    },
-    {
-      "name": "x64-Release-Tests-v145-Ninja",
-      "displayName": "x64 Release Tests v145 Ninja",
-      "generator": "Ninja",
-      "binaryDir": "${sourceDir}/build/x64-Release-Tests-v145-Ninja",
-      "installDir": "${sourceDir}/install",
-      "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Release",
-        "BERT_BUILD_TESTS": "ON",
-        "BERT_VCPKG_TRIPLET": "x64-windows",
-        "BERT_USE_ONNXRUNTIME_GPU": "OFF",
-        "LLAMA_CPP_ROOT": "D:/Users/21405/source/repos/LocalLLMPredict/llama.cpp"
       }
     },
     {

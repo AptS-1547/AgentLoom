@@ -22,6 +22,7 @@ jobs:
     env:
       BUILD_DIR: build/gha-linux-tests
       VCPKG_TRIPLET: x64-linux
+      VCPKG_BINARY_CACHE: build/vcpkg-binary-cache
       VCPKG_MAX_CONCURRENCY: 2
       CMAKE_BUILD_PARALLEL_LEVEL: 2
       ONNXRUNTIME_URL: https://github.com/microsoft/onnxruntime/releases/download/v1.17.1/onnxruntime-linux-x64-1.17.1.tgz
@@ -83,8 +84,10 @@ jobs:
       - name: Cache vcpkg install root
         uses: actions/cache@v4
         with:
-          path: vcpkg_installed
-          key: ${{ runner.os }}-${{ env.VCPKG_TRIPLET }}-vcpkg-${{ hashFiles('vcpkg.json', 'triplets/**') }}
+          path: |
+            vcpkg_installed
+            build/vcpkg-binary-cache
+          key: ${{ runner.os }}-${{ env.VCPKG_TRIPLET }}-vcpkg-${{ hashFiles('vcpkg.json', 'triplets/**', '.github/workflows/ci.yml') }}
           restore-keys: |
             ${{ runner.os }}-${{ env.VCPKG_TRIPLET }}-vcpkg-
 
@@ -141,6 +144,7 @@ jobs:
             --x-manifest-root="$GITHUB_WORKSPACE" \
             --x-install-root="$GITHUB_WORKSPACE/vcpkg_installed" \
             --overlay-triplets="$GITHUB_WORKSPACE/triplets/ci" \
+            "--binarysource=clear;files,$GITHUB_WORKSPACE/$VCPKG_BINARY_CACHE,readwrite" \
             --clean-after-build
 
       - name: Download ONNX Runtime

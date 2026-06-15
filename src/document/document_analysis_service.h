@@ -7,15 +7,12 @@
 #include "thread_pool.h"
 
 #include <chrono>
-#include <atomic>
-#include <condition_variable>
 #include <deque>
 #include <filesystem>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
-#include <thread>
 
 namespace agent::document {
 
@@ -28,6 +25,7 @@ struct DocumentAnalyzeRequest {
     std::shared_ptr<llm::ILlmClient> llm_client;
     std::shared_ptr<IDocumentEmbeddingProvider> embedding_provider;
     std::shared_ptr<IDocumentLlmChunkCache> llm_chunk_cache;
+    std::shared_ptr<semantic_cache::ISemanticCache> semantic_cache;
 };
 
 struct DocumentAnalyzeLatency {
@@ -62,6 +60,7 @@ public:
                                                            std::string_view session_id = {});
     core::Status TouchDocumentAccess(const std::string& document_id, std::int64_t accessed_at_ms = 0);
     core::Status RunRetentionCleanupOnceForTest(std::int64_t now_ms);
+    core::Status RunRetentionCleanupOnce(std::int64_t now_ms);
     void SetRetentionCleanupOptions(std::chrono::hours retention, std::chrono::seconds cleanup_interval);
 
 private:
@@ -69,11 +68,6 @@ private:
         std::string document_id;
         std::int64_t last_accessed_at_ms = 0;
     };
-
-    void StartRetentionWorkerIfReady();
-    void StopRetentionWorker();
-    void RetentionWorkerLoop();
-    core::Status RunRetentionCleanupOnce(std::int64_t now_ms);
 
     core::ThreadPool& compute_pool_;
     core::ThreadPool& io_pool_;
@@ -83,9 +77,6 @@ private:
     core::LoggerAdapter logger_;
     std::deque<DocumentLruEntry> document_lru_;
     std::mutex document_lru_mutex_;
-    std::condition_variable document_lru_cv_;
-    std::thread document_lru_worker_;
-    std::atomic_bool document_lru_stop_{false};
     std::chrono::hours retention_{std::chrono::hours(24 * 7)};
     std::chrono::seconds cleanup_interval_{std::chrono::seconds(60)};
 };

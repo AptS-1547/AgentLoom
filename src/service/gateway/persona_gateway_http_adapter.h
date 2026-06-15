@@ -2,6 +2,7 @@
 
 #include "gateway_auth.h"
 #include "document_analysis_service.h"
+#include "isemantic_cache.h"
 #include "persona_gateway_service.h"
 #include "request_interfaces.h"
 
@@ -34,7 +35,8 @@ public:
                                        std::shared_ptr<document::DocumentAnalysisService> document_service = nullptr,
                                        std::shared_ptr<llm::ILlmClient> llm_client = nullptr,
                                        std::shared_ptr<document::IDocumentEmbeddingProvider> embedding_provider = nullptr,
-                                       std::shared_ptr<document::IDocumentLlmChunkCache> llm_chunk_cache = nullptr);
+                                       std::shared_ptr<document::IDocumentLlmChunkCache> llm_chunk_cache = nullptr,
+                                       std::shared_ptr<semantic_cache::ISemanticCache> document_semantic_cache = nullptr);
 
     static bool IsApiRequest(std::string_view target) noexcept;
 
@@ -49,6 +51,7 @@ private:
     std::shared_ptr<llm::ILlmClient> llm_client_;
     std::shared_ptr<document::IDocumentEmbeddingProvider> embedding_provider_;
     std::shared_ptr<document::IDocumentLlmChunkCache> llm_chunk_cache_;
+    std::shared_ptr<semantic_cache::ISemanticCache> document_semantic_cache_;
     std::mutex document_upload_mutex_;
     std::unordered_map<std::string, DocumentUploadSession> document_uploads_;
 };

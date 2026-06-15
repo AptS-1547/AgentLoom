@@ -145,6 +145,11 @@ nlohmann::json ChunkMetricsToJson(const DocumentChunkBuildMetrics& metrics) {
         {"llmCacheLookupMs", metrics.llm_cache_lookup_ms},
         {"llmCacheStoreCount", metrics.llm_cache_store_count},
         {"llmCacheStoreMs", metrics.llm_cache_store_ms},
+        {"semanticCacheLookupCount", metrics.semantic_cache_lookup_count},
+        {"semanticCacheHitCount", metrics.semantic_cache_hit_count},
+        {"semanticCacheLookupMs", metrics.semantic_cache_lookup_ms},
+        {"semanticCacheStoreCount", metrics.semantic_cache_store_count},
+        {"semanticCacheStoreMs", metrics.semantic_cache_store_ms},
         {"llmDirectCount", metrics.llm_direct_count},
         {"llmDirectMs", metrics.llm_direct_ms},
         {"embeddingSampleMs", metrics.embedding_sample_ms},
@@ -290,7 +295,8 @@ core::Result<nlohmann::json> AnalyzeDocument(const std::filesystem::path& path,
                                              const DocumentAnalysisOptions& options,
                                              std::shared_ptr<llm::ILlmClient> llm_client,
                                              std::shared_ptr<IDocumentEmbeddingProvider> embedding_provider,
-                                             std::shared_ptr<IDocumentLlmChunkCache> llm_chunk_cache) {
+                                             std::shared_ptr<IDocumentLlmChunkCache> llm_chunk_cache,
+                                             std::shared_ptr<semantic_cache::ISemanticCache> semantic_cache) {
     const auto started = Clock::now();
     const auto resolved_file_name = FileNameOrPathName(path, file_name);
     auto file_type = ExtensionOfName(resolved_file_name);
@@ -321,6 +327,7 @@ core::Result<nlohmann::json> AnalyzeDocument(const std::filesystem::path& path,
         std::move(llm_client),
         std::move(embedding_provider),
         std::move(llm_chunk_cache),
+        std::move(semantic_cache),
         &chunk_metrics);
     const auto llm_count = CountChunksBySource(chunks, "llm");
     const auto cache_reuse_count = CountReusedChunks(chunks);
@@ -379,9 +386,7 @@ DocumentAnalysisService::DocumentAnalysisService(core::ThreadPool& compute_pool,
       io_pool_(io_pool),
       logger_(std::move(logger)) {}
 
-DocumentAnalysisService::~DocumentAnalysisService() {
-    StopRetentionWorker();
-}
+DocumentAnalysisService::~DocumentAnalysisService() = default;
 
 void DocumentAnalysisService::SetRetentionCleanupOptions(std::chrono::hours retention,
                                                          std::chrono::seconds cleanup_interval) {
@@ -390,45 +395,6 @@ void DocumentAnalysisService::SetRetentionCleanupOptions(std::chrono::hours rete
     }
     if (cleanup_interval.count() > 0) {
         cleanup_interval_ = cleanup_interval;
-    }
-    document_lru_cv_.notify_all();
-}
-
-void DocumentAnalysisService::StartRetentionWorkerIfReady() {
-    if (!metadata_repository_ || !file_store_ || document_lru_worker_.joinable()) {
-        return;
-    }
-    document_lru_stop_.store(false);
-    document_lru_worker_ = std::thread([this]() {
-        RetentionWorkerLoop();
-    });
-}
-
-void DocumentAnalysisService::StopRetentionWorker() {
-    document_lru_stop_.store(true);
-    document_lru_cv_.notify_all();
-    if (document_lru_worker_.joinable()) {
-        document_lru_worker_.join();
-    }
-}
-
-void DocumentAnalysisService::RetentionWorkerLoop() {
-    std::unique_lock<std::mutex> lock(document_lru_mutex_);
-    while (!document_lru_stop_.load()) {
-        document_lru_cv_.wait_for(lock, cleanup_interval_, [this]() {
-            return document_lru_stop_.load();
-        });
-        if (document_lru_stop_.load()) {
-            break;
-        }
-        lock.unlock();
-        auto status = RunRetentionCleanupOnce(NowUnixMs());
-        if (!status.ok()) {
-            logger_.warn("[document_lru] cleanup failed code={} reason={}",
-                         static_cast<int>(status.code()),
-                         status.message());
-        }
-        lock.lock();
     }
 }
 
@@ -509,7 +475,6 @@ core::Status DocumentAnalysisService::RunRetentionCleanupOnce(std::int64_t now_m
 
 core::Status DocumentAnalysisService::SetRepository(std::shared_ptr<storage::sqlite::SqliteConnectionPool> repository_pool) {
     if (!repository_pool) {
-        StopRetentionWorker();
         repository_pool_.reset();
         metadata_repository_.reset();
         return core::Status::Ok();
@@ -530,13 +495,11 @@ core::Status DocumentAnalysisService::SetRepository(std::shared_ptr<storage::sql
     }
     repository_pool_ = std::move(repository_pool);
     metadata_repository_ = std::move(metadata_repository);
-    StartRetentionWorkerIfReady();
     return core::Status::Ok();
 }
 
 core::Status DocumentAnalysisService::SetFileStore(std::shared_ptr<DocumentFileStore> file_store) {
     if (!file_store) {
-        StopRetentionWorker();
         file_store_.reset();
         return core::Status::Ok();
     }
@@ -545,7 +508,6 @@ core::Status DocumentAnalysisService::SetFileStore(std::shared_ptr<DocumentFileS
     }
     retention_ = file_store->retention();
     file_store_ = std::move(file_store);
-    StartRetentionWorkerIfReady();
     return core::Status::Ok();
 }
 
@@ -636,7 +598,8 @@ core::Status DocumentAnalysisService::SubmitAnalyze(DocumentAnalyzeRequest reque
                     request.options,
                     request.llm_client,
                     request.embedding_provider,
-                    request.llm_chunk_cache);
+                    request.llm_chunk_cache,
+                    request.semantic_cache);
             } catch (const std::exception& e) {
                 analyzed = core::Status::Error(
                     core::ErrorCode::InternalError,

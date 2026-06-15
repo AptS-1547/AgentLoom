@@ -1,5 +1,6 @@
 #include "embedding_pipeline.h"
 
+#include <algorithm>
 #include <utility>
 
 namespace vector {

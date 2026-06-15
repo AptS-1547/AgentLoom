@@ -67,6 +67,7 @@ core::Result<SessionSnapshot> SessionManager::CreateSession(CreateSessionRequest
         slot->state.created_at = now;
         slot->state.last_active = now;
         slot->state.emotion_state = EmotionStateTracker(request.emotion_state_config);
+        slot->state.personality = std::make_shared<const PersonalityConfig>(request.personality);
         slot->state.prompt_builder = std::make_unique<PromptBuilder>(
             std::move(request.personality),
             std::move(request.emotion_prompt_config),

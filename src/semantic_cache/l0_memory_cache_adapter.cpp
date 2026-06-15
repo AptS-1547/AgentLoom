@@ -84,6 +84,23 @@ core::Status L0MemoryCacheAdapter::Store(const CacheStoreRequest& req) {
     record.embedding = std::move(text_embedding).value();
     record.input = req.origin.text;
     record.response = req.response_payload;
+    record.metadata.scope = req.origin.scope;
+    record.metadata.answer_type = req.answer_type;
+    record.metadata.tenant_id = req.origin.tenant_id;
+    record.metadata.user_id = req.origin.user_id;
+    record.metadata.session_id = req.origin.session_id;
+    record.metadata.subject = req.origin.subject;
+    record.metadata.grade = req.origin.grade;
+    record.metadata.topic = req.origin.topic;
+    record.metadata.persona_id = req.origin.persona_id;
+    record.metadata.quality_score = req.quality_score;
+    const auto now = std::chrono::system_clock::now().time_since_epoch();
+    record.metadata.created_at_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
+    if (req.ttl) {
+        record.metadata.expires_at_ms = record.metadata.created_at_ms +
+            std::chrono::duration_cast<std::chrono::milliseconds>(*req.ttl).count();
+    }
+    record.extra_metadata = req.origin.extra;
     return index_->AddRecord(record);
 }
 

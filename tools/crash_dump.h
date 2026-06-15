@@ -15,6 +15,8 @@
 //   reg add "HKLM\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps" /v DumpFolder /t REG_EXPAND_SZ /d "%TEMP%\dumps" /f
 #pragma once
 
+#include <string>
+
 #ifdef _WIN32
 
 #include <windows.h>
@@ -29,7 +31,6 @@
 #include <ctime>
 #include <exception>
 #include <iostream>
-#include <string>
 
 #pragma comment(lib, "dbghelp.lib")
 

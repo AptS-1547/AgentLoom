@@ -37,10 +37,39 @@ using agent::document::HeadingLevelFromStyle;
 using agent::document::IDocumentEmbeddingProvider;
 using agent::document::OoxmlExtractor;
 
+class FakeDocumentSemanticCache final : public agent::semantic_cache::ISemanticCache {
+public:
+    core::Result<agent::semantic_cache::CacheLookupResult> Lookup(
+        const agent::semantic_cache::CacheLookupRequest& req) override {
+        ++lookup_count;
+        last_lookup = req;
+        agent::semantic_cache::CacheLookupResult result;
+        result.hit = hit;
+        result.similarity_score = score;
+        result.payload = payload;
+        return result;
+    }
+
+    core::Status Store(const agent::semantic_cache::CacheStoreRequest& req) override {
+        ++store_count;
+        last_store = req;
+        return core::Status::Ok();
+    }
+
+    bool hit = false;
+    float score = 0.95f;
+    std::string payload;
+    int lookup_count = 0;
+    int store_count = 0;
+    agent::semantic_cache::CacheLookupRequest last_lookup;
+    agent::semantic_cache::CacheStoreRequest last_store;
+};
+
 class FakeChunkLlmClient final : public agent::llm::ILlmClient {
 public:
     core::Result<agent::llm::ChatCompletionResponse> Complete(
         const agent::llm::ChatCompletionRequest& req) override {
+        ++call_count;
         last_request = req;
         agent::llm::ChatCompletionResponse response;
         response.model = "fake-chunk-model";
@@ -49,6 +78,7 @@ public:
     }
 
     agent::llm::ChatCompletionRequest last_request;
+    int call_count = 0;
 };
 
 class FakeEmbeddingProvider final : public IDocumentEmbeddingProvider {
@@ -496,6 +526,42 @@ TEST(DocumentChunkBuilderTest, UsesLlmFallbackWhenEnabled) {
     ASSERT_EQ(chunks[0].slices.size(), 1u);
     EXPECT_EQ(chunks[0].slices[0].kind, "concept");
     EXPECT_EQ(llm->last_request.model, "chunk-model");
+}
+
+TEST(DocumentChunkBuilderTest, UsesSemanticCacheBeforeLlmFallback) {
+    std::vector<DocumentBlock> blocks;
+    blocks.push_back(DocumentBlock{.id = "b1", .text = "函数 输入 输出 对应 关系", .source = "docx", .order = 1, .confidence = 0.5});
+
+    DocumentAnalysisOptions options;
+    options.enable_llm_chunk_fallback = true;
+    options.chunk_llm_model = "chunk-model";
+
+    auto llm = std::make_shared<FakeChunkLlmClient>();
+    auto semantic_cache = std::make_shared<FakeDocumentSemanticCache>();
+    semantic_cache->hit = true;
+    semantic_cache->payload =
+        R"({"title":"缓存标题","summary":"缓存摘要","slices":[{"title":"缓存切片","summary":"切片摘要","text":"函数表示输入与输出之间的对应关系","kind":"concept","confidence":0.9}],"confidence":0.8,"metadata":{}})";
+
+    agent::document::DocumentChunkBuildMetrics metrics;
+    auto chunks = BuildLocalChunks(
+        blocks,
+        options,
+        llm,
+        nullptr,
+        nullptr,
+        semantic_cache,
+        &metrics);
+
+    ASSERT_EQ(chunks.size(), 1u);
+    EXPECT_EQ(chunks[0].title, "缓存标题");
+    EXPECT_EQ(chunks[0].summary, "缓存摘要");
+    EXPECT_TRUE(chunks[0].reused);
+    EXPECT_EQ(chunks[0].metadata["semantic_cache_hit"], "true");
+    EXPECT_EQ(llm->call_count, 0);
+    EXPECT_EQ(semantic_cache->lookup_count, 1);
+    EXPECT_EQ(metrics.semantic_cache_hit_count, 1u);
+    EXPECT_EQ(metrics.llm_direct_count, 0u);
+    EXPECT_EQ(semantic_cache->last_lookup.topic, "document_chunk_title");
 }
 
 TEST(DocumentAnalysisPipelineTest, EmitsLocalSemanticChunks) {

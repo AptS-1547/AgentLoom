@@ -70,7 +70,9 @@ public:
     explicit FixedEmotionAnalyzer(EmotionAnalysis analysis)
         : analysis_(std::move(analysis)) {}
 
-    core::Result<EmotionAnalysis> Analyze(std::string_view, std::string_view) override {
+    core::Result<EmotionAnalysis> Analyze(std::string_view,
+                                          std::string_view,
+                                          std::shared_ptr<const PersonalityConfig> = nullptr) override {
         return analysis_;
     }
 

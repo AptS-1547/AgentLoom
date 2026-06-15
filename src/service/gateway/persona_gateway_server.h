@@ -3,6 +3,7 @@
 #include "persona_gateway_http_adapter.h"
 #include "persona_gateway_service.h"
 #include "persona_runtime.h"
+#include "runtime_maintenance_service.h"
 #include "document_analysis_service.h"
 #include "http_server.h"
 #include "static_file_handler.h"
@@ -14,6 +15,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace agent::semantic_cache {
 class RedisConnectionPool;
@@ -54,6 +56,8 @@ struct PersonaGatewayServerDependencies {
     std::shared_ptr<llm::ILlmClient> llm_client;
     std::shared_ptr<document::IDocumentEmbeddingProvider> document_embedding_provider;
     std::shared_ptr<document::IDocumentLlmChunkCache> document_llm_chunk_cache;
+    std::shared_ptr<semantic_cache::ISemanticCache> document_semantic_cache;
+    std::vector<std::shared_ptr<IRuntimeMaintenanceTask>> maintenance_tasks;
 };
 
 class PersonaGatewayServer final {
@@ -68,6 +72,7 @@ public:
 
     core::Status Start();
     void Stop();
+    core::Status RegisterMaintenanceTask(std::shared_ptr<IRuntimeMaintenanceTask> task);
 
     bool running() const noexcept;
     std::uint16_t port() const noexcept;
@@ -101,6 +106,7 @@ private:
     std::shared_ptr<IAuthRegistrationService> auth_registration_;
     PersonaGatewayHttpAdapter adapter_;
     ::net::HttpServer http_server_;
+    RuntimeMaintenanceService maintenance_;
     std::shared_ptr<::net::StaticFileHandler> static_files_;
     bool started_ = false;
 };

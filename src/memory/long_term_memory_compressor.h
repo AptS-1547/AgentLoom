@@ -5,6 +5,7 @@
 #include "../semantic_cache/semantic_cache_pipeline.h"
 #include "../storage/vector/vector_repository.h"
 #include "../storage/vector/vector_partition_registry.h"
+#include "../storage/sqlite/sqlite_connection_pool.h"
 #include "../vector/vector_index_manager.h"
 #include "../vector/embedding_pipeline.h"
 #include "../core/result.h"
@@ -42,6 +43,10 @@ struct LongTermMemoryCompressorOptions {
 
     /// Partition registry for resolving user+level to partition_id.
     std::shared_ptr<vector_storage::PartitionRegistry> partition_registry;
+
+    /// Optional registry pool used to persist the set of observed L3 user UUIDs.
+    /// If omitted, the compressor will not maintain a persistent user registry.
+    std::shared_ptr<storage::sqlite::SqliteConnectionPool> registry_pool;
 
     /// Vector index manager for search and insert notification.
     std::shared_ptr<vector::VectorIndexManager> index_manager;
@@ -123,10 +128,16 @@ public:
         int top_k = 5
     );
 
+    /// Return all users that have been registered through this compressor.
+    /// This is the source of truth for maintenance tasks.
+    core::Result<std::vector<std::string>> GetRegisteredUsers() const;
+
 private:
     explicit LongTermMemoryCompressor(LongTermMemoryCompressorOptions options);
 
     core::Result<int64_t> EnsureUserPartition(const std::string& user_uuid);
+    core::Status EnsureRegistrySchema() const;
+    core::Status RegisterUser(const std::string& user_uuid) const;
 
     /// Fetch all L0 records for a given user and date from Redis.
     core::Result<std::vector<storage::CacheRecord>> FetchDailyRecords(

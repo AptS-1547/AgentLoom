@@ -632,6 +632,36 @@ target_link_libraries(persona_gateway_e2e_server PRIVATE
 link_whole_archive(persona_gateway_e2e_server agent_config)
 copy_runtime_files(persona_gateway_e2e_server "${BERT_SQLITE_DLL}")
 
+add_executable(agent_gateway_server
+    src/server/main/agent_gateway_server.cpp
+)
+target_include_directories(agent_gateway_server PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/storage/sqlite
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/storage/vector
+)
+if(WIN32)
+    target_include_directories(agent_gateway_server PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/tools
+    )
+    target_link_libraries(agent_gateway_server PRIVATE Dbghelp)
+endif()
+target_link_libraries(agent_gateway_server PRIVATE
+    server_runtime
+    agent_service
+    agent_document
+    agent_vector
+    agent_vector_storage
+    agent_llm
+    agent_tls
+    agent_config
+    nlohmann_json::nlohmann_json
+    OpenSSL::SSL
+    OpenSSL::Crypto
+)
+link_whole_archive(agent_gateway_server agent_config)
+copy_runtime_files(agent_gateway_server "${BERT_SQLITE_DLL}")
+copy_runtime_files(agent_gateway_server ${VCPKG_RUNTIME_DLLS})
+
 add_executable(persona_config_migration
     tools/persona_config_migration.cpp
 )
@@ -1003,27 +1033,39 @@ target_include_directories(server_runtime PUBLIC
 
 target_link_libraries(server_runtime PUBLIC spdlog::spdlog)
 
-add_library(agent_models STATIC
-    src/models/llama_handles.h
-    src/models/llama_runner.cpp
-    src/models/llama_runner.h
+add_library(agent_bert_models STATIC
     src/models/onnx_model.cpp
     src/models/onnx_model.h
     src/models/onnx_session_utils.cpp
     src/models/onnx_session_utils.h
 )
 
-target_include_directories(agent_models PUBLIC
+target_include_directories(agent_bert_models PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src/models
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party
     ${ONNXRUNTIME_ROOT}/include
+)
+
+target_link_libraries(agent_bert_models PUBLIC
+    agent_core
+    onnxruntime
+    spdlog::spdlog
+)
+
+add_library(agent_models STATIC
+    src/models/llama_handles.h
+    src/models/llama_runner.cpp
+    src/models/llama_runner.h
+)
+
+target_include_directories(agent_models PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/models
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party
     ${LLAMA_CPP_INCLUDE_DIRS}
 )
 
 target_link_libraries(agent_models PUBLIC
-    agent_core
-    onnxruntime
-    spdlog::spdlog
+    agent_bert_models
     ${LLAMA_CPP_LIBS}
 )
 
@@ -1075,7 +1117,7 @@ target_include_directories(agent_vector PUBLIC
 
 target_link_libraries(agent_vector PUBLIC
     agent_core
-    agent_models
+    agent_bert_models
     agent_vector_storage
     hf_tokenizers_capi
     faiss
@@ -1137,9 +1179,7 @@ target_include_directories(agent_config PUBLIC
 )
 
 target_link_libraries(agent_config PUBLIC
-    agent_cache
     agent_net
-    agent_vector
     server_runtime
 )
 
@@ -1158,14 +1198,14 @@ if(BERT_BUILD_TESTS)
 endif()
 
 add_library(agent_service STATIC
-    src/service/inference/multimodal_service.cpp
-    src/service/inference/multimodal_service.h
     src/service/persona/persona_algorithm.cpp
     src/service/persona/persona_algorithm.h
     src/service/persona/session_manager.cpp
     src/service/persona/session_manager.h
     src/service/persona/persona_runtime.cpp
     src/service/persona/persona_runtime.h
+    src/service/persona/grpc_emotion_analyzer.cpp
+    src/service/persona/grpc_emotion_analyzer.h
     src/service/gateway/gateway_models.h
     src/service/gateway/gateway_auth.cpp
     src/service/gateway/gateway_auth.h
@@ -1175,6 +1215,8 @@ add_library(agent_service STATIC
     src/service/gateway/persona_gateway_service.h
     src/service/gateway/persona_gateway_http_adapter.cpp
     src/service/gateway/persona_gateway_http_adapter.h
+    src/service/gateway/runtime_maintenance_service.cpp
+    src/service/gateway/runtime_maintenance_service.h
     src/service/gateway/persona_gateway_server.cpp
     src/service/gateway/persona_gateway_server.h
 )
@@ -1195,8 +1237,6 @@ target_include_directories(agent_service PUBLIC
 target_link_libraries(agent_service PUBLIC
     multimodal_proto
     agent_config
-    agent_models
-    agent_cache
     agent_vector
     agent_llm
     agent_semantic_cache
@@ -1234,39 +1274,85 @@ if(BERT_BUILD_TESTS)
     gtest_discover_tests(service_tests DISCOVERY_MODE PRE_TEST)
 endif()
 
-# ==================== 统一多模态推理服务端 ====================
+# ==================== 推理服务端 ====================
 
-add_library(agent_server STATIC
+option(BERT_BUILD_MULTIMODAL_INFERENCE_SERVER "Build full multimodal inference server with VLM/llama.cpp support" ON)
+option(BERT_BUILD_EMOTION_INFERENCE_SERVER "Build CPU-only BERT emotion inference server" ON)
+
+add_library(agent_emotion_server STATIC
     src/server/grpc/grpc_error.cpp
     src/server/grpc/grpc_error.h
-    src/server/grpc/multimodal_grpc_service.cpp
-    src/server/grpc/multimodal_grpc_service.h
+    src/server/grpc/emotion_grpc_service.cpp
+    src/server/grpc/emotion_grpc_service.h
+    src/service/inference/emotion_inference_service.cpp
+    src/service/inference/emotion_inference_service.h
     src/service/inference/request_validation.cpp
     src/service/inference/request_validation.h
 )
 
-target_include_directories(agent_server PUBLIC
+target_include_directories(agent_emotion_server PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src/server/grpc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/service/inference
 )
 
-target_link_libraries(agent_server PUBLIC
+target_link_libraries(agent_emotion_server PUBLIC
     multimodal_proto
     agent_core
-    agent_service
+    agent_bert_models
     server_runtime
     agent_config
     gRPC::grpc++
     spdlog::spdlog
 )
 
-add_executable(multimodal_inference_server
-    src/server/main/multimodal_inference_server.cpp
+add_library(agent_server STATIC
+    src/server/grpc/grpc_error.cpp
+    src/server/grpc/grpc_error.h
+    src/server/grpc/multimodal_grpc_service.cpp
+    src/server/grpc/multimodal_grpc_service.h
+    src/service/inference/multimodal_service.cpp
+    src/service/inference/multimodal_service.h
+    src/service/inference/request_validation.cpp
+    src/service/inference/request_validation.h
 )
 
-target_link_libraries(multimodal_inference_server PRIVATE agent_server)
-link_whole_archive(multimodal_inference_server agent_config)
+target_include_directories(agent_server PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/server/grpc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/service/inference
+)
 
-copy_runtime_files(multimodal_inference_server ${LLAMA_CPP_RUNTIME_FILES})
+target_link_libraries(agent_server PUBLIC
+    multimodal_proto
+    agent_core
+    agent_service
+    agent_models
+    agent_cache
+    agent_vector
+    server_runtime
+    agent_config
+    gRPC::grpc++
+    spdlog::spdlog
+)
+
+if(BERT_BUILD_EMOTION_INFERENCE_SERVER)
+    add_executable(emotion_inference_server
+        src/server/main/emotion_inference_server.cpp
+    )
+
+    target_link_libraries(emotion_inference_server PRIVATE agent_emotion_server)
+    link_whole_archive(emotion_inference_server agent_config)
+endif()
+
+if(BERT_BUILD_MULTIMODAL_INFERENCE_SERVER)
+    add_executable(multimodal_inference_server
+        src/server/main/multimodal_inference_server.cpp
+    )
+
+    target_link_libraries(multimodal_inference_server PRIVATE agent_server)
+    link_whole_archive(multimodal_inference_server agent_config)
+
+    copy_runtime_files(multimodal_inference_server ${LLAMA_CPP_RUNTIME_FILES})
+endif()
 
 # ==================== 客户端工具（BERT 协议，用于向后兼容测试） ====================
 
@@ -1287,7 +1373,13 @@ target_link_libraries(bert_benchmark_client PRIVATE bert_proto gRPC::grpc++)
 # ==================== 平台适配 ====================
 
 if(UNIX AND NOT APPLE)
-    set(BERT_RPATH_TARGETS multimodal_inference_server bert_inference_client bert_benchmark_client)
+    set(BERT_RPATH_TARGETS bert_inference_client bert_benchmark_client)
+    if(TARGET multimodal_inference_server)
+        list(APPEND BERT_RPATH_TARGETS multimodal_inference_server)
+    endif()
+    if(TARGET emotion_inference_server)
+        list(APPEND BERT_RPATH_TARGETS emotion_inference_server)
+    endif()
     if(TARGET static_site_test_server)
         list(APPEND BERT_RPATH_TARGETS static_site_test_server)
     endif()
@@ -1309,19 +1401,36 @@ if(UNIX AND NOT APPLE)
 endif()
 
 # 安装
-set(BERT_INSTALL_TARGETS multimodal_inference_server bert_inference_client bert_benchmark_client)
+set(BERT_INSTALL_TARGETS bert_inference_client bert_benchmark_client)
+if(TARGET multimodal_inference_server)
+    list(APPEND BERT_INSTALL_TARGETS multimodal_inference_server)
+endif()
+if(TARGET emotion_inference_server)
+    list(APPEND BERT_INSTALL_TARGETS emotion_inference_server)
+endif()
 install(TARGETS ${BERT_INSTALL_TARGETS} RUNTIME DESTINATION bin)
 
 # 复制 ONNX Runtime 运行时库
 file(GLOB ONNXRUNTIME_RUNTIME_LIBS "${ONNXRUNTIME_ROOT}/${BERT_ONNXRUNTIME_RUNTIME_GLOB}")
 foreach(ONNXRUNTIME_RUNTIME_LIB ${ONNXRUNTIME_RUNTIME_LIBS})
-    copy_runtime_files(multimodal_inference_server "${ONNXRUNTIME_RUNTIME_LIB}")
+    if(TARGET multimodal_inference_server)
+        copy_runtime_files(multimodal_inference_server "${ONNXRUNTIME_RUNTIME_LIB}")
+    endif()
+    if(TARGET emotion_inference_server)
+        copy_runtime_files(emotion_inference_server "${ONNXRUNTIME_RUNTIME_LIB}")
+    endif()
 endforeach()
 
 # 复制 vcpkg 动态库依赖
 if(WIN32 AND BERT_VCPKG_TRIPLET AND NOT VCPKG_RUNTIME_DLLS)
     file(GLOB VCPKG_RUNTIME_DLLS "${CMAKE_CURRENT_SOURCE_DIR}/vcpkg_installed/${BERT_VCPKG_TRIPLET}/bin/*.dll")
-    set(BERT_RUNTIME_COPY_TARGETS multimodal_inference_server bert_inference_client bert_benchmark_client)
+    set(BERT_RUNTIME_COPY_TARGETS bert_inference_client bert_benchmark_client)
+    if(TARGET multimodal_inference_server)
+        list(APPEND BERT_RUNTIME_COPY_TARGETS multimodal_inference_server)
+    endif()
+    if(TARGET emotion_inference_server)
+        list(APPEND BERT_RUNTIME_COPY_TARGETS emotion_inference_server)
+    endif()
     if(TARGET static_site_test_server)
         list(APPEND BERT_RUNTIME_COPY_TARGETS static_site_test_server)
     endif()
@@ -1350,7 +1459,13 @@ endif()
 
 if(UNIX AND NOT APPLE AND BERT_VCPKG_TRIPLET)
     file(GLOB VCPKG_RUNTIME_SOS "${CMAKE_CURRENT_SOURCE_DIR}/vcpkg_installed/${BERT_VCPKG_TRIPLET}/lib/*.so*")
-    set(BERT_RUNTIME_COPY_TARGETS multimodal_inference_server bert_inference_client bert_benchmark_client)
+    set(BERT_RUNTIME_COPY_TARGETS bert_inference_client bert_benchmark_client)
+    if(TARGET multimodal_inference_server)
+        list(APPEND BERT_RUNTIME_COPY_TARGETS multimodal_inference_server)
+    endif()
+    if(TARGET emotion_inference_server)
+        list(APPEND BERT_RUNTIME_COPY_TARGETS emotion_inference_server)
+    endif()
     if(TARGET static_site_test_server)
         list(APPEND BERT_RUNTIME_COPY_TARGETS static_site_test_server)
     endif()
@@ -1384,5 +1499,7 @@ if(EXISTS "${CUDA_RUNTIME_DLL_ROOT}")
     elseif(UNIX AND NOT APPLE)
         file(GLOB CUDA_RUNTIME_LIBS "${CUDA_RUNTIME_DLL_ROOT}/*.so*")
     endif()
-    copy_runtime_files(multimodal_inference_server ${CUDA_RUNTIME_LIBS})
+    if(TARGET multimodal_inference_server)
+        copy_runtime_files(multimodal_inference_server ${CUDA_RUNTIME_LIBS})
+    endif()
 endif()

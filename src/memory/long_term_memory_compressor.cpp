@@ -1,6 +1,7 @@
 #include "long_term_memory_compressor.h"
 #include "../core/logger_adapter.h"
 #include "../semantic_cache/semantic_cache_pipeline.h"
+#include "../storage/sqlite/sqlite_statement.h"
 
 #include <nlohmann/json.hpp>
 #include <chrono>
@@ -50,8 +51,100 @@ core::Result<std::unique_ptr<LongTermMemoryCompressor>> LongTermMemoryCompressor
 
     auto compressor = std::unique_ptr<LongTermMemoryCompressor>(
         new LongTermMemoryCompressor(std::move(options)));
+    auto registry_status = compressor->EnsureRegistrySchema();
+    if (!registry_status.ok()) {
+        return registry_status;
+    }
 
     return compressor;
+}
+
+core::Status LongTermMemoryCompressor::EnsureRegistrySchema() const {
+    if (!options_.registry_pool) {
+        return core::Status::Ok();
+    }
+    auto lease_r = options_.registry_pool->AcquireWrite();
+    if (!lease_r.ok()) {
+        return lease_r.status();
+    }
+    auto lease = std::move(lease_r).value();
+    return lease->Execute(
+        "CREATE TABLE IF NOT EXISTS l3_user_registry ("
+        "user_uuid TEXT PRIMARY KEY NOT NULL, "
+        "first_seen_at_ms INTEGER NOT NULL, "
+        "last_seen_at_ms INTEGER NOT NULL)");
+}
+
+core::Status LongTermMemoryCompressor::RegisterUser(const std::string& user_uuid) const {
+    if (user_uuid.empty() || !options_.registry_pool) {
+        return core::Status::Ok();
+    }
+    auto lease_r = options_.registry_pool->AcquireWrite();
+    if (!lease_r.ok()) {
+        return lease_r.status();
+    }
+    auto lease = std::move(lease_r).value();
+    auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+
+    auto stmt_r = lease->Prepare(
+        "INSERT INTO l3_user_registry (user_uuid, first_seen_at_ms, last_seen_at_ms) "
+        "VALUES (?, ?, ?) "
+        "ON CONFLICT(user_uuid) DO UPDATE SET last_seen_at_ms = excluded.last_seen_at_ms");
+    if (!stmt_r.ok()) {
+        return stmt_r.status();
+    }
+    auto stmt = std::move(stmt_r).value();
+    auto status = stmt.BindText(1, user_uuid);
+    if (!status.ok()) {
+        return status;
+    }
+    status = stmt.BindInt64(2, now_ms);
+    if (!status.ok()) {
+        return status;
+    }
+    status = stmt.BindInt64(3, now_ms);
+    if (!status.ok()) {
+        return status;
+    }
+    auto step_r = stmt.Step();
+    if (!step_r.ok()) {
+        return step_r.status();
+    }
+    return core::Status::Ok();
+}
+
+core::Result<std::vector<std::string>> LongTermMemoryCompressor::GetRegisteredUsers() const {
+    if (!options_.registry_pool) {
+        return std::vector<std::string>{};
+    }
+    auto schema_status = EnsureRegistrySchema();
+    if (!schema_status.ok()) {
+        return schema_status;
+    }
+    auto lease_r = options_.registry_pool->AcquireRead();
+    if (!lease_r.ok()) {
+        return lease_r.status();
+    }
+    auto lease = std::move(lease_r).value();
+    auto stmt_r = lease->Prepare(
+        "SELECT user_uuid FROM l3_user_registry ORDER BY last_seen_at_ms DESC, user_uuid ASC");
+    if (!stmt_r.ok()) {
+        return stmt_r.status();
+    }
+    auto stmt = std::move(stmt_r).value();
+    std::vector<std::string> users;
+    while (true) {
+        auto step_r = stmt.Step();
+        if (!step_r.ok()) {
+            return step_r.status();
+        }
+        if (step_r.value() == storage::sqlite::SqliteStepResult::Done) {
+            break;
+        }
+        users.push_back(stmt.ColumnText(0));
+    }
+    return users;
 }
 
 core::Result<int64_t> LongTermMemoryCompressor::EnsureUserPartition(const std::string& user_uuid) {
@@ -208,6 +301,7 @@ core::Result<int> LongTermMemoryCompressor::StoreFacts(
         std::chrono::system_clock::now().time_since_epoch()).count();
 
     json meta;
+    meta["user_uuid"] = user_uuid;
     meta["date"] = date;
     meta["source_record_count"] = source_record_count;
     std::string meta_json = meta.dump();
@@ -245,6 +339,10 @@ core::Result<int> LongTermMemoryCompressor::StoreFacts(
     auto insert_status = options_.vector_repo->InsertEntries(entries);
     if (!insert_status.ok()) {
         return insert_status;
+    }
+    auto register_status = RegisterUser(user_uuid);
+    if (!register_status.ok()) {
+        return register_status;
     }
 
     if (options_.index_manager) {
@@ -285,6 +383,7 @@ core::Status LongTermMemoryCompressor::StoreSummary(const LongTermMemoryRecord& 
             std::chrono::system_clock::now().time_since_epoch()).count();
 
         json meta;
+        meta["user_uuid"] = record.user_uuid;
         meta["date"] = record.date;
         meta["source_record_count"] = record.source_record_count;
         std::string meta_json = meta.dump();
@@ -305,7 +404,11 @@ core::Status LongTermMemoryCompressor::StoreSummary(const LongTermMemoryRecord& 
             entries.push_back(std::move(entry));
         }
 
-        return options_.vector_repo->InsertEntries(entries);
+        auto status = options_.vector_repo->InsertEntries(entries);
+        if (!status.ok()) {
+            return status;
+        }
+        return RegisterUser(record.user_uuid);
     }
 
     auto r = StoreFacts(record.user_uuid, record.date, facts, record.source_record_count);

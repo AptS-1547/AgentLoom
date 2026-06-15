@@ -83,10 +83,20 @@ PersonaGatewayServer::PersonaGatewayServer(PersonaGatewayServerOptions options,
                document_service_,
                dependencies_.llm_client,
                dependencies_.document_embedding_provider,
-               dependencies_.document_llm_chunk_cache),
-      http_server_(ResolveHttpOptions(options_)) {
+               dependencies_.document_llm_chunk_cache,
+               dependencies_.document_semantic_cache),
+      http_server_(ResolveHttpOptions(options_)),
+      maintenance_(core::LoggerAdapter::ForModule("gateway")) {
     if (options_.static_files) {
         static_files_ = std::make_shared<::net::StaticFileHandler>(*options_.static_files);
+    }
+
+    static_cast<void>(maintenance_.RegisterTask(std::make_shared<SessionMaintenanceTask>(
+        sessions_,
+        std::chrono::seconds(30),
+        core::LoggerAdapter::ForModule("gateway"))));
+    for (const auto& task : dependencies_.maintenance_tasks) {
+        static_cast<void>(maintenance_.RegisterTask(task));
     }
 
     http_server_.SetHttpRequestHandler([this](std::shared_ptr<::net::IHttpRequest> request) {
@@ -99,6 +109,14 @@ PersonaGatewayServer::PersonaGatewayServer(PersonaGatewayServerOptions options,
 
 PersonaGatewayServer::~PersonaGatewayServer() {
     Stop();
+}
+
+core::Status PersonaGatewayServer::RegisterMaintenanceTask(std::shared_ptr<IRuntimeMaintenanceTask> task) {
+    if (started_ || maintenance_.running()) {
+        return core::Status::Error(core::ErrorCode::FailedPrecondition,
+                                   "maintenance tasks must be registered before server start");
+    }
+    return maintenance_.RegisterTask(std::move(task));
 }
 
 core::Status PersonaGatewayServer::Start() {
@@ -131,8 +149,29 @@ core::Status PersonaGatewayServer::Start() {
         return io_status;
     }
 
+    if (options_.document_store.enabled) {
+        auto document_task_status = maintenance_.RegisterTask(std::make_shared<DocumentRetentionMaintenanceTask>(
+            document_service_,
+            std::chrono::seconds(options_.document_store.cleanup_interval_seconds)));
+        if (!document_task_status.ok() && document_task_status.code() != core::ErrorCode::AlreadyExists) {
+            ShutdownDocumentStore();
+            io_pool_.Shutdown(false);
+            compute_pool_.Shutdown(false);
+            return document_task_status;
+        }
+    }
+
+    auto maintenance_status = maintenance_.Start();
+    if (!maintenance_status.ok()) {
+        ShutdownDocumentStore();
+        io_pool_.Shutdown(false);
+        compute_pool_.Shutdown(false);
+        return maintenance_status;
+    }
+
     auto http_status = http_server_.Start();
     if (!http_status.ok()) {
+        maintenance_.Stop();
         ShutdownDocumentStore();
         io_pool_.Shutdown(false);
         compute_pool_.Shutdown(false);
@@ -219,7 +258,7 @@ void PersonaGatewayServer::Stop() {
         return;
     }
     http_server_.Stop();
-    sessions_.CleanupExpired();
+    maintenance_.Stop();
     io_pool_.Shutdown(true);
     compute_pool_.Shutdown(true);
     if (auth_redis_) {

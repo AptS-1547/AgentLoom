@@ -88,6 +88,15 @@ TEST(SemanticCacheCodecTest, SerializeDeserialize) {
     original.embedding = GenerateRandomEmbedding(384, rng);
     original.input = "测试输入";
     original.response = "测试响应";
+    original.metadata.scope = CacheScope::User;
+    original.metadata.answer_type = AnswerType::Tutoring;
+    original.metadata.user_id = "user-1";
+    original.metadata.subject = "math";
+    original.metadata.quality_score = 0.95f;
+    original.metadata.fingerprint.embedding_model_version = "embed-v1";
+    original.metadata.fingerprint.embedding_dimension = 384;
+    original.prompt_version = "prompt-v1";
+    original.extra_metadata["source"] = "unit-test";
 
     std::string serialized = SerializeCacheRecord(original);
     ASSERT_FALSE(serialized.empty());
@@ -102,6 +111,15 @@ TEST(SemanticCacheCodecTest, SerializeDeserialize) {
     }
     EXPECT_EQ(deserialized.input, original.input);
     EXPECT_EQ(deserialized.response, original.response);
+    EXPECT_EQ(deserialized.metadata.scope, CacheScope::User);
+    EXPECT_EQ(deserialized.metadata.answer_type, AnswerType::Tutoring);
+    EXPECT_EQ(deserialized.metadata.user_id, "user-1");
+    EXPECT_EQ(deserialized.metadata.subject, "math");
+    EXPECT_FLOAT_EQ(deserialized.metadata.quality_score, 0.95f);
+    EXPECT_EQ(deserialized.metadata.fingerprint.embedding_model_version, "embed-v1");
+    EXPECT_EQ(deserialized.metadata.fingerprint.embedding_dimension, 384);
+    EXPECT_EQ(deserialized.prompt_version, "prompt-v1");
+    EXPECT_EQ(deserialized.extra_metadata.at("source"), "unit-test");
 }
 
 TEST(SemanticCacheCodecTest, Serialize384Dim) {
@@ -125,7 +143,7 @@ TEST(SemanticCacheCodecTest, Serialize384Dim) {
         sizeof(std::uint32_t) + record.input.size() +
         sizeof(std::uint32_t) + record.response.size();
 
-    EXPECT_EQ(serialized.size(), expected_size);
+    EXPECT_GE(serialized.size(), expected_size);
 
     auto result = DeserializeCacheRecord(serialized);
     ASSERT_TRUE(result.ok());
@@ -149,6 +167,31 @@ TEST(SemanticCacheCodecTest, InvalidData) {
     invalid_dim.append(reinterpret_cast<const char*>(&bad_dim), sizeof(bad_dim));
     auto result3 = DeserializeCacheRecord(invalid_dim);
     EXPECT_FALSE(result3.ok());
+}
+
+TEST(SemanticCacheCodecTest, DeserializesLegacyRecordWithoutMetadataExtension) {
+    CacheRecord record;
+    record.embedding.assign(384, 0.25f);
+    record.input = "legacy input";
+    record.response = "legacy response";
+
+    std::string legacy;
+    std::uint32_t dim = static_cast<std::uint32_t>(record.embedding.size());
+    std::uint32_t input_len = static_cast<std::uint32_t>(record.input.size());
+    std::uint32_t response_len = static_cast<std::uint32_t>(record.response.size());
+    legacy.append(reinterpret_cast<const char*>(&dim), sizeof(dim));
+    legacy.append(reinterpret_cast<const char*>(record.embedding.data()), record.embedding.size() * sizeof(float));
+    legacy.append(reinterpret_cast<const char*>(&input_len), sizeof(input_len));
+    legacy.append(record.input);
+    legacy.append(reinterpret_cast<const char*>(&response_len), sizeof(response_len));
+    legacy.append(record.response);
+
+    auto decoded = DeserializeCacheRecord(legacy);
+    ASSERT_TRUE(decoded.ok()) << decoded.status().message();
+    EXPECT_EQ(decoded.value().input, record.input);
+    EXPECT_EQ(decoded.value().response, record.response);
+    EXPECT_EQ(decoded.value().metadata.scope, CacheScope::Global);
+    EXPECT_TRUE(decoded.value().metadata.user_id.empty());
 }
 
 TEST(MockVectorRepositoryTest, EmptySearch) {
@@ -254,6 +297,61 @@ TEST(DotProductTest, NormalizedVectors) {
 
     EXPECT_GE(dot, -1.0f);
     EXPECT_LE(dot, 1.0f);
+}
+
+TEST(ContextRiskDetectorTest, BlocksGlobalCacheForRecentTurnMarker) {
+    KeywordContextRiskDetector detector;
+    CacheLookupRequest req;
+    req.scope = CacheScope::Global;
+    req.text = "这个应该怎么继续？";
+    req.recent_turns = {"上一轮内容"};
+
+    auto risk = detector.Assess(req);
+    ASSERT_TRUE(risk.ok()) << risk.status().message();
+    EXPECT_TRUE(risk.value().blocks_global_cache);
+}
+
+TEST(ContextRiskDetectorTest, AllowsStandaloneGlobalQuestion) {
+    KeywordContextRiskDetector detector;
+    CacheLookupRequest req;
+    req.scope = CacheScope::Global;
+    req.text = "二次函数的顶点式是什么？";
+
+    auto risk = detector.Assess(req);
+    ASSERT_TRUE(risk.ok()) << risk.status().message();
+    EXPECT_FALSE(risk.value().blocks_global_cache);
+}
+
+TEST(DefaultPolicyMatcherTest, RejectsGlobalLookupReadingUserEntry) {
+    DefaultPolicyMatcher matcher;
+    CacheLookupRequest req;
+    req.scope = CacheScope::Global;
+
+    CacheEntryMetadata entry;
+    entry.scope = CacheScope::User;
+    entry.user_id = "user-1";
+
+    auto matched = matcher.Matches(req, entry);
+    ASSERT_TRUE(matched.ok()) << matched.status().message();
+    EXPECT_FALSE(matched.value());
+}
+
+TEST(DefaultPolicyMatcherTest, AllowsMatchingTenantEntry) {
+    DefaultPolicyMatcher matcher;
+    CacheLookupRequest req;
+    req.scope = CacheScope::Tenant;
+    req.tenant_id = "tenant-a";
+    req.subject = "math";
+
+    CacheEntryMetadata entry;
+    entry.scope = CacheScope::Tenant;
+    entry.tenant_id = "tenant-a";
+    entry.subject = "math";
+    entry.quality_score = 0.9f;
+
+    auto matched = matcher.Matches(req, entry);
+    ASSERT_TRUE(matched.ok()) << matched.status().message();
+    EXPECT_TRUE(matched.value());
 }
 
 int main(int argc, char** argv) {

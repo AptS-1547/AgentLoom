@@ -6,6 +6,8 @@
 #include <chrono>
 #include <cstring>
 #include <random>
+#include <sstream>
+#include <unordered_map>
 
 namespace agent::semantic_cache {
 
@@ -14,6 +16,132 @@ namespace {
 // Uniform sampling matches the L0 "unbiased subset of full history" assumption
 // better than strict LRU rotation for context-selection workloads.
 thread_local std::mt19937 g_batch_rng{std::random_device{}()};
+constexpr std::uint32_t kCacheRecordExtensionMagic = 0x43524D45; // CRME
+constexpr std::uint32_t kCacheRecordExtensionVersion = 1;
+
+void AppendPod(std::string& buf, const auto& value) {
+    const auto* raw = reinterpret_cast<const char*>(&value);
+    buf.append(raw, sizeof(value));
+}
+
+core::Status ReadPod(const char*& p, const char* end, auto& value, std::string_view name) {
+    if (p + sizeof(value) > end) {
+        return core::Status::Error(core::ErrorCode::InvalidArgument, "truncated " + std::string(name));
+    }
+    std::memcpy(&value, p, sizeof(value));
+    p += sizeof(value);
+    return core::Status::Ok();
+}
+
+void AppendString(std::string& buf, const std::string& value) {
+    const auto len = static_cast<std::uint32_t>(value.size());
+    AppendPod(buf, len);
+    buf.append(value);
+}
+
+core::Status ReadString(const char*& p, const char* end, std::string& value, std::string_view name) {
+    std::uint32_t len = 0;
+    auto status = ReadPod(p, end, len, name);
+    if (!status.ok()) {
+        return status;
+    }
+    if (p + len > end) {
+        return core::Status::Error(core::ErrorCode::InvalidArgument, "truncated " + std::string(name));
+    }
+    value.assign(p, len);
+    p += len;
+    return core::Status::Ok();
+}
+
+void AppendStringMap(std::string& buf, const std::unordered_map<std::string, std::string>& values) {
+    const auto count = static_cast<std::uint32_t>(values.size());
+    AppendPod(buf, count);
+    for (const auto& [key, value] : values) {
+        AppendString(buf, key);
+        AppendString(buf, value);
+    }
+}
+
+core::Status ReadStringMap(const char*& p,
+                           const char* end,
+                           std::unordered_map<std::string, std::string>& values) {
+    std::uint32_t count = 0;
+    auto status = ReadPod(p, end, count, "metadata map count");
+    if (!status.ok()) {
+        return status;
+    }
+    values.clear();
+    values.reserve(count);
+    for (std::uint32_t i = 0; i < count; ++i) {
+        std::string key;
+        std::string value;
+        status = ReadString(p, end, key, "metadata map key");
+        if (!status.ok()) {
+            return status;
+        }
+        status = ReadString(p, end, value, "metadata map value");
+        if (!status.ok()) {
+            return status;
+        }
+        values.emplace(std::move(key), std::move(value));
+    }
+    return core::Status::Ok();
+}
+
+core::Result<std::vector<float>> EncodeText(const SemanticCachePipelineOptions& options,
+                                            const SemanticCachePipelineDeps& deps,
+                                            std::string_view text) {
+    if (!deps.tokenizer || !deps.embedding_model) {
+        return core::Status::Error(core::ErrorCode::FailedPrecondition,
+                                   "semantic cache tokenizer and embedding model are required");
+    }
+    auto tokenized = deps.tokenizer->Encode(text, options.tokenizer_options);
+    if (!tokenized.ok()) {
+        return tokenized.status();
+    }
+    auto embedded = deps.embedding_model->Embed(tokenized.value());
+    if (!embedded.ok()) {
+        return embedded.status();
+    }
+    auto batch = std::move(embedded).value();
+    if (batch.batch_size != 1 || batch.dimension != kExpectedEmbeddingDim ||
+        batch.embeddings.size() != kExpectedEmbeddingDim) {
+        return core::Status::Error(core::ErrorCode::InvalidArgument,
+                                   "semantic cache embedding shape mismatch");
+    }
+    return std::move(batch.embeddings);
+}
+
+std::string BuildLookupPayload(const storage::CacheRecord& record) {
+    std::ostringstream payload;
+    payload << record.response;
+    return payload.str();
+}
+
+std::int64_t NowUnixMs() {
+    const auto now = std::chrono::system_clock::now().time_since_epoch();
+    return std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
+}
+
+CacheEntryMetadata MetadataFromStoreRequest(const CacheStoreRequest& req) {
+    CacheEntryMetadata metadata;
+    metadata.scope = req.origin.scope;
+    metadata.answer_type = req.answer_type;
+    metadata.tenant_id = req.origin.tenant_id;
+    metadata.user_id = req.origin.user_id;
+    metadata.session_id = req.origin.session_id;
+    metadata.subject = req.origin.subject;
+    metadata.grade = req.origin.grade;
+    metadata.topic = req.origin.topic;
+    metadata.persona_id = req.origin.persona_id;
+    metadata.quality_score = req.quality_score;
+    metadata.created_at_ms = NowUnixMs();
+    if (req.ttl) {
+        metadata.expires_at_ms = metadata.created_at_ms +
+            std::chrono::duration_cast<std::chrono::milliseconds>(*req.ttl).count();
+    }
+    return metadata;
+}
 }  // namespace
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -35,6 +163,35 @@ std::string SerializeCacheRecord(const storage::CacheRecord& r) {
     std::memcpy(p, r.input.data(), input_len);   p += input_len;
     std::memcpy(p, &response_len, 4);     p += 4;
     std::memcpy(p, r.response.data(), response_len);
+
+    AppendPod(buf, kCacheRecordExtensionMagic);
+    AppendPod(buf, kCacheRecordExtensionVersion);
+    AppendPod(buf, r.metadata.entry_id);
+    auto scope = static_cast<std::int32_t>(r.metadata.scope);
+    auto answer_type = static_cast<std::int32_t>(r.metadata.answer_type);
+    AppendPod(buf, scope);
+    AppendPod(buf, answer_type);
+    AppendString(buf, r.metadata.tenant_id);
+    AppendString(buf, r.metadata.user_id);
+    AppendString(buf, r.metadata.session_id);
+    AppendString(buf, r.metadata.subject);
+    AppendString(buf, r.metadata.grade);
+    AppendString(buf, r.metadata.topic);
+    AppendString(buf, r.metadata.persona_id);
+    AppendPod(buf, r.metadata.quality_score);
+    AppendPod(buf, r.metadata.created_at_ms);
+    AppendPod(buf, r.metadata.expires_at_ms);
+    AppendString(buf, r.metadata.fingerprint.tokenizer_version);
+    AppendString(buf, r.metadata.fingerprint.embedding_model_version);
+    AppendString(buf, r.metadata.fingerprint.corpus_version);
+    AppendString(buf, r.metadata.fingerprint.policy_version);
+    AppendPod(buf, r.metadata.fingerprint.embedding_dimension);
+    AppendString(buf, r.payload_type);
+    AppendString(buf, r.prompt_version);
+    AppendString(buf, r.model_version);
+    AppendString(buf, r.corpus_version);
+    AppendString(buf, r.policy_version);
+    AppendStringMap(buf, r.extra_metadata);
 
     return buf;
 }
@@ -82,6 +239,61 @@ core::Result<storage::CacheRecord> DeserializeCacheRecord(std::string_view buf) 
         return core::Status::Error(core::ErrorCode::InvalidArgument, "truncated response");
     }
     r.response.assign(p, response_len);
+    p += response_len;
+
+    if (p == end) {
+        return r;
+    }
+
+    std::uint32_t magic = 0;
+    auto status = ReadPod(p, end, magic, "cache record extension magic");
+    if (!status.ok()) {
+        return status;
+    }
+    if (magic != kCacheRecordExtensionMagic) {
+        return core::Status::Error(core::ErrorCode::InvalidArgument, "invalid cache record extension magic");
+    }
+
+    std::uint32_t version = 0;
+    status = ReadPod(p, end, version, "cache record extension version");
+    if (!status.ok()) {
+        return status;
+    }
+    if (version != kCacheRecordExtensionVersion) {
+        return core::Status::Error(core::ErrorCode::InvalidArgument, "unsupported cache record extension version");
+    }
+
+    status = ReadPod(p, end, r.metadata.entry_id, "entry_id");
+    if (!status.ok()) return status;
+    std::int32_t scope = 0;
+    std::int32_t answer_type = 0;
+    status = ReadPod(p, end, scope, "scope");
+    if (!status.ok()) return status;
+    status = ReadPod(p, end, answer_type, "answer_type");
+    if (!status.ok()) return status;
+    r.metadata.scope = static_cast<CacheScope>(scope);
+    r.metadata.answer_type = static_cast<AnswerType>(answer_type);
+    if (auto s = ReadString(p, end, r.metadata.tenant_id, "tenant_id"); !s.ok()) return s;
+    if (auto s = ReadString(p, end, r.metadata.user_id, "user_id"); !s.ok()) return s;
+    if (auto s = ReadString(p, end, r.metadata.session_id, "session_id"); !s.ok()) return s;
+    if (auto s = ReadString(p, end, r.metadata.subject, "subject"); !s.ok()) return s;
+    if (auto s = ReadString(p, end, r.metadata.grade, "grade"); !s.ok()) return s;
+    if (auto s = ReadString(p, end, r.metadata.topic, "topic"); !s.ok()) return s;
+    if (auto s = ReadString(p, end, r.metadata.persona_id, "persona_id"); !s.ok()) return s;
+    if (auto s = ReadPod(p, end, r.metadata.quality_score, "quality_score"); !s.ok()) return s;
+    if (auto s = ReadPod(p, end, r.metadata.created_at_ms, "created_at_ms"); !s.ok()) return s;
+    if (auto s = ReadPod(p, end, r.metadata.expires_at_ms, "expires_at_ms"); !s.ok()) return s;
+    if (auto s = ReadString(p, end, r.metadata.fingerprint.tokenizer_version, "tokenizer_version"); !s.ok()) return s;
+    if (auto s = ReadString(p, end, r.metadata.fingerprint.embedding_model_version, "embedding_model_version"); !s.ok()) return s;
+    if (auto s = ReadString(p, end, r.metadata.fingerprint.corpus_version, "corpus_version"); !s.ok()) return s;
+    if (auto s = ReadString(p, end, r.metadata.fingerprint.policy_version, "policy_version"); !s.ok()) return s;
+    if (auto s = ReadPod(p, end, r.metadata.fingerprint.embedding_dimension, "embedding_dimension"); !s.ok()) return s;
+    if (auto s = ReadString(p, end, r.payload_type, "payload_type"); !s.ok()) return s;
+    if (auto s = ReadString(p, end, r.prompt_version, "prompt_version"); !s.ok()) return s;
+    if (auto s = ReadString(p, end, r.model_version, "model_version"); !s.ok()) return s;
+    if (auto s = ReadString(p, end, r.corpus_version, "corpus_version"); !s.ok()) return s;
+    if (auto s = ReadString(p, end, r.policy_version, "policy_version"); !s.ok()) return s;
+    if (auto s = ReadStringMap(p, end, r.extra_metadata); !s.ok()) return s;
 
     return r;
 }
@@ -93,8 +305,22 @@ core::Result<storage::CacheRecord> DeserializeCacheRecord(std::string_view buf) 
 core::Result<std::unique_ptr<SemanticCachePipeline>> SemanticCachePipeline::Create(
     SemanticCachePipelineOptions options,
     SemanticCachePipelineDeps deps) {
-    // TODO(orange): validate deps (all required handles non-null) and
-    // return InvalidArgument if anything mandatory is missing.
+    if (options.top_k == 0) {
+        return core::Status::Error(core::ErrorCode::InvalidArgument, "top_k must be > 0");
+    }
+    if (options.similarity_floor < -1.0f || options.similarity_floor > 1.0f) {
+        return core::Status::Error(core::ErrorCode::InvalidArgument, "similarity_floor must be within [-1, 1]");
+    }
+    if (!deps.risk_detector) {
+        deps.risk_detector = std::make_shared<KeywordContextRiskDetector>();
+    }
+    if (!deps.policy_matcher) {
+        deps.policy_matcher = std::make_shared<DefaultPolicyMatcher>();
+    }
+    if (!deps.index_manager && !deps.repository) {
+        return core::Status::Error(core::ErrorCode::InvalidArgument,
+                                   "semantic cache requires an index manager or vector repository");
+    }
     auto self = std::unique_ptr<SemanticCachePipeline>(
         new SemanticCachePipeline(std::move(options), std::move(deps)));
     return self;
@@ -107,13 +333,131 @@ SemanticCachePipeline::SemanticCachePipeline(SemanticCachePipelineOptions option
 SemanticCachePipeline::~SemanticCachePipeline() = default;
 
 core::Result<CacheLookupResult> SemanticCachePipeline::Lookup(const CacheLookupRequest& req) {
-    // TODO(orange): implement.
-    return CacheLookupResult{};  // miss
+    if (req.text.empty()) {
+        return CacheLookupResult{};
+    }
+    if (req.scope == CacheScope::Global && !options_.enable_global_scope) {
+        return CacheLookupResult{};
+    }
+
+    auto risk = deps_.risk_detector->Assess(req);
+    if (!risk.ok()) {
+        return risk.status();
+    }
+    if (req.scope == CacheScope::Global && risk.value().blocks_global_cache) {
+        return CacheLookupResult{};
+    }
+
+    auto embedding = EncodeText(options_, deps_, req.text);
+    if (!embedding.ok()) {
+        return embedding.status();
+    }
+
+    if (deps_.index_manager) {
+        auto hits = deps_.index_manager->SearchAllBatches(embedding.value(), options_.top_k);
+        if (!hits.ok()) {
+            if (hits.status().code() == core::ErrorCode::NotFound) {
+                return CacheLookupResult{};
+            }
+            return hits.status();
+        }
+        for (const auto& hit : hits.value()) {
+            if (hit.score < options_.similarity_floor) {
+                continue;
+            }
+            auto matched = deps_.policy_matcher->Matches(req, hit.record.metadata);
+            if (!matched.ok()) {
+                return matched.status();
+            }
+            if (!matched.value()) {
+                continue;
+            }
+
+            CacheLookupResult result;
+            result.hit = true;
+            result.similarity_score = hit.score;
+            result.payload = BuildLookupPayload(hit.record);
+            result.retrieved_at = std::chrono::system_clock::now();
+            return result;
+        }
+        return CacheLookupResult{};
+    }
+
+    auto records = deps_.repository->Search(embedding.value(), options_.top_k);
+    if (!records.ok()) {
+        if (records.status().code() == core::ErrorCode::NotFound) {
+            return CacheLookupResult{};
+        }
+        return records.status();
+    }
+    for (const auto& record : records.value()) {
+        if (record.embedding.size() != kExpectedEmbeddingDim) {
+            continue;
+        }
+        const float score = dot_product_unrolled<kExpectedEmbeddingDim>(embedding.value().data(), record.embedding.data());
+        if (score < options_.similarity_floor) {
+            continue;
+        }
+        auto matched = deps_.policy_matcher->Matches(req, record.metadata);
+        if (!matched.ok()) {
+            return matched.status();
+        }
+        if (!matched.value()) {
+            continue;
+        }
+        CacheLookupResult result;
+        result.hit = true;
+        result.similarity_score = score;
+        result.payload = BuildLookupPayload(record);
+        result.retrieved_at = std::chrono::system_clock::now();
+        return result;
+    }
+    return CacheLookupResult{};
 }
 
 core::Status SemanticCachePipeline::Store(const CacheStoreRequest& req) {
-    // TODO(orange): implement.
-    return core::Status::Ok();
+    if (req.origin.text.empty() || req.response_payload.empty()) {
+        return core::Status::Ok();
+    }
+    if (req.origin.scope == CacheScope::Global && !options_.enable_global_scope) {
+        return core::Status::Ok();
+    }
+
+    auto risk = deps_.risk_detector->Assess(req.origin);
+    if (!risk.ok()) {
+        return risk.status();
+    }
+    if (req.origin.scope == CacheScope::Global && risk.value().blocks_global_cache) {
+        return core::Status::Ok();
+    }
+
+    auto embedding = EncodeText(options_, deps_, req.origin.text);
+    if (!embedding.ok()) {
+        return embedding.status();
+    }
+
+    storage::CacheRecord record;
+    record.embedding = std::move(embedding).value();
+    record.input = req.origin.text;
+    record.response = req.response_payload;
+    record.metadata = MetadataFromStoreRequest(req);
+    record.prompt_version = req.origin.extra.contains("prompt_version") ? req.origin.extra.at("prompt_version") : std::string{};
+    record.model_version = req.origin.extra.contains("model_version") ? req.origin.extra.at("model_version") : std::string{};
+    record.corpus_version = req.origin.extra.contains("corpus_version") ? req.origin.extra.at("corpus_version") : std::string{};
+    record.policy_version = req.origin.extra.contains("policy_version") ? req.origin.extra.at("policy_version") : std::string{};
+    record.payload_type = req.origin.extra.contains("payload_type") ? req.origin.extra.at("payload_type") : std::string{};
+    record.extra_metadata = req.origin.extra;
+    record.metadata.fingerprint.tokenizer_version =
+        req.origin.extra.contains("tokenizer_version") ? req.origin.extra.at("tokenizer_version") : std::string{};
+    record.metadata.fingerprint.embedding_model_version = record.model_version;
+    record.metadata.fingerprint.corpus_version = record.corpus_version;
+    record.metadata.fingerprint.policy_version = record.policy_version;
+    record.metadata.fingerprint.embedding_dimension = static_cast<std::int32_t>(record.embedding.size());
+
+    if (deps_.index_manager) {
+        return deps_.index_manager->AddRecord(record);
+    }
+    return deps_.repository->Store(std::vector<storage::CacheRecord>{std::move(record)});
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -388,6 +732,91 @@ core::Result<std::vector<storage::CacheRecord>> cache_vector::VectorIndexManager
     }
 
     return result;
+}
+
+core::Result<std::vector<cache_vector::ScoredCacheRecord>> cache_vector::VectorIndexManager::SearchAllBatches(
+    const std::vector<float>& embedding,
+    std::size_t top_k) {
+    if (embedding.size() != kExpectedEmbeddingDim) {
+        return core::Status::Error(core::ErrorCode::InvalidArgument,
+            "embedding dimension mismatch: expected " + std::to_string(kExpectedEmbeddingDim)
+            + " got " + std::to_string(embedding.size()));
+    }
+    if (top_k == 0) {
+        return core::Status::Error(core::ErrorCode::InvalidArgument, "top_k must be > 0");
+    }
+
+    auto status = LoadActiveBatch();
+    if (!status.ok()) {
+        return status;
+    }
+    status = LoadTimestampIndex();
+    if (!status.ok()) {
+        return status;
+    }
+    if (active_timestamp_ == 0 && timestamp_index_.empty()) {
+        status = RebuildTimestampIndexFromRedis();
+        if (!status.ok()) {
+            return status;
+        }
+    }
+
+    search_records_.clear();
+    if (active_timestamp_ != 0) {
+        auto result = redis_pool_->HGetAll(BuildBatchKey(active_timestamp_));
+        if (!result.ok()) {
+            return result.status();
+        }
+        for (const auto& [field, serialized] : result.value()) {
+            auto record_result = DeserializeCacheRecord(serialized);
+            if (record_result.ok()) {
+                search_records_.push_back(std::move(record_result.value()));
+            }
+        }
+    }
+
+    for (auto ts : timestamp_index_) {
+        auto result = redis_pool_->HGetAll(BuildBatchKey(ts));
+        if (!result.ok()) {
+            return result.status();
+        }
+        for (const auto& [field, serialized] : result.value()) {
+            auto record_result = DeserializeCacheRecord(serialized);
+            if (record_result.ok()) {
+                search_records_.push_back(std::move(record_result.value()));
+            }
+        }
+    }
+
+    if (search_records_.empty()) {
+        return core::Status::Error(core::ErrorCode::NotFound, "no records loaded");
+    }
+
+    std::vector<ScoredCacheRecord> scored;
+    scored.reserve(search_records_.size());
+    for (const auto& record : search_records_) {
+        if (record.embedding.size() != kExpectedEmbeddingDim) {
+            continue;
+        }
+        scored.push_back(ScoredCacheRecord{
+            record,
+            dot_product_unrolled<kExpectedEmbeddingDim>(embedding.data(), record.embedding.data())
+        });
+    }
+    if (scored.empty()) {
+        return core::Status::Error(core::ErrorCode::NotFound, "no valid records loaded");
+    }
+
+    const auto n = std::min(top_k, scored.size());
+    std::partial_sort(
+        scored.begin(),
+        scored.begin() + n,
+        scored.end(),
+        [](const ScoredCacheRecord& lhs, const ScoredCacheRecord& rhs) {
+            return lhs.score > rhs.score;
+        });
+    scored.resize(n);
+    return scored;
 }
 
 core::Result<std::vector<cache_vector::SearchWithContextResult>> cache_vector::VectorIndexManager::SearchWithContext(

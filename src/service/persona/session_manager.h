@@ -101,6 +101,7 @@ struct SessionState {
     std::chrono::steady_clock::time_point created_at{};
     std::chrono::steady_clock::time_point last_active{};
     std::deque<ConversationTurn> recent_history;
+    std::shared_ptr<const PersonalityConfig> personality;
     EmotionStateTracker emotion_state;
     std::unique_ptr<PromptBuilder> prompt_builder;
     SessionMetrics metrics;

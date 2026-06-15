@@ -2,6 +2,7 @@
 
 #include "llama_runner.h"
 #include "onnx_model.h"
+#include "onnx_session_utils.h"
 #include "vector_cache.h"
 #include "vlm_cache.h"
 #include "../../core/logger_adapter.h"
@@ -40,6 +41,46 @@ core::Status Error(core::ErrorCode code, std::string message) {
     return core::Status::Error(code, std::move(message));
 }
 
+bert::ModelRuntimeOptions ToModelRuntimeOptions(const BertRuntimeConfigOptions& config) {
+    bert::ModelRuntimeOptions options;
+    options.execution_provider = config.execution_provider;
+    options.allow_cpu_fallback = config.allow_cpu_fallback;
+    options.cuda_device_id = config.cuda_device_id;
+    options.intra_op_num_threads = config.intra_op_num_threads;
+    options.inter_op_num_threads = config.inter_op_num_threads;
+    options.enable_cpu_mem_arena = config.enable_cpu_mem_arena;
+    options.enable_mem_pattern = config.enable_mem_pattern;
+    return options;
+}
+
+vlm_cache::Options ToVlmCacheOptions(const VlmCacheConfigOptions& config) {
+    vlm_cache::Options options;
+    options.enabled = config.enabled;
+    options.persist = config.persist;
+    options.cache_dir = config.cache_dir;
+    options.max_entries = config.max_entries;
+    options.max_bytes = config.max_bytes;
+    options.ttl_seconds = config.ttl_seconds;
+    options.store_images = config.store_images;
+    options.store_prompts = config.store_prompts;
+    options.allow_stale_on_failure = config.allow_stale_on_failure;
+    options.default_allow_cache = config.default_allow_cache;
+    return options;
+}
+
+vlm_cache::VectorOptions ToVlmCacheVectorOptions(const VlmCacheVectorOptions& config) {
+    vlm_cache::VectorOptions options;
+    options.enabled = config.enabled;
+    options.sim_threshold_high = config.sim_threshold_high;
+    options.sim_threshold_mid = config.sim_threshold_mid;
+    options.max_saliency_for_mid = config.max_saliency_for_mid;
+    options.max_entries_per_bucket = config.max_entries_per_bucket;
+    options.ttl_seconds = config.ttl_seconds;
+    options.persist = config.persist;
+    options.vector_dir = config.vector_dir;
+    return options;
+}
+
 double BytesToMiB(std::size_t bytes) {
     return static_cast<double>(bytes) / (1024.0 * 1024.0);
 }
@@ -52,15 +93,15 @@ public:
 
     explicit Impl(const MultimodalServerOptions& options)
         : vram_options_(options.vram),
-          vlm_cache_(options.vlm_cache),
-          vector_index_(options.vlm_cache_vector),
+          vlm_cache_(ToVlmCacheOptions(options.vlm_cache)),
+          vector_index_(ToVlmCacheVectorOptions(options.vlm_cache_vector)),
           llm_model_path_(options.llm_model),
           mmproj_path_(options.mmproj),
           model_fingerprint_(BuildModelFingerprint(options.llm_model, options.mmproj, options.n_gpu_layers)),
           n_gpu_layers_(options.n_gpu_layers) {
         if (!options.bert_model.empty()) {
             logger.info("Loading BERT model: {}", options.bert_model);
-            if (!bert_model_.LoadModel(options.bert_model, options.bert_runtime)) {
+            if (!bert_model_.LoadModel(options.bert_model, ToModelRuntimeOptions(options.bert_runtime))) {
                 logger.error("Failed to load BERT model");
             }
         }

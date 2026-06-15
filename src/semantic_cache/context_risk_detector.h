@@ -29,4 +29,22 @@ public:
     virtual core::Result<ContextRiskAssessment> Assess(const CacheLookupRequest& req) = 0;
 };
 
+struct KeywordContextRiskDetectorOptions {
+    std::vector<std::string> markers = {
+        "这个", "那个", "这些", "那些", "上面", "下面", "前面", "后面", "刚才", "刚刚",
+        "上一", "上一步", "前一步", "这张图", "图片里", "图中",
+        "this", "that", "these", "those", "above", "previous", "last step", "the image"
+    };
+};
+
+class KeywordContextRiskDetector final : public IContextRiskDetector {
+public:
+    explicit KeywordContextRiskDetector(KeywordContextRiskDetectorOptions options = {});
+
+    core::Result<ContextRiskAssessment> Assess(const CacheLookupRequest& req) override;
+
+private:
+    KeywordContextRiskDetectorOptions options_;
+};
+
 }  // namespace agent::semantic_cache

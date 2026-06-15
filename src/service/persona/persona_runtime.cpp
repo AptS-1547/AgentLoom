@@ -191,7 +191,9 @@ core::Status SemanticMemoryContextProvider::AdmitTurn(std::string_view session_i
     return l0_cache_->Store(store);
 }
 
-core::Result<EmotionAnalysis> NeutralEmotionAnalyzer::Analyze(std::string_view, std::string_view) {
+core::Result<EmotionAnalysis> NeutralEmotionAnalyzer::Analyze(std::string_view,
+                                                              std::string_view,
+                                                              std::shared_ptr<const PersonalityConfig>) {
     EmotionAnalysis analysis;
     analysis.emotion.primary = "neutral";
     analysis.emotion.intensity = 0.0;
@@ -318,7 +320,9 @@ core::Result<PersonaRuntime::PreparedChat> PersonaRuntime::PrepareChat(SessionSt
                  prepared.memory.l0_hit,
                  prepared.memory.l3_hit);
 
-    auto emotion = emotion_analyzer_->Analyze(prepared.request.user_input, prepared.request.trace_id);
+    auto emotion = emotion_analyzer_->Analyze(prepared.request.user_input,
+                                              prepared.request.trace_id,
+                                              session.personality);
     if (!emotion.ok()) {
         logger_.warn("[trace={}] [persona_runtime] user emotion failed session={} code={} reason={}",
                      prepared.request.trace_id,
@@ -524,7 +528,9 @@ void PersonaRuntime::CompleteWithLlm(SessionState& session, PreparedChat prepare
     prepared.latency.total = Since(prepared.started_at);
     prepared.latency.io_stage = Since(io_stage_start);
 
-    auto ai_emotion = emotion_analyzer_->Analyze(completion.content, prepared.request.trace_id);
+    auto ai_emotion = emotion_analyzer_->Analyze(completion.content,
+                                                 prepared.request.trace_id,
+                                                 session.personality);
     if (!ai_emotion.ok()) {
         callback(ai_emotion.status());
         return;

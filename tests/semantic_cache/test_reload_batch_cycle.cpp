@@ -12,7 +12,9 @@ using namespace storage;
 class ReloadBatchCycleTest : public ::testing::Test {
 protected:
     void SetUp() override {
-        test_db_path_ = "test_reload_cycle.db";
+        const auto unique = std::chrono::system_clock::now().time_since_epoch().count();
+        test_db_path_ = (std::filesystem::temp_directory_path() /
+            ("test_reload_cycle_" + std::to_string(unique) + ".db")).string();
         std::filesystem::remove(test_db_path_);
 
         auto conn_result = sqlite::SqliteConnection::Open(test_db_path_);
@@ -25,7 +27,8 @@ protected:
                 .port = "5000",
                 .pool_size = 2
             });
-        redis_pool_->Start();
+        auto redis_status = redis_pool_->Start();
+        ASSERT_TRUE(redis_status.ok()) << redis_status.message();
 
         user_uuid_ = "test_user_reload_cycle_" + std::to_string(std::chrono::system_clock::now().time_since_epoch().count());
 
@@ -38,7 +41,8 @@ protected:
             redis_pool_->Shutdown();
         }
         sqlite_conn_ = sqlite::SqliteConnection();
-        std::filesystem::remove(test_db_path_);
+        std::error_code ec;
+        std::filesystem::remove(test_db_path_, ec);
     }
 
     void CleanupRedisKeys() {
@@ -92,7 +96,8 @@ TEST_F(ReloadBatchCycleTest, RebuildFromRedisWhenIndexEmpty) {
         }
     }
 
-    std::string new_db = "test_rebuild_fresh.db";
+    std::string new_db = (std::filesystem::temp_directory_path() /
+        ("test_rebuild_fresh_" + std::to_string(std::chrono::system_clock::now().time_since_epoch().count()) + ".db")).string();
     std::filesystem::remove(new_db);
     auto new_conn_result = sqlite::SqliteConnection::Open(new_db);
     ASSERT_TRUE(new_conn_result.ok());
@@ -107,5 +112,6 @@ TEST_F(ReloadBatchCycleTest, RebuildFromRedisWhenIndexEmpty) {
         ASSERT_FALSE(result.value().empty());
     }  // fresh_manager 析构，释放数据库文件句柄
 
-    std::filesystem::remove(new_db);
+    std::error_code ec;
+    std::filesystem::remove(new_db, ec);
 }

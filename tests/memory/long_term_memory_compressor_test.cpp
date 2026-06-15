@@ -4,6 +4,7 @@
 #include "../storage/sqlite/sqlite_connection_pool.h"
 #include "../semantic_cache/redis_connection_pool.h"
 #include <gtest/gtest.h>
+#include <algorithm>
 #include <filesystem>
 
 namespace fs = std::filesystem;
@@ -75,6 +76,7 @@ protected:
         opts.redis_pool = redis_pool_;
         opts.vector_repo = vector_repo_;
         opts.partition_registry = partition_registry_;
+        opts.registry_pool = sqlite_pool_;
         opts.collection_id = collection_id_;
         opts.mode = CompressorMode::Testing;
         auto r = LongTermMemoryCompressor::Create(std::move(opts));
@@ -118,6 +120,11 @@ TEST_F(LongTermMemoryCompressorTest, StoreSummaryAndRetrieve) {
     EXPECT_EQ(retrieved.source_record_count, 15);
     EXPECT_TRUE(retrieved.summary.find("C++ template metaprogramming") != std::string::npos);
     EXPECT_TRUE(retrieved.summary.find("3 exercises") != std::string::npos);
+
+    auto users = compressor->GetRegisteredUsers();
+    ASSERT_TRUE(users.ok()) << users.status().message();
+    ASSERT_FALSE(users.value().empty());
+    EXPECT_NE(std::find(users.value().begin(), users.value().end(), "test-user-123"), users.value().end());
 }
 
 TEST_F(LongTermMemoryCompressorTest, GetUserSummariesOrderedByDate) {
@@ -145,6 +152,35 @@ TEST_F(LongTermMemoryCompressorTest, GetUserSummariesOrderedByDate) {
     EXPECT_EQ(summaries[0].date, "2026-05-27");
     EXPECT_EQ(summaries[1].date, "2026-05-26");
     EXPECT_EQ(summaries[2].date, "2026-05-25");
+}
+
+TEST_F(LongTermMemoryCompressorTest, StoresUserUuidInFactMetadata) {
+    auto compressor = MakeCompressor();
+
+    LongTermMemoryRecord record;
+    record.user_uuid = "metadata-user";
+    record.date = "2026-05-27";
+    record.summary = "- Likes algebra practice\n";
+    record.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    record.source_record_count = 3;
+
+    auto store_status = compressor->StoreSummary(record);
+    ASSERT_TRUE(store_status.ok()) << store_status.message();
+
+    vector_storage::PartitionKey key;
+    key.collection_id = collection_id_;
+    key.user_id = "metadata-user";
+    key.memory_level = "L3";
+    auto partition = partition_registry_->Lookup(key);
+    ASSERT_TRUE(partition.ok()) << partition.status().message();
+    ASSERT_TRUE(partition.value().has_value());
+
+    auto entries = vector_repo_->ListEntries(*partition.value(), false);
+    ASSERT_TRUE(entries.ok()) << entries.status().message();
+    ASSERT_EQ(entries.value().size(), 1);
+    EXPECT_NE(entries.value()[0].extra_metadata_json.find("\"user_uuid\":\"metadata-user\""),
+              std::string::npos);
 }
 
 TEST_F(LongTermMemoryCompressorTest, GetDailySummaryNotFound) {

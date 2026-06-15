@@ -18,3 +18,10 @@
 - 4. 代码需保持简洁实现，接口和源码文件能合并即合并，只要不要超过800行上限即可，我会适当提出重构要求，
 ### 注意
 - 1. 所有的GetContent以及任何通过Powershell的文本读取都必须显式指定UTF-8
+### 构建/依赖约定
+- 1. Windows 本地构建必须保持 CMake generator、MSVC 工具集、vcpkg 二进制依赖三者版本一致。若 vcpkg 依赖由 MSVC 14.50/v145 编译，项目也必须使用 VS2026/v145 生成与构建，避免出现 `__std_find_first_not_of_trivial_pos_1` 一类 STL/ABI 链接错误。
+- 2. 本机 `D:\Strawberry\c\bin\cmake.exe` 是旧 CMake 3.29.2，不支持 `Visual Studio 18 2026` generator。Windows VS2026/v145 构建需优先使用 `C:\Program Files\CMake\bin\cmake.exe`，或确保该路径在 PATH 中早于 Strawberry。
+- 3. VS2026/v145 构建推荐使用独立 build 目录，例如 `build/x64-Release-Tests-v145`，不要复用旧 VS2022/v143 的 `build/x64-Release-Tests` 目录。
+- 4. Windows 与 Linux/WSL 的 vcpkg install root 必须隔离。Windows 使用仓库根 `vcpkg_installed`；Linux/WSL 使用 `build/linux-vcpkg-installed`。不要让 WSL/Linux 脚本写入仓库根 `vcpkg_installed`，否则可能清理或污染 Windows triplet。
+- 5. vcpkg binary cache 建议按平台隔离。Windows 可使用 `build/vcpkg-binary-cache-windows`，Linux/WSL 可使用 `build/vcpkg-binary-cache`，避免不同 triplet、工具链或 ABI 产物互相污染。
+- 6. 若需要在 PowerShell 中读取构建脚本、CMake 文件、日志或源码，仍需显式指定 UTF-8，例如 `Get-Content -Encoding UTF8 ...`。

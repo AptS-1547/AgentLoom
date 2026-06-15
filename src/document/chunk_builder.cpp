@@ -79,6 +79,88 @@ DocumentLlmChunkCacheKey MakeLlmCacheKey(std::string_view model, std::string_vie
     };
 }
 
+nlohmann::json SliceToCacheJson(const ChunkSlice& slice) {
+    return {
+        {"title", slice.title},
+        {"summary", slice.summary},
+        {"text", slice.text},
+        {"kind", slice.kind},
+        {"confidence", slice.confidence},
+    };
+}
+
+ChunkSlice SliceFromCacheJson(const nlohmann::json& json) {
+    ChunkSlice slice;
+    if (!json.is_object()) {
+        return slice;
+    }
+    slice.title = json.value("title", std::string{});
+    slice.summary = json.value("summary", std::string{});
+    slice.text = json.value("text", std::string{});
+    slice.kind = json.value("kind", std::string{"paragraph"});
+    slice.confidence = json.value("confidence", 0.5);
+    return slice;
+}
+
+std::string ChunkToSemanticPayload(const ChunkTrunk& chunk) {
+    nlohmann::json slices = nlohmann::json::array();
+    for (const auto& slice : chunk.slices) {
+        slices.push_back(SliceToCacheJson(slice));
+    }
+    nlohmann::json payload = {
+        {"title", chunk.title},
+        {"summary", chunk.summary},
+        {"slices", slices},
+        {"confidence", chunk.confidence},
+        {"metadata", chunk.metadata},
+    };
+    return payload.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+}
+
+std::optional<ChunkTrunk> ChunkFromSemanticPayload(std::string_view payload) {
+    try {
+        const auto json = nlohmann::json::parse(payload);
+        if (!json.is_object()) {
+            return std::nullopt;
+        }
+        ChunkTrunk chunk;
+        chunk.title = json.value("title", std::string{});
+        chunk.summary = json.value("summary", std::string{});
+        chunk.confidence = json.value("confidence", 0.72);
+        chunk.source = "llm";
+        if (const auto it = json.find("metadata"); it != json.end() && it->is_object()) {
+            chunk.metadata = it->get<std::map<std::string, std::string>>();
+        }
+        if (const auto it = json.find("slices"); it != json.end() && it->is_array()) {
+            for (const auto& item : *it) {
+                chunk.slices.push_back(SliceFromCacheJson(item));
+            }
+        }
+        return chunk;
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+void StampReusedChunk(ChunkTrunk& chunk,
+                      const std::vector<DocumentBlock>& blocks,
+                      const BlockGroup& group,
+                      std::string_view text) {
+    const auto& first = blocks[group.front()];
+    chunk.chunk_id = "chunk-" + std::to_string(first.order);
+    chunk.block_ids.clear();
+    chunk.block_ids.reserve(group.size());
+    for (const auto index : group) {
+        chunk.block_ids.push_back(blocks[index].id);
+    }
+    chunk.text = std::string(text);
+    chunk.order = first.order;
+    chunk.page = first.page;
+    chunk.slide = first.slide;
+    chunk.source = "llm";
+    chunk.reused = true;
+}
+
 bool IsSupportedEmbeddingDim(std::size_t dim) noexcept {
     return dim == agent::semantic_cache::kExpectedEmbeddingDim;
 }
@@ -538,6 +620,7 @@ std::vector<ChunkTrunk> BuildLocalChunks(const std::vector<DocumentBlock>& block
                                          std::shared_ptr<llm::ILlmClient> llm_client,
                                          std::shared_ptr<IDocumentEmbeddingProvider> embedding_provider,
                                          std::shared_ptr<IDocumentLlmChunkCache> llm_chunk_cache,
+                                         std::shared_ptr<semantic_cache::ISemanticCache> document_semantic_cache,
                                          DocumentChunkBuildMetrics* metrics) {
     std::vector<ChunkTrunk> chunks;
     auto groups = CollectChunkGroups(blocks, options, embedding_provider, metrics);
@@ -560,23 +643,44 @@ std::vector<ChunkTrunk> BuildLocalChunks(const std::vector<DocumentBlock>& block
                         ++metrics->llm_cache_hit_count;
                     }
                     auto chunk = std::move(cached).value();
-                    const auto& first = blocks[group.front()];
-                    chunk.chunk_id = "chunk-" + std::to_string(first.order);
-                    chunk.block_ids.clear();
-                    chunk.block_ids.reserve(group.size());
-                    for (const auto index : group) {
-                        chunk.block_ids.push_back(blocks[index].id);
-                    }
-                    chunk.text = text;
-                    chunk.order = first.order;
-                    chunk.page = first.page;
-                    chunk.slide = first.slide;
-                    chunk.source = "llm";
-                    chunk.reused = true;
+                    StampReusedChunk(chunk, blocks, group, text);
                     chunk.metadata["llm_cache_hit"] = "true";
                     chunk.metadata["llm_cache_key"] = cache_key.text_hash;
                     chunks.push_back(std::move(chunk));
                     continue;
+                }
+            }
+            if (document_semantic_cache) {
+                if (metrics) {
+                    ++metrics->semantic_cache_lookup_count;
+                }
+                semantic_cache::CacheLookupRequest lookup;
+                lookup.text = text;
+                lookup.scope = semantic_cache::CacheScope::Global;
+                lookup.answer_type = semantic_cache::AnswerType::Generic;
+                lookup.topic = "document_chunk_title";
+                lookup.extra["prompt_version"] = std::string(kChunkPromptVersion);
+                lookup.extra["model_version"] = options.chunk_llm_model;
+                lookup.extra["payload_type"] = "document_chunk";
+                const auto semantic_started = Clock::now();
+                auto semantic_hit = document_semantic_cache->Lookup(lookup);
+                if (metrics) {
+                    metrics->semantic_cache_lookup_ms += SinceMs(semantic_started);
+                }
+                if (semantic_hit.ok() && semantic_hit.value().hit) {
+                    auto chunk = ChunkFromSemanticPayload(semantic_hit.value().payload);
+                    if (chunk) {
+                        if (metrics) {
+                            ++metrics->semantic_cache_hit_count;
+                        }
+                        StampReusedChunk(*chunk, blocks, group, text);
+                        chunk->metadata["llm_cache_hit"] = "false";
+                        chunk->metadata["semantic_cache_hit"] = "true";
+                        chunk->metadata["semantic_cache_score"] = std::to_string(semantic_hit.value().similarity_score);
+                        chunk->metadata["llm_cache_key"] = cache_key.text_hash;
+                        chunks.push_back(std::move(*chunk));
+                        continue;
+                    }
                 }
             }
             std::string failure_reason;
@@ -602,6 +706,30 @@ std::vector<ChunkTrunk> BuildLocalChunks(const std::vector<DocumentBlock>& block
                     }
                     if (!store_status.ok()) {
                         llm_chunk->metadata["llm_cache_store_error"] = store_status.message();
+                    }
+                }
+                if (document_semantic_cache) {
+                    semantic_cache::CacheStoreRequest store;
+                    store.origin.text = text;
+                    store.origin.scope = semantic_cache::CacheScope::Global;
+                    store.origin.answer_type = semantic_cache::AnswerType::Generic;
+                    store.origin.topic = "document_chunk_title";
+                    store.origin.extra["prompt_version"] = std::string(kChunkPromptVersion);
+                    store.origin.extra["model_version"] = options.chunk_llm_model;
+                    store.origin.extra["payload_type"] = "document_chunk";
+                    store.response_payload = ChunkToSemanticPayload(*llm_chunk);
+                    store.answer_type = semantic_cache::AnswerType::Generic;
+                    store.quality_score = static_cast<float>(llm_chunk->confidence);
+                    if (metrics) {
+                        ++metrics->semantic_cache_store_count;
+                    }
+                    const auto semantic_store_started = Clock::now();
+                    auto store_status = document_semantic_cache->Store(store);
+                    if (metrics) {
+                        metrics->semantic_cache_store_ms += SinceMs(semantic_store_started);
+                    }
+                    if (!store_status.ok()) {
+                        llm_chunk->metadata["semantic_cache_store_error"] = store_status.message();
                     }
                 }
                 chunks.push_back(std::move(*llm_chunk));

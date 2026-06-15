@@ -1,7 +1,10 @@
 #include "../../src/semantic_cache/semantic_cache_pipeline.h"
 #include "../../src/core/result.h"
+#include <algorithm>
 #include <iostream>
 #include <chrono>
+#include <functional>
+#include <limits>
 #include <vector>
 #include <string>
 #include <random>

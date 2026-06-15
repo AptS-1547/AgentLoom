@@ -89,13 +89,37 @@ linux/scripts/package.sh
 
 ### 运行服务
 
-使用配置文件启动：
+**Agent Gateway Server（推荐生产部署）**
+
+统一网关服务，集成 Persona Gateway、HTTP/WS、静态文件托管、文档分析：
+
+```powershell
+build\x64-Release\Release\agent_gateway_server.exe config\gateway.json
+```
+
+服务监听：
+- `0.0.0.0:8080` - HTTP API + WebSocket + 静态文件
+- 集成 Persona Runtime、L0/L3 记忆、语义缓存、课堂调度
+
+**Multimodal Inference Server**
+
+gRPC 多模态推理服务（BERT + VLM）：
 
 ```powershell
 build\x64-Release\Release\multimodal_inference_server.exe --config config\server.example.json
 ```
 
-服务默认监听 `127.0.0.1:50051`（gRPC）和 `0.0.0.0:8080`（HTTP/WebSocket）。
+服务监听：`127.0.0.1:50051`（gRPC）
+
+**Emotion Inference Server**
+
+仅 BERT 情绪推理的轻量级服务（CPU-only）：
+
+```powershell
+build\x64-Release\Release\emotion_inference_server.exe --config config\emotion.json
+```
+
+服务监听：`127.0.0.1:50052`（gRPC）
 
 ### 运行测试
 
@@ -152,18 +176,49 @@ ctest --test-dir build/tests -C Release --output-on-failure
 
 ### 主要构建目标
 
-| Target | 类型 | 说明 |
-|--------|------|------|
-| `multimodal_inference_server` | executable | 统一推理服务入口（gRPC + HTTP/WS） |
-| `gateway_server` | executable | 网关层服务（Persona/Session/Classroom） |
-| `agent_core` | static library | core 基础设施 |
-| `agent_net` | static library | HTTP/WebSocket/连接池 |
-| `agent_models` | static library | ONNX + llama.cpp 模型封装 |
-| `agent_cache` | static library | VLM 缓存 |
-| `agent_vector` | static library | 向量索引与 Embedding |
-| `agent_semantic_cache` | static library | 语义缓存与 Redis |
-| `agent_storage` | static library | SQLite 持久化 |
-| `core_tests` / `net_tests` / `config_tests` | test executables | 单元测试 |
+**服务器可执行文件**
+
+| Target | 说明 |
+|--------|------|
+| `agent_gateway_server` | 生产级网关服务器：Persona Gateway + HTTP/WS + 静态文件托管 + 文档分析 |
+| `multimodal_inference_server` | 多模态推理服务器：gRPC + BERT + VLM/llama.cpp（可选） |
+| `emotion_inference_server` | BERT 情绪推理服务器：仅 CPU，gRPC |
+| `persona_gateway_e2e_server` | E2E 测试网关服务器（手动测试用） |
+
+**核心库**
+
+| Library | 职责 |
+|---------|------|
+| `agent_core` | Result/Status、内存池、线程池、对象池、队列、RAII |
+| `agent_net` | HTTP/WebSocket runtime、连接池、背压控制 |
+| `agent_tls` | TLS context、SSL/TLS 封装 |
+| `agent_http_client` | 出站 HTTP/HTTPS 客户端、重试策略 |
+| `agent_llm` | LLM 客户端（OpenAI + 本地 gRPC） |
+| `agent_models` | ONNX Runtime + llama.cpp 模型封装 |
+| `agent_cache` | VLM 结果缓存 |
+| `agent_vector` | 向量索引（Exact/Faiss）+ Embedding pipeline + HF Tokenizer FFI |
+| `agent_semantic_cache` | 语义缓存管线 + Redis 连接池 + L0 记忆适配器 |
+| `agent_storage` | SQLite 异步执行器 + 连接池 + 事务 |
+| `agent_vector_storage` | 向量元数据存储 + 分区注册表 |
+| `agent_memory` | L3 长期记忆压缩器 |
+| `agent_document` | 文档分析 + OOXML 解析 + 分块 + LLM chunk 缓存 |
+| `agent_service` | Persona 运行时 + 会话管理 + 课堂调度 + 网关服务 |
+| `agent_config` | 配置系统 + section registry + CLI fallback |
+| `server_runtime` | Logger + server common utilities |
+
+**测试与工具**
+
+| Target | 说明 |
+|--------|------|
+| `core_tests` / `net_tests` / `config_tests` | 核心模块单元测试 |
+| `storage_tests` / `vector_storage_tests` | 存储层单元测试 |
+| `semantic_cache_tests` / `document_tests` | 缓存与文档单元测试 |
+| `memory_tests` / `vector_tests` / `service_tests` | 业务层单元测试 |
+| `llm_tests` / `llm_integration_tests` | LLM 客户端测试 |
+| `http_client_tests` / `tls_tests` | HTTP/TLS 客户端测试 |
+| `l3_compression_e2e_test` | L3 记忆压缩 E2E 测试 |
+| `document_analysis_e2e_test` | 文档分析 E2E 测试 |
+| `bert_inference_client` / `bert_benchmark_client` | BERT 协议客户端工具 |
 
 ---
 
@@ -202,27 +257,53 @@ ctest --test-dir build/tests -C Release --output-on-failure
 
 ## 🧪 测试覆盖
 
-当前测试规模：**59+ CTest 用例**，覆盖率持续提升中。
+当前测试规模：**70+ CTest 用例**，覆盖率持续提升中。
 
 ### 测试覆盖领域
 
 ✅ **core** - 内存池、对象池、线程池、共享内存块、队列、UniqueHandle  
 ✅ **net** - HTTP/WebSocket runtime、连接池、背压、静态文件、请求接口  
+✅ **http_client** - 出站 HTTP/HTTPS 客户端、URL 解析、重试策略  
+✅ **tls** - TLS context、SSL 证书加载  
 ✅ **config** - 配置加载、CLI fallback、section 校验  
-✅ **vector** - Tokenizer、Embedding、向量索引、Top-K 检索  
-✅ **service** - 推理编排、请求校验、失败路径  
+✅ **storage** - SQLite 异步执行器、连接池、事务、RAII  
+✅ **vector_storage** - 向量元数据存储、分区注册表、指纹计算  
+✅ **vector** - Tokenizer、Embedding、向量索引、Top-K 检索、索引管理器  
+✅ **semantic_cache** - 缓存管线、L0 适配器、批量加载  
+✅ **document** - OOXML 提取器、文档解析  
+✅ **memory** - L3 长期记忆压缩器、向量化存储  
+✅ **llm** - OpenAI 客户端、本地 gRPC 客户端、重试与降级  
+✅ **service** - Persona 算法、会话管理、Persona 运行时、网关服务  
 
-### 运行特定测试
+### 运行测试
 
 ```powershell
-# 增量构建单个测试
-cmake --build build/tests --target core_tests --config Release
-cmake --build build/tests --target net_tests --config Release
-cmake --build build/tests --target vector_tests --config Release
+# 运行所有测试
+ctest --test-dir build/tests -C Release --output-on-failure
 
 # 运行特定测试
 build\tests\Release\core_tests.exe
 build\tests\Release\net_tests.exe
+build\tests\Release\vector_tests.exe
+build\tests\Release\semantic_cache_tests.exe
+build\tests\Release\service_tests.exe
+
+# 增量构建单个测试
+cmake --build build/tests --target core_tests --config Release
+cmake --build build/tests --target semantic_cache_tests --config Release
+```
+
+### E2E 测试工具
+
+```powershell
+# L3 记忆压缩 E2E
+build\tests\Release\l3_compression_e2e_test.exe config\l3_test.json
+
+# 文档分析 E2E
+build\tests\Release\document_analysis_e2e_test.exe config\doc_test.json
+
+# Persona Gateway E2E（手动测试）
+build\tests\Release\persona_gateway_e2e_server.exe config\gateway_e2e.json
 ```
 
 ---
@@ -289,20 +370,27 @@ multimodal_inference_server.exe `
 
 ### vcpkg 管理依赖
 
-- gRPC、Protobuf、OpenSSL、spdlog、GTest
-- nlohmann/json、hiredis、redis++、libzip、pugixml
+- **gRPC** + Protobuf - RPC 框架
+- **OpenSSL** - TLS/SSL 加密
+- **spdlog** - 高性能日志
+- **GTest** - 单元测试框架
+- **hiredis** + redis++ - Redis 客户端
+- **libzip** - ZIP 文件解析（DOCX/PPTX）
+- **pugixml** - XML 解析（OOXML）
 
 ### 预编译依赖
 
-- **ONNX Runtime** 1.17.1 (CPU) / 1.20.1 (GPU)
-- **llama.cpp** with mtmd support
-- **OpenCV** 4.10
-- **Boost** 1.85 (header-only)
-- **Faiss** CPU prebuilt
-- **SQLite** prebuilt
-- **MKL** 2023.1 (optional, for vector ops)
+- **ONNX Runtime** 1.17.1 (CPU) / 1.20.1 (GPU) - BERT 推理
+- **llama.cpp** with mtmd support - VLM 多模态推理
+- **OpenCV** 4.10 - 图像处理
+- **Boost** 1.85 (header-only) - Asio/Beast/Redis
+- **Faiss** 1.14.1 CPU - 向量索引
+- **SQLite** 3.53.1 - 本地持久化
+- **Eigen** 5.0.1 - 线性代数（向量运算）
+- **MKL** 2023.1 - BLAS 加速（Faiss 依赖）
+- **HuggingFace Tokenizers** (Rust FFI) - 分词器
 
-依赖按 `deps/` 和 `vcpkg_installed/` 两种方式集成，构建脚本自动处理。
+依赖按 `deps/` 和 `vcpkg_installed/` 两种方式集成。Linux 构建脚本自动下载和配置所有依赖。
 
 ---
 

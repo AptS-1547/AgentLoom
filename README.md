@@ -1,113 +1,49 @@
 # AgentBackendPredict
 
-AgentBackendPredict 是教育智能体项目的 C++ 后端基础设施与推理服务仓库。当前仓库已经从早期的单体推理服务，演进为以 `core / net / config / service / server / cache / vector / models` 分层的 C++20 基础设施工程。
+> 教育智能体的 C++ 后端基础设施与推理服务
 
-本仓库当前承担两类职责：
+[![C++20](https://img.shields.io/badge/C%2B%2B-20-blue.svg)](https://isocpp.org/)
+[![CMake](https://img.shields.io/badge/CMake-3.20+-green.svg)](https://cmake.org/)
+[![Tests](https://img.shields.io/badge/tests-59%2B%20passing-brightgreen.svg)](#测试覆盖)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-1. **现有推理端职责**：提供 BERT/ONNX、VLM/llama.cpp、gRPC 推理服务、VLM 缓存、请求校验和运行时监控。
-2. **下一阶段商业化基础设施职责**：沉淀 HTTP/WebSocket runtime、连接池、线程池、内存池、统一 RAII、配置系统、向量缓存和后续对话热路径缓存/RAG/推理引擎路由基础。
+## 📖 项目简介
 
-当前重点不是单纯增加业务逻辑，而是先建立稳定、可测试、可复用的服务端基础设施。
+AgentBackendPredict 是教育智能体项目的 C++ 后端基础设施，提供高性能推理服务、语义缓存、多级记忆管理和网关层服务编排能力。
 
-## 当前状态
+从早期的单体推理服务演进为 **生产级 C++20 服务端基础设施**，以 `core / net / config / cache / vector / models / service / server` 分层架构，支撑教育智能体的热路径、资源管理和协议层能力。
 
-已完成或正在使用的基础设施：
+### ✨ 核心特性
 
-- `src/core`
-  - `Status / Result`
-  - `AppException`
-  - raw memory pool
-  - object pool
-  - `SharedMemoryBlock`
-  - trait-based `UniqueHandle`
-  - blocking queue
-  - thread pool
-  - worker status monitoring
-- `src/net`
-  - Boost.Beast HTTP runtime
-  - WebSocket runtime
-  - `async_read_some` 分片读取路径
-  - backpressure queue
-  - bounded shared buffer
-  - static file handler
-  - connection pool
-  - `IHttpRequest`
-  - `IWebSocketStreamRequest`
-- `src/config`
-  - JSON config + CLI fallback
-  - `IConfigSection`
-  - section registry
-  - macro-assisted section registration
-  - distributed validation
-- `src/service`
-  - 推理业务编排
-  - 请求校验
-- `src/server`
-  - gRPC adapter
-  - process entry
-  - runtime logger / common utilities
-- `src/cache`
-  - VLM cache
-- `src/vector`
-  - 轻量向量缓存/索引原型
-- `tests`
-  - core / net / config 单元测试
+- 🚀 **高性能推理**：ONNX Runtime + llama.cpp/mtmd 多模态推理，支持 BERT/VLM
+- 🧠 **多级记忆系统**：L0 上下文记忆 + L3 长期压缩记忆，支持向量化语义检索
+- 🎯 **语义缓存**：多层缓存策略（本地热缓存 + Redis 共享缓存 + Faiss 向量索引）
+- 🌐 **完整网关层**：HTTP/WebSocket 服务器、连接池、背压控制、静态文件托管
+- 📚 **文档分析**：DOCX/PPTX 解析、文档分块、元数据管理和 LLM 缓存
+- 🎭 **课堂调度器**：多人格并发调度、主动发言状态机、Trace 链路追踪
+- 🧩 **基础设施完善**：内存池、线程池、对象池、RAII 封装、统一错误处理
 
-当前测试规模：
+### 🎯 适用场景
 
-- `39` 个 CTest 用例
-- 覆盖内存池、对象池、共享内存块、线程池、多生产者 submit、UniqueHandle、HTTP/WebSocket runtime、连接池、配置系统和 section validation。
+- 教育智能体多模态推理后端
+- 高性能对话服务热路径缓存
+- 语义搜索与 RAG 检索增强
+- 生产级 C++ 服务端基础设施参考
 
-## 架构
+---
 
-```text
-src/
-├── core/                      # Result/Status、异常、RAII、内存池、线程池、队列
-├── net/                       # Boost.Beast HTTP/WebSocket、连接池、背压、请求接口
-├── config/                    # 配置文件加载、CLI fallback、section registry
-├── cache/                     # VLM 结果缓存
-├── vector/                    # 向量缓存/索引基础，后续接 SIMD kernel / Faiss / SQLite
-├── models/                    # ONNX Runtime、llama.cpp/mtmd 模型封装
-├── service/                   # 业务编排层，目前包含 inference service
-├── server/                    # gRPC adapter、runtime、main entry
-│   ├── grpc/
-│   ├── runtime/
-│   └── main/
-└── client/                    # BERT 兼容客户端和 benchmark client
+## 🚀 快速开始
 
-tests/
-├── core/
-├── net/
-└── config/
+### 前置依赖
 
-proto/
-├── multimodal_inference.proto # 统一多模态协议
-└── bert_inference.proto       # BERT 协议，保留向后兼容
-```
+- **编译器**：Visual Studio 2022 (MSVC) / GCC 11+ / Clang 14+
+- **CMake**：3.20+
+- **vcpkg**：用于管理 gRPC、Protobuf、OpenSSL、spdlog 等依赖
+- **预编译库**：ONNX Runtime、OpenCV、Boost 1.85、llama.cpp
 
-主要 CMake target：
+### 构建服务
 
-| Target | 类型 | 说明 |
-|--------|------|------|
-| `agent_core` | static library | core 基础设施 |
-| `agent_net` | static library | HTTP/WebSocket/连接池/协议基础设施 |
-| `server_runtime` | static library | 日志和 server common |
-| `agent_models` | static library | ONNX Runtime + llama.cpp model wrapper |
-| `agent_cache` | static library | VLM cache |
-| `agent_vector` | static library | vector cache/index |
-| `agent_config` | static library | config section system |
-| `agent_service` | static library | inference service 编排 |
-| `agent_server` | static library | gRPC service adapter |
-| `multimodal_inference_server` | executable | 当前统一推理服务入口 |
-| `bert_inference_client` | executable | BERT 兼容测试客户端 |
-| `bert_benchmark_client` | executable | BERT benchmark client |
-| `core_tests` | test executable | core 单元测试 |
-| `net_tests` | test executable | net 单元测试 |
-| `config_tests` | test executable | config 单元测试 |
-
-## 构建
-
-### Windows Release
+**Windows Release 构建**
 
 ```powershell
 cmake -B build/x64-Release -G "Visual Studio 17 2022" -A x64 `
@@ -118,300 +54,353 @@ cmake -B build/x64-Release -G "Visual Studio 17 2022" -A x64 `
 cmake --build build/x64-Release --target multimodal_inference_server --config Release --parallel
 ```
 
-### Windows Release + Tests
+**Linux Release 构建（WSL2）**
 
-```powershell
-cmake -B build/x64-Release-Tests -G "Visual Studio 17 2022" -A x64 `
-  -DCMAKE_CONFIGURATION_TYPES=Release `
-  -DBERT_BUILD_TESTS=ON `
-  -DBERT_VCPKG_TRIPLET=x64-windows `
-  -DBERT_USE_ONNXRUNTIME_GPU=OFF
+Linux 构建使用 WSL2 环境和自动化脚本：
 
-cmake --build build/x64-Release-Tests --config Release --parallel
-ctest --test-dir build/x64-Release-Tests -C Release --output-on-failure
+```bash
+# 1. 准备工具链和依赖
+linux/scripts/bootstrap_toolchain.sh
+linux/scripts/prepare_deps.sh
+
+# 2. 配置构建
+linux/scripts/configure.sh
+
+# 3. 构建（不包含推理服务器）
+linux/scripts/build.sh
+
+# 4. 构建推理服务器（需要 CUDA llama.cpp）
+linux/scripts/configure.sh --inference
+linux/scripts/build.sh --inference
+
+# 5. 运行测试
+linux/scripts/test.sh
+
+# 6. 打包产物
+linux/scripts/package.sh
 ```
 
-常用增量构建：
+脚本会自动处理：
+- Python venv 创建
+- ONNX Runtime、Boost、Eigen、SQLite、Faiss、MKL 依赖下载
+- vcpkg 依赖安装（gRPC、Protobuf、OpenSSL、spdlog 等）
+- llama.cpp CUDA 构建（如需推理服务器）
+- CMake 配置和 Ninja 构建
 
-```powershell
-cmake --build build/x64-Release-Tests --target core_tests --config Release --parallel
-cmake --build build/x64-Release-Tests --target net_tests --config Release --parallel
-cmake --build build/x64-Release-Tests --target config_tests --config Release --parallel
-```
+### 运行服务
 
-## 运行服务
-
-推荐使用配置文件启动：
+使用配置文件启动：
 
 ```powershell
 build\x64-Release\Release\multimodal_inference_server.exe --config config\server.example.json
 ```
 
-也可以使用 CLI fallback 覆盖关键字段：
+服务默认监听 `127.0.0.1:50051`（gRPC）和 `0.0.0.0:8080`（HTTP/WebSocket）。
+
+### 运行测试
 
 ```powershell
-build\x64-Release\Release\multimodal_inference_server.exe `
-  --config config\server.example.json `
-  --llm "D:/models/qwen2-vl.gguf" `
-  --mmproj "D:/models/mmproj.gguf" `
-  --bert "D:/models/joint_model.onnx" `
-  --host 0.0.0.0 `
-  --port 50051
+# 构建测试
+cmake -B build/tests -G "Visual Studio 17 2022" -A x64 `
+  -DBERT_BUILD_TESTS=ON `
+  -DBERT_VCPKG_TRIPLET=x64-windows
+
+cmake --build build/tests --config Release --parallel
+
+# 运行所有测试
+ctest --test-dir build/tests -C Release --output-on-failure
 ```
 
-当前配置入口由 `src/config` 的 section system 维护。新增配置字段时，优先新增或扩展对应 `IConfigSection` 实现，不建议把解析逻辑堆回 `main()` 或大型 if-else。
+---
 
-配置样例：
+## 🏗️ 架构概览
+
+### 模块分层
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│                      Application Layer                       │
+│  Gateway · Persona Runtime · Classroom Scheduler · Session  │
+└───────────────────────────────┬─────────────────────────────┘
+┌───────────────────────────────┴─────────────────────────────┐
+│                       Service Layer                          │
+│  Inference · Document Analysis · Memory · Semantic Cache    │
+└───────────────────────────────┬─────────────────────────────┘
+┌───────────────────────────────┴─────────────────────────────┐
+│                    Infrastructure Layer                      │
+│  core · net · config · cache · vector · models · storage    │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 核心模块
+
+| 模块 | 职责 |
+|------|------|
+| **core** | Result/Status、异常、内存池、线程池、对象池、RAII、队列 |
+| **net** | HTTP/WebSocket runtime、连接池、背压控制、请求接口 |
+| **config** | 配置加载、CLI fallback、section registry、分布式校验 |
+| **cache** | VLM 结果缓存、Redis 连接池、多级缓存策略 |
+| **vector** | 向量索引（Exact/Faiss）、Embedding pipeline、HF Tokenizer FFI |
+| **models** | ONNX Runtime 封装、llama.cpp/mtmd 封装、模型生命周期管理 |
+| **service** | 推理编排、文档分析、记忆管理、语义缓存 |
+| **server** | gRPC adapter、Gateway HTTP/WS、runtime logger、进程入口 |
+| **storage** | SQLite 持久化、文档元数据、会话状态 |
+| **semantic_cache** | L0 记忆适配器、Redis 语义缓存、上下文风险检测、缓存策略 |
+| **memory** | L3 长期记忆压缩器、向量化记忆存储 |
+| **llm** | 本地/云端 LLM 客户端、gRPC 推理适配、重试与降级 |
+| **document** | 文档解析、分块、元数据存储、LLM chunk 缓存 |
+
+### 主要构建目标
+
+| Target | 类型 | 说明 |
+|--------|------|------|
+| `multimodal_inference_server` | executable | 统一推理服务入口（gRPC + HTTP/WS） |
+| `gateway_server` | executable | 网关层服务（Persona/Session/Classroom） |
+| `agent_core` | static library | core 基础设施 |
+| `agent_net` | static library | HTTP/WebSocket/连接池 |
+| `agent_models` | static library | ONNX + llama.cpp 模型封装 |
+| `agent_cache` | static library | VLM 缓存 |
+| `agent_vector` | static library | 向量索引与 Embedding |
+| `agent_semantic_cache` | static library | 语义缓存与 Redis |
+| `agent_storage` | static library | SQLite 持久化 |
+| `core_tests` / `net_tests` / `config_tests` | test executables | 单元测试 |
+
+---
+
+## 📚 文档索引
+
+### 架构与设计
+
+- [基础设施开发计划](docs/INFRASTRUCTURE_PLAN.md)
+- [商业化架构方案](docs/COMMERCIAL_ARCHITECTURE.md)
+- [对话热路径缓存与推理引擎路由](docs/CONVERSATION_CACHE_AND_INFERENCE_STRATEGY.md)
+- [架构图](docs/ARCHITECTURE_DIAGRAM.md)
+- [流式架构](docs/STREAMING_ARCHITECTURE.md)
+
+### 实现细节
+
+- [配置系统](docs/CONFIG_SYSTEM.md)
+- [缓存与优化](docs/CACHE_AND_OPTIMIZATION.md)
+- [Net API 设计笔记](docs/NET_API_NOTES.md)
+- [Redis 兼容性](docs/REDIS_COMPATIBILITY.md)
+- [向量化 Embedding 模型](docs/PHASE2_EMBEDDING_MODEL.md)
+
+### 迁移与部署
+
+- [部署指南](docs/DEPLOYMENT.md)
+- [视觉模型迁移](docs/VISION_MIGRATION.md)
+- [Redis++ 迁移](docs/REDIS_PLUSPLUS_MIGRATION_COMPLETE.md)
+- [网关前端对齐](docs/GATEWAY_FRONTEND_SESSION_ALIGNMENT.md)
+
+### 其他
+
+- [性能报告](docs/PERFORMANCE_REPORT.md)
+- [E2E 测试与情绪管道](docs/E2E_TEST_AND_EMOTION_PIPELINE.md)
+- [团队实施计划](docs/TEAM_IMPLEMENTATION_PLAN.md)
+
+---
+
+## 🧪 测试覆盖
+
+当前测试规模：**59+ CTest 用例**，覆盖率持续提升中。
+
+### 测试覆盖领域
+
+✅ **core** - 内存池、对象池、线程池、共享内存块、队列、UniqueHandle  
+✅ **net** - HTTP/WebSocket runtime、连接池、背压、静态文件、请求接口  
+✅ **config** - 配置加载、CLI fallback、section 校验  
+✅ **vector** - Tokenizer、Embedding、向量索引、Top-K 检索  
+✅ **service** - 推理编排、请求校验、失败路径  
+
+### 运行特定测试
+
+```powershell
+# 增量构建单个测试
+cmake --build build/tests --target core_tests --config Release
+cmake --build build/tests --target net_tests --config Release
+cmake --build build/tests --target vector_tests --config Release
+
+# 运行特定测试
+build\tests\Release\core_tests.exe
+build\tests\Release\net_tests.exe
+```
+
+---
+
+## ⚙️ 配置说明
+
+服务通过 JSON 配置文件 + CLI 参数启动，支持多 section 分布式校验。
+
+### 配置样例
 
 ```json
 {
   "models": {
-    "llm": "D:/path/to/qwen2-vl.gguf",
-    "mmproj": "D:/path/to/mmproj.gguf",
-    "bert": "D:/path/to/joint_model.onnx",
-    "vit": "",
-    "n_gpu_layers": -1,
-    "provider": "auto",
-    "cuda_device": 0
+    "llm": "D:/models/qwen2-vl.gguf",
+    "mmproj": "D:/models/mmproj.gguf",
+    "bert": "D:/models/joint_model.onnx",
+    "n_gpu_layers": -1
   },
   "grpc": {
     "host": "127.0.0.1",
     "port": "50051",
-    "log_dir": "logs",
-    "num_cqs": 0,
-    "min_pollers": 0,
-    "max_pollers": 0,
-    "max_receive_message_mb": 100,
-    "max_send_message_mb": 10,
-    "stats_log_interval_seconds": 30,
-    "slow_request_ms": 250
+    "max_receive_message_mb": 100
+  },
+  "http": {
+    "host": "0.0.0.0",
+    "port": "8080",
+    "num_threads": 4,
+    "dist_root": "dist"
   },
   "auth": {
     "metadata_key": "x-agent-auth",
-    "token": "",
-    "token_file": "",
     "token_env": "AGENT_BACKEND_AUTH_TOKEN"
   },
-  "limits": {
-    "max_image_mb": 20,
-    "max_image_pixels": 16777216,
-    "max_image_width": 8192,
-    "max_image_height": 8192,
-    "max_prompt_bytes": 8192,
-    "min_context_size": 128,
-    "max_context_size": 8192,
-    "max_vlm_tokens": 2048,
-    "max_temperature": 2.0,
-    "max_top_k": 1000,
-    "max_sequence_length": 512,
-    "max_batch_size": 64,
-    "max_token_id": 10000000,
-    "max_abs_personality": 100.0
-  },
-  "vram_guard": {
-    "monitor_interval_seconds": 10,
-    "warning_free_mb": 1024,
-    "unload_free_mb": 512,
-    "min_free_before_load_mb": 0,
-    "reload_after_unload": false,
-    "unload_on_oom_error": true
-  },
   "vlm_cache": {
-    "enabled": false,
-    "persist": false,
-    "dir": "cache/vlm",
+    "enabled": true,
     "max_entries": 512,
     "max_mb": 1024,
-    "ttl_seconds": 3600,
-    "store_images": true,
-    "store_prompts": true,
-    "stale_on_failure": true,
-    "default_allow_cache": true,
-    "vector": {
-      "enabled": false,
-      "sim_threshold_high": 0.97,
-      "sim_threshold_mid": 0.93,
-      "max_saliency_for_mid": 0.15,
-      "max_entries_per_bucket": 256,
-      "ttl_seconds": 3600,
-      "dir": "cache/vlm/vectors"
-    }
+    "ttl_seconds": 3600
+  },
+  "semantic_cache": {
+    "enabled": true,
+    "redis_url": "tcp://127.0.0.1:6379",
+    "sim_threshold": 0.93,
+    "max_entries": 10000
   }
 }
 ```
 
-## 测试覆盖
-
-当前测试覆盖重点：
-
-- memory pool allocation / release / stats
-- memory pool concurrent allocate / release
-- object pool ownership transfer
-- object pool construction failure rollback
-- `SharedMemoryBlock` copy / move / reset reference counting
-- blocking queue capacity and multi-producer/multi-consumer
-- thread pool execution, shutdown drain, failure status, worker status
-- concurrent submit from multiple producers
-- `UniqueHandle` move / release / reset
-- Beast HTTP request/response wrapper
-- bounded `SharedBuffer`
-- backpressure queue
-- static file handler
-- HTTP runtime handler dispatch
-- typed `IHttpRequest`
-- WebSocket upgrade / echo / fragmented read path
-- typed `IWebSocketStreamRequest`
-- WebSocket outbound backpressure
-- connection pool lease lifetime and protocol limits
-- config help detection
-- config file + CLI fallback override
-- auth token file resolving
-- section-level validation
-
-运行完整测试：
+### CLI 覆盖参数
 
 ```powershell
-ctest --test-dir build/x64-Release-Tests -C Release --output-on-failure
+multimodal_inference_server.exe `
+  --config config/server.json `
+  --llm "D:/models/custom.gguf" `
+  --host 0.0.0.0 `
+  --port 50051
 ```
 
-## 依赖
+完整配置说明见 [配置系统文档](docs/CONFIG_SYSTEM.md)。
 
-主要依赖：
+---
 
-- Visual Studio 2022 / MSVC
-- C++20
-- ONNX Runtime 1.17.1 CPU / 1.20.1 GPU
-- llama.cpp with mtmd support
-- OpenCV 4.10
-- Boost 1.85 headers
-- gRPC
-- Protobuf
-- spdlog
-- OpenSSL
-- SQLite prebuilt package
-- Faiss CPU prebuilt package
-- Eigen headers
-- GTest for tests
-- nlohmann/json, vendored in `third_party`
+## 🔗 依赖管理
 
-依赖策略：
+### vcpkg 管理依赖
 
-- vcpkg 主要用于 gRPC、Protobuf、OpenSSL、spdlog、GTest 等基础库。
-- ONNX Runtime、OpenCV、Boost、SQLite、Faiss、MKL、llama.cpp 当前按预编译/本地路径集成。
-- 后续 Redis 计划通过 Boost.Redis 接入，Redis 只作为共享缓存和失效协调层，不作为唯一数据真源。
+- gRPC、Protobuf、OpenSSL、spdlog、GTest
+- nlohmann/json、hiredis、redis++、libzip、pugixml
 
-## 与 EducationalAgentProject 的关系
+### 预编译依赖
 
-`EducationalAgentProject` 是教育智能体主项目，负责 persona、Prompt、记忆、OpenAI-compatible API、小模型前后处理、多 persona 调度和 Python 侧业务编排。
+- **ONNX Runtime** 1.17.1 (CPU) / 1.20.1 (GPU)
+- **llama.cpp** with mtmd support
+- **OpenCV** 4.10
+- **Boost** 1.85 (header-only)
+- **Faiss** CPU prebuilt
+- **SQLite** prebuilt
+- **MKL** 2023.1 (optional, for vector ops)
 
-本仓库负责 C++ 后端基础设施、ONNX/gRPC 推理服务、协议层 runtime、缓存和后续高性能服务端能力。
+依赖按 `deps/` 和 `vcpkg_installed/` 两种方式集成，构建脚本自动处理。
 
-当前设计方向：
+---
 
-- Python 侧保留快速迭代和复杂业务逻辑。
-- C++ 侧负责热路径、资源治理、协议层、缓存、推理服务和稳定基础设施。
-- 高 QPS 对话主路径后续以 vLLM 为主力 LLM serving。
-- llama.cpp 保留为 VLM、低显存、边缘设备和主路径 OOM/过载备用推理路径。
+## 🎯 与 EducationalAgentProject 的关系
 
-## 缓存与推理路由规划
+**EducationalAgentProject** 是教育智能体主项目，负责 Persona、Prompt、OpenAI-compatible API、Python 侧业务编排和多 persona 调度。
 
-当前已实现：
+**AgentBackendPredict** 负责 C++ 后端基础设施、推理服务、协议层 runtime、缓存和高性能服务端能力。
 
-- VLM 结果缓存
-- 轻量 vector cache 原型
-- HTTP/WebSocket connection pool
-- typed request interfaces
-- 基础 backpressure
+### 职责划分
 
-下一阶段规划：
+| 层 | 负责方 | 内容 |
+|----|--------|------|
+| 业务逻辑 | Python | Persona、Prompt、记忆策略、业务编排 |
+| 热路径 | C++ | 推理、缓存、向量检索、网关、连接池 |
+| 主力 LLM | vLLM | 高 QPS 对话主路径 |
+| 备用/VLM | llama.cpp | VLM、低显存、边缘设备、OOM 降级 |
 
-- `vector_similarity`
-  - normalized dot product
-  - fixed dim 384 / 768 kernels
-  - dynamic fallback
-  - Top-K / threshold scan
-  - SIMD path after benchmark
-- `LocalHotVectorIndex`
-  - local hot embedding matrix
-  - bucket-based lookup
-  - Redis payload fetch
-- `CuratedSemanticCache`
-  - 离线中文教育对话缓存基底
-  - DeepSeek / GLM / Qwen 生成
-  - 多模型评审和质量分
-  - answer_core + persona render
-- `KnowledgeRagCache`
-  - 教材、课标、经典题、常见误区
-  - structured knowledge card
-  - citation and corpus version
-- `MemoryContextLayer`
-  - memory scope validation
-  - user/session scoped cache
-  - long context fallback
-- `LlmEngineRouter`
-  - vLLM main path
-  - llama.cpp fallback path
-  - capacity-aware routing
-  - OOM/overload degradation
+---
 
-详细讨论见：
+## 🚧 路线图
 
-- [对话热路径缓存与推理引擎路由策略](docs/CONVERSATION_CACHE_AND_INFERENCE_STRATEGY.md)
-- [商业化架构方案](docs/COMMERCIAL_ARCHITECTURE.md)
+### 当前阶段（v2.0）
 
-## 文档
+- ✅ 基础设施分层架构
+- ✅ HTTP/WebSocket runtime
+- ✅ 向量化 Embedding pipeline
+- ✅ 语义缓存与 Redis 集成
+- ✅ 文档分析与元数据管理
+- ✅ 网关层与课堂调度器
+- 🔄 L3 长期记忆压缩（进行中）
 
-- [Infrastructure Development Plan](docs/INFRASTRUCTURE_PLAN.md)
-- [Commercial Architecture](docs/COMMERCIAL_ARCHITECTURE.md)
-- [Conversation Cache and Inference Strategy](docs/CONVERSATION_CACHE_AND_INFERENCE_STRATEGY.md)
-- [Legacy Architecture Analysis](docs/LEGACY_ARCHITECTURE_ANALYSIS.md)
-- [Deployment](docs/DEPLOYMENT.md)
-- [Architecture Diagram](docs/ARCHITECTURE_DIAGRAM.md)
-- [Cache and Optimization](docs/CACHE_AND_OPTIMIZATION.md)
-- [Net API Notes](docs/NET_API_NOTES.md)
-- [GStreamer Windows Setup](docs/GSTREAMER_WINDOWS_SETUP.md)
-- [Next Runtime Roadmap](docs/NEXT_RUNTIME_ROADMAP.md)
-- [Vision Migration](docs/VISION_MIGRATION.md)
-- [Vision Pipeline Analysis](docs/VISION_PIPELINE_ANALYSIS.md)
-- [gRPC API](proto/multimodal_inference.proto)
+### 下一阶段
 
-## 当前工程原则
+- 🎯 语义缓存完整链路（预填充 + 在线更新）
+- 🎯 RAG 知识库集成（教材、课标、经典题）
+- 🎯 vLLM 推理引擎路由与降级
+- 🎯 流式推理与 WebSocket 双工
+- 🎯 性能优化（SIMD 向量运算、零拷贝传输）
+- 🎯 多机部署与负载均衡
 
-- core 层不依赖 gRPC、OpenCV、Faiss、SQLite、Redis。
-- storage / vector / cache / net / service 应保持边界清晰。
-- C API 资源优先通过 trait-based RAII 包装。
-- 大对象、帧数据和网络 buffer 需要明确所有权和边界检查。
-- HTTP/WebSocket 语义优先复用 Boost.Beast，不重复定义协议基础语义。
-- Redis 是共享缓存，不是唯一真源。
-- Faiss 是可替换向量索引实现，不向公共接口泄漏 Faiss 类型。
-- SQLite 是本地持久化优先选项。
-- 测试应覆盖失败路径、并发路径和资源释放路径。
+详见 [下一阶段 Runtime 路线图](docs/NEXT_RUNTIME_ROADMAP.md)。
 
-## 更新日志
+---
 
-### 2026-05-16
+## 🛠️ 开发指南
 
-- 重构为当前分层架构：`core / net / config / service / server / cache / vector / models`。
-- 新增 C++20 core 基础设施：memory pool、object pool、`SharedMemoryBlock`、thread pool、blocking queue、`UniqueHandle`。
-- 新增 Boost.Beast HTTP/WebSocket runtime。
-- 新增 WebSocket `async_read_some` 分片读取路径和大消息边界限制。
-- 新增 HTTP/WebSocket connection pool。
-- 新增 `IHttpRequest` 和 `IWebSocketStreamRequest` 业务协议接口。
-- 新增 section-based config system，替代旧 if-else CLI fallback。
-- 新增 core / net / config 单元测试。
-- 明确后续对话热路径缓存、RAG、Redis、vLLM/llama.cpp 路由方案。
+### 代码约定
 
-### 2026-05-04
+1. C API 对象（HANDLE、SQL 连接、io_context）封装为 RAII
+2. 错误码/异常统一包装为 `core::Status` 和 `core::Result<T>`
+3. 业务代码错误需在 `core::Status` 基础上输出日志
+4. 避免 `void*` 裸指针，优先使用 `std::optional<T>`
+5. 内存分配使用 `core` 中的内存池/对象池
+6. 所有模块需要单元测试和 E2E 测试
+7. 每个业务模块提供扩展接口（`I` 前缀抽象类）
+8. 避免平台单一 API（如 WIN32 API），使用条件编译分支
+9. 所有文件读写、路径处理默认 UTF-8，不使用系统本地编码
+10. 接口和源码文件能合并即合并，不超过 800 行上限
 
-- 合并 BERT/LLM/Multimodal 三个服务端为单一 `multimodal_inference_server`。
-- 整合 BERT ONNX Runtime、VLM llama.cpp/mtmd、VLM cache、请求验证和 VRAM guard。
-- 引入 JSON 配置文件 + CLI fallback。
-- 引入 gRPC 健康检查、运行时统计和慢请求追踪。
+### 风格约定
 
-### 2026-03
+- **注释**：少量准确的英文注释
+- **命名**：遵循 C++ 标准库风格（snake_case for functions/variables，PascalCase for types）
+- **模块边界**：core 层不依赖 gRPC/OpenCV/Faiss/Redis
+- **测试覆盖**：失败路径、并发路径、资源释放路径
 
-- 初始版本，独立的 BERT 和 LLM 服务端。
+完整开发指南见 [CLAUDE.md](CLAUDE.md)。
 
-## License
+---
 
-MIT License
+## 🤝 贡献
+
+欢迎提交 Issue 和 Pull Request！
+
+在贡献代码前，请确保：
+
+1. 运行 `ctest` 确保所有测试通过
+2. 新功能需要添加单元测试
+3. 遵循项目代码约定和风格
+4. 更新相关文档
+
+---
+
+## 📝 License
+
+[MIT License](LICENSE)
+
+---
+
+## 📧 联系方式
+
+- **项目维护**：Orange20000922
+- **主项目**：[EducationalAgentProject](../EducationalAgentProject)
+- **相关项目**：[Filerestore_CLI](https://github.com/Orange20000922/Filerestore_CLI)
+
+---
+
+<p align="center">
+  <i>Built with ❤️ by Orange20000922</i>
+</p>

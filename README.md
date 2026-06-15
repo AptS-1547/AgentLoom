@@ -458,8 +458,6 @@ multimodal_inference_server.exe `
 - **模块边界**：core 层不依赖 gRPC/OpenCV/Faiss/Redis
 - **测试覆盖**：失败路径、并发路径、资源释放路径
 
-完整开发指南见 [CLAUDE.md](CLAUDE.md)。
-
 ---
 
 ## 🤝 贡献

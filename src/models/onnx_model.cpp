@@ -28,6 +28,7 @@ struct OnnxBERTModel::Impl {
     std::vector<std::string> output_name_strings;
 
     OnnxSessionInfo session_info;
+    std::string last_error;
 
     // 节点维度信息
     const size_t num_emotions = 10;
@@ -48,6 +49,7 @@ OnnxBERTModel& OnnxBERTModel::operator=(OnnxBERTModel&&) noexcept = default;
 bool OnnxBERTModel::LoadModel(const std::filesystem::path& model_path,
                               const ModelRuntimeOptions& options) {
     try {
+        impl_->last_error.clear();
         impl_->session.reset();
         impl_->memory_info.reset();
         impl_->input_names.clear();
@@ -85,10 +87,16 @@ bool OnnxBERTModel::LoadModel(const std::filesystem::path& model_path,
         return true;
 
     } catch (const Ort::Exception& e) {
+        impl_->last_error = e.what();
         logger.error("[BERT] ONNX Runtime error: {}", e.what());
         return false;
     } catch (const std::exception& e) {
+        impl_->last_error = e.what();
         logger.error("[BERT] Error loading model: {}", e.what());
+        return false;
+    } catch (...) {
+        impl_->last_error = "unknown error";
+        logger.error("[BERT] Error loading model: unknown error");
         return false;
     }
 }
@@ -346,6 +354,10 @@ std::string OnnxBERTModel::GetActiveExecutionProvider() const {
         return "unloaded";
     }
     return impl_->session_info.active_provider;
+}
+
+std::string OnnxBERTModel::LastError() const {
+    return impl_ ? impl_->last_error : std::string{};
 }
 
 } // namespace bert

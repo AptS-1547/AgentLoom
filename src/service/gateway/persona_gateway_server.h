@@ -5,6 +5,7 @@
 #include "persona_runtime.h"
 #include "runtime_maintenance_service.h"
 #include "document_analysis_service.h"
+#include "teaching_evaluator.h"
 #include "http_server.h"
 #include "static_file_handler.h"
 #include "thread_pool.h"
@@ -57,6 +58,8 @@ struct PersonaGatewayServerDependencies {
     std::shared_ptr<document::IDocumentEmbeddingProvider> document_embedding_provider;
     std::shared_ptr<document::IDocumentLlmChunkCache> document_llm_chunk_cache;
     std::shared_ptr<semantic_cache::ISemanticCache> document_semantic_cache;
+    std::shared_ptr<semantic_cache::RedisConnectionPool> l0_redis_pool;
+    std::filesystem::path evaluation_config_path;
     std::vector<std::shared_ptr<IRuntimeMaintenanceTask>> maintenance_tasks;
 };
 

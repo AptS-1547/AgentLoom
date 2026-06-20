@@ -86,21 +86,20 @@
     "execution_provider": "auto"
   },
   "emotion_analyzer": {
-    "enabled": true,
+    "enabled": false,
     "backend": "grpc",
     "target": "127.0.0.1:50051",
-    "tokenizer_path": "../onnx_models/joint/tokenizer.json",
-    "deadline_ms": 30000,
+    "deadline_ms": 3000,
     "auth_token": "",
     "auth_metadata_key": "authorization",
-    "max_length": 96,
+    "max_length": 128,
     "truncation": true,
     "padding": true,
     "add_special_tokens": true
   },
   "emotion_fusion": {
-    "enabled": true,
-    "vector_enabled": true,
+    "enabled": false,
+    "vector_enabled": false,
     "bert_weight": 1.0,
     "default_reliability": 0.7,
     "accept_confidence": 0.55,
@@ -123,7 +122,7 @@
       "disgust": 0.52,
       "neutral": 0.82,
       "excitement": 0.74,
-      "tenderness": 0.70,
+      "tenderness": 0.7,
       "curiosity": 0.76
     },
     "keyword_rules": {

@@ -6,6 +6,7 @@
 
 #include "persona_gateway_server.h"
 #include "grpc_emotion_analyzer.h"
+#include "emotion_fusion_analyzer.h"
 #include "semantic_cache_types.h"
 #include "document_llm_chunk_cache.h"
 #include "isemantic_cache.h"
@@ -250,6 +251,11 @@ private:
     std::shared_ptr<vector::EmbeddingPipeline> pipeline_;
 };
 
+struct L0MemoryCacheBundle {
+    std::shared_ptr<agent::semantic_cache::ISemanticCache> cache;
+    std::shared_ptr<agent::semantic_cache::RedisConnectionPool> redis_pool;
+};
+
 struct ToolConfig {
     fs::path config_path;
     fs::path repo_root;
@@ -264,6 +270,7 @@ struct ToolConfig {
     bool l0_enabled = false;
     fs::path tokenizer_path;
     fs::path embedding_model_path;
+    fs::path emotion_tokenizer_path;
     std::string embedding_provider = "auto";
     int embedding_dimension = 384;
     std::string l0_redis_host = "127.0.0.1";
@@ -277,6 +284,9 @@ struct ToolConfig {
     agent::llm::GrpcLocalLlmClientOptions local_llm;
     bool grpc_emotion_enabled = false;
     agent::service::persona::GrpcEmotionAnalyzerOptions grpc_emotion;
+    agent::service::persona::EmotionFusionAnalyzerOptions emotion_fusion;
+    bool emotion_fusion_enabled = true;
+    std::vector<agent::service::persona::EmotionKeywordRule> emotion_keyword_rules;
     bool disable_tls_verify_on_windows = true;
     bool document_llm_chunk_cache_enabled = false;
     std::string document_llm_chunk_cache_redis_host = "127.0.0.1";
@@ -330,6 +340,40 @@ std::string ResolveApiKey(const fs::path& config_path, const Json& llm) {
         return key;
     }
     return {};
+}
+
+std::vector<agent::service::persona::EmotionKeywordRule> ParseEmotionKeywordRules(const Json& emotion_fusion) {
+    auto rules = agent::service::persona::DefaultEmotionKeywordRules();
+    auto it = emotion_fusion.find("keyword_rules");
+    if (it == emotion_fusion.end() || !it->is_object()) {
+        return rules;
+    }
+    for (auto label = it->begin(); label != it->end(); ++label) {
+        if (!label.value().is_array()) {
+            continue;
+        }
+        for (const auto& item : label.value()) {
+            if (item.is_string()) {
+                rules.push_back(agent::service::persona::EmotionKeywordRule{
+                    label.key(),
+                    item.get<std::string>(),
+                    1.0,
+                });
+                continue;
+            }
+            if (item.is_object()) {
+                const auto pattern = GetString(item, "pattern");
+                if (!pattern.empty()) {
+                    rules.push_back(agent::service::persona::EmotionKeywordRule{
+                        label.key(),
+                        pattern,
+                        GetFloat(item, "score", 1.0f),
+                    });
+                }
+            }
+        }
+    }
+    return rules;
 }
 
 ToolConfig LoadConfig(const fs::path& config_path) {
@@ -463,6 +507,53 @@ ToolConfig LoadConfig(const fs::path& config_path) {
     config.grpc_emotion.tokenizer_options.padding = GetBool(emotion, "padding", true);
     config.grpc_emotion.tokenizer_options.pad_to_longest_in_batch = false;
     config.grpc_emotion.tokenizer_options.add_special_tokens = GetBool(emotion, "add_special_tokens", true);
+    config.emotion_tokenizer_path = ResolvePath(
+        config_path,
+        GetString(emotion, "tokenizer_path", config.tokenizer_path.string()));
+
+    const auto emotion_fusion = config.root.value("emotion_fusion", Json::object());
+    config.emotion_fusion_enabled = GetBool(emotion_fusion, "enabled", true);
+    config.emotion_fusion.enabled = config.emotion_fusion_enabled;
+    config.emotion_fusion.bert_weight = GetFloat(emotion_fusion, "bert_weight", static_cast<float>(config.emotion_fusion.bert_weight));
+    config.emotion_fusion.default_reliability =
+        GetFloat(emotion_fusion, "default_reliability", static_cast<float>(config.emotion_fusion.default_reliability));
+    config.emotion_fusion.accept_confidence =
+        GetFloat(emotion_fusion, "accept_confidence", static_cast<float>(config.emotion_fusion.accept_confidence));
+    config.emotion_fusion.ambiguity_margin =
+        GetFloat(emotion_fusion, "ambiguity_margin", static_cast<float>(config.emotion_fusion.ambiguity_margin));
+    config.emotion_fusion.head_bias =
+        GetFloat(emotion_fusion, "head_bias", static_cast<float>(config.emotion_fusion.head_bias));
+    config.emotion_fusion.bert_signal_weight =
+        GetFloat(emotion_fusion, "bert_signal_weight", static_cast<float>(config.emotion_fusion.bert_signal_weight));
+    const auto evidence_weight =
+        GetFloat(emotion_fusion, "evidence_signal_weight", static_cast<float>(config.emotion_fusion.keyword_signal_weight));
+    config.emotion_fusion.keyword_signal_weight =
+        GetFloat(emotion_fusion, "keyword_signal_weight", evidence_weight);
+    config.emotion_fusion.vector_signal_weight =
+        GetFloat(emotion_fusion, "vector_signal_weight", evidence_weight);
+    config.emotion_fusion.llm_signal_weight =
+        GetFloat(emotion_fusion, "llm_signal_weight", static_cast<float>(config.emotion_fusion.llm_signal_weight));
+    config.emotion_fusion.margin_signal_weight =
+        GetFloat(emotion_fusion, "margin_signal_weight", static_cast<float>(config.emotion_fusion.margin_signal_weight));
+    config.emotion_fusion.llm_gate_confidence =
+        GetFloat(emotion_fusion, "llm_gate_confidence", static_cast<float>(config.emotion_fusion.llm_gate_confidence));
+    config.emotion_fusion.llm_gate_min_delta =
+        GetFloat(emotion_fusion, "llm_gate_min_delta", static_cast<float>(config.emotion_fusion.llm_gate_min_delta));
+    if (auto it = emotion_fusion.find("label_reliability"); it != emotion_fusion.end() && it->is_object()) {
+        for (auto label = it->begin(); label != it->end(); ++label) {
+            if (label.value().is_number()) {
+                config.emotion_fusion.label_reliability[label.key()] = label.value().get<double>();
+            }
+        }
+    }
+    if (auto it = emotion_fusion.find("source_weights"); it != emotion_fusion.end() && it->is_object()) {
+        for (auto source = it->begin(); source != it->end(); ++source) {
+            if (source.value().is_number()) {
+                config.emotion_fusion.source_weights[source.key()] = source.value().get<double>();
+            }
+        }
+    }
+    config.emotion_keyword_rules = ParseEmotionKeywordRules(emotion_fusion);
 
     const auto embedding = config.root.value("embedding", Json::object());
     config.tokenizer_path = ResolvePath(config_path, GetString(embedding, "tokenizer_path", "../onnx_models/minilm/tokenizer.json"));
@@ -643,24 +734,37 @@ core::Result<std::shared_ptr<agent::service::persona::IEmotionAnalyzer>> CreateE
         return std::shared_ptr<agent::service::persona::IEmotionAnalyzer>(
             std::make_shared<agent::service::persona::NeutralEmotionAnalyzer>());
     }
-    if (!fs::exists(config.tokenizer_path)) {
-        return core::Status::Error(core::ErrorCode::NotFound, "emotion tokenizer not found: " + config.tokenizer_path.string());
+    if (!fs::exists(config.emotion_tokenizer_path)) {
+        return core::Status::Error(core::ErrorCode::NotFound, "emotion tokenizer not found: " + config.emotion_tokenizer_path.string());
     }
 
-    auto tokenizer = vector::HfTokenizer::LoadFromFile(config.tokenizer_path);
+    auto tokenizer = vector::HfTokenizer::LoadFromFile(config.emotion_tokenizer_path);
     if (!tokenizer.ok()) {
         return tokenizer.status();
     }
     auto tokenizer_ptr = std::make_shared<vector::HfTokenizer>(std::move(tokenizer).value());
-    return std::shared_ptr<agent::service::persona::IEmotionAnalyzer>(
+    std::shared_ptr<agent::service::persona::IEmotionAnalyzer> grpc =
         std::make_shared<agent::service::persona::GrpcEmotionAnalyzer>(
             config.grpc_emotion,
-            std::move(tokenizer_ptr)));
+            std::move(tokenizer_ptr));
+    if (!config.emotion_fusion_enabled) {
+        return grpc;
+    }
+    std::vector<std::shared_ptr<agent::service::persona::IEmotionEvidenceProvider>> providers;
+    providers.push_back(std::make_shared<agent::service::persona::KeywordEmotionEvidenceProvider>(
+        config.emotion_keyword_rules));
+    return std::shared_ptr<agent::service::persona::IEmotionAnalyzer>(
+        std::make_shared<agent::service::persona::FusedEmotionAnalyzer>(
+            std::move(grpc),
+            config.emotion_fusion,
+            std::move(providers)));
 }
 
-core::Result<std::shared_ptr<agent::semantic_cache::ISemanticCache>> CreateL0MemoryCache(const ToolConfig& config) {
+core::Result<L0MemoryCacheBundle> CreateL0MemoryCache(const ToolConfig& config) {
     if (!config.l0_enabled) {
-        return std::shared_ptr<agent::semantic_cache::ISemanticCache>(std::make_shared<NoopSemanticCache>());
+        L0MemoryCacheBundle bundle;
+        bundle.cache = std::make_shared<NoopSemanticCache>();
+        return bundle;
     }
     if (!fs::exists(config.tokenizer_path)) {
         return core::Status::Error(core::ErrorCode::NotFound, "tokenizer not found: " + config.tokenizer_path.string());
@@ -716,11 +820,13 @@ core::Result<std::shared_ptr<agent::semantic_cache::ISemanticCache>> CreateL0Mem
     options.top_k = config.l0_top_k;
     options.neighbors_per_hit = config.l0_neighbors_per_hit;
     options.similarity_floor = config.l0_similarity_floor;
-    return std::shared_ptr<agent::semantic_cache::ISemanticCache>(
-        std::make_shared<agent::semantic_cache::L0MemoryCacheAdapter>(
+    L0MemoryCacheBundle bundle;
+    bundle.redis_pool = redis;
+    bundle.cache = std::make_shared<agent::semantic_cache::L0MemoryCacheAdapter>(
             std::move(embedding),
             std::move(index),
-            options));
+            options);
+    return bundle;
 }
 
 core::Result<std::shared_ptr<vector::EmbeddingPipeline>> CreateEmbeddingPipeline(const ToolConfig& config) {
@@ -1010,11 +1116,12 @@ int main(int argc, char** argv) {
         }
         auto llm_client = std::move(llm).value();
 
-        auto cache = CreateL0MemoryCache(config);
-        if (!cache.ok()) {
+        auto l0 = CreateL0MemoryCache(config);
+        if (!l0.ok()) {
             logging::Shutdown();
-            return Fail("L0 memory: " + cache.status().message());
+            return Fail("L0 memory: " + l0.status().message());
         }
+        auto l0_bundle = std::move(l0).value();
         LOG_INFO("[agent-gateway] L0 memory: {} redis={}:{} tokenizer={} model={}",
                  config.l0_enabled ? "enabled" : "disabled",
                  config.l0_redis_host,
@@ -1058,7 +1165,7 @@ int main(int argc, char** argv) {
 
         agent::service::persona::SemanticMemoryContextProviderOptions memory_options;
         auto memory = std::make_shared<agent::service::persona::SemanticMemoryContextProvider>(
-            std::move(cache).value(),
+            l0_bundle.cache,
             l3_memory,
             memory_options);
         auto emotion = CreateEmotionAnalyzer(config);
@@ -1076,6 +1183,8 @@ int main(int argc, char** argv) {
         dependencies.document_embedding_provider = std::move(document_embedding).value();
         dependencies.document_llm_chunk_cache = std::move(document_llm_chunk_cache).value();
         dependencies.document_semantic_cache = std::move(document_semantic_cache).value();
+        dependencies.l0_redis_pool = l0_bundle.redis_pool;
+        dependencies.evaluation_config_path = config.repo_root / "config" / "evaluation_indicators.json";
 
         if (config.gateway.auth.session_store_backend != "redis") {
             fs::create_directories(fs::path(config.gateway.auth.session_database_path).parent_path());

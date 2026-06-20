@@ -5,8 +5,10 @@
 #include "logger_adapter.h"
 #include "persona_runtime.h"
 #include "session_manager.h"
+#include "teaching_evaluator.h"
 
 #include <functional>
+#include <filesystem>
 #include <future>
 #include <memory>
 
@@ -20,6 +22,9 @@ public:
     PersonaGatewayService(persona::SessionManager& sessions,
                           persona::PersonaRuntime& runtime,
                           IClassroomScheduler* classroom_scheduler = nullptr,
+                          std::shared_ptr<evaluation::TeachingEvaluator> evaluator = nullptr,
+                          std::shared_ptr<semantic_cache::RedisConnectionPool> l0_redis_pool = nullptr,
+                          std::filesystem::path evaluation_config_path = {},
                           core::LoggerAdapter logger = core::LoggerAdapter::ForModule("service"));
 
     core::Result<SessionGatewayResponse> CreateSession(CreateSessionGatewayRequest request);
@@ -54,6 +59,9 @@ private:
     persona::SessionManager& sessions_;
     persona::PersonaRuntime& runtime_;
     IClassroomScheduler* classroom_scheduler_ = nullptr;
+    std::shared_ptr<evaluation::TeachingEvaluator> evaluator_;
+    std::shared_ptr<semantic_cache::RedisConnectionPool> l0_redis_pool_;
+    std::filesystem::path evaluation_config_path_;
     core::LoggerAdapter logger_;
 };
 

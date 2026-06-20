@@ -7,6 +7,7 @@
 #include <boost/beast/ssl.hpp>
 
 #include <chrono>
+#include <exception>
 #include <utility>
 
 namespace agent::net {
@@ -210,7 +211,8 @@ core::Result<HttpClientResponse> ExecuteTls(const ParsedUrl& url,
     if (ec) return FromOpErr(ec, "HTTPS read");
 
     // Best-effort close; ignore any error from cancelled writes during shutdown.
-    lowest.close();
+    beast::error_code ignore;
+    lowest.socket().close(ignore);
     return ConvertResponse(hres);
 }
 
@@ -228,22 +230,30 @@ BeastHttpClient::BeastHttpClient(BeastHttpClientOptions options)
 BeastHttpClient::~BeastHttpClient() = default;
 
 core::Result<HttpClientResponse> BeastHttpClient::Execute(const HttpClientRequest& req) {
-    if (req.timeout_ms <= 0) {
-        return core::Status(core::ErrorCode::InvalidArgument, "timeout_ms must be > 0");
-    }
-
-    auto url_r = ParseUrl(req.url);
-    if (!url_r) return url_r.status();
-    auto url = std::move(url_r).value();
-
-    if (url.scheme == UrlScheme::Https) {
-        if (!options_.tls_context) {
-            return core::Status(core::ErrorCode::InvalidArgument,
-                "https URL but client has no TLS context");
+    try {
+        if (req.timeout_ms <= 0) {
+            return core::Status(core::ErrorCode::InvalidArgument, "timeout_ms must be > 0");
         }
-        return ExecuteTls(url, req, *options_.tls_context);
+
+        auto url_r = ParseUrl(req.url);
+        if (!url_r) return url_r.status();
+        auto url = std::move(url_r).value();
+
+        if (url.scheme == UrlScheme::Https) {
+            if (!options_.tls_context) {
+                return core::Status(core::ErrorCode::InvalidArgument,
+                    "https URL but client has no TLS context");
+            }
+            return ExecuteTls(url, req, *options_.tls_context);
+        }
+        return ExecutePlain(url, req);
+    } catch (const std::exception& e) {
+        return core::Status(core::ErrorCode::InternalError,
+            std::string("HTTP client exception: ") + e.what());
+    } catch (...) {
+        return core::Status(core::ErrorCode::InternalError,
+            "HTTP client exception: unknown error");
     }
-    return ExecutePlain(url, req);
 }
 
 }  // namespace agent::net

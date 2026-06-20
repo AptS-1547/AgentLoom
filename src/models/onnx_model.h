@@ -106,6 +106,11 @@ public:
      */
     std::string GetActiveExecutionProvider() const;
 
+    /**
+     * Returns the most recent load or inference failure reason.
+     */
+    std::string LastError() const;
+
 private:
     // PIMPL 实现
     struct Impl;

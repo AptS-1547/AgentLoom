@@ -42,10 +42,16 @@ std::string DefaultPersonaName(std::string_view persona_id) {
 PersonaGatewayService::PersonaGatewayService(persona::SessionManager& sessions,
                                              persona::PersonaRuntime& runtime,
                                              IClassroomScheduler* classroom_scheduler,
+                                             std::shared_ptr<evaluation::TeachingEvaluator> evaluator,
+                                             std::shared_ptr<semantic_cache::RedisConnectionPool> l0_redis_pool,
+                                             std::filesystem::path evaluation_config_path,
                                              core::LoggerAdapter logger)
     : sessions_(sessions),
       runtime_(runtime),
       classroom_scheduler_(classroom_scheduler),
+      evaluator_(std::move(evaluator)),
+      l0_redis_pool_(std::move(l0_redis_pool)),
+      evaluation_config_path_(std::move(evaluation_config_path)),
       logger_(std::move(logger)) {}
 
 core::Result<SessionGatewayResponse> PersonaGatewayService::CreateSession(CreateSessionGatewayRequest request) {
@@ -224,6 +230,24 @@ core::Result<TrainingReportGatewayResponse> PersonaGatewayService::TrainingRepor
     response.total_turns = snapshot.value().metrics.turn_count;
     response.metrics = snapshot.value().metrics;
     response.summary = "Training report evaluation pipeline is pending; session metrics are available.";
+    if (evaluator_ && l0_redis_pool_ && !evaluation_config_path_.empty()) {
+        evaluation::TeachingEvaluationRequest eval_req;
+        eval_req.user_uuid = snapshot.value().user_uuid;
+        eval_req.session_id = snapshot.value().session_id;
+        eval_req.trace_id = request.trace_id;
+        eval_req.config_path = evaluation_config_path_;
+        eval_req.redis_pool = l0_redis_pool_;
+        auto evaluated = evaluator_->Evaluate(eval_req);
+        if (evaluated.ok()) {
+            response.evaluation = std::move(evaluated).value();
+            response.summary = "Training report evaluation completed.";
+        } else {
+            response.evaluation = {
+                {"error", evaluated.status().message()},
+            };
+            response.summary = "Training report evaluation unavailable; session metrics are available.";
+        }
+    }
     return response;
 }
 

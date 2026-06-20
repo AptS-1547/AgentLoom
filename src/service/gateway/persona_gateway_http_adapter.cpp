@@ -228,6 +228,7 @@ Json ReportEnvelope(const TrainingReportGatewayResponse& response) {
             {"generatedAt", response.generated_at},
             {"totalTurns", response.total_turns},
             {"summary", response.summary},
+            {"evaluation", response.evaluation},
             {"metrics", MetricsToJson(response.metrics)},
             {"schemaVersion", "training_report.v1"},
         }},

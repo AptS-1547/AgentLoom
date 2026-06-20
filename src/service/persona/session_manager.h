@@ -45,6 +45,9 @@ struct ConversationTurn {
     std::string response;
     std::string timestamp;
     std::string context_id;
+    std::string persona_id;
+    std::optional<double> valence;
+    std::optional<double> arousal;
 };
 
 struct SessionOptions {

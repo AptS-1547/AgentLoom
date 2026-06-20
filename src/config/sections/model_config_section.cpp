@@ -43,8 +43,9 @@ bool ModelsConfigSection::LoadCli(CliCursor& cursor, MultimodalServerOptions& op
 }
 
 void ModelsConfigSection::Validate(MultimodalServerOptions& options) const {
-    if (options.llm_model.empty()) {
-        throw std::runtime_error("--llm is required");
+    // Emotion-only targets can run with just the BERT ONNX model.
+    if (options.llm_model.empty() && options.bert_model.empty()) {
+        throw std::runtime_error("--llm or --bert is required");
     }
 }
 

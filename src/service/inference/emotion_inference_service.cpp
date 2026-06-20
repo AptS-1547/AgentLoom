@@ -45,7 +45,12 @@ public:
 
         Logger().info("[emotion] loading BERT model: {}", options.bert_model);
         if (!bert_model_.LoadModel(options.bert_model, ToModelRuntimeOptions(options.bert_runtime))) {
-            Logger().error("[emotion] failed to load BERT model");
+            Logger().error("[emotion] failed to load BERT model path={} provider={} reason={}",
+                           options.bert_model,
+                           options.bert_runtime.execution_provider,
+                           bert_model_.LastError().empty() ? "unknown error" : bert_model_.LastError());
+        } else {
+            Logger().info("[emotion] BERT model loaded: {}", bert_model_.GetInfo());
         }
     }
 

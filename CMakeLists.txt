@@ -106,6 +106,7 @@ endif()
 set(ONNXRUNTIME_CPU_ROOT "${BERT_DEFAULT_ONNXRUNTIME_CPU_ROOT}" CACHE PATH "Path to the CPU ONNX Runtime package")
 set(ONNXRUNTIME_GPU_ROOT "${BERT_DEFAULT_ONNXRUNTIME_GPU_ROOT}" CACHE PATH "Path to the GPU ONNX Runtime package")
 set(CUDA_RUNTIME_DLL_ROOT "${BERT_DEFAULT_CUDA_RUNTIME_ROOT}" CACHE PATH "Directory containing CUDA/cuDNN runtime libraries")
+set(BERT_EXTRA_RUNTIME_DLL_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/build/Release" CACHE PATH "Optional directory containing local runtime DLL/SO overrides")
 set(BERT_USE_ONNXRUNTIME_GPU "AUTO" CACHE STRING "Use the GPU ONNX Runtime package: AUTO, ON, or OFF")
 set_property(CACHE BERT_USE_ONNXRUNTIME_GPU PROPERTY STRINGS AUTO ON OFF)
 
@@ -669,6 +670,20 @@ target_link_libraries(persona_config_migration PRIVATE
     nlohmann_json::nlohmann_json
 )
 
+add_executable(emotion_fusion_map_calibrator
+    tools/emotion_fusion_map_calibrator.cpp
+)
+target_link_libraries(emotion_fusion_map_calibrator PRIVATE
+    agent_service
+    agent_models
+    agent_vector
+    agent_llm
+    agent_http_client
+    nlohmann_json::nlohmann_json
+)
+copy_runtime_files(emotion_fusion_map_calibrator "${BERT_ONNXRUNTIME_SHARED_LIB}")
+copy_runtime_files(emotion_fusion_map_calibrator ${VCPKG_RUNTIME_DLLS})
+
 # ──────────── Bare boost::redis smoke test (not part of CTest) ────────────
 add_executable(redis_bare_connection_test
     tools/redis_bare_connection_test.cpp
@@ -1204,8 +1219,12 @@ add_library(agent_service STATIC
     src/service/persona/session_manager.h
     src/service/persona/persona_runtime.cpp
     src/service/persona/persona_runtime.h
+    src/service/persona/emotion_fusion_analyzer.cpp
+    src/service/persona/emotion_fusion_analyzer.h
     src/service/persona/grpc_emotion_analyzer.cpp
     src/service/persona/grpc_emotion_analyzer.h
+    src/service/evaluation/teaching_evaluator.cpp
+    src/service/evaluation/teaching_evaluator.h
     src/service/gateway/gateway_models.h
     src/service/gateway/gateway_auth.cpp
     src/service/gateway/gateway_auth.h
@@ -1226,6 +1245,7 @@ target_include_directories(agent_service PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src/document/ooxml
     ${CMAKE_CURRENT_SOURCE_DIR}/src/service/inference
     ${CMAKE_CURRENT_SOURCE_DIR}/src/service/persona
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/service/evaluation
     ${CMAKE_CURRENT_SOURCE_DIR}/src/service/gateway
     ${CMAKE_CURRENT_SOURCE_DIR}/src/net
     ${CMAKE_CURRENT_SOURCE_DIR}/src/llm
@@ -1256,6 +1276,8 @@ if(BERT_BUILD_TESTS)
         tests/service/persona_algorithm_test.cpp
         tests/service/session_manager_test.cpp
         tests/service/persona_runtime_test.cpp
+        tests/service/emotion_fusion_analyzer_test.cpp
+        tests/service/teaching_evaluator_test.cpp
         tests/service/persona_gateway_service_test.cpp
     )
 
@@ -1419,7 +1441,27 @@ foreach(ONNXRUNTIME_RUNTIME_LIB ${ONNXRUNTIME_RUNTIME_LIBS})
     if(TARGET emotion_inference_server)
         copy_runtime_files(emotion_inference_server "${ONNXRUNTIME_RUNTIME_LIB}")
     endif()
+    if(TARGET emotion_fusion_map_calibrator)
+        copy_runtime_files(emotion_fusion_map_calibrator "${ONNXRUNTIME_RUNTIME_LIB}")
+    endif()
 endforeach()
+
+if(EXISTS "${BERT_EXTRA_RUNTIME_DLL_ROOT}")
+    if(WIN32)
+        file(GLOB BERT_EXTRA_RUNTIME_LIBS
+            "${BERT_EXTRA_RUNTIME_DLL_ROOT}/onnxruntime*.dll"
+        )
+    elseif(UNIX AND NOT APPLE)
+        file(GLOB BERT_EXTRA_RUNTIME_LIBS
+            "${BERT_EXTRA_RUNTIME_DLL_ROOT}/libonnxruntime*.so*"
+        )
+    endif()
+    foreach(BERT_EXTRA_RUNTIME_LIB ${BERT_EXTRA_RUNTIME_LIBS})
+        if(TARGET emotion_fusion_map_calibrator)
+            copy_runtime_files(emotion_fusion_map_calibrator "${BERT_EXTRA_RUNTIME_LIB}")
+        endif()
+    endforeach()
+endif()
 
 # 复制 vcpkg 动态库依赖
 if(WIN32 AND BERT_VCPKG_TRIPLET AND NOT VCPKG_RUNTIME_DLLS)
@@ -1501,5 +1543,8 @@ if(EXISTS "${CUDA_RUNTIME_DLL_ROOT}")
     endif()
     if(TARGET multimodal_inference_server)
         copy_runtime_files(multimodal_inference_server ${CUDA_RUNTIME_LIBS})
+    endif()
+    if(TARGET emotion_fusion_map_calibrator)
+        copy_runtime_files(emotion_fusion_map_calibrator ${CUDA_RUNTIME_LIBS})
     endif()
 endif()

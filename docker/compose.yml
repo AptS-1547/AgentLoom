@@ -1,0 +1,78 @@
+services:
+  redis:
+    image: redis:7
+    container_name: agent-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  emotion-inference:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: packaged-runtime
+    image: agentbackendpredict:runtime
+    container_name: agent-emotion-inference
+    environment:
+      APP_ROLE: emotion-inference
+      APP_CONFIG: /app/config/emotion.container.example.json
+    command: ["emotion-inference"]
+    ports:
+      - "50052:50052"
+    volumes:
+      - ../config:/app/config:ro
+      - ../onnx_models:/app/onnx_models:ro
+      - ../logs:/app/logs
+      - ../dumps:/app/dumps
+    restart: unless-stopped
+
+  gateway:
+    image: agentbackendpredict:runtime
+    container_name: agent-gateway
+    depends_on:
+      redis:
+        condition: service_healthy
+      emotion-inference:
+        condition: service_started
+    environment:
+      APP_ROLE: gateway
+      APP_CONFIG: /app/config/agent_gateway.container.example.json
+    command: ["gateway"]
+    ports:
+      - "8080:8080"
+    volumes:
+      - ../config:/app/config:ro
+      - ../dist:/app/dist:ro
+      - ../data:/app/data
+      - ../logs:/app/logs
+      - ../dumps:/app/dumps
+      - ../onnx_models:/app/onnx_models:ro
+    restart: unless-stopped
+
+  multimodal-inference:
+    image: agentbackendpredict:runtime
+    container_name: agent-multimodal-inference
+    profiles: ["vlm"]
+    environment:
+      APP_ROLE: multimodal-inference
+      APP_CONFIG: /app/config/server.example.json
+    command: ["multimodal-inference"]
+    ports:
+      - "50051:50051"
+    volumes:
+      - ../config:/app/config:ro
+      - ../onnx_models:/app/onnx_models:ro
+      - ../deps:/app/deps:ro
+      - ../logs:/app/logs
+      - ../dumps:/app/dumps
+    restart: unless-stopped
+
+volumes:
+  redis-data:

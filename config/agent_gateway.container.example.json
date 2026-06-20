@@ -1,7 +1,7 @@
 {
-  "_comment": "Production-style config for agent_gateway_server. Paths are resolved relative to this file.",
+  "_comment": "Container-oriented Gateway config. Paths are resolved inside the runtime image under /app.",
   "logging": {
-    "log_dir": "../logs/agent_gateway",
+    "log_dir": "/app/logs/agent_gateway",
     "logger_name": "agent_gateway_server",
     "file_name": "agent_gateway_server.log",
     "enable_console": true,
@@ -10,8 +10,8 @@
     "max_files": 7
   },
   "persona_gateway": {
-    "address": "127.0.0.1",
-    "port": 18080,
+    "address": "0.0.0.0",
+    "port": 8080,
     "http_io_threads": 2,
     "websocket_path": "/ws/session",
     "session_idle_timeout_minutes": 15,
@@ -33,7 +33,7 @@
     },
     "static_files": {
       "enabled": true,
-      "root": "../dist",
+      "root": "/app/dist",
       "index_file": "index.html",
       "spa_fallback": true
     }
@@ -53,9 +53,9 @@
     "require_session_record": false,
     "auto_provision_session": true,
     "session_store_backend": "sqlite",
-    "session_database_path": "../data/agent_gateway/auth_sessions.db",
-    "redis_host": "127.0.0.1",
-    "redis_port": "5000",
+    "session_database_path": "/app/data/agent_gateway/auth_sessions.db",
+    "redis_host": "redis",
+    "redis_port": "6379",
     "redis_pool_size": 16,
     "redis_command_timeout_ms": 5000,
     "redis_key_prefix": "agent:gateway:auth",
@@ -71,26 +71,26 @@
     "max_retries": 2,
     "require_api_key": true,
     "allow_placeholder": false,
-    "disable_tls_verify_on_windows": true
+    "disable_tls_verify_on_windows": false
   },
   "local_llm": {
     "enabled": false,
-    "target": "127.0.0.1:50051",
+    "target": "multimodal-inference:50051",
     "deadline_ms": 30000,
     "auth_token": "",
     "auth_metadata_key": "authorization"
   },
   "embedding": {
-    "tokenizer_path": "../onnx_models/minilm/tokenizer.json",
-    "model_path": "../onnx_models/minilm/model.onnx",
+    "tokenizer_path": "/app/onnx_models/minilm/tokenizer.json",
+    "model_path": "/app/onnx_models/minilm/model.onnx",
     "dimension": 384,
     "execution_provider": "auto"
   },
   "emotion_analyzer": {
     "enabled": true,
     "backend": "grpc",
-    "target": "127.0.0.1:50051",
-    "tokenizer_path": "../onnx_models/joint/tokenizer.json",
+    "target": "emotion-inference:50052",
+    "tokenizer_path": "/app/onnx_models/joint/tokenizer.json",
     "deadline_ms": 3000,
     "auth_token": "",
     "auth_metadata_key": "authorization",
@@ -113,36 +113,13 @@
       "keyword": 0.75,
       "vector": 0.85,
       "llm": 0.9
-    },
-    "label_reliability": {
-      "joy": 0.78,
-      "sadness": 0.72,
-      "anger": 0.69,
-      "fear": 0.64,
-      "surprise": 0.58,
-      "disgust": 0.52,
-      "neutral": 0.82,
-      "excitement": 0.74,
-      "tenderness": 0.70,
-      "curiosity": 0.76
-    },
-    "keyword_rules": {
-      "sadness": [
-        {
-          "pattern": "考砸|学不会|没希望",
-          "score": 0.95
-        }
-      ],
-      "curiosity": [
-        "为什么|怎么来的|能不能再讲"
-      ]
     }
   },
   "l0_memory": {
     "enabled": true,
-    "redis_host": "127.0.0.1",
-    "redis_port": 5000,
-    "sqlite_path": "../data/agent_gateway/l0_memory.db",
+    "redis_host": "redis",
+    "redis_port": 6379,
+    "sqlite_path": "/app/data/agent_gateway/l0_memory.db",
     "max_cached_records": 1000,
     "top_k": 5,
     "neighbors_per_hit": 1,
@@ -151,8 +128,8 @@
   },
   "document_store": {
     "enabled": true,
-    "root": "../data/agent_gateway/documents",
-    "database_path": "../data/agent_gateway/document_store.db",
+    "root": "/app/data/agent_gateway/documents",
+    "database_path": "/app/data/agent_gateway/document_store.db",
     "read_connection_count": 2,
     "write_connection_count": 1,
     "busy_timeout_ms": 5000,
@@ -161,17 +138,17 @@
   },
   "document_llm_chunk_cache": {
     "enabled": true,
-    "redis_host": "127.0.0.1",
-    "redis_port": 5000,
+    "redis_host": "redis",
+    "redis_port": 6379,
     "redis_pool_size": 4,
     "key_prefix": "agent:gateway:document:llm_chunk",
     "ttl_seconds": 604800
   },
   "document_semantic_cache": {
     "enabled": true,
-    "redis_host": "127.0.0.1",
-    "redis_port": 5000,
-    "sqlite_path": "../data/agent_gateway/document_semantic_cache.db",
+    "redis_host": "redis",
+    "redis_port": 6379,
+    "sqlite_path": "/app/data/agent_gateway/document_semantic_cache.db",
     "user_uuid": "document-semantic-cache",
     "max_cached_records": 10000,
     "top_k": 6,
@@ -179,8 +156,8 @@
   },
   "l3_memory": {
     "enabled": true,
-    "sqlite_path": "../data/agent_gateway/l3_memory.db",
-    "registry_sqlite_path": "../data/agent_gateway/l3_registry.db",
+    "sqlite_path": "/app/data/agent_gateway/l3_memory.db",
+    "registry_sqlite_path": "/app/data/agent_gateway/l3_registry.db",
     "collection_name": "l3_memory",
     "embedding_fingerprint": "minilm-l6-v2",
     "tokenizer_fingerprint": "minilm-l6-v2",

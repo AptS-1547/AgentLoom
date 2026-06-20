@@ -17,6 +17,7 @@ AgentBackendPredict 是教育智能体项目的 C++ 后端基础设施，提供�
 
 - 🚀 **高性能推理**：ONNX Runtime + llama.cpp/mtmd 多模态推理，支持 BERT/VLM
 - 🧠 **多级记忆系统**：L0 上下文记忆 + L3 长期压缩记忆，支持向量化语义检索
+- ❤️ **情感层融合**：BERT 主干 + 关键词/向量证据 + softmax 融合头 + V-A 情绪状态机
 - 🎯 **语义缓存**：多层缓存策略（本地热缓存 + Redis 共享缓存 + Faiss 向量索引）
 - 🌐 **完整网关层**：HTTP/WebSocket 服务器、连接池、背压控制、静态文件托管
 - 📚 **文档分析**：DOCX/PPTX 解析、文档分块、元数据管理和 LLM 缓存
@@ -173,6 +174,41 @@ ctest --test-dir build/tests -C Release --output-on-failure
 | **memory** | L3 长期记忆压缩器、向量化记忆存储 |
 | **llm** | 本地/云端 LLM 客户端、gRPC 推理适配、重试与降级 |
 | **document** | 文档解析、分块、元数据存储、LLM chunk 缓存 |
+
+### 情感层处理模式
+
+主链路情感层以 BERT 情绪分类为 primary analyzer，并在 `FusedEmotionAnalyzer` 中融合多来源证据：
+
+```text
+用户/AI 文本
+  -> gRPC BERT emotion analyzer
+  -> keyword / vector / LLM evidence
+  -> per-label fusion logits
+  -> softmax emotion distribution
+  -> confidence / margin gate
+  -> V-A emotion state tracker
+  -> prompt hint + generation params + memory metadata
+```
+
+融合头不再把异构证据直接归一化，而是先构建每个 label 的 logit：
+
+```text
+logit[label] =
+    head_bias
+  + bert_signal_weight * bert_weight * bert_prob[label] * label_reliability[label]
+  + evidence_signal_weight * evidence_score[label]
+  + margin_signal_weight * primary_margin_bonus
+```
+
+随后对 logits 做 softmax，得到主情绪分布。这样既保留 BERT 概率、Macro-F1 风格标签可靠性、关键词/向量/LLM 来源权重的可解释性，也保留多类情绪竞争关系。
+
+门控策略基于融合后的 top confidence 和 top margin：
+
+```text
+top < accept_confidence || top1 - top2 < ambiguity_margin
+```
+
+低置信或类别接近时可触发 LLM fallback；fallback 结果作为 `llm` evidence 重新进入融合头，而不是直接覆盖 BERT。最终用户情绪和 AI 回复情绪共同更新 V-A 状态机，并序列化到会话状态与 L0 记忆元数据中。
 
 ### 主要构建目标
 

@@ -186,6 +186,19 @@ core::Status SemanticMemoryContextProvider::AdmitTurn(std::string_view session_i
     store.origin.answer_type = semantic_cache::AnswerType::Personalized;
     store.origin.user_id = std::string(user_uuid);
     store.origin.session_id = std::string(session_id);
+    store.origin.persona_id = turn.persona_id;
+    store.origin.extra["emotion"] = turn.emotion;
+    store.origin.extra["intensity"] = std::to_string(turn.intensity);
+    store.origin.extra["behavior"] = turn.behavior;
+    store.origin.extra["tone"] = turn.tone;
+    store.origin.extra["context_id"] = turn.context_id;
+    if (turn.valence) {
+        store.origin.extra["valence"] = std::to_string(*turn.valence);
+    }
+    if (turn.arousal) {
+        store.origin.extra["arousal"] = std::to_string(*turn.arousal);
+    }
+    store.origin.extra["payload_type"] = "conversation_turn";
     store.response_payload = turn.response;
     store.answer_type = semantic_cache::AnswerType::Personalized;
     return l0_cache_->Store(store);
@@ -544,16 +557,7 @@ void PersonaRuntime::CompleteWithLlm(SessionState& session, PreparedChat prepare
     turn.tone = prepared.user_emotion.tone;
     turn.response = completion.content;
     turn.context_id = prepared.request.context_id;
-
-    auto admit_status = memory_provider_->AdmitTurn(
-        prepared.request.session_id,
-        session.user_uuid,
-        turn,
-        prepared.request.trace_id);
-    if (!admit_status.ok()) {
-        callback(admit_status);
-        return;
-    }
+    turn.persona_id = session.persona_id;
 
     auto state_update = session.emotion_state.Update(
         prepared.user_emotion.emotion.primary,
@@ -562,6 +566,18 @@ void PersonaRuntime::CompleteWithLlm(SessionState& session, PreparedChat prepare
         ai_emotion.value().emotion.intensity);
     if (!state_update.ok()) {
         callback(state_update.status());
+        return;
+    }
+    turn.valence = state_update.value().valence;
+    turn.arousal = state_update.value().arousal;
+
+    auto admit_status = memory_provider_->AdmitTurn(
+        prepared.request.session_id,
+        session.user_uuid,
+        turn,
+        prepared.request.trace_id);
+    if (!admit_status.ok()) {
+        callback(admit_status);
         return;
     }
 

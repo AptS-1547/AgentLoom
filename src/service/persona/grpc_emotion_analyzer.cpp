@@ -165,6 +165,91 @@ core::Result<EmotionAnalysis> GrpcEmotionAnalyzer::Analyze(
     return BuildAnalysis(response);
 }
 
+core::Result<std::vector<EmotionAnalysis>> GrpcEmotionAnalyzer::AnalyzeBatch(
+    std::span<const std::string_view> texts,
+    std::string_view trace_id,
+    std::shared_ptr<const PersonalityConfig> personality) {
+    if (!stub_) {
+        return core::Status::Error(core::ErrorCode::FailedPrecondition, "emotion grpc stub is not initialized");
+    }
+    if (!tokenizer_ || !tokenizer_->valid()) {
+        return core::Status::Error(core::ErrorCode::FailedPrecondition, "emotion tokenizer is not initialized");
+    }
+    if (texts.empty()) {
+        return core::Status::Error(core::ErrorCode::InvalidArgument, "emotion batch is empty");
+    }
+
+    std::unique_lock lock(tokenizer_mutex_);
+    auto tokenized = tokenizer_->EncodeBatch(texts, options_.tokenizer_options);
+    lock.unlock();
+    if (!tokenized.ok()) {
+        return tokenized.status();
+    }
+
+    multimodal_inference::EmotionBatchRequest request;
+    request.mutable_input_ids()->Add(tokenized.value().input_ids.begin(), tokenized.value().input_ids.end());
+    request.mutable_attention_mask()->Add(tokenized.value().attention_mask.begin(), tokenized.value().attention_mask.end());
+    request.set_batch_size(static_cast<int>(tokenized.value().batch_size));
+    request.set_seq_length(static_cast<int>(tokenized.value().sequence_length));
+
+    const auto personality_vector = BuildPersonalityVector(std::move(personality));
+    request.mutable_personality()->Reserve(static_cast<int>(personality_vector.size() * texts.size()));
+    for (std::size_t index = 0; index < texts.size(); ++index) {
+        request.mutable_personality()->Add(personality_vector.begin(), personality_vector.end());
+    }
+
+    grpc::ClientContext context;
+    context.set_deadline(std::chrono::system_clock::now() + options_.deadline);
+    if (!options_.auth_token.empty()) {
+        context.AddMetadata(options_.auth_metadata_key, options_.auth_token);
+    }
+    if (!trace_id.empty()) {
+        context.AddMetadata("x-trace-id", std::string(trace_id));
+    }
+
+    multimodal_inference::EmotionBatchResponse response;
+    const auto status = stub_->PredictEmotionBatch(&context, request, &response);
+    if (!status.ok()) {
+        return FromGrpcStatus(status);
+    }
+    if (!response.error().empty()) {
+        return core::Status::Error(core::ErrorCode::InternalError, response.error());
+    }
+
+    constexpr int kEmotionCount = static_cast<int>(std::size(kEmotionLabels));
+    constexpr int kBehaviorCount = static_cast<int>(std::size(kBehaviorLabels));
+    constexpr int kToneCount = static_cast<int>(std::size(kToneLabels));
+    const int batch_size = request.batch_size();
+    if (response.emotion_logits_size() != batch_size * kEmotionCount ||
+        response.behavior_logits_size() != batch_size * kBehaviorCount ||
+        response.tone_logits_size() != batch_size * kToneCount ||
+        response.intensity_size() != batch_size) {
+        return core::Status::Error(core::ErrorCode::InternalError, "emotion grpc batch response has unexpected shape");
+    }
+
+    std::vector<EmotionAnalysis> analyses;
+    analyses.reserve(static_cast<std::size_t>(batch_size));
+    for (int row = 0; row < batch_size; ++row) {
+        multimodal_inference::EmotionResponse item;
+        for (int col = 0; col < kEmotionCount; ++col) {
+            item.add_emotion_logits(response.emotion_logits(row * kEmotionCount + col));
+        }
+        for (int col = 0; col < kBehaviorCount; ++col) {
+            item.add_behavior_logits(response.behavior_logits(row * kBehaviorCount + col));
+        }
+        for (int col = 0; col < kToneCount; ++col) {
+            item.add_tone_logits(response.tone_logits(row * kToneCount + col));
+        }
+        item.set_intensity(response.intensity(row));
+        auto analysis = BuildAnalysis(item);
+        if (!analysis.ok()) {
+            return analysis.status();
+        }
+        analyses.push_back(std::move(analysis).value());
+    }
+    return analyses;
+}
+
 core::Status GrpcEmotionAnalyzer::FromGrpcStatus(const grpc::Status& status) {
     if (status.ok()) {
         return core::Status::Ok();

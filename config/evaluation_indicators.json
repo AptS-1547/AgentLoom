@@ -1,0 +1,299 @@
+{
+  "embedding_model": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+  "default_sim_threshold": 0.75,
+  "categories": {
+    "teaching_clarity": {
+      "name": "讲解清晰度",
+      "indicators": {
+        "concept_definition": {
+          "name": "概念定义出现",
+          "apply_to": "teacher",
+          "keywords": ["所谓", "定义是", "指的是", "意思是", "简单来说就是", "概念是", "本质上是", "就是指"],
+          "prototypes": [
+            "所谓力就是物体间的相互作用",
+            "加速度的定义是速度变化量除以时间",
+            "简单来说它的意思就是物体会保持原来的运动状态",
+            "我们把物体抵抗形变的能力叫做弹性"
+          ],
+          "sim_threshold": 0.74,
+          "weight": 1.0
+        },
+        "concept_decomposition": {
+          "name": "概念拆解次数",
+          "apply_to": "teacher",
+          "keywords": ["第一[个点步是,，]", "第二[个点步是,，]", "第三[个点步是,，]", "首先.*然后", "分为.*和", "分成.*部分", "包含.*部分", "从.*方面"],
+          "prototypes": [
+            "这个知识点我们分三个部分来讲解",
+            "首先看第一个条件，然后分析第二个因素",
+            "牛顿第二定律包含三个要素：力、质量、加速度",
+            "我们从以下几个方面逐一分析这道题"
+          ],
+          "sim_threshold": 0.74,
+          "weight": 1.0
+        },
+        "example_usage": {
+          "name": "举例次数",
+          "apply_to": "teacher",
+          "keywords": ["比如", "例如", "举个例子", "举例来说", "就拿.*来说", "像是"],
+          "prototypes": [
+            "比如你坐在车上突然刹车会向前倾，这就是惯性",
+            "举个生活中的例子来帮大家理解",
+            "就拿我们每天骑自行车来说"
+          ],
+          "sim_threshold": 0.76,
+          "weight": 1.0
+        },
+        "analogy_usage": {
+          "name": "类比次数",
+          "apply_to": "teacher",
+          "keywords": ["就像", "好比", "类似于", "类比", "想象成", "好像.*一样", "相当于", "可以比作"],
+          "prototypes": [
+            "你可以把电流想象成水管里的水流",
+            "电阻就好比水管中间的一个狭窄处",
+            "原子核和电子的关系，类似太阳和行星的关系",
+            "这个过程就像你把一块海绵使劲挤压"
+          ],
+          "sim_threshold": 0.74,
+          "weight": 1.0
+        },
+        "repeat_explanation": {
+          "name": "重复讲解次数",
+          "apply_to": "teacher",
+          "keywords": ["换句话说", "换个方式", "我再讲一遍", "也就是说", "再说一次", "重新解释", "换个说法", "说白了"],
+          "prototypes": [
+            "刚才这个概念没听懂没关系，我换个方式再讲一遍",
+            "也就是说力越大加速度就越大",
+            "说白了就是能量不会凭空消失"
+          ],
+          "sim_threshold": 0.76,
+          "weight": 1.0
+        },
+        "emphasis_marking": {
+          "name": "重点标记次数",
+          "apply_to": "teacher",
+          "keywords": ["重点是", "关键", "注意", "一定要记住", "很重要", "容易出错", "考试常考", "划重点", "千万别忘"],
+          "prototypes": [
+            "这里是考试经常考到的一个重点知识",
+            "大家一定要记住这个公式，非常容易出错",
+            "这个地方特别重要，大家做好标记"
+          ],
+          "sim_threshold": 0.76,
+          "weight": 1.0
+        },
+        "summary_marking": {
+          "name": "总结标记",
+          "apply_to": "teacher",
+          "keywords": ["总结一下", "归纳", "回顾一下", "综上", "总的来说", "概括起来"],
+          "prototypes": [
+            "好我们来总结一下今天学的三个定律",
+            "最后做一个简单的回顾，今天讲了哪些内容"
+          ],
+          "sim_threshold": 0.76,
+          "weight": 1.0
+        }
+      }
+    },
+    "classroom_management": {
+      "name": "课堂管理",
+      "indicators": {
+        "strategy_remind": {
+          "name": "策略-提醒",
+          "apply_to": "teacher",
+          "keywords": ["安静", "坐好", "认真听", "别说话", "注意听讲", "专心", "请安静", "不要走神", "集中注意力"],
+          "prototypes": [
+            "同学们请安静下来认真听讲",
+            "后排的同学不要说话了，集中注意力",
+            "请大家把手机收起来专心听课"
+          ],
+          "sim_threshold": 0.76,
+          "weight": 1.0
+        },
+        "strategy_warn": {
+          "name": "策略-警告",
+          "apply_to": "teacher",
+          "keywords": ["再.*就", "最后一次", "不要再", "我已经说过", "再说一遍", "下次再.*就"],
+          "prototypes": [
+            "我已经提醒你三次了，再不听课我就请家长",
+            "这是最后一次警告，下次直接找班主任",
+            "我再说一遍，不要在课堂上讲话"
+          ],
+          "sim_threshold": 0.76,
+          "weight": 1.0
+        },
+        "strategy_humor": {
+          "name": "策略-幽默化解",
+          "apply_to": "teacher",
+          "keywords": ["开玩笑", "逗你玩", "哈哈", "搞笑", "笑"],
+          "prototypes": [
+            "我给大家讲个小笑话活跃一下课堂气氛",
+            "看来大家都快睡着了，我来讲个有趣的事情提提神"
+          ],
+          "sim_threshold": 0.76,
+          "weight": 1.0
+        },
+        "strategy_after_class": {
+          "name": "策略-课后沟通",
+          "apply_to": "teacher",
+          "keywords": ["下课找我", "课后聊", "课后来办公室", "放学后", "下课后谈", "课后再说"],
+          "prototypes": [
+            "这个问题比较复杂，你下课后到办公室来找我单独聊",
+            "放学后你来找我一趟，我们好好谈谈",
+            "课后我们再详细讨论这件事情"
+          ],
+          "sim_threshold": 0.76,
+          "weight": 1.0
+        },
+        "rule_clarity": {
+          "name": "规则明确性",
+          "apply_to": "teacher",
+          "keywords": ["规则", "规定", "不能", "不允许", "要举手", "必须", "课堂纪律", "要求"],
+          "prototypes": [
+            "课堂上发言之前必须先举手",
+            "我们班的课堂纪律规定不能随意走动",
+            "上课期间不允许吃东西也不允许玩手机"
+          ],
+          "sim_threshold": 0.76,
+          "weight": 1.0
+        }
+      }
+    },
+    "psychological_communication": {
+      "name": "心理沟通",
+      "indicators": {
+        "open_question": {
+          "name": "开放式提问",
+          "apply_to": "teacher",
+          "keywords": ["能说说", "怎么想的", "你觉得呢", "能聊聊", "是什么感觉", "你认为呢", "想听听你的", "你怎么看"],
+          "prototypes": [
+            "你能跟我说说你最近遇到了什么事情吗",
+            "你心里是怎么想的，能不能和老师聊一聊",
+            "你觉得是什么原因让你有这种感受呢"
+          ],
+          "sim_threshold": 0.74,
+          "weight": 1.0
+        },
+        "empathy_basic": {
+          "name": "共情表达",
+          "apply_to": "teacher",
+          "keywords": ["我理解", "我明白", "我能感受到", "你说的对", "确实不容易", "挺难的", "很正常", "可以理解"],
+          "prototypes": [
+            "老师能理解你现在的心情，确实挺不容易的",
+            "换做是我遇到这种情况可能也会很难过",
+            "你有这种感觉是完全正常的，不用觉得不好意思"
+          ],
+          "sim_threshold": 0.74,
+          "weight": 1.0
+        },
+        "premature_advice": {
+          "name": "过早建议/评判",
+          "apply_to": "teacher",
+          "keywords": ["你应该", "你必须", "你不对", "你错了", "我建议你", "你得", "你要学会"],
+          "prototypes": [
+            "你应该每天按时完成作业不要偷懒",
+            "我觉得你这样做是不对的",
+            "你必须改掉这个坏习惯否则成绩上不去"
+          ],
+          "sim_threshold": 0.76,
+          "weight": 1.0,
+          "negative": true
+        },
+        "self_disclosure": {
+          "name": "自我表露",
+          "apply_to": "teacher",
+          "keywords": ["我以前也", "我也遇到过", "我当时", "我小时候", "我上学的时候", "我也有过"],
+          "prototypes": [
+            "老师上学的时候也遇到过类似的困难",
+            "说实话我年轻时候成绩也不好，后来慢慢赶上来的",
+            "我记得我当年学这个科目的时候也觉得特别头疼"
+          ],
+          "sim_threshold": 0.74,
+          "weight": 1.0
+        },
+        "encouragement": {
+          "name": "鼓励肯定",
+          "apply_to": "teacher",
+          "keywords": ["很好", "很棒", "不错", "有进步", "有道理", "说得好", "做得好", "真厉害", "加油", "你可以的"],
+          "prototypes": [
+            "你这次回答得非常好，看得出来有认真思考",
+            "比上次考试进步了很多，老师为你感到高兴",
+            "你在这个方面很有天赋，继续加油"
+          ],
+          "sim_threshold": 0.74,
+          "weight": 1.0
+        },
+        "follow_up": {
+          "name": "后续跟进",
+          "apply_to": "teacher",
+          "keywords": ["下次再来", "随时找我", "有问题来找", "有什么事再说", "下次聊", "随时欢迎"],
+          "prototypes": [
+            "以后遇到什么困惑随时都可以来找老师聊",
+            "我们下次可以继续聊这个话题",
+            "老师的办公室随时欢迎你来，有什么事别闷在心里"
+          ],
+          "sim_threshold": 0.76,
+          "weight": 1.0
+        },
+        "emotion_word_detection": {
+          "name": "情绪词检测",
+          "apply_to": "teacher",
+          "keywords": ["伤心", "难过", "害怕", "紧张", "焦虑", "委屈", "生气", "烦躁", "不开心", "压力大", "担心", "害羞", "孤独", "沮丧", "无助"],
+          "prototypes": [
+            "老师看你今天好像不太开心，是不是有什么心事",
+            "你看起来有点紧张焦虑，是怎么了"
+          ],
+          "sim_threshold": 0.76,
+          "weight": 1.0
+        },
+        "emotion_attribution": {
+          "name": "情绪归因",
+          "apply_to": "teacher",
+          "keywords": ["为什么会", "什么原因", "怎么回事", "发生了什么", "是因为", "什么事情让你"],
+          "prototypes": [
+            "是什么事情让你这么难过呢",
+            "能告诉老师是什么原因吗",
+            "是从什么时候开始觉得压力大的"
+          ],
+          "sim_threshold": 0.76,
+          "weight": 1.0
+        },
+        "problem_decomposition": {
+          "name": "问题拆解",
+          "apply_to": "teacher",
+          "keywords": ["第一步", "先做", "分步骤", "一步一步", "先从.*开始", "我们先把.*分", "咱们一步步"],
+          "prototypes": [
+            "我们把这个难题分成三个小步骤来逐一攻破",
+            "你先从最简单的那道题开始做起，做完再看下一道",
+            "这个问题咱们分步骤来解决，先搞定第一个"
+          ],
+          "sim_threshold": 0.76,
+          "weight": 1.0
+        },
+        "relationship_building": {
+          "name": "关系建立",
+          "apply_to": "student",
+          "keywords": ["谢谢老师", "下次还找你", "愿意继续", "老师真好", "谢谢你", "跟你说很开心"],
+          "prototypes": [
+            "谢谢老师愿意花时间听我说这些",
+            "和老师聊完心里感觉好多了",
+            "以后有事我还想来找您聊天"
+          ],
+          "sim_threshold": 0.74,
+          "weight": 1.0
+        }
+      }
+    }
+  },
+
+  "medium_indicators": {
+    "_comment": "Medium 级别指标，需要 V-A 状态机数据和 OU 参数",
+    "student_emotion_improvement": {
+      "name": "学生情绪改善",
+      "description": "心理沟通场景下，教师正面干预对学生情绪的超额改善（扣除 OU 自然均值回归）",
+      "method": "bcei",
+      "positive_emotions": ["joy", "excitement", "tenderness", "curiosity"],
+      "min_window_size": 3,
+      "max_gap": 1,
+      "weight": 1.5
+    }
+  }
+}

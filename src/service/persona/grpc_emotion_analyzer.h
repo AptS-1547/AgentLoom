@@ -8,6 +8,7 @@
 #include <chrono>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -33,6 +34,11 @@ public:
         std::string_view text,
         std::string_view trace_id,
         std::shared_ptr<const PersonalityConfig> personality = nullptr) override;
+
+    core::Result<std::vector<EmotionAnalysis>> AnalyzeBatch(
+        std::span<const std::string_view> texts,
+        std::string_view trace_id,
+        std::shared_ptr<const PersonalityConfig> personality = nullptr);
 
 private:
     static core::Status FromGrpcStatus(const grpc::Status& status);

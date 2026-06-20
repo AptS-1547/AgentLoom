@@ -6,6 +6,7 @@
 #include <optional>
 #include <string>
 #include <vector>
+#include <nlohmann/json.hpp>
 
 namespace agent::service::gateway {
 
@@ -120,6 +121,7 @@ struct TrainingReportGatewayResponse : GatewayEnvelopeBase {
     std::string generated_at;
     std::uint64_t total_turns = 0;
     std::string summary;
+    nlohmann::json evaluation = nlohmann::json::object();
     persona::SessionMetrics metrics;
 };
 

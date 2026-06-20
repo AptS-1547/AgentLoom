@@ -4,6 +4,12 @@
 > Status: active planning note  
 > Date: 2026-05-24
 
+> 2026-06-20 update: this document is retained as the historical roadmap for
+> tokenizer, embedding, vector storage, semantic cache, and document pipeline
+> work. The current execution roadmap after the formal Server/E2E baseline and
+> emotion fusion experiments is now tracked in
+> `docs/CURRENT_RUNTIME_ROADMAP_2026_06.md`.
+
 ## 1. Current Baseline
 
 The protocol and storage foundations are now considered usable runtime

@@ -1,7 +1,8 @@
 #include "openai_llm_client.h"
 #include <nlohmann/json.hpp>
-#include <thread>
+#include <exception>
 #include <fstream>
+#include <thread>
 
 namespace agent::llm {
 
@@ -179,14 +180,22 @@ OpenAiLlmClient::~OpenAiLlmClient() = default;
 
 core::Result<ChatCompletionResponse> OpenAiLlmClient::Complete(
     const ChatCompletionRequest& req) {
-    return ExecuteWithRetry(req);
+    try {
+        return ExecuteWithRetry(req);
+    } catch (const std::exception& e) {
+        return core::Status(core::ErrorCode::InternalError,
+            std::string("LLM client exception: ") + e.what());
+    } catch (...) {
+        return core::Status(core::ErrorCode::InternalError,
+            "LLM client exception: unknown error");
+    }
 }
 
 core::Result<ChatCompletionResponse> OpenAiLlmClient::ExecuteWithRetry(
     const ChatCompletionRequest& req) {
 
     Json request_json = BuildRequestJson(req, options_.default_model);
-    std::string request_body = request_json.dump();
+    std::string request_body = request_json.dump(-1, ' ', false, Json::error_handler_t::replace);
 
     std::string url = options_.base_url;
     if (url.back() != '/') {

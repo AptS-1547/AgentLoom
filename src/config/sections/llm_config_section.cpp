@@ -29,11 +29,15 @@ void LlmConfigSection::LoadJson(const Json& root, MultimodalServerOptions& optio
     }
 
     SetString(*section, Name(), "base_url", options.llm.base_url);
+    SetBool(*section, Name(), "enabled", options.llm.enabled);
     SetString(*section, Name(), "api_key_env", options.llm.api_key_env);
     SetString(*section, Name(), "api_key_file", options.llm.api_key_file);
     SetString(*section, Name(), "model", options.llm.model);
     SetInt(*section, Name(), "timeout_ms", options.llm.timeout_ms, 1000, 600000);
     SetInt(*section, Name(), "max_retries", options.llm.max_retries, 0, 10);
+    SetBool(*section, Name(), "require_api_key", options.llm.require_api_key);
+    SetBool(*section, Name(), "allow_placeholder", options.llm.allow_placeholder);
+    SetBool(*section, Name(), "disable_tls_verify_on_windows", options.llm.disable_tls_verify_on_windows);
     SetString(*section, Name(), "ca_bundle_path", options.llm.ca_bundle_path);
 
     // Paths are stored as-is (relative); resolution happens in LlmPromptStore::Load.
@@ -106,7 +110,7 @@ std::filesystem::path ResolveRelativeToConfig(const std::filesystem::path& p,
 
 void LlmConfigSection::Validate(MultimodalServerOptions& options) const {
     // LLM client is optional — skip validation if base_url is not configured.
-    if (options.llm.base_url.empty()) {
+    if (!options.llm.enabled || options.llm.base_url.empty()) {
         return;
     }
 
@@ -129,10 +133,12 @@ void LlmConfigSection::Validate(MultimodalServerOptions& options) const {
         return;
     }
 
-    throw std::runtime_error(
-        "LLM base_url is set but no API key found. "
-        "Set env var " + options.llm.api_key_env +
-        " or set llm.api_key_file in config.");
+    if (options.llm.require_api_key) {
+        throw std::runtime_error(
+            "LLM base_url is set but no API key found. "
+            "Set env var " + options.llm.api_key_env +
+            " or set llm.api_key_file in config.");
+    }
 }
 
 } // namespace

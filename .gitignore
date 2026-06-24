@@ -19,6 +19,7 @@ third_party/nlohmann/*
 #日志文件
 *.log
 test/
+logs/
 #临时文件
 *.tmp
 # Claude/Codex cache

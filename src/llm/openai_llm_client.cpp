@@ -19,6 +19,16 @@ std::string RoleToString(ChatRole role) {
     return "user";
 }
 
+Json ContentPartToJson(const ChatContentPart& part) {
+    switch (part.type) {
+        case ChatContentPartType::Text:
+            return Json{{"type", "text"}, {"text", part.text}};
+        case ChatContentPartType::ImageUrl:
+            return Json{{"type", "image_url"}, {"image_url", {{"url", part.image_url}}}};
+    }
+    return Json{{"type", "text"}, {"text", part.text}};
+}
+
 Json BuildRequestJson(const ChatCompletionRequest& req, const std::string& default_model) {
     Json j;
     j["model"] = req.model.empty() ? default_model : req.model;
@@ -26,7 +36,14 @@ Json BuildRequestJson(const ChatCompletionRequest& req, const std::string& defau
     for (const auto& msg : req.messages) {
         Json msg_obj;
         msg_obj["role"] = RoleToString(msg.role);
-        msg_obj["content"] = msg.content;
+        if (msg.parts.empty()) {
+            msg_obj["content"] = msg.content;
+        } else {
+            msg_obj["content"] = Json::array();
+            for (const auto& part : msg.parts) {
+                msg_obj["content"].push_back(ContentPartToJson(part));
+            }
+        }
         j["messages"].push_back(msg_obj);
     }
     j["temperature"] = req.temperature;
@@ -104,6 +121,30 @@ core::Result<ChatCompletionResponse> ParseResponse(const std::string& body, int 
 }
 
 }  // namespace
+
+ChatContentPart ChatContentPart::Text(std::string text) {
+    ChatContentPart part;
+    part.type = ChatContentPartType::Text;
+    part.text = std::move(text);
+    return part;
+}
+
+ChatContentPart ChatContentPart::ImageUrl(std::string image_url) {
+    ChatContentPart part;
+    part.type = ChatContentPartType::ImageUrl;
+    part.image_url = std::move(image_url);
+    return part;
+}
+
+ChatContentPart ChatContentPart::ImageData(std::string_view media_type, std::string_view base64_data) {
+    ChatContentPart part;
+    part.type = ChatContentPartType::ImageUrl;
+    part.image_url = "data:";
+    part.image_url.append(media_type);
+    part.image_url.append(";base64,");
+    part.image_url.append(base64_data);
+    return part;
+}
 
 core::Status LlmPromptStore::Load(
     const std::unordered_map<std::string, std::filesystem::path>& prompt_paths,

@@ -54,6 +54,8 @@ struct PersonaGatewayServerOptions {
 struct PersonaGatewayServerDependencies {
     std::shared_ptr<persona::IMemoryContextProvider> memory_provider;
     std::shared_ptr<persona::IEmotionAnalyzer> emotion_analyzer;
+    std::shared_ptr<persona::IToolMemoryProvider> tool_memory_provider;
+    std::shared_ptr<persona::ISkillSessionManager> skill_session_manager;
     std::shared_ptr<llm::ILlmClient> llm_client;
     std::shared_ptr<document::IDocumentEmbeddingProvider> document_embedding_provider;
     std::shared_ptr<document::IDocumentLlmChunkCache> document_llm_chunk_cache;

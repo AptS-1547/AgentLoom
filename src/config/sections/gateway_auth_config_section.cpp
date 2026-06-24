@@ -76,6 +76,7 @@ void GatewayAuthConfigSection::LoadJson(const Json& root, MultimodalServerOption
     SetInt(*section, Name(), "redis_pool_size", options.gateway_auth.redis_pool_size, 1, 1024);
     SetInt(*section, Name(), "redis_command_timeout_ms", options.gateway_auth.redis_command_timeout_ms, 1, 60000);
     SetString(*section, Name(), "redis_key_prefix", options.gateway_auth.redis_key_prefix);
+    SetBool(*section, Name(), "generate_dev_keys", options.gateway_auth.generate_dev_keys);
 }
 
 bool GatewayAuthConfigSection::LoadCli(CliCursor& cursor, MultimodalServerOptions& options) const {
@@ -132,10 +133,10 @@ void GatewayAuthConfigSection::Validate(MultimodalServerOptions& options) const 
         const auto path = ResolveRelativeToConfig(auth.private_key_file, options.config_file_path);
         auth.private_key_pem = ReadTextFile(path, "gateway_auth.private_key_file");
     }
-    if (auth.enabled && auth.public_key_pem.empty()) {
+    if (auth.enabled && auth.public_key_pem.empty() && !auth.generate_dev_keys) {
         throw std::runtime_error("gateway_auth.public_key_pem or public_key_file is required when gateway auth is enabled");
     }
-    if (auth.enabled && auth.private_key_pem.empty()) {
+    if (auth.enabled && auth.private_key_pem.empty() && !auth.generate_dev_keys) {
         throw std::runtime_error("gateway_auth.private_key_pem or private_key_file is required when gateway auth is enabled");
     }
     if (auth.session_store_backend.empty()) {

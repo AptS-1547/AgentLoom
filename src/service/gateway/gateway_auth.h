@@ -53,6 +53,11 @@ struct GatewayAuthOptions {
     std::string redis_key_prefix = "agent:gateway:auth";
 };
 
+struct GatewayDevelopmentKeyPair {
+    std::string private_key_pem;
+    std::string public_key_pem;
+};
+
 struct AuthSessionRecord {
     std::string token_id;
     std::string user_uuid;
@@ -166,5 +171,6 @@ private:
 };
 
 std::optional<std::string> ExtractCookieValue(std::string_view cookie_header, std::string_view name);
+core::Result<GatewayDevelopmentKeyPair> GenerateDevelopmentRsaKeyPair();
 
 } // namespace agent::service::gateway

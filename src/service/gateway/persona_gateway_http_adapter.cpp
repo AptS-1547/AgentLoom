@@ -300,6 +300,81 @@ Json DocumentMetadataEnvelope(std::string trace_id, const document::DocumentMeta
     };
 }
 
+std::string SkillStateName(persona::SkillSessionState state) {
+    switch (state) {
+    case persona::SkillSessionState::Idle: return "idle";
+    case persona::SkillSessionState::Starting: return "starting";
+    case persona::SkillSessionState::Ready: return "ready";
+    case persona::SkillSessionState::Running: return "running";
+    case persona::SkillSessionState::WaitingInput: return "waiting_input";
+    case persona::SkillSessionState::Closing: return "closing";
+    case persona::SkillSessionState::Closed: return "closed";
+    case persona::SkillSessionState::Failed: return "failed";
+    case persona::SkillSessionState::Expired: return "expired";
+    }
+    return "unknown";
+}
+
+Json SkillObservationToJson(const persona::SkillObservation& observation) {
+    Json metadata = Json::object();
+    if (!observation.metadata_json.empty()) {
+        try {
+            metadata = Json::parse(observation.metadata_json);
+        } catch (const Json::exception&) {
+            metadata = observation.metadata_json;
+        }
+    }
+    return Json{
+        {"skillId", observation.skill_id},
+        {"sessionId", observation.session_id},
+        {"traceId", observation.trace_id},
+        {"summary", observation.summary},
+        {"confidence", observation.confidence},
+        {"stale", observation.stale},
+        {"shouldInjectPrompt", observation.should_inject_prompt},
+        {"source", observation.source},
+        {"metadata", std::move(metadata)},
+    };
+}
+
+Json SkillSessionSnapshotToJson(const persona::SkillSessionSnapshot& snapshot) {
+    Json observations = Json::array();
+    for (const auto& observation : snapshot.recent_observations) {
+        observations.push_back(SkillObservationToJson(observation));
+    }
+    return Json{
+        {"skillId", snapshot.skill_id},
+        {"sessionId", snapshot.session_id},
+        {"userUuid", snapshot.user_uuid},
+        {"personaId", snapshot.persona_id},
+        {"traceId", snapshot.trace_id},
+        {"state", SkillStateName(snapshot.state)},
+        {"statusText", snapshot.status_text},
+        {"lastObservation", snapshot.last_observation},
+        {"lastError", snapshot.last_error},
+        {"closeReason", snapshot.close_reason},
+        {"maxDurationMs", snapshot.max_duration.count()},
+        {"recentObservations", std::move(observations)},
+    };
+}
+
+Json SkillSessionEnvelope(std::string trace_id, const persona::SkillSessionSnapshot& snapshot) {
+    return Json{
+        {"ok", true},
+        {"traceId", std::move(trace_id)},
+        {"data", SkillSessionSnapshotToJson(snapshot)},
+    };
+}
+
+Json SkillSessionStatusEnvelope(std::string trace_id,
+                                const std::optional<persona::SkillSessionSnapshot>& snapshot) {
+    return Json{
+        {"ok", true},
+        {"traceId", std::move(trace_id)},
+        {"data", snapshot ? SkillSessionSnapshotToJson(*snapshot) : Json(nullptr)},
+    };
+}
+
 core::Result<Json> ParseJsonBody(const ::net::BeastHttpRequest& req) {
     if (req.body().empty()) {
         return Json::object();
@@ -581,6 +656,7 @@ struct HttpRouteContext {
     std::shared_ptr<document::IDocumentEmbeddingProvider> embedding_provider;
     std::shared_ptr<document::IDocumentLlmChunkCache> llm_chunk_cache;
     std::shared_ptr<semantic_cache::ISemanticCache> document_semantic_cache;
+    std::shared_ptr<persona::ISkillSessionManager> skill_session_manager;
     std::shared_ptr<IAuthRegistrationService> auth_registration;
     std::shared_ptr<::net::IHttpRequest> request;
     const ::net::BeastHttpRequest& message;
@@ -598,6 +674,7 @@ struct WsRouteContext {
     std::shared_ptr<document::IDocumentEmbeddingProvider> embedding_provider;
     std::shared_ptr<document::IDocumentLlmChunkCache> llm_chunk_cache;
     std::shared_ptr<semantic_cache::ISemanticCache> document_semantic_cache;
+    std::shared_ptr<persona::ISkillSessionManager> skill_session_manager;
     std::shared_ptr<::net::IWebSocketStreamRequest> request;
     const Json& body;
     const AuthIdentity& identity;
@@ -1004,6 +1081,69 @@ DECLARE_HTTP_ROUTE(SystemStatsRoute, ::net::http::verb::get, "api", "system", "s
     SendResult(context.request, context.service.SystemStats(context.trace_id), context.trace_id, SystemStatsEnvelope);
 }
 
+DECLARE_HTTP_ROUTE(SkillSessionStartRoute, ::net::http::verb::post, "api", "skill", "session", "start") {
+    if (!context.skill_session_manager) {
+        const auto status = core::Status::Error(core::ErrorCode::FailedPrecondition, "skill session manager is not configured");
+        SendJson(context.request, HttpStatusFor(status.code()), ErrorEnvelope(context.trace_id, status), context.trace_id);
+        return;
+    }
+    persona::SkillSessionStartRequest req;
+    req.trace_id = context.trace_id;
+    req.skill_id = context.body.value("skillId", context.body.value("skill_id", std::string{}));
+    req.session_id = context.body.value("sessionId", context.body.value("session_id", std::string{}));
+    req.user_uuid = context.body.value("userUuid", context.body.value("user_uuid", context.identity.user_uuid));
+    req.persona_id = context.body.value("personaId", context.body.value("persona_id", std::string{}));
+    req.source = context.body.value("source", std::string{"http"});
+    req.reason = context.body.value("reason", std::string{});
+    if (context.body.contains("arguments")) {
+        req.arguments_json = context.body["arguments"].dump(-1, ' ', false, Json::error_handler_t::replace);
+    } else {
+        req.arguments_json = context.body.value("argumentsJson", context.body.value("arguments_json", std::string{"{}"}));
+    }
+    const auto max_duration_ms = context.body.value("maxDurationMs", context.body.value("max_duration_ms", std::int64_t{0}));
+    if (max_duration_ms > 0) {
+        req.max_duration = std::chrono::milliseconds(max_duration_ms);
+    }
+    auto result = context.skill_session_manager->Start(req);
+    SendResult(context.request, std::move(result), context.trace_id, [&trace_id = context.trace_id](const auto& snapshot) {
+        return SkillSessionEnvelope(trace_id, snapshot);
+    });
+}
+
+DECLARE_HTTP_ROUTE(SkillSessionStopRoute, ::net::http::verb::post, "api", "skill", "session", "stop") {
+    if (!context.skill_session_manager) {
+        const auto status = core::Status::Error(core::ErrorCode::FailedPrecondition, "skill session manager is not configured");
+        SendJson(context.request, HttpStatusFor(status.code()), ErrorEnvelope(context.trace_id, status), context.trace_id);
+        return;
+    }
+    persona::SkillSessionStopRequest req;
+    req.trace_id = context.trace_id;
+    req.skill_id = context.body.value("skillId", context.body.value("skill_id", std::string{}));
+    req.session_id = context.body.value("sessionId", context.body.value("session_id", std::string{}));
+    req.source = context.body.value("source", std::string{"http"});
+    req.reason = context.body.value("reason", std::string{"client_stop"});
+    req.summarize = context.body.value("summarize", true);
+    req.write_l3 = context.body.value("writeL3", context.body.value("write_l3", false));
+    auto result = context.skill_session_manager->Stop(req);
+    SendResult(context.request, std::move(result), context.trace_id, [&trace_id = context.trace_id](const auto& snapshot) {
+        return SkillSessionEnvelope(trace_id, snapshot);
+    });
+}
+
+DECLARE_HTTP_ROUTE(SkillSessionStatusRoute, ::net::http::verb::post, "api", "skill", "session", "status") {
+    if (!context.skill_session_manager) {
+        const auto status = core::Status::Error(core::ErrorCode::FailedPrecondition, "skill session manager is not configured");
+        SendJson(context.request, HttpStatusFor(status.code()), ErrorEnvelope(context.trace_id, status), context.trace_id);
+        return;
+    }
+    const auto skill_id = context.body.value("skillId", context.body.value("skill_id", std::string{}));
+    const auto session_id = context.body.value("sessionId", context.body.value("session_id", std::string{}));
+    auto result = context.skill_session_manager->Get(session_id, skill_id);
+    SendResult(context.request, std::move(result), context.trace_id, [&trace_id = context.trace_id](const auto& snapshot) {
+        return SkillSessionStatusEnvelope(trace_id, snapshot);
+    });
+}
+
 DECLARE_HTTP_ROUTE(DocumentRegisterRoute, ::net::http::verb::post, "api", "document", "register") {
     if (!context.document_service) {
         const auto status = core::Status::Error(core::ErrorCode::FailedPrecondition, "document analysis service is not configured");
@@ -1146,6 +1286,81 @@ DECLARE_WS_ROUTE(SessionCloseWsRoute, "session.close") {
     auto result = context.service.CloseSession(std::move(req));
     Json out = result.ok()
         ? Json{{"type", "session.closed"}, {"payload", SessionEnvelope(result.value())}}
+        : Json{{"type", "error"}, {"payload", ErrorEnvelope(context.trace_id, result.status())}};
+    context.request->Send(TextFrame(context.request->memory_pool(), out.dump()));
+}
+
+DECLARE_WS_ROUTE(SkillSessionStartWsRoute, "skill.session.start") {
+    if (!context.skill_session_manager) {
+        SendWsError(
+            context.request,
+            context.trace_id,
+            core::Status::Error(core::ErrorCode::FailedPrecondition, "skill session manager is not configured"));
+        return;
+    }
+    const auto payload = context.body.value("payload", Json::object());
+    persona::SkillSessionStartRequest req;
+    req.trace_id = context.trace_id;
+    req.skill_id = payload.value("skillId", payload.value("skill_id", std::string{}));
+    req.session_id = payload.value("sessionId", payload.value("session_id", std::string{}));
+    req.user_uuid = payload.value("userUuid", payload.value("user_uuid", context.identity.user_uuid));
+    req.persona_id = payload.value("personaId", payload.value("persona_id", std::string{}));
+    req.source = payload.value("source", std::string{"websocket"});
+    req.reason = payload.value("reason", std::string{});
+    if (payload.contains("arguments")) {
+        req.arguments_json = payload["arguments"].dump(-1, ' ', false, Json::error_handler_t::replace);
+    } else {
+        req.arguments_json = payload.value("argumentsJson", payload.value("arguments_json", std::string{"{}"}));
+    }
+    const auto max_duration_ms = payload.value("maxDurationMs", payload.value("max_duration_ms", std::int64_t{0}));
+    if (max_duration_ms > 0) {
+        req.max_duration = std::chrono::milliseconds(max_duration_ms);
+    }
+    auto result = context.skill_session_manager->Start(req);
+    Json out = result.ok()
+        ? Json{{"type", "skill.session.started"}, {"payload", SkillSessionEnvelope(context.trace_id, result.value())}}
+        : Json{{"type", "error"}, {"payload", ErrorEnvelope(context.trace_id, result.status())}};
+    context.request->Send(TextFrame(context.request->memory_pool(), out.dump()));
+}
+
+DECLARE_WS_ROUTE(SkillSessionStopWsRoute, "skill.session.stop") {
+    if (!context.skill_session_manager) {
+        SendWsError(
+            context.request,
+            context.trace_id,
+            core::Status::Error(core::ErrorCode::FailedPrecondition, "skill session manager is not configured"));
+        return;
+    }
+    const auto payload = context.body.value("payload", Json::object());
+    persona::SkillSessionStopRequest req;
+    req.trace_id = context.trace_id;
+    req.skill_id = payload.value("skillId", payload.value("skill_id", std::string{}));
+    req.session_id = payload.value("sessionId", payload.value("session_id", std::string{}));
+    req.source = payload.value("source", std::string{"websocket"});
+    req.reason = payload.value("reason", std::string{"client_stop"});
+    req.summarize = payload.value("summarize", true);
+    req.write_l3 = payload.value("writeL3", payload.value("write_l3", false));
+    auto result = context.skill_session_manager->Stop(req);
+    Json out = result.ok()
+        ? Json{{"type", "skill.session.stopped"}, {"payload", SkillSessionEnvelope(context.trace_id, result.value())}}
+        : Json{{"type", "error"}, {"payload", ErrorEnvelope(context.trace_id, result.status())}};
+    context.request->Send(TextFrame(context.request->memory_pool(), out.dump()));
+}
+
+DECLARE_WS_ROUTE(SkillSessionStatusWsRoute, "skill.session.status") {
+    if (!context.skill_session_manager) {
+        SendWsError(
+            context.request,
+            context.trace_id,
+            core::Status::Error(core::ErrorCode::FailedPrecondition, "skill session manager is not configured"));
+        return;
+    }
+    const auto payload = context.body.value("payload", Json::object());
+    const auto skill_id = payload.value("skillId", payload.value("skill_id", std::string{}));
+    const auto session_id = payload.value("sessionId", payload.value("session_id", std::string{}));
+    auto result = context.skill_session_manager->Get(session_id, skill_id);
+    Json out = result.ok()
+        ? Json{{"type", "skill.session.status"}, {"payload", SkillSessionStatusEnvelope(context.trace_id, result.value())}}
         : Json{{"type", "error"}, {"payload", ErrorEnvelope(context.trace_id, result.status())}};
     context.request->Send(TextFrame(context.request->memory_pool(), out.dump()));
 }
@@ -1387,7 +1602,8 @@ PersonaGatewayHttpAdapter::PersonaGatewayHttpAdapter(PersonaGatewayService& serv
                                                      std::shared_ptr<llm::ILlmClient> llm_client,
                                                      std::shared_ptr<document::IDocumentEmbeddingProvider> embedding_provider,
                                                      std::shared_ptr<document::IDocumentLlmChunkCache> llm_chunk_cache,
-                                                     std::shared_ptr<semantic_cache::ISemanticCache> document_semantic_cache)
+                                                     std::shared_ptr<semantic_cache::ISemanticCache> document_semantic_cache,
+                                                     std::shared_ptr<persona::ISkillSessionManager> skill_session_manager)
     : service_(service),
       authenticator_(std::move(authenticator)),
       auth_registration_(std::move(auth_registration)),
@@ -1395,7 +1611,8 @@ PersonaGatewayHttpAdapter::PersonaGatewayHttpAdapter(PersonaGatewayService& serv
       llm_client_(std::move(llm_client)),
       embedding_provider_(std::move(embedding_provider)),
       llm_chunk_cache_(std::move(llm_chunk_cache)),
-      document_semantic_cache_(std::move(document_semantic_cache)) {}
+      document_semantic_cache_(std::move(document_semantic_cache)),
+      skill_session_manager_(std::move(skill_session_manager)) {}
 
 bool PersonaGatewayHttpAdapter::IsApiRequest(std::string_view target) noexcept {
     const auto q = target.find('?');
@@ -1445,6 +1662,7 @@ void PersonaGatewayHttpAdapter::HandleHttp(std::shared_ptr<::net::IHttpRequest> 
             embedding_provider_,
             llm_chunk_cache_,
             document_semantic_cache_,
+            skill_session_manager_,
             auth_registration_,
             std::move(request),
             msg,
@@ -1538,6 +1756,7 @@ void PersonaGatewayHttpAdapter::HandleWebSocket(std::shared_ptr<::net::IWebSocke
             embedding_provider_,
             llm_chunk_cache_,
             document_semantic_cache_,
+            skill_session_manager_,
             std::move(request),
             body,
             identity,

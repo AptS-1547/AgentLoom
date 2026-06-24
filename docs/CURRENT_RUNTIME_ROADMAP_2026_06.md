@@ -250,14 +250,142 @@ VLM 仍然是高价值方向，但当前完成度最低、工程风险最高。�
 - 场景识别相对可用，但表情/身份类描述不稳定。
 - 多模态结果如何影响情绪状态机仍需要谨慎定义。
 
+### 7.1 WebRTC 输入层定位
+
+WebRTC 不应被设计为单纯的“视频上传接口”，而应作为长期多模态感知链路的实时输入底座。它解决的是输入、采样、推理成本和跨帧状态维护的工程闭环问题。只要 WebRTC 输入层完成，后续无论接云端 GLM/VLM、轻量本地 VLM，还是比赛端未来的多模态方案，都可以复用同一套实时视频接入、帧抽样、事件队列和状态缓存基础设施。
+
+当前更合适的第一阶段目标是：
+
+```text
+Browser camera
+  -> WebRTC
+  -> GStreamer webrtcbin
+  -> decoded frame/appsink
+  -> dynamic frame sampler
+  -> VLM request/cache/event queue
+```
+
+这一阶段不要求 VLM 直接闭环到情绪状态机，而是先证明视频输入、解码、抽帧和异步推理链路稳定。
+
+### 7.2 信令层复用现有 WebSocket 基础设施
+
+项目现有 WebSocket/Boost.Beast/Asio 封装已经覆盖了大部分连接处理能力，因此 WebRTC 信令层可以优先复用现有 `net::HttpServer` 与 `SetWebSocketStreamHandler` 模式，而不是重新实现一套独立网络服务。
+
+建议新增内部信令端点：
+
+```text
+/ws/vision/signaling
+```
+
+该端点只负责 WebRTC signaling，不承载大体积媒体数据：
+
+- 交换 SDP offer/answer。
+- 交换 ICE candidate。
+- 维护 connection id 与 session id 的映射。
+- 向视觉 runtime 发送连接建立、断开、错误等控制事件。
+- 在极端断线、重复 candidate、浏览器刷新、服务端 pipeline 创建失败时给出明确错误。
+
+媒体数据仍通过 WebRTC RTP/RTCP 进入 GStreamer 管线，避免把视频帧塞进 WebSocket。
+
+第一版信令消息可以保持很小：
+
+```json
+{
+  "type": "offer | answer | ice | close | error",
+  "session_id": "string",
+  "connection_id": "string",
+  "payload": {}
+}
+```
+
+### 7.3 GStreamer/webrtcbin 管线
+
+WebRTC media 层建议优先使用 GStreamer `webrtcbin`。原因是它提供了相对固定的封装模式，适合在 C++ 后端中做工程化落地，并且后续可以逐步接入 NVIDIA 硬件解码或其他平台硬件加速。
+
+第一版管线目标：
+
+```text
+webrtcbin
+  -> depay
+  -> decode
+  -> videoconvert
+  -> appsink
+```
+
+appsink 输出帧后进入已有或新增的动态抽帧模块。抽帧模块不应逐帧调用 VLM，而是根据变化程度、时间间隔、显著性和缓存命中情况决定是否提交视觉分析任务。
+
+硬件加速建议作为第二阶段能力：
+
+- NVIDIA 环境可尝试 NVDEC/NVENC 或 GStreamer NVIDIA 插件。
+- CPU-only 环境必须保留软件解码 fallback。
+- 不应让 CUDA/GPU 依赖阻断 Linux target 的基础编译。
+- VLM 推理服务仍建议作为独立容器，主网关只负责输入、采样和请求编排。
+
+### 7.4 多容器边界
+
+多模态链路仍建议保持多容器架构：
+
+| 容器 | 职责 |
+|------|------|
+| Gateway | HTTP/WebSocket/WebRTC signaling、session、记忆、缓存、主链路编排 |
+| Vision Ingest / VLM Adapter | GStreamer/WebRTC media、帧抽样、VLM 请求与视觉事件生成 |
+| BERT Emotion Server | 文本情绪推理 |
+| Redis | 缓存、会话元数据、语义/视觉事件存储 |
+
+如果第一版为了开发便利把 Gateway 与 Vision Ingest 放在同一进程，也应保持接口边界清晰，后续可以拆成独立容器。VLM 推理本身不建议和 Gateway 强耦合，因为模型依赖、GPU/CUDA/驱动兼容性和资源占用都明显不同。
+
+### 7.5 VLM 幻觉治理策略
+
+多模态第一阶段不应把 VLM 输出当作强事实源，尤其不能直接用单帧 VLM 描述覆盖用户身份、性别、表情或情绪判断。此前 E2E 观察已经显示，Qwen VL 3B 对人脸、身份、性别和客体持续性存在幻觉，场景识别相对更可用。
+
+因此 VLM 输出需要分层使用：
+
+| 输出类型 | 第一阶段策略 |
+|----------|--------------|
+| 场景/环境 | 可作为低风险上下文注入 |
+| 动作变化 | 可作为事件提示，但需跨帧确认 |
+| 物体存在 | 需要连续帧或缓存一致性确认 |
+| 身份/性别/人脸属性 | 默认不作为可靠事实 |
+| 表情/情绪 | 不直接写入情绪状态机 |
+
+建议维护视觉事件而不是直接维护“结论”：
+
+```text
+visual_event = {
+  scene_hint,
+  action_hint,
+  object_hint,
+  confidence,
+  source_frame_id,
+  temporal_consistency
+}
+```
+
+这些事件可以进入 LLM context 或语义/视觉缓存，但进入情绪状态机前必须经过更严格的门控。
+
+### 7.6 第一版验收标准
+
+WebRTC/VLM 第一阶段建议以工程闭环为验收目标，而不是以 VLM 准确率为目标：
+
+- 浏览器可通过 WebRTC 建立视频连接。
+- 服务端可通过现有 WebSocket 信令完成 offer/answer/ICE 交换。
+- GStreamer pipeline 能稳定输出 decoded frame。
+- 服务端能按动态抽帧策略保存或传递关键帧。
+- 断线、刷新、重复连接、pipeline 创建失败不会拖垮主 Server。
+- VLM 请求在独立任务/线程池中执行，不阻塞主链路。
+- Redis 或内部事件队列能记录视觉事件。
+- 不将单帧 VLM 输出直接写入情绪状态机。
+
 建议推进顺序：
 
 ```text
-1. 完成 GStreamer/WebRTC 实时视频输入服务。
-2. 做帧采样与 saliency 检测。
-3. 接入 VLM 缓存与动作变化检测。
-4. 做 identity persistence / 跨帧一致性。
-5. 最后再考虑接入情绪状态机。
+1. 基于现有 WebSocket 封装完成 WebRTC signaling。
+2. 完成 GStreamer/webrtcbin 实时视频输入服务。
+3. 接入 appsink decoded frame 输出。
+4. 做动态帧采样与 saliency 检测。
+5. 接入 VLM 缓存、动作变化检测与视觉事件队列。
+6. 做 identity persistence / 跨帧一致性。
+7. 最后再考虑接入情绪状态机。
 ```
 
 VLM 第一阶段定位：

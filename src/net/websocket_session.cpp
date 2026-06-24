@@ -280,9 +280,11 @@ void WebSocketSession::NotifyClose(const ConnectionCloseInfo& close_info) {
     if (close_notified_.exchange(true, std::memory_order_acq_rel)) {
         return;
     }
-    lease_.Close(close_info);
+    auto enriched = close_info;
+    enriched.connection_id = lease_.context().connection_id;
+    lease_.Close(enriched);
     if (callbacks_.close_handler) {
-        callbacks_.close_handler(close_info);
+        callbacks_.close_handler(enriched);
     }
 }
 

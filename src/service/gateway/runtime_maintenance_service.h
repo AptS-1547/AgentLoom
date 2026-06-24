@@ -5,6 +5,7 @@
 #include "long_term_memory_compressor.h"
 #include "result.h"
 #include "session_manager.h"
+#include "skill_session_manager.h"
 
 #include <atomic>
 #include <chrono>
@@ -18,6 +19,10 @@
 #include <unordered_set>
 #include <thread>
 #include <vector>
+
+namespace media {
+class WebRtcSessionRegistry;
+}
 
 namespace agent::service::gateway {
 
@@ -99,6 +104,38 @@ public:
 private:
     std::shared_ptr<document::DocumentAnalysisService> documents_;
     std::chrono::milliseconds interval_;
+};
+
+class WebRtcSessionMaintenanceTask final : public IRuntimeMaintenanceTask {
+public:
+    WebRtcSessionMaintenanceTask(std::shared_ptr<media::WebRtcSessionRegistry> registry,
+                                 std::chrono::milliseconds interval,
+                                 core::LoggerAdapter logger = core::LoggerAdapter::ForModule("gateway"));
+
+    std::string_view Name() const noexcept override;
+    std::chrono::milliseconds Interval() const noexcept override;
+    core::Status Tick(std::stop_token stop_token) override;
+
+private:
+    std::shared_ptr<media::WebRtcSessionRegistry> registry_;
+    std::chrono::milliseconds interval_;
+    core::LoggerAdapter logger_;
+};
+
+class SkillSessionMaintenanceTask final : public IRuntimeMaintenanceTask {
+public:
+    SkillSessionMaintenanceTask(std::shared_ptr<persona::ISkillSessionManager> manager,
+                                std::chrono::milliseconds interval,
+                                core::LoggerAdapter logger = core::LoggerAdapter::ForModule("gateway"));
+
+    std::string_view Name() const noexcept override;
+    std::chrono::milliseconds Interval() const noexcept override;
+    core::Status Tick(std::stop_token stop_token) override;
+
+private:
+    std::shared_ptr<persona::ISkillSessionManager> manager_;
+    std::chrono::milliseconds interval_;
+    core::LoggerAdapter logger_;
 };
 
 struct L3MemoryFlushMaintenanceOptions {

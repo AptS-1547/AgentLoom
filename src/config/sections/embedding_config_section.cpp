@@ -26,6 +26,9 @@ void EmbeddingConfigSection::LoadJson(const Json& root, MultimodalServerOptions&
 
     SetString(*section, Name(), "tokenizer_path", options.embedding.tokenizer_path);
     SetString(*section, Name(), "onnx_model_path", options.embedding.onnx_model_path);
+    if (options.embedding.onnx_model_path.empty()) {
+        SetString(*section, Name(), "model_path", options.embedding.onnx_model_path);
+    }
     SetString(*section, Name(), "execution_provider", options.embedding.execution_provider);
     SetBool(*section, Name(), "allow_cpu_fallback", options.embedding.allow_cpu_fallback);
     SetInt(*section, Name(), "cuda_device_id", options.embedding.cuda_device_id, 0);

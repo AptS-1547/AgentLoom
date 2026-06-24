@@ -1,5 +1,7 @@
 #include "runtime_maintenance_service.h"
 
+#include "webrtc_session_registry.h"
+
 #include <algorithm>
 #include <ctime>
 #include <iomanip>
@@ -221,6 +223,60 @@ core::Status DocumentRetentionMaintenanceTask::Tick(std::stop_token stop_token) 
         return core::Status::Ok();
     }
     return documents_->RunRetentionCleanupOnce(NowUnixMs());
+}
+
+WebRtcSessionMaintenanceTask::WebRtcSessionMaintenanceTask(
+    std::shared_ptr<media::WebRtcSessionRegistry> registry,
+    std::chrono::milliseconds interval,
+    core::LoggerAdapter logger)
+    : registry_(std::move(registry)),
+      interval_(interval),
+      logger_(std::move(logger)) {}
+
+std::string_view WebRtcSessionMaintenanceTask::Name() const noexcept {
+    return "webrtc_session_cleanup";
+}
+
+std::chrono::milliseconds WebRtcSessionMaintenanceTask::Interval() const noexcept {
+    return interval_;
+}
+
+core::Status WebRtcSessionMaintenanceTask::Tick(std::stop_token stop_token) {
+    if (stop_token.stop_requested() || !registry_) {
+        return core::Status::Ok();
+    }
+    const auto expired = registry_->CleanupExpired(stop_token);
+    if (expired > 0) {
+        logger_.info("[maintenance] rtc session cleanup expired_count={}", expired);
+    }
+    return core::Status::Ok();
+}
+
+SkillSessionMaintenanceTask::SkillSessionMaintenanceTask(
+    std::shared_ptr<persona::ISkillSessionManager> manager,
+    std::chrono::milliseconds interval,
+    core::LoggerAdapter logger)
+    : manager_(std::move(manager)),
+      interval_(interval),
+      logger_(std::move(logger)) {}
+
+std::string_view SkillSessionMaintenanceTask::Name() const noexcept {
+    return "skill_session_cleanup";
+}
+
+std::chrono::milliseconds SkillSessionMaintenanceTask::Interval() const noexcept {
+    return interval_;
+}
+
+core::Status SkillSessionMaintenanceTask::Tick(std::stop_token stop_token) {
+    if (stop_token.stop_requested() || !manager_) {
+        return core::Status::Ok();
+    }
+    const auto expired = manager_->CleanupExpired(stop_token);
+    if (expired > 0) {
+        logger_.info("[maintenance] skill session cleanup expired_count={}", expired);
+    }
+    return core::Status::Ok();
 }
 
 L3MemoryFlushMaintenanceTask::L3MemoryFlushMaintenanceTask(

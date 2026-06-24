@@ -20,9 +20,18 @@
 #include <algorithm>
 
 
+#if defined(_MSC_VER)
+#define AGENT_SEMANTIC_CACHE_RESTRICT __restrict
+#elif defined(__GNUC__) || defined(__clang__)
+#define AGENT_SEMANTIC_CACHE_RESTRICT __restrict__
+#else
+#define AGENT_SEMANTIC_CACHE_RESTRICT
+#endif
+
 // This file implements a simple semantic cache pipeline that stores CacheRecords in Redis in batches.
 template<size_t Dim, typename T = float>
-inline T dot_product_unrolled(const T* __restrict a, const T* __restrict b) noexcept
+inline T dot_product_unrolled(const T* AGENT_SEMANTIC_CACHE_RESTRICT a,
+                              const T* AGENT_SEMANTIC_CACHE_RESTRICT b) noexcept
 {
     static_assert(Dim > 0, "Dimension must be > 0");
     static_assert(std::is_same_v<T, float>, "Only float is supported in this AVX2 version");
@@ -100,7 +109,8 @@ inline T dot_product_unrolled(const T* __restrict a, const T* __restrict b) noex
 }
 
 template<size_t Dim>
-inline float dot_product_small(const float* __restrict a, const float* __restrict b) noexcept
+inline float dot_product_small(const float* AGENT_SEMANTIC_CACHE_RESTRICT a,
+                               const float* AGENT_SEMANTIC_CACHE_RESTRICT b) noexcept
 {
     static_assert(Dim <= 8, "Use only for small dims");
     if constexpr (Dim == 0) return 0.0f;

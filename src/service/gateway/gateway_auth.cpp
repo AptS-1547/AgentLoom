@@ -5,6 +5,7 @@
 #include <openssl/bio.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
+#include <openssl/rsa.h>
 
 #include "sqlite/sqlite_connection.h"
 #include "sqlite/sqlite_statement.h"
@@ -815,6 +816,47 @@ std::optional<std::string> ExtractCookieValue(std::string_view cookie_header, st
         start = end + 1;
     }
     return std::nullopt;
+}
+
+core::Result<GatewayDevelopmentKeyPair> GenerateDevelopmentRsaKeyPair() {
+    std::unique_ptr<EVP_PKEY_CTX, decltype(&EVP_PKEY_CTX_free)> ctx(
+        EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, nullptr),
+        EVP_PKEY_CTX_free);
+    if (!ctx ||
+        EVP_PKEY_keygen_init(ctx.get()) != 1 ||
+        EVP_PKEY_CTX_set_rsa_keygen_bits(ctx.get(), 2048) != 1) {
+        return core::Status::Error(core::ErrorCode::InternalError, "failed to initialize RSA key generator");
+    }
+
+    EVP_PKEY* raw_key = nullptr;
+    if (EVP_PKEY_keygen(ctx.get(), &raw_key) != 1 || raw_key == nullptr) {
+        return core::Status::Error(core::ErrorCode::InternalError, "failed to generate RSA key pair");
+    }
+    std::unique_ptr<EVP_PKEY, PKeyDeleter> key(raw_key);
+
+    std::unique_ptr<BIO, BioDeleter> private_bio(BIO_new(BIO_s_mem()));
+    std::unique_ptr<BIO, BioDeleter> public_bio(BIO_new(BIO_s_mem()));
+    if (!private_bio || !public_bio) {
+        return core::Status::Error(core::ErrorCode::InternalError, "failed to allocate OpenSSL BIO");
+    }
+    if (PEM_write_bio_PrivateKey(private_bio.get(), key.get(), nullptr, nullptr, 0, nullptr, nullptr) != 1) {
+        return core::Status::Error(core::ErrorCode::InternalError, "failed to write private key PEM");
+    }
+    if (PEM_write_bio_PUBKEY(public_bio.get(), key.get()) != 1) {
+        return core::Status::Error(core::ErrorCode::InternalError, "failed to write public key PEM");
+    }
+
+    BUF_MEM* private_mem = nullptr;
+    BUF_MEM* public_mem = nullptr;
+    BIO_get_mem_ptr(private_bio.get(), &private_mem);
+    BIO_get_mem_ptr(public_bio.get(), &public_mem);
+    if (!private_mem || !public_mem) {
+        return core::Status::Error(core::ErrorCode::InternalError, "failed to read generated key PEM");
+    }
+    return GatewayDevelopmentKeyPair{
+        std::string(private_mem->data, private_mem->length),
+        std::string(public_mem->data, public_mem->length),
+    };
 }
 
 } // namespace agent::service::gateway

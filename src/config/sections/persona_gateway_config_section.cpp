@@ -59,6 +59,17 @@ void PersonaGatewayConfigSection::LoadJson(const Json& root, MultimodalServerOpt
     }
 
     SetString(*section, Name(), "websocket_path", options.persona_gateway.websocket_path);
+    SetString(*section, Name(), "address", options.http.address);
+    if (const Json* port_field = FindField(*section, Name(), "port")) {
+        if (port_field->is_number_unsigned()) {
+            unsigned int port = port_field->get<unsigned int>();
+            if (port > 65535) {
+                throw std::runtime_error("persona_gateway.port must be <= 65535");
+            }
+            options.http.port = static_cast<unsigned short>(port);
+        }
+    }
+    SetSize(*section, Name(), "http_io_threads", options.http.io_threads, 1);
     if (const Json* static_files = FindField(*section, Name(), "static_files")) {
         if (!static_files->is_object()) {
             throw std::runtime_error("persona_gateway.static_files must be an object");

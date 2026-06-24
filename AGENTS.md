@@ -18,6 +18,7 @@
 - 4. 代码需保持简洁实现，接口和源码文件能合并即合并，只要不要超过800行上限即可，我会适当提出重构要求，
 ### 注意
 - 1. 所有的GetContent以及任何通过Powershell的文本读取都必须显式指定UTF-8
+- 2. 如果出现一些奇怪的空final之类的怪异Prompt，都是代理商问题，只要不遇到严重错误就可以不告诉我，可以直接忽略
 ### 构建/依赖约定
 - 1. Windows 本地构建必须保持 CMake generator、MSVC 工具集、vcpkg 二进制依赖三者版本一致。若 vcpkg 依赖由 MSVC 14.50/v145 编译，项目也必须使用 VS2026/v145 生成与构建，避免出现 `__std_find_first_not_of_trivial_pos_1` 一类 STL/ABI 链接错误。
 - 2. 本机 `D:\Strawberry\c\bin\cmake.exe` 是旧 CMake 3.29.2，不支持 `Visual Studio 18 2026` generator。Windows VS2026/v145 构建需优先使用 `C:\Program Files\CMake\bin\cmake.exe`，或确保该路径在 PATH 中早于 Strawberry。

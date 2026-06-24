@@ -915,6 +915,43 @@ target_link_libraries(agent_vector_storage PUBLIC
 )
 
 if(TARGET gstreamer_core)
+    add_library(agent_media STATIC
+        src/media/opencv_frame_sampler.cpp
+        src/media/opencv_frame_sampler.h
+        src/media/vision_runtime_interfaces.cpp
+        src/media/vision_runtime_interfaces.h
+        src/media/webrtc_media_pipeline.cpp
+        src/media/webrtc_media_pipeline.h
+        src/media/webrtc_session_registry.cpp
+        src/media/webrtc_session_registry.h
+        src/media/webrtc_signaling_handler.cpp
+        src/media/webrtc_signaling_handler.h
+        src/media/webrtc_bin.cpp
+        src/media/webrtc_bin.h
+    )
+
+    target_include_directories(agent_media PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/media
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/core
+    )
+
+    target_link_libraries(agent_media PUBLIC
+        agent_core
+        agent_net
+        agent_semantic_cache
+        agent_vector
+        ${OpenCV_LIBS}
+        gstreamer_core
+        "${GSTREAMER_ROOT}/lib/gstapp-1.0.lib"
+        "${GSTREAMER_ROOT}/lib/gstsdp-1.0.lib"
+        "${GSTREAMER_ROOT}/lib/gstwebrtc-1.0.lib"
+    )
+
+    target_compile_definitions(agent_media PRIVATE
+        GST_USE_UNSTABLE_API
+    )
+
     add_executable(media_gstreamer_probe
         src/media/gstreamer_probe.cpp
     )
@@ -970,6 +1007,26 @@ target_link_libraries(ws_download_client PRIVATE
     agent_net
 )
 
+if(TARGET agent_media)
+    add_executable(webrtc_signaling_smoke_server
+        tools/webrtc_signaling_smoke_server.cpp
+    )
+
+    target_link_libraries(webrtc_signaling_smoke_server PRIVATE
+        agent_service
+        agent_media
+        agent_net
+    )
+
+    copy_runtime_files(webrtc_signaling_smoke_server ${BERT_OPENCV_RUNTIME_FILES})
+
+    if(WIN32)
+        set_target_properties(webrtc_signaling_smoke_server PROPERTIES
+            VS_DEBUGGER_ENVIRONMENT "PATH=${GSTREAMER_ROOT}/bin;%PATH%;GST_PLUGIN_PATH=${GSTREAMER_ROOT}/lib/gstreamer-1.0"
+        )
+    endif()
+endif()
+
 add_custom_command(TARGET static_site_test_server POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/net/static_site"
@@ -1006,6 +1063,30 @@ if(BERT_BUILD_TESTS)
     )
 
     gtest_discover_tests(net_tests DISCOVERY_MODE PRE_TEST)
+
+    if(TARGET agent_media)
+        add_executable(media_tests
+            tests/media/opencv_frame_sampler_test.cpp
+            tests/media/webrtc_media_pipeline_test.cpp
+            tests/media/webrtc_signaling_handler_test.cpp
+            tests/media/webrtc_bin_test.cpp
+        )
+
+        target_link_libraries(media_tests PRIVATE
+            agent_media
+            GTest::gtest_main
+        )
+
+        copy_runtime_files(media_tests ${BERT_OPENCV_RUNTIME_FILES})
+
+        if(WIN32)
+            set_target_properties(media_tests PROPERTIES
+                VS_DEBUGGER_ENVIRONMENT "PATH=${GSTREAMER_ROOT}/bin;%PATH%;GST_PLUGIN_PATH=${GSTREAMER_ROOT}/lib/gstreamer-1.0"
+            )
+        endif()
+
+        gtest_discover_tests(media_tests DISCOVERY_MODE PRE_TEST)
+    endif()
 
     add_executable(storage_tests
         tests/storage/sqlite_storage_test.cpp
@@ -1171,6 +1252,7 @@ add_library(agent_config STATIC
     src/config/option_parser.cpp
     src/config/option_parser.h
     src/config/request_options.h
+    src/config/sections/agent_gateway_config_section.cpp
     src/config/sections/auth_config_section.cpp
     src/config/sections/config_path_section.cpp
     src/config/sections/embedding_config_section.cpp
@@ -1181,6 +1263,7 @@ add_library(agent_config STATIC
     src/config/sections/llm_config_section.cpp
     src/config/sections/model_config_section.cpp
     src/config/sections/persona_gateway_config_section.cpp
+    src/config/sections/skill_session_config_section.cpp
     src/config/sections/vlm_cache_config_section.cpp
     src/config/sections/vram_config_section.cpp
     src/config/server_config.cpp
@@ -1219,6 +1302,10 @@ add_library(agent_service STATIC
     src/service/persona/session_manager.h
     src/service/persona/persona_runtime.cpp
     src/service/persona/persona_runtime.h
+    src/service/persona/skill_session_manager.cpp
+    src/service/persona/skill_session_manager.h
+    src/service/persona/tool_memory_provider.cpp
+    src/service/persona/tool_memory_provider.h
     src/service/persona/emotion_fusion_analyzer.cpp
     src/service/persona/emotion_fusion_analyzer.h
     src/service/persona/grpc_emotion_analyzer.cpp
@@ -1271,6 +1358,26 @@ target_link_libraries(agent_service PUBLIC
     spdlog::spdlog
 )
 
+if(TARGET agent_media)
+    target_link_libraries(agent_service PRIVATE
+        agent_media
+    )
+
+    add_library(agent_skill_media STATIC
+        src/service/persona/skill_vision_event_sink.cpp
+        src/service/persona/skill_vision_event_sink.h
+    )
+
+    target_include_directories(agent_skill_media PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/service/persona
+    )
+
+    target_link_libraries(agent_skill_media PUBLIC
+        agent_service
+        agent_media
+    )
+endif()
+
 if(BERT_BUILD_TESTS)
     add_executable(service_tests
         tests/service/persona_algorithm_test.cpp
@@ -1285,6 +1392,12 @@ if(BERT_BUILD_TESTS)
         agent_service
         GTest::gtest_main
     )
+
+    if(TARGET agent_skill_media)
+        target_link_libraries(service_tests PRIVATE
+            agent_skill_media
+        )
+    endif()
 
     target_include_directories(service_tests PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/tools

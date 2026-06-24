@@ -11,6 +11,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 struct VramGuardOptions {
     int monitor_interval_seconds = 10;
@@ -70,6 +71,7 @@ struct VlmCacheVectorOptions {
 };
 
 struct LlmOptions {
+    bool enabled = true;
     std::string base_url;
     std::string api_key_env = "AGENT_LLM_API_KEY";
     std::string api_key_file;
@@ -78,10 +80,128 @@ struct LlmOptions {
     std::string model = "deepseek-chat";
     int timeout_ms = 30000;
     int max_retries = 2;
+    bool require_api_key = true;
+    bool allow_placeholder = false;
+    bool disable_tls_verify_on_windows = true;
     /// Optional CA bundle (PEM) for HTTPS verification.  Relative to config
     /// file directory.  Leave empty on Linux to use the system trust store.
     std::string ca_bundle_path;
     std::unordered_map<std::string, std::filesystem::path> prompts;
+};
+
+struct LoggingConfigOptions {
+    std::filesystem::path log_dir = "../logs/persona_gateway_e2e";
+    std::string logger_name = "agent_gateway_server";
+    std::string file_name = "agent_gateway_server.log";
+    bool enable_console = true;
+    bool use_daily_rotation = false;
+    std::size_t max_file_size_bytes = 10 * 1024 * 1024;
+    std::size_t max_files = 5;
+};
+
+struct LocalLlmConfigOptions {
+    bool enabled = false;
+    std::string target = "127.0.0.1:50051";
+    int deadline_ms = 30000;
+    std::string auth_token;
+    std::string auth_metadata_key = "authorization";
+};
+
+struct EmotionAnalyzerConfigOptions {
+    bool enabled = false;
+    std::string backend = "neutral";
+    std::string target = "127.0.0.1:50051";
+    std::filesystem::path tokenizer_path;
+    int deadline_ms = 3000;
+    std::string auth_token;
+    std::string auth_metadata_key = "authorization";
+    std::size_t max_length = 128;
+    bool truncation = true;
+    bool padding = true;
+    bool add_special_tokens = true;
+};
+
+struct EmotionKeywordRuleConfigOptions {
+    std::string label;
+    std::string pattern;
+    float score = 1.0f;
+};
+
+struct EmotionFusionConfigOptions {
+    bool enabled = true;
+    float bert_weight = 1.0f;
+    float default_reliability = 0.7f;
+    float accept_confidence = 0.55f;
+    float ambiguity_margin = 0.12f;
+    float head_bias = 0.0f;
+    float bert_signal_weight = 2.0f;
+    float keyword_signal_weight = 2.2f;
+    float vector_signal_weight = 2.2f;
+    float llm_signal_weight = 0.0f;
+    float margin_signal_weight = 0.5f;
+    float llm_gate_confidence = 0.0f;
+    float llm_gate_min_delta = 0.0f;
+    std::unordered_map<std::string, double> source_weights;
+    std::unordered_map<std::string, double> label_reliability;
+    std::vector<EmotionKeywordRuleConfigOptions> keyword_rules;
+};
+
+struct L0MemoryConfigOptions {
+    bool enabled = true;
+    std::string redis_host = "127.0.0.1";
+    int redis_port = 5000;
+    std::filesystem::path sqlite_path = "../data/persona_gateway_e2e/l0_memory.db";
+    std::size_t max_cached_records = 1000;
+    std::size_t top_k = 5;
+    std::size_t neighbors_per_hit = 1;
+    float similarity_floor = 0.78f;
+    std::string user_uuid = "e2e-l0";
+};
+
+struct DocumentLlmChunkCacheConfigOptions {
+    bool enabled = false;
+    std::string redis_host = "127.0.0.1";
+    int redis_port = 5000;
+    std::size_t redis_pool_size = 4;
+    std::string key_prefix = "agent:gateway:document:llm_chunk";
+    int ttl_seconds = 7 * 24 * 60 * 60;
+};
+
+struct DocumentSemanticCacheConfigOptions {
+    bool enabled = false;
+    std::string redis_host = "127.0.0.1";
+    int redis_port = 5000;
+    std::filesystem::path sqlite_path = "../data/agent_gateway/document_semantic_cache.db";
+    std::string user_uuid = "document-semantic-cache";
+    std::size_t max_cached_records = 10000;
+    std::size_t top_k = 6;
+    float similarity_floor = 0.94f;
+};
+
+struct L3MemoryConfigOptions {
+    bool enabled = false;
+    std::filesystem::path sqlite_path = "../data/agent_gateway/l3_memory.db";
+    std::filesystem::path registry_sqlite_path = "../data/agent_gateway/l3_registry.db";
+    std::string collection_name = "l3_memory";
+    std::string embedding_fingerprint = "minilm-l6-v2";
+    std::string tokenizer_fingerprint = "minilm-l6-v2";
+    std::string corpus_version = "v1";
+    std::string policy_version = "v1";
+    std::string index_backend = "exact";
+    std::size_t max_resident_partitions = 16;
+    int max_records_per_batch = 1000;
+    int compression_max_tokens = 800;
+    float compression_temperature = 0.1f;
+    std::vector<std::string> user_uuids;
+};
+
+struct L3FlushSchedulerConfigOptions {
+    bool enabled = false;
+    int check_interval_seconds = 300;
+    int flush_hour = 3;
+    int flush_minute = 0;
+    int flush_date_offset_days = 0;
+    bool defer_when_sessions_active = true;
 };
 
 struct GatewayAuthConfigOptions {
@@ -110,6 +230,7 @@ struct GatewayAuthConfigOptions {
     int redis_pool_size = 8;
     int redis_command_timeout_ms = 5000;
     std::string redis_key_prefix = "agent:gateway:auth";
+    bool generate_dev_keys = false;
 };
 
 struct GatewayStaticFilesConfigOptions {
@@ -150,6 +271,16 @@ struct PersonaGatewayConfigOptions {
     bool reject_suspicious_patterns = true;
 };
 
+struct SkillSessionConfigOptions {
+    bool enabled = true;
+    int startup_timeout_ms = 15000;
+    int max_duration_ms = 120000;
+    int idle_timeout_ms = 60000;
+    int closing_timeout_ms = 10000;
+    std::size_t max_recent_observations = 8;
+    int cleanup_interval_seconds = 30;
+};
+
 template <typename GatewayAuthOptionsT>
 GatewayAuthOptionsT ToGatewayAuthOptions(const GatewayAuthConfigOptions& config) {
     GatewayAuthOptionsT options;
@@ -185,9 +316,19 @@ struct MultimodalServerOptions {
     BertRuntimeConfigOptions bert_runtime;
     EmbeddingModelOptions embedding;
     LlmOptions llm;
+    LoggingConfigOptions logging;
+    LocalLlmConfigOptions local_llm;
+    EmotionAnalyzerConfigOptions emotion_analyzer;
+    EmotionFusionConfigOptions emotion_fusion;
+    L0MemoryConfigOptions l0_memory;
+    DocumentLlmChunkCacheConfigOptions document_llm_chunk_cache;
+    DocumentSemanticCacheConfigOptions document_semantic_cache;
+    L3MemoryConfigOptions l3_memory;
+    L3FlushSchedulerConfigOptions l3_flush_scheduler;
     request_validation::AuthOptions auth;
     GatewayAuthConfigOptions gateway_auth;
     PersonaGatewayConfigOptions persona_gateway;
+    SkillSessionConfigOptions skill_session;
     request_validation::RequestLimits limits;
     VramGuardOptions vram;
     VlmCacheConfigOptions vlm_cache;

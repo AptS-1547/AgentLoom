@@ -14,6 +14,7 @@
 
 using agent::llm::ChatCompletionRequest;
 using agent::llm::ChatCompletionResponse;
+using agent::llm::ChatContentPart;
 using agent::llm::ChatRole;
 using agent::llm::FallbackLlmClient;
 using agent::llm::FallbackLlmClientOptions;
@@ -277,6 +278,38 @@ TEST_F(OpenAiLlmClientTest, SystemMessageIncluded) {
     client_->Complete(req);
     EXPECT_NE(behavior_->last_body.find("system"), std::string::npos);
     EXPECT_NE(behavior_->last_body.find("you are a tutor"), std::string::npos);
+}
+
+TEST_F(OpenAiLlmClientTest, VisionContentPartsUseOpenAiCompatibleImageUrlFormat) {
+    ChatCompletionRequest req;
+    req.model = "glm-4.6v";
+    req.messages.push_back({
+        ChatRole::User,
+        "",
+        {
+            ChatContentPart::ImageData("image/jpeg", "abc123"),
+            ChatContentPart::Text("请描述画面"),
+        },
+    });
+
+    auto result = client_->Complete(req);
+
+    ASSERT_TRUE(result.ok()) << result.status().message();
+    EXPECT_NE(behavior_->last_body.find("\"model\":\"glm-4.6v\""), std::string::npos);
+    EXPECT_NE(behavior_->last_body.find("\"content\":[{"), std::string::npos);
+    EXPECT_NE(behavior_->last_body.find("\"type\":\"image_url\""), std::string::npos);
+    EXPECT_NE(behavior_->last_body.find("data:image/jpeg;base64,abc123"), std::string::npos);
+    EXPECT_NE(behavior_->last_body.find("\"type\":\"text\""), std::string::npos);
+    EXPECT_NE(behavior_->last_body.find("请描述画面"), std::string::npos);
+}
+
+TEST_F(OpenAiLlmClientTest, PlainTextMessageKeepsStringContentFormat) {
+    auto req = SimpleRequest();
+    auto result = client_->Complete(req);
+
+    ASSERT_TRUE(result.ok()) << result.status().message();
+    EXPECT_NE(behavior_->last_body.find("\"content\":\"hello\""), std::string::npos);
+    EXPECT_EQ(behavior_->last_body.find("\"content\":[{"), std::string::npos);
 }
 
 // ── unit: HTTP-level error responses ────────────────────────────────────────

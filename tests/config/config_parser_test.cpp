@@ -246,7 +246,13 @@ TEST(ConfigOptionParserTest, ResolvesAuthTokenFromFile) {
 }
 
 TEST(ConfigOptionParserTest, RejectsMissingRequiredLlm) {
-    EXPECT_THROW(Parse({"server", "--bert", "bert.onnx"}), std::runtime_error);
+    EXPECT_THROW(
+        Parse({
+            "server",
+            "--bert", "bert.onnx",
+            "--llm-base-url", "https://api.example.com/v1"
+        }),
+        std::runtime_error);
 }
 
 TEST(ConfigOptionParserTest, RejectsInvalidSectionValidation) {

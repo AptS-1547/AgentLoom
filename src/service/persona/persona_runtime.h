@@ -4,6 +4,8 @@
 #include "long_term_memory_compressor.h"
 #include "openai_llm_client.h"
 #include "session_manager.h"
+#include "skill_session_manager.h"
+#include "tool_memory_provider.h"
 
 #include <chrono>
 #include <functional>
@@ -18,6 +20,7 @@ struct RecalledContext {
     std::vector<ConversationTurn> recent_turns;
     bool l0_hit = false;
     bool l3_hit = false;
+    bool l4_hit = false;
 };
 
 struct MemoryContextRequest {
@@ -176,6 +179,7 @@ struct ChatResponse {
     EmotionAnalysis ai_emotion;
     bool l0_hit = false;
     bool l3_hit = false;
+    bool l4_hit = false;
     std::uint64_t turn_index = 0;
     AnswerCacheInfo answer_cache;
     ChatLatencyBreakdown latency;
@@ -198,6 +202,8 @@ public:
                    std::shared_ptr<llm::ILlmClient> llm_client,
                    PersonaRuntimeOptions options = {},
                    std::shared_ptr<IAnswerCacheProvider> answer_cache_provider = nullptr,
+                   std::shared_ptr<IToolMemoryProvider> tool_memory_provider = nullptr,
+                   std::shared_ptr<ISkillSessionManager> skill_session_manager = nullptr,
                    core::LoggerAdapter logger = core::LoggerAdapter::ForModule("service"),
                    std::shared_ptr<IEmotionCalibrationSampleSink> emotion_calibration_sink = nullptr);
 
@@ -234,6 +240,8 @@ private:
     std::shared_ptr<IEmotionAnalyzer> emotion_analyzer_;
     std::shared_ptr<llm::ILlmClient> llm_client_;
     std::shared_ptr<IAnswerCacheProvider> answer_cache_provider_;
+    std::shared_ptr<IToolMemoryProvider> tool_memory_provider_;
+    std::shared_ptr<ISkillSessionManager> skill_session_manager_;
     std::shared_ptr<IEmotionCalibrationSampleSink> emotion_calibration_sink_;
     PersonaRuntimeOptions options_;
     core::LoggerAdapter logger_;

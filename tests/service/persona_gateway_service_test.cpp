@@ -51,6 +51,7 @@ using agent::service::persona::PersonaRuntimeOptions;
 using agent::service::persona::PersonalityConfig;
 using agent::service::persona::SemanticMemoryContextProvider;
 using agent::service::persona::SessionManager;
+using agent::service::persona::SkillSessionManager;
 using Json = nlohmann::json;
 namespace asio = boost::asio;
 namespace beast = boost::beast;
@@ -142,6 +143,7 @@ struct GatewayFixture {
     std::shared_ptr<NeutralEmotionAnalyzer> emotion;
     std::shared_ptr<FakeLlmClient> llm;
     std::shared_ptr<SemanticMemoryContextProvider> memory;
+    std::shared_ptr<SkillSessionManager> skill_sessions;
     PersonaRuntime runtime;
     ClassroomScheduler classroom_scheduler;
     PersonaGatewayService gateway;
@@ -152,7 +154,8 @@ struct GatewayFixture {
           emotion(std::make_shared<NeutralEmotionAnalyzer>()),
           llm(std::make_shared<FakeLlmClient>()),
           memory(std::make_shared<SemanticMemoryContextProvider>(cache)),
-          runtime(sessions, memory, emotion, llm, PersonaRuntimeOptions{.recent_raw_turns = 10, .default_model = "test-model"}),
+          skill_sessions(std::make_shared<SkillSessionManager>()),
+          runtime(sessions, memory, emotion, llm, PersonaRuntimeOptions{.recent_raw_turns = 10, .default_model = "test-model"}, nullptr, nullptr, skill_sessions),
           gateway(sessions, runtime, &classroom_scheduler) {
         EXPECT_TRUE(compute.Start().ok());
         EXPECT_TRUE(io.Start().ok());
@@ -491,6 +494,130 @@ TEST(PersonaGatewayHttpAdapterTest, RoutesWebSocketMessagesThroughRegistry) {
         });
     EXPECT_EQ(unknown["type"], "error");
     EXPECT_EQ(unknown["payload"]["error"]["code"], "INVALID_ARGUMENT");
+
+    server.Stop();
+}
+
+TEST(PersonaGatewayHttpAdapterTest, HandlesSkillSessionHttpControlRoutes) {
+    GatewayFixture f;
+    PersonaGatewayHttpAdapter adapter(f.gateway, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, f.skill_sessions);
+    ::net::HttpServer server({.address = "127.0.0.1", .port = 0, .io_threads = 1});
+    server.SetHttpRequestHandler([&adapter](std::shared_ptr<::net::IHttpRequest> request) {
+        adapter.HandleHttp(std::move(request));
+    });
+    ASSERT_TRUE(server.Start().ok());
+
+    auto started = SendJsonRequest(
+        server.port(),
+        ::net::http::verb::post,
+        "/api/skill/session/start",
+        Json{
+            {"traceId", "trace-skill-http-start"},
+            {"skillId", "vision.observe"},
+            {"sessionId", "session-skill-http"},
+            {"userUuid", "user-skill-http"},
+            {"personaId", "dazhi"},
+            {"source", "test"},
+            {"reason", "start vision"},
+            {"arguments", {{"mode", "camera"}}},
+            {"maxDurationMs", 120000},
+        });
+    ASSERT_EQ(started.result(), ::net::http::status::ok);
+    auto started_body = Json::parse(started.body());
+    ASSERT_TRUE(started_body["ok"].get<bool>());
+    EXPECT_EQ(started_body["data"]["skillId"], "vision.observe");
+    EXPECT_EQ(started_body["data"]["sessionId"], "session-skill-http");
+    EXPECT_EQ(started_body["data"]["state"], "starting");
+
+    auto status = SendJsonRequest(
+        server.port(),
+        ::net::http::verb::post,
+        "/api/skill/session/status",
+        Json{
+            {"traceId", "trace-skill-http-status"},
+            {"skillId", "vision.observe"},
+            {"sessionId", "session-skill-http"},
+        });
+    ASSERT_EQ(status.result(), ::net::http::status::ok);
+    auto status_body = Json::parse(status.body());
+    ASSERT_TRUE(status_body["ok"].get<bool>());
+    EXPECT_EQ(status_body["data"]["state"], "starting");
+
+    auto stopped = SendJsonRequest(
+        server.port(),
+        ::net::http::verb::post,
+        "/api/skill/session/stop",
+        Json{
+            {"traceId", "trace-skill-http-stop"},
+            {"skillId", "vision.observe"},
+            {"sessionId", "session-skill-http"},
+            {"source", "test"},
+            {"reason", "stop vision"},
+        });
+    ASSERT_EQ(stopped.result(), ::net::http::status::ok);
+    auto stopped_body = Json::parse(stopped.body());
+    ASSERT_TRUE(stopped_body["ok"].get<bool>());
+    EXPECT_EQ(stopped_body["data"]["state"], "closed");
+    EXPECT_EQ(stopped_body["data"]["closeReason"], "stop vision");
+
+    server.Stop();
+}
+
+TEST(PersonaGatewayHttpAdapterTest, HandlesSkillSessionWebSocketControlRoutes) {
+    GatewayFixture f;
+    PersonaGatewayHttpAdapter adapter(f.gateway, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, f.skill_sessions);
+    ::net::HttpServer server({.address = "127.0.0.1", .port = 0, .io_threads = 1});
+    server.SetWebSocketStreamHandler("/ws/session", [&adapter](std::shared_ptr<::net::IWebSocketStreamRequest> request) {
+        adapter.HandleWebSocket(std::move(request));
+    });
+    ASSERT_TRUE(server.Start().ok());
+
+    auto started = SendWebSocketJson(
+        server.port(),
+        "/ws/session",
+        Json{
+            {"type", "skill.session.start"},
+            {"traceId", "trace-skill-ws-start"},
+            {"payload", {
+                {"skillId", "vision.observe"},
+                {"sessionId", "session-skill-ws"},
+                {"userUuid", "user-skill-ws"},
+                {"personaId", "dazhi"},
+            }},
+        });
+    ASSERT_EQ(started["type"], "skill.session.started");
+    EXPECT_EQ(started["payload"]["data"]["state"], "starting");
+
+    auto status = SendWebSocketJson(
+        server.port(),
+        "/ws/session",
+        Json{
+            {"type", "skill.session.status"},
+            {"traceId", "trace-skill-ws-status"},
+            {"payload", {
+                {"skillId", "vision.observe"},
+                {"sessionId", "session-skill-ws"},
+            }},
+        });
+    ASSERT_EQ(status["type"], "skill.session.status");
+    EXPECT_EQ(status["payload"]["data"]["sessionId"], "session-skill-ws");
+    EXPECT_EQ(status["payload"]["data"]["state"], "starting");
+
+    auto stopped = SendWebSocketJson(
+        server.port(),
+        "/ws/session",
+        Json{
+            {"type", "skill.session.stop"},
+            {"traceId", "trace-skill-ws-stop"},
+            {"payload", {
+                {"skillId", "vision.observe"},
+                {"sessionId", "session-skill-ws"},
+                {"reason", "ws stop"},
+            }},
+        });
+    ASSERT_EQ(stopped["type"], "skill.session.stopped");
+    EXPECT_EQ(stopped["payload"]["data"]["state"], "closed");
+    EXPECT_EQ(stopped["payload"]["data"]["closeReason"], "ws stop");
 
     server.Stop();
 }

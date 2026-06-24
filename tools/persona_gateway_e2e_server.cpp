@@ -269,6 +269,9 @@ struct ToolConfig {
     bool emotion_fusion_enabled = true;
     std::vector<agent::service::persona::EmotionKeywordRule> emotion_keyword_rules;
     bool emotion_vector_enabled = false;
+    bool skill_session_enabled = true;
+    agent::service::persona::SkillSessionOptions skill_session_options;
+    int skill_session_cleanup_interval_seconds = 30;
 };
 
 struct L0MemoryCacheBundle {
@@ -526,6 +529,21 @@ ToolConfig LoadConfig(const fs::path& config_path) {
     }
     config.emotion_keyword_rules = ParseEmotionKeywordRules(emotion_fusion);
     config.emotion_vector_enabled = GetBool(emotion_fusion, "vector_enabled", false);
+
+    const auto skill_session = config.root.value("skill_session", Json::object());
+    config.skill_session_enabled = GetBool(skill_session, "enabled", true);
+    config.skill_session_options.startup_timeout =
+        std::chrono::milliseconds(GetInt(skill_session, "startup_timeout_ms", 15000));
+    config.skill_session_options.max_duration =
+        std::chrono::milliseconds(GetInt(skill_session, "max_duration_ms", 120000));
+    config.skill_session_options.idle_timeout =
+        std::chrono::milliseconds(GetInt(skill_session, "idle_timeout_ms", 60000));
+    config.skill_session_options.closing_timeout =
+        std::chrono::milliseconds(GetInt(skill_session, "closing_timeout_ms", 10000));
+    config.skill_session_options.max_recent_observations =
+        GetSize(skill_session, "max_recent_observations", 8);
+    config.skill_session_cleanup_interval_seconds =
+        GetInt(skill_session, "cleanup_interval_seconds", 30);
 
     return config;
 }
@@ -817,6 +835,22 @@ int main(int argc, char** argv) {
         dependencies.llm_client = std::move(llm).value();
         dependencies.l0_redis_pool = l0_bundle.redis_pool;
         dependencies.evaluation_config_path = config.repo_root / "config" / "evaluation_indicators.json";
+        std::shared_ptr<agent::service::persona::SkillSessionManager> skill_sessions;
+        if (config.skill_session_enabled) {
+            skill_sessions = std::make_shared<agent::service::persona::SkillSessionManager>(
+                config.skill_session_options,
+                core::LoggerAdapter::ForModule("skill"));
+            dependencies.skill_session_manager = skill_sessions;
+            dependencies.maintenance_tasks.push_back(
+                std::make_shared<agent::service::gateway::SkillSessionMaintenanceTask>(
+                    skill_sessions,
+                    std::chrono::seconds(config.skill_session_cleanup_interval_seconds),
+                    core::LoggerAdapter::ForModule("gateway")));
+            LOG_INFO("[gateway-e2e] skill session enabled startup_timeout_ms={} max_duration_ms={} idle_timeout_ms={}",
+                     config.skill_session_options.startup_timeout.count(),
+                     config.skill_session_options.max_duration.count(),
+                     config.skill_session_options.idle_timeout.count());
+        }
 
         if (config.gateway.auth.session_store_backend != "redis") {
             fs::create_directories(fs::path(config.gateway.auth.session_database_path).parent_path());

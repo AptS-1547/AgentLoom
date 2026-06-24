@@ -24,6 +24,7 @@ struct ConnectionCloseInfo {
     ConnectionCloseReason reason = ConnectionCloseReason::RemoteClosed;
     core::Status status = core::Status::Ok();
     std::string detail;
+    std::uint64_t connection_id = 0;
 
     static ConnectionCloseInfo Remote(std::string detail = {}) {
         return {ConnectionCloseReason::RemoteClosed, core::Status::Ok(), std::move(detail)};

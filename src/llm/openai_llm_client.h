@@ -32,9 +32,25 @@ enum class ChatRole {
     Assistant,
 };
 
+enum class ChatContentPartType {
+    Text,
+    ImageUrl,
+};
+
+struct ChatContentPart {
+    ChatContentPartType type = ChatContentPartType::Text;
+    std::string text;
+    std::string image_url;
+
+    static ChatContentPart Text(std::string text);
+    static ChatContentPart ImageUrl(std::string image_url);
+    static ChatContentPart ImageData(std::string_view media_type, std::string_view base64_data);
+};
+
 struct ChatMessage {
     ChatRole role = ChatRole::User;
     std::string content;
+    std::vector<ChatContentPart> parts;
 };
 
 struct ChatCompletionRequest {

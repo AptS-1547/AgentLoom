@@ -817,6 +817,7 @@ TEST(HttpServerRuntimeTest, ReportsOversizedWebSocketMessageWithoutClosingConnec
     server.SetWebSocketCloseHandler([&](const net::ConnectionCloseInfo& close_info) {
         if (!close_recorded.exchange(true)) {
             EXPECT_NE(close_info.reason, net::ConnectionCloseReason::BackpressureLimit);
+            EXPECT_GT(close_info.connection_id, 0u);
         }
     });
 

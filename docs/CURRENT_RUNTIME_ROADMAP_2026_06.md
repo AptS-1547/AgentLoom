@@ -34,7 +34,7 @@ P2 补完情绪层 domain/OOD pre-gate；
 | P1 | 语义缓存主链路接入 | 当前最值得优先实现的功能 |
 | P2 | 情绪层 domain/OOD pre-gate | 情绪感知工程闭环的最后关键结构 |
 | P3 | BERT/情绪模型升级与数据闭环 | 赛后或下一阶段模型工程 |
-| P4 | VLM 多模态实时链路 | 高价值但高风险，需分阶段推进 |
+| P4 | VLM 多模态实时链路 | 流处理与抽帧基本完成，待多路推流验证和 VLM 接入 |
 
 ## 3. P0：交付态回归验证
 
@@ -241,85 +241,85 @@ domain_score[label] = cosine_similarity(text_embedding, label_domain_centroid[la
 
 ## 7. P4：VLM 多模态实时链路
 
-VLM 仍然是高价值方向，但当前完成度最低、工程风险最高。短期不建议把它作为拉升情绪准确率的主要手段。
+VLM 仍然是高价值方向，但当前瓶颈已经不再是“有没有视频输入层”。代码现状显示，WebRTC signaling、GStreamer `webrtcbin` media pipeline、`appsink` decoded frame 输出、OpenCV 动态抽帧、视觉事件聚合和 smoke 工具已经基本落地。下一阶段重点应从“搭链路”转为“验证多路推流、正式接入 VLM、做资源隔离和稳定性回归”。
 
-已知问题：
+已经具备：
 
-- GStreamer/WebRTC 服务尚未完成。
-- Qwen VL 3B 在人脸、身份、性别、客体持续性上存在明显幻觉。
-- 场景识别相对可用，但表情/身份类描述不稳定。
-- 多模态结果如何影响情绪状态机仍需要谨慎定义。
+- `src/media/webrtc_signaling_handler.*`：复用现有 WebSocket runtime，支持 `/ws/vision/signaling` 的 offer/answer/ICE/close/resume/config。
+- `src/media/webrtc_session_registry.*`：维护 WebRTC session、connection、reconnect token、frame checkpoint，并支持 Redis checkpoint store。
+- `src/media/webrtc_media_pipeline.*`：创建 GStreamer pipeline，接入 `webrtcbin`，通过 `decodebin -> videoconvert -> appsink` 输出 RGB frame。
+- `src/media/opencv_frame_sampler.*`：按 session 维护 MOG2、直方图、边缘变化、EMA、cooldown 和可选自适应 FPS 抽帧状态。
+- `src/media/vision_runtime_interfaces.*`：定义 `IFrameSampler`、`IVlmVisionClient`、`VisionEvent`、`VisionEventMonitor`、dedup sink 和 context provider。
+- `tools/playwright_webrtc_signaling_smoke.py` 与 `tools/webrtc_signaling_smoke_server.cpp`：已具备浏览器 WebRTC smoke、多 session 参数、解码帧落盘和 sampler 验证入口。
+- `tests/media/*`：覆盖 signaling、session checkpoint、pipeline 创建、OpenCV sampler、事件聚合和 dedup。
 
-### 7.1 WebRTC 输入层定位
+仍需验证或补齐：
 
-WebRTC 不应被设计为单纯的“视频上传接口”，而应作为长期多模态感知链路的实时输入底座。它解决的是输入、采样、推理成本和跨帧状态维护的工程闭环问题。只要 WebRTC 输入层完成，后续无论接云端 GLM/VLM、轻量本地 VLM，还是比赛端未来的多模态方案，都可以复用同一套实时视频接入、帧抽样、事件队列和状态缓存基础设施。
+- 多路浏览器推流下的 CPU、内存、线程池队列、GStreamer pipeline 生命周期和关闭回收。
+- `IVlmVisionClient` 当前还是接口位，media pipeline 尚未把关键帧编码后正式提交给 VLM 服务。
+- VLM 请求需要放入 IO pool 或独立 worker，不能在 GStreamer callback、WebSocket 线程或主对话线程中执行。
+- 视觉事件进入 persona runtime 的链路已有 `skill_vision_event_sink` 基础，但 VLM observation 的正式字段、置信度、缓存与降权策略仍需收敛。
+- NVIDIA/VAAPI/D3D11 等硬件解码策略仍需按平台验证，CPU-only fallback 必须保留。
 
-当前更合适的第一阶段目标是：
+### 7.1 当前链路定位
+
+当前链路应视为“实时视觉输入与抽帧底座已基本完成”，而不是早期的“待实现 WebRTC 输入层”。更准确的当前目标是：
 
 ```text
 Browser camera
-  -> WebRTC
-  -> GStreamer webrtcbin
-  -> decoded frame/appsink
-  -> dynamic frame sampler
-  -> VLM request/cache/event queue
+  -> WebRTC signaling over /ws/vision/signaling
+  -> GStreamer webrtcbin media pipeline
+  -> decodebin / videoconvert / appsink
+  -> OpenCV dynamic frame sampler
+  -> VisionEvent / monitor / dedup
+  -> async VLM request/cache/event queue
+  -> controlled vision.observe observation
 ```
 
-这一阶段不要求 VLM 直接闭环到情绪状态机，而是先证明视频输入、解码、抽帧和异步推理链路稳定。
+这一阶段仍不建议让 VLM 直接闭环到情绪状态机。更稳的定位是：先把多路推流、抽帧、关键帧事件、VLM observation 和主链路注入做成可控工具会话。
 
-### 7.2 信令层复用现有 WebSocket 基础设施
+### 7.2 信令与会话层现状
 
-项目现有 WebSocket/Boost.Beast/Asio 封装已经覆盖了大部分连接处理能力，因此 WebRTC 信令层可以优先复用现有 `net::HttpServer` 与 `SetWebSocketStreamHandler` 模式，而不是重新实现一套独立网络服务。
-
-建议新增内部信令端点：
+项目现有 WebSocket/Boost.Beast/Asio 封装已经被 WebRTC signaling 复用，内部端点为：
 
 ```text
 /ws/vision/signaling
 ```
 
-该端点只负责 WebRTC signaling，不承载大体积媒体数据：
+该端点负责：
 
 - 交换 SDP offer/answer。
 - 交换 ICE candidate。
-- 维护 connection id 与 session id 的映射。
-- 向视觉 runtime 发送连接建立、断开、错误等控制事件。
-- 在极端断线、重复 candidate、浏览器刷新、服务端 pipeline 创建失败时给出明确错误。
+- 返回 ICE server config。
+- 维护 connection id、session id、trace id 和 reconnect token。
+- 支持 resume / close。
+- 在 pipeline 创建失败、未知消息、断线和重连失败时返回明确错误。
 
-媒体数据仍通过 WebRTC RTP/RTCP 进入 GStreamer 管线，避免把视频帧塞进 WebSocket。
+媒体数据仍通过 WebRTC RTP/RTCP 进入 GStreamer 管线，不通过 WebSocket 传输大体积帧。后续重点不是重新设计信令协议，而是验证多 session 并发、断线重连、刷新、重复 close、pipeline fatal error 这些生产路径。
 
-第一版信令消息可以保持很小：
+### 7.3 GStreamer/webrtcbin 与抽帧现状
 
-```json
-{
-  "type": "offer | answer | ice | close | error",
-  "session_id": "string",
-  "connection_id": "string",
-  "payload": {}
-}
-```
-
-### 7.3 GStreamer/webrtcbin 管线
-
-WebRTC media 层建议优先使用 GStreamer `webrtcbin`。原因是它提供了相对固定的封装模式，适合在 C++ 后端中做工程化落地，并且后续可以逐步接入 NVIDIA 硬件解码或其他平台硬件加速。
-
-第一版管线目标：
+当前 media pipeline 已经按如下路径构建：
 
 ```text
 webrtcbin
-  -> depay
-  -> decode
+  -> incoming pad
+  -> queue
+  -> decodebin
   -> videoconvert
-  -> appsink
+  -> appsink(RGB)
+  -> compute_pool frame sampler
 ```
 
-appsink 输出帧后进入已有或新增的动态抽帧模块。抽帧模块不应逐帧调用 VLM，而是根据变化程度、时间间隔、显著性和缓存命中情况决定是否提交视觉分析任务。
+`appsink` 输出帧后通过 `core::ThreadPool` 投递给 `IFrameSampler`，避免在 GStreamer callback 中执行重计算。OpenCV sampler 已具备显著度、时间窗口、cooldown 和自适应采样能力；后续更应关注多路推流下的采样公平性、队列背压、关键帧编码成本和事件去重，而不是继续重写输入层。
 
-硬件加速建议作为第二阶段能力：
+硬件解码建议保持为渐进能力：
 
-- NVIDIA 环境可尝试 NVDEC/NVENC 或 GStreamer NVIDIA 插件。
-- CPU-only 环境必须保留软件解码 fallback。
-- 不应让 CUDA/GPU 依赖阻断 Linux target 的基础编译。
-- VLM 推理服务仍建议作为独立容器，主网关只负责输入、采样和请求编排。
+- NVIDIA 环境优先验证现有 decoder preference 与 GStreamer 插件可用性。
+- Linux VAAPI 和 Windows D3D11 需要分别验证，不应让平台单一 API 成为默认路径。
+- CPU-only 软件解码 fallback 必须作为可运行基线。
+- VLM 推理服务仍建议独立容器或独立进程，Gateway 只负责输入、采样、事件和请求编排。
+- 推理模块迁移按已编译 gRPC server、protobuf/gRPC 头文件和运行时依赖交付；不再作为 Gateway/service 可复用库继续拆分。
 
 ### 7.4 多容器边界
 
@@ -333,6 +333,8 @@ appsink 输出帧后进入已有或新增的动态抽帧模块。抽帧模块不
 | Redis | 缓存、会话元数据、语义/视觉事件存储 |
 
 如果第一版为了开发便利把 Gateway 与 Vision Ingest 放在同一进程，也应保持接口边界清晰，后续可以拆成独立容器。VLM 推理本身不建议和 Gateway 强耦合，因为模型依赖、GPU/CUDA/驱动兼容性和资源占用都明显不同。
+
+BERT/VLM 推理服务的项目间迁移边界是 gRPC 进程和协议头文件。可迁移库目标应集中在 Persona Runtime、Session、Classroom、Gateway route/core/helper、文档与记忆编排等业务复用层；推理服务内部模型封装和 server 入口直接随 `emotion_inference_server` / `multimodal_inference_server` 产物迁移。
 
 ### 7.5 VLM 幻觉治理策略
 
@@ -363,32 +365,33 @@ visual_event = {
 
 这些事件可以进入 LLM context 或语义/视觉缓存，但进入情绪状态机前必须经过更严格的门控。
 
-### 7.6 第一版验收标准
+### 7.6 下一版验收标准
 
-WebRTC/VLM 第一阶段建议以工程闭环为验收目标，而不是以 VLM 准确率为目标：
+WebRTC/VLM 下一版建议以“多路稳定推流 + 受控 VLM observation”为验收目标，而不是以单路链路能否跑通为目标：
 
-- 浏览器可通过 WebRTC 建立视频连接。
-- 服务端可通过现有 WebSocket 信令完成 offer/answer/ICE 交换。
-- GStreamer pipeline 能稳定输出 decoded frame。
-- 服务端能按动态抽帧策略保存或传递关键帧。
-- 断线、刷新、重复连接、pipeline 创建失败不会拖垮主 Server。
-- VLM 请求在独立任务/线程池中执行，不阻塞主链路。
-- Redis 或内部事件队列能记录视觉事件。
-- 不将单帧 VLM 输出直接写入情绪状态机。
+- Playwright smoke 能以 `--sessions > 1` 建立多路 WebRTC 推流，并输出每路 frame/session 统计。
+- 多路推流下 session registry、reconnect checkpoint、close/cleanup 不泄漏 session 或 pipeline。
+- GStreamer fatal bus error、浏览器刷新、重复 ICE、重复 close、pipeline 创建失败不会拖垮主 Server。
+- compute pool / IO pool 有明确队列容量、丢帧或降采样策略，不能无限堆积关键帧和 VLM 请求。
+- sampler 产生的关键帧能编码为 VLM 请求输入，并通过 `IVlmVisionClient` 或 adapter 异步提交。
+- VLM 返回的 `VisionInferenceResult` 能转换为 `VisionEvent.analysis` / `vision.observe` observation。
+- VLM cache、视觉事件 dedup、session 连续命中降权和 rate limit 至少覆盖基础路径。
+- 视觉 observation 可进入 LLM context，但不将单帧 VLM 输出直接写入情绪状态机或 L3 长期事实。
+- Windows 本地 smoke 与 Linux/container 构建路径互不污染。
 
 建议推进顺序：
 
 ```text
-1. 基于现有 WebSocket 封装完成 WebRTC signaling。
-2. 完成 GStreamer/webrtcbin 实时视频输入服务。
-3. 接入 appsink decoded frame 输出。
-4. 做动态帧采样与 saliency 检测。
-5. 接入 VLM 缓存、动作变化检测与视觉事件队列。
-6. 做 identity persistence / 跨帧一致性。
-7. 最后再考虑接入情绪状态机。
+1. 使用现有 Playwright smoke 验证多路推流、断线重连、close/cleanup。
+2. 为 media pipeline 增加关键帧编码与 VLM 请求调度，不在 GStreamer callback 内调用 VLM。
+3. 实现正式 IVlmVisionClient adapter，对接本地 multimodal_inference_server 或 OpenAI-compatible VLM。
+4. 接入 VLM cache、事件 dedup、rate limit 与 session 级连续命中降权。
+5. 将 VLM result 转成受控 vision.observe observation，并注入 persona runtime。
+6. 做多路长稳压测，记录 CPU、内存、队列长度、VLM 调用频率和失败率。
+7. 最后再评估是否让高置信、多帧一致的视觉事件影响情绪状态机。
 ```
 
-VLM 第一阶段定位：
+VLM 当前阶段定位：
 
 ```text
 场景/动作辅助感知，而不是直接决定用户情绪。
@@ -403,6 +406,7 @@ VLM 第一阶段定位：
 2. 情绪 domain/OOD pre-gate。
 3. 赛前或交付前做一次全量 E2E 回归。
 4. 源码交付清单整理。
+5. 可复用 service targets 与推理 gRPC server 产物迁移清单整理。
 ```
 
 赛后或下一阶段：
@@ -410,7 +414,7 @@ VLM 第一阶段定位：
 ```text
 1. BERT/情绪模型升级。
 2. 真实 Agent 数据闭环。
-3. 多模态实时链路。
+3. 多模态多路推流验证与 VLM 正式接入。
 4. 语义缓存从 reference 模式升级到 selective bypass。
 ```
 

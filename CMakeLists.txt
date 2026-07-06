@@ -1295,7 +1295,25 @@ if(BERT_BUILD_TESTS)
     gtest_discover_tests(config_tests DISCOVERY_MODE PRE_TEST)
 endif()
 
-add_library(agent_service STATIC
+add_library(agent_service_core INTERFACE)
+
+target_include_directories(agent_service_core INTERFACE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/document
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/llm
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/semantic_cache
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/service/persona
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/service/gateway
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/net
+)
+
+target_link_libraries(agent_service_core INTERFACE
+    agent_core
+    agent_net
+    nlohmann_json::nlohmann_json
+)
+
+add_library(agent_agent_runtime STATIC
     src/service/persona/persona_algorithm.cpp
     src/service/persona/persona_algorithm.h
     src/service/persona/session_manager.cpp
@@ -1310,27 +1328,164 @@ add_library(agent_service STATIC
     src/service/persona/emotion_fusion_analyzer.h
     src/service/persona/grpc_emotion_analyzer.cpp
     src/service/persona/grpc_emotion_analyzer.h
-    src/service/evaluation/teaching_evaluator.cpp
-    src/service/evaluation/teaching_evaluator.h
-    src/service/gateway/gateway_models.h
-    src/service/gateway/gateway_auth.cpp
-    src/service/gateway/gateway_auth.h
     src/service/gateway/classroom_scheduler.cpp
     src/service/gateway/classroom_scheduler.h
+)
+
+target_include_directories(agent_agent_runtime PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/service/persona
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/service/gateway
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/llm
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/semantic_cache
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/memory
+)
+
+target_link_libraries(agent_agent_runtime PUBLIC
+    multimodal_proto
+    agent_core
+    agent_llm
+    agent_semantic_cache
+    agent_memory
+    nlohmann_json::nlohmann_json
+    gRPC::grpc++
+    spdlog::spdlog
+)
+
+add_library(agent_gateway_auth STATIC
+    src/service/gateway/gateway_auth.cpp
+    src/service/gateway/gateway_auth.h
+)
+
+target_include_directories(agent_gateway_auth PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/service/gateway
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/net
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/semantic_cache
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/storage
+)
+
+target_link_libraries(agent_gateway_auth PUBLIC
+    agent_core
+    agent_net
+    agent_semantic_cache
+    agent_storage
+    nlohmann_json::nlohmann_json
+    OpenSSL::SSL
+    OpenSSL::Crypto
+    spdlog::spdlog
+)
+
+add_library(agent_teaching_gateway STATIC
+    src/service/evaluation/teaching_evaluator.cpp
+    src/service/evaluation/teaching_evaluator.h
+)
+
+target_include_directories(agent_teaching_gateway PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/service/evaluation
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/semantic_cache
+)
+
+target_link_libraries(agent_teaching_gateway PUBLIC
+    agent_core
+    agent_semantic_cache
+    nlohmann_json::nlohmann_json
+)
+
+add_library(agent_agent_gateway STATIC
+    src/service/gateway/gateway_models.h
     src/service/gateway/persona_gateway_service.cpp
     src/service/gateway/persona_gateway_service.h
+    src/service/gateway/persona_gateway_agent_routes.cpp
+    src/service/gateway/persona_gateway_route_core.h
+    src/service/gateway/persona_gateway_route_helpers.h
+)
+
+target_include_directories(agent_agent_gateway PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/service/gateway
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/service/persona
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/service/evaluation
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/semantic_cache
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/storage
+)
+
+target_link_libraries(agent_agent_gateway PUBLIC
+    agent_agent_runtime
+    agent_teaching_gateway
+    agent_gateway_auth
+    agent_service_core
+    agent_storage
+    agent_semantic_cache
+    agent_core
+    nlohmann_json::nlohmann_json
+    spdlog::spdlog
+)
+
+add_library(agent_classroom_gateway STATIC
+    src/service/gateway/persona_gateway_classroom_routes.cpp
+    src/service/gateway/persona_gateway_route_core.h
+    src/service/gateway/persona_gateway_route_helpers.h
+)
+
+target_include_directories(agent_classroom_gateway PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/service/gateway
+)
+
+target_link_libraries(agent_classroom_gateway PUBLIC
+    agent_agent_gateway
+    agent_service_core
+)
+
+add_library(agent_training_report_gateway STATIC
+    src/service/gateway/persona_gateway_teaching_routes.cpp
+    src/service/gateway/persona_gateway_route_core.h
+    src/service/gateway/persona_gateway_route_helpers.h
+)
+
+target_include_directories(agent_training_report_gateway PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/service/gateway
+)
+
+target_link_libraries(agent_training_report_gateway PUBLIC
+    agent_agent_gateway
+    agent_teaching_gateway
+    agent_service_core
+)
+
+add_library(agent_document_gateway STATIC
+    src/service/gateway/persona_gateway_document_routes.cpp
+    src/service/gateway/persona_gateway_route_core.h
+    src/service/gateway/persona_gateway_route_helpers.h
+)
+
+target_include_directories(agent_document_gateway PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/document
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/service/gateway
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/llm
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/semantic_cache
+)
+
+target_link_libraries(agent_document_gateway PUBLIC
+    agent_agent_gateway
+    agent_document
+    agent_llm
+    agent_semantic_cache
+    agent_service_core
+)
+
+add_library(agent_gateway_server_lib STATIC
     src/service/gateway/persona_gateway_http_adapter.cpp
     src/service/gateway/persona_gateway_http_adapter.h
+    src/service/gateway/persona_gateway_route_core.h
+    src/service/gateway/persona_gateway_route_helpers.h
     src/service/gateway/runtime_maintenance_service.cpp
     src/service/gateway/runtime_maintenance_service.h
     src/service/gateway/persona_gateway_server.cpp
     src/service/gateway/persona_gateway_server.h
 )
 
-target_include_directories(agent_service PUBLIC
+target_include_directories(agent_gateway_server_lib PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src/document
     ${CMAKE_CURRENT_SOURCE_DIR}/src/document/ooxml
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/service/inference
     ${CMAKE_CURRENT_SOURCE_DIR}/src/service/persona
     ${CMAKE_CURRENT_SOURCE_DIR}/src/service/evaluation
     ${CMAKE_CURRENT_SOURCE_DIR}/src/service/gateway
@@ -1341,10 +1496,11 @@ target_include_directories(agent_service PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src/storage
 )
 
-target_link_libraries(agent_service PUBLIC
-    multimodal_proto
+target_link_libraries(agent_gateway_server_lib PUBLIC
+    agent_service_core
+    agent_agent_gateway
+    agent_gateway_auth
     agent_config
-    agent_vector
     agent_llm
     agent_semantic_cache
     agent_memory
@@ -1359,10 +1515,39 @@ target_link_libraries(agent_service PUBLIC
 )
 
 if(TARGET agent_media)
-    target_link_libraries(agent_service PRIVATE
+    target_link_libraries(agent_gateway_server_lib PRIVATE
         agent_media
     )
+endif()
 
+add_library(agent_service INTERFACE)
+
+target_link_libraries(agent_service INTERFACE
+    agent_service_core
+    agent_agent_runtime
+    agent_gateway_auth
+    agent_teaching_gateway
+    agent_agent_gateway
+    agent_classroom_gateway
+    agent_training_report_gateway
+    agent_document_gateway
+    agent_gateway_server_lib
+)
+
+foreach(_gateway_route_target IN ITEMS
+        document_analysis_e2e_test
+        persona_gateway_e2e_server
+        agent_gateway_server
+        webrtc_signaling_smoke_server)
+    if(TARGET ${_gateway_route_target})
+        link_whole_archive(${_gateway_route_target} agent_agent_gateway)
+        link_whole_archive(${_gateway_route_target} agent_classroom_gateway)
+        link_whole_archive(${_gateway_route_target} agent_training_report_gateway)
+        link_whole_archive(${_gateway_route_target} agent_document_gateway)
+    endif()
+endforeach()
+
+if(TARGET agent_media)
     add_library(agent_skill_media STATIC
         src/service/persona/skill_vision_event_sink.cpp
         src/service/persona/skill_vision_event_sink.h
@@ -1373,7 +1558,7 @@ if(TARGET agent_media)
     )
 
     target_link_libraries(agent_skill_media PUBLIC
-        agent_service
+        agent_agent_runtime
         agent_media
     )
 endif()
@@ -1404,7 +1589,12 @@ if(BERT_BUILD_TESTS)
     )
 
     copy_runtime_files(service_tests "${BERT_SQLITE_DLL}")
+    copy_runtime_files(service_tests ${BERT_FAISS_RUNTIME_FILES})
     copy_runtime_files(service_tests ${VCPKG_RUNTIME_DLLS})
+    link_whole_archive(service_tests agent_agent_gateway)
+    link_whole_archive(service_tests agent_classroom_gateway)
+    link_whole_archive(service_tests agent_training_report_gateway)
+    link_whole_archive(service_tests agent_document_gateway)
 
     gtest_discover_tests(service_tests DISCOVERY_MODE PRE_TEST)
 endif()

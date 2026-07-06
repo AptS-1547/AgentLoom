@@ -35,7 +35,12 @@ using agent::service::gateway::ClassroomPollGatewayRequest;
 using agent::service::gateway::ClassroomScheduler;
 using agent::service::gateway::CloseSessionGatewayRequest;
 using agent::service::gateway::CreateSessionGatewayRequest;
+using agent::service::gateway::PersonaMetadataGatewayRequest;
 using agent::service::gateway::PersonaGatewayHttpAdapter;
+using agent::service::gateway::InMemoryPersonaMetadataStore;
+using agent::service::gateway::SqlitePersonaMetadataStore;
+using agent::service::gateway::RedisPersonaMetadataCache;
+using agent::service::gateway::CachedPersonaMetadataStore;
 using agent::service::gateway::PersonaGatewayServer;
 using agent::service::gateway::PersonaGatewayServerDependencies;
 using agent::service::gateway::PersonaGatewayServerOptions;
@@ -182,9 +187,10 @@ struct GatewayFixture {
     std::shared_ptr<SkillSessionManager> skill_sessions;
     PersonaRuntime runtime;
     ClassroomScheduler classroom_scheduler;
+    std::shared_ptr<InMemoryPersonaMetadataStore> persona_metadata_store;
     PersonaGatewayService gateway;
 
-    GatewayFixture()
+    explicit GatewayFixture(bool enable_persona_metadata_store = false)
         : sessions(compute, io),
           cache(std::make_shared<FakeSemanticCache>()),
           emotion(std::make_shared<NeutralEmotionAnalyzer>()),
@@ -192,7 +198,8 @@ struct GatewayFixture {
           memory(std::make_shared<SemanticMemoryContextProvider>(cache)),
           skill_sessions(std::make_shared<SkillSessionManager>()),
           runtime(sessions, memory, emotion, llm, PersonaRuntimeOptions{.recent_raw_turns = 10, .default_model = "test-model"}, nullptr, nullptr, skill_sessions),
-          gateway(sessions, runtime, &classroom_scheduler) {
+          persona_metadata_store(enable_persona_metadata_store ? std::make_shared<InMemoryPersonaMetadataStore>() : nullptr),
+          gateway(sessions, runtime, &classroom_scheduler, nullptr, nullptr, persona_metadata_store) {
         EXPECT_TRUE(compute.Start().ok());
         EXPECT_TRUE(io.Start().ok());
     }
@@ -217,6 +224,20 @@ CreateSessionGatewayRequest MakeCreateRequest() {
     req.context_ids = {"group_1"};
     req.default_persona = true;
     req.personality = std::move(personality);
+    req.emotion_state_config.noise_sigma = 0.0;
+    return req;
+}
+
+PersonaMetadataGatewayRequest MakePersonaMetadataRequest(std::string user_uuid = "user-gateway",
+                                                         std::string persona_id = "dazhi",
+                                                         std::string description = "stored persona") {
+    PersonaMetadataGatewayRequest req;
+    req.trace_id = "trace-persona-upsert";
+    req.tenant_id = "default";
+    req.user_uuid = std::move(user_uuid);
+    req.persona_id = std::move(persona_id);
+    req.personality.name = req.persona_id;
+    req.personality.description = std::move(description);
     req.emotion_state_config.noise_sigma = 0.0;
     return req;
 }
@@ -361,6 +382,11 @@ std::filesystem::path UploadTempPathForTest(const std::string& upload_id) {
     return std::filesystem::temp_directory_path() / file_name;
 }
 
+bool FileExistsForTest(const std::filesystem::path& path) {
+    std::error_code ec;
+    return std::filesystem::exists(path, ec);
+}
+
 std::string PathUtf8(const std::filesystem::path& path) {
     const auto value = path.u8string();
     return std::string(value.begin(), value.end());
@@ -452,6 +478,53 @@ TEST(PersonaGatewayServiceTest, RunsCreateChatReportAndCloseLifecycle) {
     EXPECT_FALSE(rejected.ok());
 }
 
+TEST(PersonaGatewayServiceTest, RequiresAccountPersonaMetadataWhenStoreIsConfigured) {
+    GatewayFixture f(true);
+
+    auto missing = f.gateway.CreateSession(MakeCreateRequest());
+    ASSERT_FALSE(missing.ok());
+    EXPECT_EQ(missing.status().code(), core::ErrorCode::NotFound);
+
+    auto upsert = f.gateway.UpsertPersonaMetadata(MakePersonaMetadataRequest());
+    ASSERT_TRUE(upsert.ok()) << upsert.status().message();
+
+    auto req = MakeCreateRequest();
+    req.personality.description = "forged session body persona";
+    auto created = f.gateway.CreateSession(std::move(req));
+    ASSERT_TRUE(created.ok()) << created.status().message();
+
+    ChatGatewayRequest chat;
+    chat.trace_id = "trace-persona-metadata-chat";
+    chat.session_id = "session-gateway";
+    chat.message = "hello";
+    auto reply = f.gateway.Chat(std::move(chat));
+    ASSERT_TRUE(reply.ok()) << reply.status().message();
+    {
+        std::lock_guard lock(f.llm->mutex_);
+        ASSERT_FALSE(f.llm->last_request.messages.empty());
+        EXPECT_NE(f.llm->last_request.messages.front().content.find("stored persona"), std::string::npos);
+        EXPECT_EQ(f.llm->last_request.messages.front().content.find("forged session body persona"), std::string::npos);
+    }
+}
+
+TEST(PersonaGatewayServiceTest, PersonaMetadataIsScopedToAuthenticatedAccount) {
+    GatewayFixture f(true);
+    auto upsert = f.gateway.UpsertPersonaMetadata(MakePersonaMetadataRequest("owner-user", "dazhi", "owner persona"));
+    ASSERT_TRUE(upsert.ok()) << upsert.status().message();
+
+    auto attacker = MakeCreateRequest();
+    attacker.user_uuid = "attacker-user";
+    attacker.session_id = "session-attacker-persona";
+    auto rejected = f.gateway.CreateSession(std::move(attacker));
+    ASSERT_FALSE(rejected.ok());
+    EXPECT_EQ(rejected.status().code(), core::ErrorCode::NotFound);
+
+    auto owner = MakeCreateRequest();
+    owner.user_uuid = "owner-user";
+    auto created = f.gateway.CreateSession(std::move(owner));
+    ASSERT_TRUE(created.ok()) << created.status().message();
+}
+
 TEST(PersonaGatewayServiceTest, RoutesClassroomMessageByContextAndPollsProactiveState) {
     GatewayFixture f;
 
@@ -498,6 +571,39 @@ TEST(PersonaGatewayServiceTest, RoutesClassroomMessageByContextAndPollsProactive
     ASSERT_TRUE(proactive.ok()) << proactive.status().message();
     EXPECT_TRUE(proactive.value().should_speak);
     EXPECT_EQ(proactive.value().speaker_persona_id, "xiaozhi");
+}
+
+TEST(PersonaGatewayServiceTest, ClassroomSessionBootstrapsAllAccountPersonas) {
+    GatewayFixture f(true);
+    ASSERT_TRUE(f.gateway.UpsertPersonaMetadata(
+        MakePersonaMetadataRequest("user-gateway", "dazhi", "primary classroom persona")).ok());
+    ASSERT_TRUE(f.gateway.UpsertPersonaMetadata(
+        MakePersonaMetadataRequest("user-gateway", "xiaozhi", "secondary classroom persona")).ok());
+
+    auto req = MakeCreateRequest();
+    req.session_id = "session-primary-classroom";
+    req.persona_id = "dazhi";
+    req.default_persona = true;
+    auto created = f.gateway.CreateSession(std::move(req));
+    ASSERT_TRUE(created.ok()) << created.status().message();
+    EXPECT_EQ(f.sessions.SessionCount(), 2u);
+
+    ClassroomMessageGatewayRequest message;
+    message.trace_id = "trace-classroom-bootstrap-message";
+    message.classroom_id = "classroom-a";
+    message.target_persona_id = "xiaozhi";
+    message.authenticated_user_uuid = "user-gateway";
+    message.message = "hello secondary persona";
+    auto reply = f.gateway.ClassroomMessage(std::move(message));
+    ASSERT_TRUE(reply.ok()) << reply.status().message();
+    EXPECT_EQ(reply.value().speaker_persona_id, "xiaozhi");
+    EXPECT_NE(reply.value().session_id, "session-primary-classroom");
+
+    {
+        std::lock_guard lock(f.llm->mutex_);
+        ASSERT_FALSE(f.llm->last_request.messages.empty());
+        EXPECT_NE(f.llm->last_request.messages.front().content.find("secondary classroom persona"), std::string::npos);
+    }
 }
 
 TEST(PersonaGatewayServiceTest, RejectsChatAndClassroomWhenAuthenticatedUserDoesNotOwnSession) {
@@ -566,6 +672,52 @@ TEST(PersonaGatewayHttpAdapterTest, HandlesSessionCreateAndChatJsonRoutes) {
     EXPECT_TRUE(chat_body["ok"].get<bool>());
     EXPECT_EQ(chat_body["data"]["reply"]["content"], "student reply");
     EXPECT_EQ(chat_body["data"]["turnIndex"], 1);
+    server.Stop();
+}
+
+TEST(PersonaGatewayHttpAdapterTest, ManagesPersonaMetadataByAuthenticatedAccount) {
+    GatewayFixture f(true);
+    PersonaGatewayHttpAdapter adapter(f.gateway, std::make_shared<FixedAuthenticator>(TestAuthIdentity("persona-http-user")));
+    ::net::HttpServer server({.address = "127.0.0.1", .port = 0, .io_threads = 1});
+    server.SetHttpRequestHandler([&adapter](std::shared_ptr<::net::IHttpRequest> request) {
+        adapter.HandleHttp(std::move(request));
+    });
+    ASSERT_TRUE(server.Start().ok());
+
+    auto upsert = SendJsonRequest(
+        server.port(),
+        ::net::http::verb::post,
+        "/api/persona",
+        Json{
+            {"traceId", "trace-http-persona-upsert"},
+            {"userUuid", "forged-user"},
+            {"personaId", "dazhi"},
+            {"personality", {{"name", "dazhi"}, {"description", "stored http persona"}}},
+        });
+    ASSERT_EQ(upsert.result(), ::net::http::status::ok);
+    auto upsert_body = Json::parse(upsert.body());
+    EXPECT_EQ(upsert_body["data"]["userUuid"], "persona-http-user");
+    EXPECT_EQ(upsert_body["data"]["personality"]["description"], "stored http persona");
+
+    auto get = SendJsonRequest(
+        server.port(),
+        ::net::http::verb::get,
+        "/api/persona/dazhi",
+        Json{{"traceId", "trace-http-persona-get"}});
+    ASSERT_EQ(get.result(), ::net::http::status::ok);
+    EXPECT_EQ(Json::parse(get.body())["data"]["personality"]["description"], "stored http persona");
+
+    auto create = SendJsonRequest(
+        server.port(),
+        ::net::http::verb::post,
+        "/api/session/create",
+        Json{
+            {"traceId", "trace-http-persona-session-create"},
+            {"sessionId", "session-http-persona"},
+            {"personaId", "dazhi"},
+            {"personality", {{"name", "dazhi"}, {"description", "forged create session persona"}}},
+        });
+    EXPECT_EQ(create.result(), ::net::http::status::ok);
     server.Stop();
 }
 
@@ -1228,14 +1380,31 @@ TEST(PersonaGatewayHttpAdapterTest, RejectsDocumentPathRegisterWhenTestEndpointD
     std::filesystem::remove(db_path.string() + "-shm", ec);
 }
 
-TEST(PersonaGatewayHttpAdapterTest, PassesEmotionPromptsIntoSessionPromptBuilder) {
-    GatewayFixture f;
+TEST(PersonaGatewayHttpAdapterTest, PassesAccountPersonaEmotionPromptsIntoSessionPromptBuilder) {
+    GatewayFixture f(true);
     PersonaGatewayHttpAdapter adapter(f.gateway, std::make_shared<FixedAuthenticator>(TestAuthIdentity("user-emotion-prompt")));
     ::net::HttpServer server({.address = "127.0.0.1", .port = 0, .io_threads = 1});
     server.SetHttpRequestHandler([&adapter](std::shared_ptr<::net::IHttpRequest> request) {
         adapter.HandleHttp(std::move(request));
     });
     ASSERT_TRUE(server.Start().ok());
+
+    auto upsert = SendJsonRequest(
+        server.port(),
+        ::net::http::verb::post,
+        "/api/persona",
+        Json{
+            {"traceId", "trace-emotion-prompt-upsert"},
+            {"personaId", "dazhi"},
+            {"personality", {{"name", "dazhi"}, {"description", "student"}}},
+            {"emotionPrompts", {
+                {"emotionMap", {{"neutral", "用户状态平稳，保持自然教学节奏"}}},
+                {"emotionReliability", {{"neutral", 1.0}}},
+                {"confidenceThresholds", {{"strong", 0.5}, {"weak", 0.3}}},
+                {"intensityLevels", {{"high_min", 0.7}}},
+            }},
+        });
+    ASSERT_EQ(upsert.result(), ::net::http::status::ok);
 
     auto create = SendJsonRequest(
         server.port(),
@@ -1246,13 +1415,6 @@ TEST(PersonaGatewayHttpAdapterTest, PassesEmotionPromptsIntoSessionPromptBuilder
             {"sessionId", "session-emotion-prompt"},
             {"userUuid", "user-emotion-prompt"},
             {"personaId", "dazhi"},
-            {"personality", {{"name", "dazhi"}, {"description", "student"}}},
-            {"emotionPrompts", {
-                {"emotionMap", {{"neutral", "用户状态平稳，保持自然教学节奏"}}},
-                {"emotionReliability", {{"neutral", 1.0}}},
-                {"confidenceThresholds", {{"strong", 0.5}, {"weak", 0.3}}},
-                {"intensityLevels", {{"high_min", 0.7}}},
-            }},
         });
     ASSERT_EQ(create.result(), ::net::http::status::ok);
 
@@ -1684,6 +1846,43 @@ TEST(GatewayAuthSessionStoreTest, PersistsResolvesAndRevokesSessions) {
     std::filesystem::remove(path.string() + "-shm", ec);
 }
 
+TEST(PersonaMetadataStoreTest, SqlitePersistsPersonaMetadataAcrossInstances) {
+    const auto path = std::filesystem::temp_directory_path() / "agent_gateway_persona_metadata_test.db";
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    std::filesystem::remove(path.string() + "-wal", ec);
+    std::filesystem::remove(path.string() + "-shm", ec);
+
+    {
+        SqlitePersonaMetadataStore store(path.string());
+        ASSERT_TRUE(store.EnsureSchema().ok());
+        auto req = MakePersonaMetadataRequest("persona-owner", "dazhi", "sqlite stored persona");
+        ASSERT_TRUE(store.Upsert(agent::service::gateway::PersonaMetadataRecord{
+            req.tenant_id,
+            req.user_uuid,
+            req.persona_id,
+            req.personality,
+            req.emotion_prompt_config,
+            req.emotion_state_config,
+        }).ok());
+    }
+
+    SqlitePersonaMetadataStore reopened(path.string());
+    ASSERT_TRUE(reopened.EnsureSchema().ok());
+    auto loaded = reopened.Get("default", "persona-owner", "dazhi");
+    ASSERT_TRUE(loaded.ok()) << loaded.status().message();
+    EXPECT_EQ(loaded.value().personality.description, "sqlite stored persona");
+    EXPECT_EQ(loaded.value().user_uuid, "persona-owner");
+
+    auto missing = reopened.Get("default", "other-user", "dazhi");
+    EXPECT_FALSE(missing.ok());
+    EXPECT_EQ(missing.status().code(), core::ErrorCode::NotFound);
+
+    std::filesystem::remove(path, ec);
+    std::filesystem::remove(path.string() + "-wal", ec);
+    std::filesystem::remove(path.string() + "-shm", ec);
+}
+
 TEST(GatewayAuthRegistrationServiceTest, StoresUsernameAndPasswordHashWithoutUsingSubject) {
     const auto path = std::filesystem::temp_directory_path() / "agent_gateway_auth_registration_test.db";
     std::error_code ec;
@@ -1852,6 +2051,18 @@ TEST(PersonaGatewayServerTest, HostsApiWebSocketAdapterAndStaticDistOnOneHttpSer
     PersonaGatewayServer server(std::move(options), std::move(dependencies));
     ASSERT_TRUE(server.Start().ok());
     const auto auth_cookie = RegisterDevAuthCookie(server.port(), "user-server");
+
+    auto persona = SendJsonRequest(
+        server.port(),
+        ::net::http::verb::post,
+        "/api/persona",
+        Json{
+            {"traceId", "trace-server-persona"},
+            {"personaId", "dazhi"},
+            {"personality", {{"name", "dazhi"}, {"description", "student"}}},
+        },
+        {{"Cookie", auth_cookie}});
+    ASSERT_EQ(persona.result(), ::net::http::status::ok);
 
     auto create = SendJsonRequest(
         server.port(),
@@ -2413,17 +2624,17 @@ TEST(PersonaGatewayServerTest, CleansUnfinishedBinaryDocumentUploadWhenWebSocket
         ws.write(asio::buffer(file_bytes));
         auto ack = read_json();
         ASSERT_EQ(ack["type"], "document.upload.chunk_ack");
-        ASSERT_TRUE(std::filesystem::exists(temp_path));
+        ASSERT_TRUE(FileExistsForTest(temp_path));
 
         beast::error_code ws_ec;
         auto& socket = beast::get_lowest_layer(ws);
         socket.shutdown(tcp::socket::shutdown_both, ws_ec);
         socket.close(ws_ec);
 
-        for (int attempt = 0; attempt < 20 && std::filesystem::exists(temp_path); ++attempt) {
+        for (int attempt = 0; attempt < 20 && FileExistsForTest(temp_path); ++attempt) {
             std::this_thread::sleep_for(10ms);
         }
-        EXPECT_FALSE(std::filesystem::exists(temp_path));
+        EXPECT_FALSE(FileExistsForTest(temp_path));
 
         server.Stop();
     }
@@ -2436,6 +2647,64 @@ TEST(PersonaGatewayServerTest, CleansUnfinishedBinaryDocumentUploadWhenWebSocket
     std::filesystem::remove(auth_db_path.string() + "-wal", ec);
     std::filesystem::remove(auth_db_path.string() + "-shm", ec);
     std::filesystem::remove_all(store_root, ec);
+}
+
+TEST(PersonaMetadataStoreTest, RedisCacheReadsThroughFromSqliteWhenAvailable) {
+    agent::semantic_cache::RedisPoolOptions options;
+    options.host = "127.0.0.1";
+    options.port = "5000";
+    options.pool_size = 1;
+    options.command_timeout = std::chrono::milliseconds(1000);
+    auto redis = std::make_shared<agent::semantic_cache::RedisConnectionPool>(options);
+    auto start = redis->Start();
+    if (!start.ok()) {
+        GTEST_SKIP() << "redis connection failed: " << start.message();
+    }
+
+    const auto path = std::filesystem::temp_directory_path() / "agent_gateway_persona_metadata_cache_test.db";
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    std::filesystem::remove(path.string() + "-wal", ec);
+    std::filesystem::remove(path.string() + "-shm", ec);
+    const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
+    const std::string prefix = "agent:test:gateway:persona:" + std::to_string(nonce);
+    auto keys = redis->Scan(prefix + "*");
+    if (keys.ok() && !keys.value().empty()) {
+        static_cast<void>(redis->Del(keys.value()));
+    }
+
+    auto primary = std::make_shared<SqlitePersonaMetadataStore>(path.string());
+    auto cache = std::make_shared<RedisPersonaMetadataCache>(redis, prefix);
+    CachedPersonaMetadataStore store(primary, cache);
+    ASSERT_TRUE(store.EnsureSchema().ok());
+
+    auto req = MakePersonaMetadataRequest("persona-cache-owner", "dazhi", "cached sqlite persona");
+    agent::service::gateway::PersonaMetadataRecord record{
+        req.tenant_id,
+        req.user_uuid,
+        req.persona_id,
+        req.personality,
+        req.emotion_prompt_config,
+        req.emotion_state_config,
+    };
+    ASSERT_TRUE(primary->Upsert(record).ok());
+
+    auto loaded = store.Get("default", "persona-cache-owner", "dazhi");
+    ASSERT_TRUE(loaded.ok()) << loaded.status().message();
+    EXPECT_EQ(loaded.value().personality.description, "cached sqlite persona");
+
+    auto cached = cache->Get("default", "persona-cache-owner", "dazhi");
+    ASSERT_TRUE(cached.ok()) << cached.status().message();
+    EXPECT_EQ(cached.value().personality.description, "cached sqlite persona");
+
+    keys = redis->Scan(prefix + "*");
+    if (keys.ok() && !keys.value().empty()) {
+        static_cast<void>(redis->Del(keys.value()));
+    }
+    redis->Shutdown();
+    std::filesystem::remove(path, ec);
+    std::filesystem::remove(path.string() + "-wal", ec);
+    std::filesystem::remove(path.string() + "-shm", ec);
 }
 
 } // namespace

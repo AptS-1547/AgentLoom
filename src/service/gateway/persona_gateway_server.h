@@ -65,6 +65,7 @@ struct PersonaGatewayServerDependencies {
     std::shared_ptr<semantic_cache::ISemanticCache> document_semantic_cache;
     std::shared_ptr<semantic_cache::RedisConnectionPool> l0_redis_pool;
     std::shared_ptr<semantic_cache::L0MemoryCacheAdapter> l0_memory_adapter;
+    std::shared_ptr<IPersonaMetadataStore> persona_metadata_store;
     std::filesystem::path evaluation_config_path;
     std::vector<std::shared_ptr<IRuntimeMaintenanceTask>> maintenance_tasks;
 };
@@ -96,6 +97,7 @@ private:
     void HandleWebSocketClose(const ::net::ConnectionCloseInfo& close_info);
     core::Status ValidateDependencies() const;
     core::Status EnsureAuthSessionStore();
+    core::Status EnsurePersonaMetadataStore();
     core::Status EnsureDocumentStore();
     void ShutdownDocumentStore();
 
@@ -107,11 +109,12 @@ private:
     persona::SessionManager sessions_;
     persona::PersonaRuntime runtime_;
     ClassroomScheduler classroom_scheduler_;
+    std::shared_ptr<agent::semantic_cache::RedisConnectionPool> auth_redis_;
+    std::shared_ptr<IAuthSessionStore> auth_session_store_;
+    std::shared_ptr<IPersonaMetadataStore> persona_metadata_store_;
     PersonaGatewayService service_;
     std::shared_ptr<document::DocumentAnalysisService> document_service_;
     std::shared_ptr<storage::sqlite::SqliteConnectionPool> document_repository_pool_;
-    std::shared_ptr<agent::semantic_cache::RedisConnectionPool> auth_redis_;
-    std::shared_ptr<IAuthSessionStore> auth_session_store_;
     std::shared_ptr<IGatewayAuthenticator> authenticator_;
     std::shared_ptr<IAuthRegistrationService> auth_registration_;
     PersonaGatewayHttpAdapter adapter_;

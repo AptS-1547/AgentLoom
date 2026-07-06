@@ -13,6 +13,8 @@ AgentBackendPredict 是教育智能体项目的 C++ 后端基础设施，提供�
 
 从早期的单体推理服务演进为 **生产级 C++20 服务端基础设施**，以 `core / net / config / cache / vector / models / service / server` 分层架构，支撑教育智能体的热路径、资源管理和协议层能力。
 
+推理模块的复用边界是独立 gRPC server：迁移时优先交付已编译的 `emotion_inference_server` / `multimodal_inference_server`、生成的 protobuf/gRPC 头文件与客户端协议头，而不是把模型推理内部继续拆成网关侧库目标。Gateway 与 Persona Runtime 通过 gRPC/adapter 对接推理服务。
+
 ### ✨ 核心特性
 
 - 🚀 **高性能推理**：ONNX Runtime + llama.cpp/mtmd 多模态推理，支持 BERT/VLM
@@ -167,8 +169,8 @@ ctest --test-dir build/tests -C Release --output-on-failure
 | **cache** | VLM 结果缓存、Redis 连接池、多级缓存策略 |
 | **vector** | 向量索引（Exact/Faiss）、Embedding pipeline、HF Tokenizer FFI |
 | **models** | ONNX Runtime 封装、llama.cpp/mtmd 封装、模型生命周期管理 |
-| **service** | 推理编排、文档分析、记忆管理、语义缓存 |
-| **server** | gRPC adapter、Gateway HTTP/WS、runtime logger、进程入口 |
+| **service** | Persona Runtime、Session、Classroom、Gateway service、文档/记忆编排 |
+| **server** | 独立 gRPC inference server、Gateway HTTP/WS、runtime logger、进程入口 |
 | **storage** | SQLite 持久化、文档元数据、会话状态 |
 | **semantic_cache** | L0 记忆适配器、Redis 语义缓存、上下文风险检测、缓存策略 |
 | **memory** | L3 长期记忆压缩器、向量化记忆存储 |
@@ -221,6 +223,8 @@ top < accept_confidence || top1 - top2 < ambiguity_margin
 | `emotion_inference_server` | BERT 情绪推理服务器：仅 CPU，gRPC |
 | `persona_gateway_e2e_server` | E2E 测试网关服务器（手动测试用） |
 
+推理服务在项目间迁移时按 gRPC 进程边界处理：复制/发布编译产物、运行时依赖、配置样例和 protobuf/gRPC 头文件即可。业务侧可复用逻辑集中在 Persona/Session/Classroom/Gateway route targets，不要求消费方链接推理 server 内部实现库。
+
 **核心库**
 
 | Library | 职责 |
@@ -238,7 +242,7 @@ top < accept_confidence || top1 - top2 < ambiguity_margin
 | `agent_vector_storage` | 向量元数据存储 + 分区注册表 |
 | `agent_memory` | L3 长期记忆压缩器 |
 | `agent_document` | 文档分析 + OOXML 解析 + 分块 + LLM chunk 缓存 |
-| `agent_service` | Persona 运行时 + 会话管理 + 课堂调度 + 网关服务 |
+| `agent_service` | Persona 运行时 + 会话管理 + 课堂调度 + 网关服务聚合 |
 | `agent_config` | 配置系统 + section registry + CLI fallback |
 | `server_runtime` | Logger + server common utilities |
 

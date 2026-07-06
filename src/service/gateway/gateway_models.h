@@ -39,6 +39,29 @@ struct CreateSessionGatewayRequest {
     bool default_persona = false;
 };
 
+struct PersonaMetadataRecord {
+    std::string tenant_id = "default";
+    std::string user_uuid;
+    std::string persona_id;
+    persona::PersonalityConfig personality;
+    std::optional<persona::EmotionPromptConfig> emotion_prompt_config;
+    persona::EmotionStateConfig emotion_state_config;
+};
+
+struct PersonaMetadataGatewayRequest {
+    std::string trace_id;
+    std::string tenant_id = "default";
+    std::string user_uuid;
+    std::string persona_id;
+    persona::PersonalityConfig personality;
+    std::optional<persona::EmotionPromptConfig> emotion_prompt_config;
+    persona::EmotionStateConfig emotion_state_config;
+};
+
+struct PersonaMetadataGatewayResponse : GatewayEnvelopeBase {
+    PersonaMetadataRecord persona;
+};
+
 struct SessionGatewayResponse : GatewayEnvelopeBase {
     persona::SessionSnapshot session;
 };

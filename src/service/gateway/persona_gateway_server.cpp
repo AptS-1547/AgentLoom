@@ -51,6 +51,26 @@ std::shared_ptr<IAuthSessionStore> MakeAuthSessionStore(
     return std::make_shared<SqliteAuthSessionStore>(options.session_database_path);
 }
 
+std::shared_ptr<IPersonaMetadataStore> MakePersonaMetadataStore(
+    const GatewayAuthOptions& options,
+    const PersonaGatewayServerDependencies& dependencies,
+    const std::shared_ptr<agent::semantic_cache::RedisConnectionPool>& auth_redis) {
+    if (dependencies.persona_metadata_store) {
+        return dependencies.persona_metadata_store;
+    }
+    if (options.session_database_path.empty()) {
+        return std::make_shared<InMemoryPersonaMetadataStore>();
+    }
+    auto primary = std::make_shared<SqlitePersonaMetadataStore>(options.session_database_path);
+    if (!auth_redis) {
+        return primary;
+    }
+    auto cache = std::make_shared<RedisPersonaMetadataCache>(
+        auth_redis,
+        options.redis_key_prefix.empty() ? "agent:gateway:persona" : options.redis_key_prefix + ":persona");
+    return std::make_shared<CachedPersonaMetadataStore>(std::move(primary), std::move(cache));
+}
+
 } // namespace
 
 PersonaGatewayServer::PersonaGatewayServer(PersonaGatewayServerOptions options,
@@ -72,18 +92,20 @@ PersonaGatewayServer::PersonaGatewayServer(PersonaGatewayServerOptions options,
                dependencies_.skill_session_manager,
                logger_),
       classroom_scheduler_({}, core::LoggerAdapter::ForModule("classroom")),
+      auth_session_store_(MakeAuthSessionStore(options_.auth, auth_redis_)),
+      persona_metadata_store_(MakePersonaMetadataStore(options_.auth, dependencies_, auth_redis_)),
       service_(sessions_,
                runtime_,
                &classroom_scheduler_,
                std::make_shared<evaluation::TeachingEvaluator>(),
                dependencies_.l0_redis_pool,
+               persona_metadata_store_,
                dependencies_.evaluation_config_path,
                logger_),
       document_service_(std::make_shared<document::DocumentAnalysisService>(
           compute_pool_,
           io_pool_,
           core::LoggerAdapter::ForModule("document"))),
-      auth_session_store_(MakeAuthSessionStore(options_.auth, auth_redis_)),
       authenticator_(std::make_shared<JwtCookieAuthenticator>(options_.auth, auth_session_store_)),
       auth_registration_(std::make_shared<JwtAuthRegistrationService>(options_.auth, auth_session_store_)),
       adapter_(service_,
@@ -156,6 +178,10 @@ core::Status PersonaGatewayServer::Start() {
     if (!auth_store_status.ok()) {
         return auth_store_status;
     }
+    auto persona_metadata_status = EnsurePersonaMetadataStore();
+    if (!persona_metadata_status.ok()) {
+        return persona_metadata_status;
+    }
     auto document_store_status = EnsureDocumentStore();
     if (!document_store_status.ok()) {
         return document_store_status;
@@ -219,6 +245,13 @@ core::Status PersonaGatewayServer::EnsureAuthSessionStore() {
         return core::Status::Ok();
     }
     return auth_session_store_->EnsureSchema();
+}
+
+core::Status PersonaGatewayServer::EnsurePersonaMetadataStore() {
+    if (!persona_metadata_store_) {
+        return core::Status::Ok();
+    }
+    return persona_metadata_store_->EnsureSchema();
 }
 
 core::Status PersonaGatewayServer::EnsureDocumentStore() {
@@ -343,11 +376,7 @@ void PersonaGatewayServer::HandleWebSocketClose(const ::net::ConnectionCloseInfo
     if (close_info.target != options_.websocket_path) {
         return;
     }
-    if (close_info.reason == ::net::ConnectionCloseReason::RemoteClosed ||
-        close_info.reason == ::net::ConnectionCloseReason::ServerShutdown) {
-        return;
-    }
-    adapter_.CleanupDocumentUploadsForConnection(close_info.connection_id);
+    adapter_.CleanupUnfinishedDocumentUploadsForConnection(close_info.connection_id);
 }
 
 core::Status PersonaGatewayServer::ValidateDependencies() const {

@@ -1,6 +1,6 @@
-#include "persona_gateway_http_adapter.h"
+#pragma once
 
-#include <nlohmann/json.hpp>
+#include "persona_gateway_route_core.h"
 
 #include <algorithm>
 #include <chrono>
@@ -12,13 +12,14 @@
 #include <sstream>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
-namespace agent::service::gateway {
-namespace {
+namespace agent::service::gateway::route_detail {
 
 using Json = nlohmann::json;
 
-std::string ErrorCodeName(core::ErrorCode code) {
+static std::string ErrorCodeName(core::ErrorCode code) {
     switch (code) {
     case core::ErrorCode::InvalidArgument: return "INVALID_ARGUMENT";
     case core::ErrorCode::NotFound: return "NOT_FOUND";
@@ -33,7 +34,7 @@ std::string ErrorCodeName(core::ErrorCode code) {
     }
 }
 
-::net::http::status HttpStatusFor(core::ErrorCode code) {
+static ::net::http::status HttpStatusFor(core::ErrorCode code) {
     switch (code) {
     case core::ErrorCode::InvalidArgument: return ::net::http::status::bad_request;
     case core::ErrorCode::NotFound: return ::net::http::status::not_found;
@@ -47,7 +48,7 @@ std::string ErrorCodeName(core::ErrorCode code) {
     }
 }
 
-std::string HeaderValue(const ::net::BeastHttpRequest& req, ::net::http::field field) {
+static std::string HeaderValue(const ::net::BeastHttpRequest& req, ::net::http::field field) {
     auto it = req.find(field);
     if (it == req.end()) {
         return {};
@@ -55,7 +56,7 @@ std::string HeaderValue(const ::net::BeastHttpRequest& req, ::net::http::field f
     return std::string(it->value());
 }
 
-std::string HeaderValue(const ::net::BeastHttpRequest& req, std::string_view field) {
+static std::string HeaderValue(const ::net::BeastHttpRequest& req, std::string_view field) {
     auto it = req.find(field);
     if (it == req.end()) {
         return {};
@@ -63,7 +64,7 @@ std::string HeaderValue(const ::net::BeastHttpRequest& req, std::string_view fie
     return std::string(it->value());
 }
 
-std::filesystem::path PathFromUtf8(std::string_view path) {
+static std::filesystem::path PathFromUtf8(std::string_view path) {
 #ifdef _WIN32
     std::u8string utf8;
     utf8.reserve(path.size());
@@ -76,7 +77,7 @@ std::filesystem::path PathFromUtf8(std::string_view path) {
 #endif
 }
 
-std::string TraceFrom(const ::net::BeastHttpRequest& req, const Json* body = nullptr) {
+static std::string TraceFrom(const ::net::BeastHttpRequest& req, const Json* body = nullptr) {
     auto trace = HeaderValue(req, "X-Trace-Id");
     if (trace.empty()) {
         trace = HeaderValue(req, "X-Request-Id");
@@ -90,7 +91,7 @@ std::string TraceFrom(const ::net::BeastHttpRequest& req, const Json* body = nul
     return trace;
 }
 
-Json ErrorEnvelope(std::string trace_id, const core::Status& status) {
+static Json ErrorEnvelope(std::string trace_id, const core::Status& status) {
     return Json{
         {"ok", false},
         {"traceId", trace_id},
@@ -101,7 +102,7 @@ Json ErrorEnvelope(std::string trace_id, const core::Status& status) {
     };
 }
 
-Json EmotionToJson(const persona::EmotionAnalysis& emotion) {
+static Json EmotionToJson(const persona::EmotionAnalysis& emotion) {
     return Json{
         {"primary", emotion.emotion.primary},
         {"intensity", emotion.emotion.intensity},
@@ -110,7 +111,7 @@ Json EmotionToJson(const persona::EmotionAnalysis& emotion) {
     };
 }
 
-std::string StatusName(persona::SessionStatus status) {
+static std::string StatusName(persona::SessionStatus status) {
     switch (status) {
     case persona::SessionStatus::Creating: return "creating";
     case persona::SessionStatus::Active: return "active";
@@ -121,7 +122,7 @@ std::string StatusName(persona::SessionStatus status) {
     return "unknown";
 }
 
-Json MetricsToJson(const persona::SessionMetrics& metrics) {
+static Json MetricsToJson(const persona::SessionMetrics& metrics) {
     const auto avg = metrics.request_count == 0
         ? 0
         : metrics.total_latency.count() / static_cast<long long>(metrics.request_count);
@@ -135,7 +136,7 @@ Json MetricsToJson(const persona::SessionMetrics& metrics) {
     };
 }
 
-Json SessionToJson(const persona::SessionSnapshot& session) {
+static Json SessionToJson(const persona::SessionSnapshot& session) {
     return Json{
         {"sessionId", session.session_id},
         {"userUuid", session.user_uuid},
@@ -153,7 +154,7 @@ Json SessionToJson(const persona::SessionSnapshot& session) {
     };
 }
 
-Json SessionEnvelope(const SessionGatewayResponse& response) {
+static Json SessionEnvelope(const SessionGatewayResponse& response) {
     return Json{
         {"ok", true},
         {"traceId", response.trace_id},
@@ -163,7 +164,7 @@ Json SessionEnvelope(const SessionGatewayResponse& response) {
     };
 }
 
-Json PersonalityToJson(const persona::PersonalityConfig& personality) {
+static Json PersonalityToJson(const persona::PersonalityConfig& personality) {
     return Json{
         {"name", personality.name},
         {"description", personality.description},
@@ -177,7 +178,7 @@ Json PersonalityToJson(const persona::PersonalityConfig& personality) {
     };
 }
 
-Json EmotionPromptConfigToJson(const std::optional<persona::EmotionPromptConfig>& config) {
+static Json EmotionPromptConfigToJson(const std::optional<persona::EmotionPromptConfig>& config) {
     if (!config) {
         return Json(nullptr);
     }
@@ -189,7 +190,7 @@ Json EmotionPromptConfigToJson(const std::optional<persona::EmotionPromptConfig>
     };
 }
 
-Json PersonaMetadataToJson(const PersonaMetadataRecord& record) {
+static Json PersonaMetadataToJson(const PersonaMetadataRecord& record) {
     return Json{
         {"tenantId", record.tenant_id},
         {"userUuid", record.user_uuid},
@@ -213,7 +214,7 @@ Json PersonaMetadataToJson(const PersonaMetadataRecord& record) {
     };
 }
 
-Json PersonaMetadataEnvelope(const PersonaMetadataGatewayResponse& response) {
+static Json PersonaMetadataEnvelope(const PersonaMetadataGatewayResponse& response) {
     return Json{
         {"ok", true},
         {"traceId", response.trace_id},
@@ -222,7 +223,7 @@ Json PersonaMetadataEnvelope(const PersonaMetadataGatewayResponse& response) {
     };
 }
 
-Json ChatEnvelope(const ChatGatewayResponse& response) {
+static Json ChatEnvelope(const ChatGatewayResponse& response) {
     return Json{
         {"ok", true},
         {"traceId", response.trace_id},
@@ -259,7 +260,7 @@ Json ChatEnvelope(const ChatGatewayResponse& response) {
     };
 }
 
-Json ClassroomEnvelope(const ClassroomGatewayResponse& response) {
+static Json ClassroomEnvelope(const ClassroomGatewayResponse& response) {
     return Json{
         {"ok", true},
         {"traceId", response.trace_id},
@@ -277,7 +278,7 @@ Json ClassroomEnvelope(const ClassroomGatewayResponse& response) {
     };
 }
 
-Json ReportEnvelope(const TrainingReportGatewayResponse& response) {
+static Json ReportEnvelope(const TrainingReportGatewayResponse& response) {
     return Json{
         {"ok", true},
         {"traceId", response.trace_id},
@@ -294,7 +295,7 @@ Json ReportEnvelope(const TrainingReportGatewayResponse& response) {
     };
 }
 
-Json ThreadPoolStatsToJson(const core::ThreadPoolStats& stats) {
+static Json ThreadPoolStatsToJson(const core::ThreadPoolStats& stats) {
     return Json{
         {"workerCount", stats.worker_count},
         {"queuedTasks", stats.queued_tasks},
@@ -306,7 +307,7 @@ Json ThreadPoolStatsToJson(const core::ThreadPoolStats& stats) {
     };
 }
 
-Json SystemStatsEnvelope(const SystemStatsGatewayResponse& response) {
+static Json SystemStatsEnvelope(const SystemStatsGatewayResponse& response) {
     return Json{
         {"ok", true},
         {"traceId", response.trace_id},
@@ -321,7 +322,7 @@ Json SystemStatsEnvelope(const SystemStatsGatewayResponse& response) {
     };
 }
 
-Json DocumentAnalyzeEnvelope(const document::DocumentAnalyzeResponse& response) {
+static Json DocumentAnalyzeEnvelope(const document::DocumentAnalyzeResponse& response) {
     return Json{
         {"ok", true},
         {"traceId", response.trace_id},
@@ -336,7 +337,7 @@ Json DocumentAnalyzeEnvelope(const document::DocumentAnalyzeResponse& response) 
     };
 }
 
-Json DocumentMetadataEnvelope(std::string trace_id, const document::DocumentMetadataRecord& record) {
+static Json DocumentMetadataEnvelope(std::string trace_id, const document::DocumentMetadataRecord& record) {
     return Json{
         {"ok", true},
         {"traceId", std::move(trace_id)},
@@ -359,7 +360,7 @@ Json DocumentMetadataEnvelope(std::string trace_id, const document::DocumentMeta
     };
 }
 
-std::string SkillStateName(persona::SkillSessionState state) {
+static std::string SkillStateName(persona::SkillSessionState state) {
     switch (state) {
     case persona::SkillSessionState::Idle: return "idle";
     case persona::SkillSessionState::Starting: return "starting";
@@ -374,7 +375,7 @@ std::string SkillStateName(persona::SkillSessionState state) {
     return "unknown";
 }
 
-Json SkillObservationToJson(const persona::SkillObservation& observation) {
+static Json SkillObservationToJson(const persona::SkillObservation& observation) {
     Json metadata = Json::object();
     if (!observation.metadata_json.empty()) {
         try {
@@ -396,7 +397,7 @@ Json SkillObservationToJson(const persona::SkillObservation& observation) {
     };
 }
 
-Json SkillSessionSnapshotToJson(const persona::SkillSessionSnapshot& snapshot) {
+static Json SkillSessionSnapshotToJson(const persona::SkillSessionSnapshot& snapshot) {
     Json observations = Json::array();
     for (const auto& observation : snapshot.recent_observations) {
         observations.push_back(SkillObservationToJson(observation));
@@ -417,7 +418,7 @@ Json SkillSessionSnapshotToJson(const persona::SkillSessionSnapshot& snapshot) {
     };
 }
 
-Json SkillSessionEnvelope(std::string trace_id, const persona::SkillSessionSnapshot& snapshot) {
+static Json SkillSessionEnvelope(std::string trace_id, const persona::SkillSessionSnapshot& snapshot) {
     return Json{
         {"ok", true},
         {"traceId", std::move(trace_id)},
@@ -425,7 +426,7 @@ Json SkillSessionEnvelope(std::string trace_id, const persona::SkillSessionSnaps
     };
 }
 
-Json SkillSessionStatusEnvelope(std::string trace_id,
+static Json SkillSessionStatusEnvelope(std::string trace_id,
                                 const std::optional<persona::SkillSessionSnapshot>& snapshot) {
     return Json{
         {"ok", true},
@@ -434,7 +435,7 @@ Json SkillSessionStatusEnvelope(std::string trace_id,
     };
 }
 
-core::Status EnsureSkillSessionOwner(const std::optional<persona::SkillSessionSnapshot>& snapshot,
+static core::Status EnsureSkillSessionOwner(const std::optional<persona::SkillSessionSnapshot>& snapshot,
                                      const AuthIdentity& identity) {
     if (!identity.authenticated) {
         return core::Status::Error(core::ErrorCode::PermissionDenied, "authenticated account is required");
@@ -447,7 +448,7 @@ core::Status EnsureSkillSessionOwner(const std::optional<persona::SkillSessionSn
         : core::Status::Error(core::ErrorCode::PermissionDenied, "skill session does not belong to authenticated user");
 }
 
-core::Status EnsureDocumentUploadOwner(const DocumentUploadSession& session,
+static core::Status EnsureDocumentUploadOwner(const DocumentUploadSession& session,
                                        const AuthIdentity& identity,
                                        std::uint64_t connection_id) {
     if (session.connection_id != connection_id) {
@@ -463,7 +464,7 @@ core::Status EnsureDocumentUploadOwner(const DocumentUploadSession& session,
     return core::Status::Ok();
 }
 
-core::Result<Json> ParseJsonBody(const ::net::BeastHttpRequest& req) {
+static core::Result<Json> ParseJsonBody(const ::net::BeastHttpRequest& req) {
     if (req.body().empty()) {
         return Json::object();
     }
@@ -474,7 +475,7 @@ core::Result<Json> ParseJsonBody(const ::net::BeastHttpRequest& req) {
     }
 }
 
-std::vector<std::string> SplitPath(std::string_view target) {
+static std::vector<std::string> SplitPath(std::string_view target) {
     const auto q = target.find('?');
     if (q != std::string_view::npos) {
         target = target.substr(0, q);
@@ -497,7 +498,7 @@ std::vector<std::string> SplitPath(std::string_view target) {
     return parts;
 }
 
-void SendJson(const std::shared_ptr<::net::IHttpRequest>& request,
+static void SendJson(const std::shared_ptr<::net::IHttpRequest>& request,
               ::net::http::status status,
               const Json& body,
               std::string_view trace_id) {
@@ -508,7 +509,7 @@ void SendJson(const std::shared_ptr<::net::IHttpRequest>& request,
     request->Respond(std::move(response));
 }
 
-void SendJsonWithHeaders(const std::shared_ptr<::net::IHttpRequest>& request,
+static void SendJsonWithHeaders(const std::shared_ptr<::net::IHttpRequest>& request,
                          ::net::http::status status,
                          const Json& body,
                          std::string_view trace_id,
@@ -523,11 +524,11 @@ void SendJsonWithHeaders(const std::shared_ptr<::net::IHttpRequest>& request,
     request->Respond(std::move(response));
 }
 
-std::int64_t ToUnixSeconds(std::chrono::system_clock::time_point time) {
+static std::int64_t ToUnixSeconds(std::chrono::system_clock::time_point time) {
     return std::chrono::duration_cast<std::chrono::seconds>(time.time_since_epoch()).count();
 }
 
-void SendAuthRegistrationResult(const std::shared_ptr<::net::IHttpRequest>& request,
+static void SendAuthRegistrationResult(const std::shared_ptr<::net::IHttpRequest>& request,
                                 std::string_view trace_id,
                                 const AuthRegistrationResult& value) {
     Json body{
@@ -553,7 +554,7 @@ void SendAuthRegistrationResult(const std::shared_ptr<::net::IHttpRequest>& requ
 }
 
 template <typename T, typename Fn>
-void SendResult(const std::shared_ptr<::net::IHttpRequest>& request,
+static void SendResult(const std::shared_ptr<::net::IHttpRequest>& request,
                 core::Result<T> result,
                 std::string trace_id,
                 Fn serializer) {
@@ -565,7 +566,7 @@ void SendResult(const std::shared_ptr<::net::IHttpRequest>& request,
     SendJson(request, ::net::http::status::ok, body, trace_id);
 }
 
-persona::PersonalityConfig PersonalityFromJson(const Json& body) {
+static persona::PersonalityConfig PersonalityFromJson(const Json& body) {
     persona::PersonalityConfig personality;
     const auto persona_obj = body.value("personality", Json::object());
     personality.name = persona_obj.value("name", body.value("personaId", std::string{}));
@@ -580,7 +581,7 @@ persona::PersonalityConfig PersonalityFromJson(const Json& body) {
     return personality;
 }
 
-std::optional<persona::EmotionPromptConfig> EmotionPromptConfigFromJson(const Json& body) {
+static std::optional<persona::EmotionPromptConfig> EmotionPromptConfigFromJson(const Json& body) {
     const auto it = body.find("emotionPrompts");
     if (it == body.end() || !it->is_object()) {
         return std::nullopt;
@@ -606,7 +607,7 @@ std::optional<persona::EmotionPromptConfig> EmotionPromptConfigFromJson(const Js
     return config;
 }
 
-persona::EmotionStateConfig EmotionStateConfigFromJson(const Json& body) {
+static persona::EmotionStateConfig EmotionStateConfigFromJson(const Json& body) {
     persona::EmotionStateConfig config;
     const auto it = body.find("emotionState");
     if (it == body.end() || !it->is_object()) {
@@ -627,7 +628,7 @@ persona::EmotionStateConfig EmotionStateConfigFromJson(const Json& body) {
     return config;
 }
 
-std::string MessagePayloadToString(const ::net::WebSocketMessage& message) {
+static std::string MessagePayloadToString(const ::net::WebSocketMessage& message) {
     std::string out;
     for (const auto& fragment : message.fragments) {
         out.append(fragment.view());
@@ -635,7 +636,7 @@ std::string MessagePayloadToString(const ::net::WebSocketMessage& message) {
     return out;
 }
 
-int Base64Value(char ch) {
+static int Base64Value(char ch) {
     if (ch >= 'A' && ch <= 'Z') return ch - 'A';
     if (ch >= 'a' && ch <= 'z') return ch - 'a' + 26;
     if (ch >= '0' && ch <= '9') return ch - '0' + 52;
@@ -644,7 +645,7 @@ int Base64Value(char ch) {
     return -1;
 }
 
-core::Result<std::string> Base64Decode(std::string_view input) {
+static core::Result<std::string> Base64Decode(std::string_view input) {
     std::string out;
     out.reserve(input.size() * 3 / 4);
     int value = 0;
@@ -675,7 +676,7 @@ core::Result<std::string> Base64Decode(std::string_view input) {
     return out;
 }
 
-::net::WebSocketFrame TextFrame(core::RawMemoryPool& pool, std::string_view text) {
+static ::net::WebSocketFrame TextFrame(core::RawMemoryPool& pool, std::string_view text) {
     ::net::WebSocketFrame frame;
     frame.kind = ::net::WebSocketMessageKind::Text;
     auto copied = ::net::SharedBuffer::Copy(pool, text);
@@ -685,14 +686,14 @@ core::Result<std::string> Base64Decode(std::string_view input) {
     return frame;
 }
 
-void SendWsError(const std::shared_ptr<::net::IWebSocketStreamRequest>& request,
+static void SendWsError(const std::shared_ptr<::net::IWebSocketStreamRequest>& request,
                  std::string_view trace_id,
                  const core::Status& status) {
     Json out{{"type", "error"}, {"payload", ErrorEnvelope(std::string(trace_id), status)}};
     request->Send(TextFrame(request->memory_pool(), out.dump()));
 }
 
-std::filesystem::path UploadTempPath(std::string_view upload_id) {
+static std::filesystem::path UploadTempPath(std::string_view upload_id) {
     std::string file_name = "agent_document_upload_";
     for (char ch : upload_id) {
         const auto safe = std::isalnum(static_cast<unsigned char>(ch)) || ch == '-' || ch == '_';
@@ -702,7 +703,7 @@ std::filesystem::path UploadTempPath(std::string_view upload_id) {
     return std::filesystem::temp_directory_path() / file_name;
 }
 
-core::Status WriteUploadChunk(const std::filesystem::path& path,
+static core::Status WriteUploadChunk(const std::filesystem::path& path,
                               std::string_view data,
                               std::uint64_t offset) {
     std::fstream file;
@@ -725,12 +726,12 @@ core::Status WriteUploadChunk(const std::filesystem::path& path,
     return core::Status::Ok();
 }
 
-void RemoveFileQuietly(const std::filesystem::path& path) {
+static void RemoveFileQuietly(const std::filesystem::path& path) {
     std::error_code ec;
     std::filesystem::remove(path, ec);
 }
 
-core::Status AppendBinaryUploadFrame(
+static core::Status AppendBinaryUploadFrame(
     std::unordered_map<std::string, DocumentUploadSession>& uploads,
     std::uint64_t connection_id,
     const ::net::WebSocketMessage& message,
@@ -788,243 +789,4 @@ core::Status AppendBinaryUploadFrame(
     return core::Status::Ok();
 }
 
-} // namespace
-
-PersonaGatewayHttpAdapter::PersonaGatewayHttpAdapter(PersonaGatewayService& service,
-                                                     std::shared_ptr<IGatewayAuthenticator> authenticator,
-                                                     std::shared_ptr<IAuthRegistrationService> auth_registration,
-                                                     std::shared_ptr<document::DocumentAnalysisService> document_service,
-                                                     std::shared_ptr<llm::ILlmClient> llm_client,
-                                                     std::shared_ptr<document::IDocumentEmbeddingProvider> embedding_provider,
-                                                     std::shared_ptr<document::IDocumentLlmChunkCache> llm_chunk_cache,
-                                                     std::shared_ptr<semantic_cache::ISemanticCache> document_semantic_cache,
-                                                     std::shared_ptr<persona::ISkillSessionManager> skill_session_manager,
-                                                     bool enable_dev_registration)
-    : PersonaGatewayHttpAdapter(service,
-                                std::move(authenticator),
-                                std::move(auth_registration),
-                                std::move(document_service),
-                                std::move(llm_client),
-                                std::move(embedding_provider),
-                                std::move(llm_chunk_cache),
-                                std::move(document_semantic_cache),
-                                std::move(skill_session_manager),
-                                PersonaGatewayHttpAdapterOptions{
-                                    .enable_dev_registration = enable_dev_registration,
-                                    .enable_path_register_test_endpoint = false,
-                                    .enable_path_analyze_test_endpoint = false}) {}
-
-PersonaGatewayHttpAdapter::PersonaGatewayHttpAdapter(PersonaGatewayService& service,
-                                                     std::shared_ptr<IGatewayAuthenticator> authenticator,
-                                                     std::shared_ptr<IAuthRegistrationService> auth_registration,
-                                                     std::shared_ptr<document::DocumentAnalysisService> document_service,
-                                                     std::shared_ptr<llm::ILlmClient> llm_client,
-                                                     std::shared_ptr<document::IDocumentEmbeddingProvider> embedding_provider,
-                                                     std::shared_ptr<document::IDocumentLlmChunkCache> llm_chunk_cache,
-                                                     std::shared_ptr<semantic_cache::ISemanticCache> document_semantic_cache,
-                                                     std::shared_ptr<persona::ISkillSessionManager> skill_session_manager,
-                                                     PersonaGatewayHttpAdapterOptions options)
-    : service_(service),
-      authenticator_(std::move(authenticator)),
-      auth_registration_(std::move(auth_registration)),
-      document_service_(std::move(document_service)),
-      llm_client_(std::move(llm_client)),
-      embedding_provider_(std::move(embedding_provider)),
-      llm_chunk_cache_(std::move(llm_chunk_cache)),
-      document_semantic_cache_(std::move(document_semantic_cache)),
-      skill_session_manager_(std::move(skill_session_manager)),
-      options_(options) {}
-
-bool PersonaGatewayHttpAdapter::IsApiRequest(std::string_view target) noexcept {
-    const auto q = target.find('?');
-    if (q != std::string_view::npos) {
-        target = target.substr(0, q);
-    }
-    return target == "/api" || target.starts_with("/api/");
-}
-
-void PersonaGatewayHttpAdapter::CleanupUnfinishedDocumentUploadsForConnection(std::uint64_t connection_id) {
-    std::vector<std::filesystem::path> temp_paths;
-    {
-        std::lock_guard lock(document_upload_mutex_);
-        for (auto it = document_uploads_.begin(); it != document_uploads_.end();) {
-            if (it->second.connection_id != connection_id) {
-                ++it;
-                continue;
-            }
-            temp_paths.push_back(it->second.temp_path);
-            it = document_uploads_.erase(it);
-        }
-    }
-
-    for (const auto& temp_path : temp_paths) {
-        std::error_code ec;
-        std::filesystem::remove(temp_path, ec);
-    }
-}
-
-void PersonaGatewayHttpAdapter::HandleHttp(std::shared_ptr<::net::IHttpRequest> request) {
-    const auto& msg = request->message();
-    if (!IsApiRequest(msg.target())) {
-        const auto trace_id = TraceFrom(msg);
-        const auto status = core::Status::Error(core::ErrorCode::NotFound, "route not found");
-        SendJson(request, ::net::http::status::not_found, ErrorEnvelope(trace_id, status), trace_id);
-        return;
-    }
-
-    const auto parts = SplitPath(msg.target());
-    auto parsed = ParseJsonBody(msg);
-    const Json* parsed_body = parsed.ok() ? &parsed.value() : nullptr;
-    const auto trace_id = TraceFrom(msg, parsed_body);
-    if (!parsed.ok()) {
-        SendJson(request, ::net::http::status::bad_request, ErrorEnvelope(trace_id, parsed.status()), trace_id);
-        return;
-    }
-    const auto& body = parsed.value();
-    auto routes = HttpRouteRegistry::Instance().CreateRoutes();
-    std::unordered_map<std::string, std::string> params;
-    for (const auto& route : routes) {
-        if (!route->Matches(msg.method(), parts, params)) {
-            continue;
-        }
-        AuthIdentity identity;
-        if (authenticator_ && route->RequiresAuth()) {
-            auto auth = authenticator_->Authenticate(msg);
-            if (!auth.ok()) {
-                SendJson(request, HttpStatusFor(auth.status().code()), ErrorEnvelope(trace_id, auth.status()), trace_id);
-                return;
-            }
-            identity = std::move(auth).value();
-        }
-        if (route->RequiresAuthenticatedIdentity() && !identity.authenticated) {
-            const auto status = core::Status::Error(core::ErrorCode::PermissionDenied, "authenticated account is required");
-            SendJson(request, HttpStatusFor(status.code()), ErrorEnvelope(trace_id, status), trace_id);
-            return;
-        }
-        HttpRouteContext context{
-            service_,
-            document_service_,
-            llm_client_,
-            embedding_provider_,
-            llm_chunk_cache_,
-            document_semantic_cache_,
-            skill_session_manager_,
-            auth_registration_,
-            options_.enable_dev_registration,
-            options_.enable_path_register_test_endpoint,
-            options_.enable_path_analyze_test_endpoint,
-            std::move(request),
-            msg,
-            body,
-            identity,
-            trace_id,
-            parts,
-            std::move(params),
-        };
-        route->Handle(context);
-        return;
-    }
-
-    const auto status = core::Status::Error(core::ErrorCode::NotFound, "route not found");
-    SendJson(request, ::net::http::status::not_found, ErrorEnvelope(trace_id, status), trace_id);
-}
-
-void PersonaGatewayHttpAdapter::HandleWebSocket(std::shared_ptr<::net::IWebSocketStreamRequest> request) {
-    if (!request->message().ok()) {
-        auto error = ErrorEnvelope(core::GenerateTraceId(), request->message().status);
-        request->Send(TextFrame(request->memory_pool(), error.dump()));
-        return;
-    }
-
-    if (request->message().kind == ::net::WebSocketMessageKind::Binary) {
-        std::string upload_id;
-        std::uint64_t received = 0;
-        std::uint64_t total = 0;
-        core::Status status;
-        {
-            std::lock_guard lock(document_upload_mutex_);
-            status = AppendBinaryUploadFrame(
-                document_uploads_,
-                request->connection().connection_id,
-                request->message(),
-                &upload_id,
-                &received,
-                &total);
-        }
-        if (!status.ok()) {
-            SendWsError(request, core::GenerateTraceId(), status);
-            return;
-        }
-        Json out{
-            {"type", "document.upload.chunk_ack"},
-            {"payload", {
-                {"ok", true},
-                {"traceId", core::GenerateTraceId()},
-                {"uploadId", upload_id},
-                {"mode", "binary"},
-                {"receivedBytes", received},
-                {"totalBytes", total},
-                {"finalFragment", request->message().final_fragment},
-            }},
-        };
-        request->Send(TextFrame(request->memory_pool(), out.dump()));
-        return;
-    }
-
-    const auto text = MessagePayloadToString(request->message());
-    Json body;
-    try {
-        body = Json::parse(text);
-    } catch (const Json::exception& e) {
-        auto error = ErrorEnvelope(core::GenerateTraceId(), core::Status::Error(core::ErrorCode::InvalidArgument, e.what()));
-        request->Send(TextFrame(request->memory_pool(), error.dump()));
-        return;
-    }
-
-    const auto type = body.value("type", std::string{});
-    const auto trace_id = body.value("traceId", core::GenerateTraceId());
-    auto routes = WsRouteRegistry::Instance().CreateRoutes();
-    for (const auto& route : routes) {
-        if (!route->Matches(type)) {
-            continue;
-        }
-        AuthIdentity identity;
-        if (authenticator_ && route->RequiresAuth()) {
-            auto auth = authenticator_->Authenticate(request->handshake_request());
-            if (!auth.ok()) {
-                Json out{{"type", "error"}, {"payload", ErrorEnvelope(trace_id, auth.status())}};
-                request->Send(TextFrame(request->memory_pool(), out.dump()));
-                return;
-            }
-            identity = std::move(auth).value();
-        }
-        if (route->RequiresAuthenticatedIdentity() && !identity.authenticated) {
-            const auto status = core::Status::Error(core::ErrorCode::PermissionDenied, "authenticated account is required");
-            Json out{{"type", "error"}, {"payload", ErrorEnvelope(trace_id, status)}};
-            request->Send(TextFrame(request->memory_pool(), out.dump()));
-            return;
-        }
-        WsRouteContext context{
-            service_,
-            document_service_,
-            llm_client_,
-            embedding_provider_,
-            llm_chunk_cache_,
-            document_semantic_cache_,
-            skill_session_manager_,
-            std::move(request),
-            body,
-            identity,
-            trace_id,
-            document_upload_mutex_,
-            document_uploads_,
-        };
-        route->Handle(context);
-        return;
-    }
-
-    auto error = ErrorEnvelope(trace_id, core::Status::Error(core::ErrorCode::InvalidArgument, "unknown websocket message type"));
-    request->Send(TextFrame(request->memory_pool(), Json{{"type", "error"}, {"payload", error}}.dump()));
-}
-
-} // namespace agent::service::gateway
+} // namespace agent::service::gateway::route_detail

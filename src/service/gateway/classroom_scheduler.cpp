@@ -35,32 +35,39 @@ core::Status ClassroomScheduler::RegisterPersona(ClassroomPersonaRegistration re
     if (request.persona_id.empty() || request.session_id.empty()) {
         return core::Status::Error(core::ErrorCode::InvalidArgument, "persona_id and session_id are required");
     }
+    {
+        try{
+            std::lock_guard lock(mutex_);
+            auto& classroom = classrooms_[request.classroom_id];
+            auto& persona = classroom.personas[request.persona_id];
+            persona.persona_id = request.persona_id;
+            persona.session_id = request.session_id;
+            persona.context_ids = std::move(request.context_ids);
+            persona.context_patterns = std::move(request.context_patterns);
+            persona.config_source = std::move(request.config_source);
+            persona.agent = request.agent;
+            persona.proactive = request.proactive;
+            persona.default_persona = request.default_persona;
+            persona.started_at = std::chrono::steady_clock::now();
+            persona.last_user_time = persona.started_at;
+            persona.proactive_state = ProactiveState::Normal;
+                    
+            if (persona.default_persona || classroom.default_persona.empty()) {
+                classroom.default_persona = persona.persona_id;
+            }
+            classroom.context_cache.clear();
 
-    std::lock_guard lock(mutex_);
-    auto& classroom = classrooms_[request.classroom_id];
-    auto& persona = classroom.personas[request.persona_id];
-    persona.persona_id = request.persona_id;
-    persona.session_id = request.session_id;
-    persona.context_ids = std::move(request.context_ids);
-    persona.context_patterns = std::move(request.context_patterns);
-    persona.config_source = std::move(request.config_source);
-    persona.agent = request.agent;
-    persona.proactive = request.proactive;
-    persona.default_persona = request.default_persona;
-    persona.started_at = std::chrono::steady_clock::now();
-    persona.last_user_time = persona.started_at;
-    persona.proactive_state = ProactiveState::Normal;
-
-    if (persona.default_persona || classroom.default_persona.empty()) {
-        classroom.default_persona = persona.persona_id;
+            logger_.info("[classroom] registered classroom={} persona={} session={} default={}",
+                        request.classroom_id,
+                        persona.persona_id,
+                        persona.session_id,
+                        persona.default_persona);
+        } catch (const std::exception& e) {
+            logger_.error("[classroom] RegisterPersona failed: {}", e.what());
+            return core::Status::Error(core::ErrorCode::InternalError,
+                std::string("RegisterPersona failed: ") + e.what());
+        }
     }
-    classroom.context_cache.clear();
-
-    logger_.info("[classroom] registered classroom={} persona={} session={} default={}",
-                 request.classroom_id,
-                 persona.persona_id,
-                 persona.session_id,
-                 persona.default_persona);
     return core::Status::Ok();
 }
 

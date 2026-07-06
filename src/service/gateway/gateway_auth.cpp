@@ -5,6 +5,7 @@
 #include <openssl/bio.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
+#include <openssl/rand.h>
 #include <openssl/rsa.h>
 
 #include "sqlite/sqlite_connection.h"
@@ -18,6 +19,7 @@
 #include <iomanip>
 #include <memory>
 #include <random>
+#include <span>
 #include <sstream>
 #include <vector>
 
@@ -27,6 +29,10 @@ namespace {
 using Json = nlohmann::json;
 using storage::sqlite::SqliteConnection;
 using storage::sqlite::SqliteStepResult;
+
+constexpr int kPasswordIterations = 120000;
+constexpr std::size_t kPasswordSaltBytes = 16;
+constexpr std::size_t kPasswordHashBytes = 32;
 
 struct BioDeleter {
     void operator()(BIO* bio) const noexcept {
@@ -57,6 +63,81 @@ std::string Trim(std::string_view value) {
         return {};
     }
     return std::string(first, last);
+}
+
+std::string HexEncode(std::span<const unsigned char> bytes) {
+    std::ostringstream out;
+    out << std::hex << std::setfill('0');
+    for (unsigned char byte : bytes) {
+        out << std::setw(2) << static_cast<int>(byte);
+    }
+    return out.str();
+}
+
+core::Result<std::string> HashPassword(std::string_view password,
+                                       std::string_view salt,
+                                       int iterations) {
+    if (password.empty()) {
+        return core::Status::Error(core::ErrorCode::InvalidArgument, "password is required");
+    }
+    if (salt.empty() || iterations <= 0) {
+        return core::Status::Error(core::ErrorCode::InvalidArgument, "password hash parameters are invalid");
+    }
+    std::array<unsigned char, kPasswordHashBytes> hash{};
+    const int ok = PKCS5_PBKDF2_HMAC(
+        password.data(),
+        static_cast<int>(password.size()),
+        reinterpret_cast<const unsigned char*>(salt.data()),
+        static_cast<int>(salt.size()),
+        iterations,
+        EVP_sha256(),
+        static_cast<int>(hash.size()),
+        hash.data());
+    if (ok != 1) {
+        return core::Status::Error(core::ErrorCode::InternalError, "failed to hash password");
+    }
+    return HexEncode(hash);
+}
+
+core::Result<AuthUserRecord> BuildPasswordRecord(const AuthRegistrationRequest& request) {
+    AuthUserRecord record;
+    record.username = Trim(request.username);
+    if (record.username.empty() && request.password.empty()) {
+        return record;
+    }
+    if (record.username.empty()) {
+        return core::Status::Error(core::ErrorCode::InvalidArgument, "username is required");
+    }
+    if (request.password.size() < 8) {
+        return core::Status::Error(core::ErrorCode::InvalidArgument, "password must contain at least 8 bytes");
+    }
+
+    std::array<unsigned char, kPasswordSaltBytes> salt{};
+    if (RAND_bytes(salt.data(), static_cast<int>(salt.size())) != 1) {
+        return core::Status::Error(core::ErrorCode::InternalError, "failed to generate password salt");
+    }
+    record.password_salt = HexEncode(salt);
+    record.password_iterations = kPasswordIterations;
+    auto hash = HashPassword(request.password, record.password_salt, record.password_iterations);
+    if (!hash.ok()) {
+        return hash.status();
+    }
+    record.password_hash = std::move(hash).value();
+    return record;
+}
+
+core::Status VerifyPassword(std::string_view password, const AuthUserRecord& record) {
+    if (record.username.empty() || record.password_hash.empty() ||
+        record.password_salt.empty() || record.password_iterations <= 0) {
+        return core::Status::Error(core::ErrorCode::FailedPrecondition, "password login is not configured for this user");
+    }
+    auto hash = HashPassword(password, record.password_salt, record.password_iterations);
+    if (!hash.ok()) {
+        return hash.status();
+    }
+    return hash.value() == record.password_hash
+        ? core::Status::Ok()
+        : core::Status::Error(core::ErrorCode::PermissionDenied, "invalid username or password");
 }
 
 std::vector<std::string_view> SplitJwt(std::string_view token) {
@@ -298,6 +379,46 @@ core::Result<AuthSessionRecord> AuthSessionRecordFromJson(std::string_view paylo
     return record;
 }
 
+Json AuthUserRecordToJson(const AuthUserRecord& record) {
+    return Json{
+        {"user_uuid", record.user_uuid},
+        {"tenant_id", record.tenant_id.empty() ? "default" : record.tenant_id},
+        {"username", record.username},
+        {"password_hash", record.password_hash},
+        {"password_salt", record.password_salt},
+        {"password_iterations", record.password_iterations},
+        {"subject", record.subject},
+        {"created_at", ToUnixSeconds(record.created_at)},
+        {"updated_at", ToUnixSeconds(record.updated_at)},
+        {"disabled", record.disabled},
+    };
+}
+
+core::Result<AuthUserRecord> AuthUserRecordFromJson(std::string_view payload) {
+    Json json;
+    try {
+        json = Json::parse(payload);
+    } catch (const Json::exception& e) {
+        return core::Status::Error(core::ErrorCode::InvalidArgument, e.what());
+    }
+
+    AuthUserRecord record;
+    record.user_uuid = json.value("user_uuid", std::string{});
+    record.tenant_id = json.value("tenant_id", std::string{"default"});
+    record.username = json.value("username", std::string{});
+    record.password_hash = json.value("password_hash", std::string{});
+    record.password_salt = json.value("password_salt", std::string{});
+    record.password_iterations = json.value("password_iterations", 0);
+    record.subject = json.value("subject", std::string{});
+    record.created_at = FromUnixSeconds(json.value("created_at", std::int64_t{0}));
+    record.updated_at = FromUnixSeconds(json.value("updated_at", std::int64_t{0}));
+    record.disabled = json.value("disabled", false);
+    if (record.user_uuid.empty() || record.username.empty()) {
+        return core::Status::Error(core::ErrorCode::InvalidArgument, "invalid auth user record");
+    }
+    return record;
+}
+
 std::chrono::seconds RemainingTtl(std::chrono::system_clock::time_point expires_at) {
     const auto now = std::chrono::system_clock::now();
     if (expires_at <= now) {
@@ -323,6 +444,31 @@ bool AudienceMatches(const Json& payload, std::string_view expected) {
         });
     }
     return false;
+}
+
+core::Status EnsureColumn(SqliteConnection& connection,
+                          std::string_view table,
+                          std::string_view column,
+                          std::string_view definition) {
+    auto statement_result = connection.Prepare("PRAGMA table_info(" + std::string(table) + ")");
+    if (!statement_result.ok()) {
+        return statement_result.status();
+    }
+    auto statement = std::move(statement_result).value();
+    while (true) {
+        auto step = statement.Step();
+        if (!step.ok()) {
+            return step.status();
+        }
+        if (step.value() == SqliteStepResult::Done) {
+            break;
+        }
+        if (statement.ColumnText(1) == column) {
+            return core::Status::Ok();
+        }
+    }
+    return connection.Execute(
+        "ALTER TABLE " + std::string(table) + " ADD COLUMN " + std::string(definition));
 }
 
 } // namespace
@@ -547,28 +693,107 @@ core::Result<AuthRegistrationResult> JwtAuthRegistrationService::Register(const 
     identity.expires_at = now + ttl;
     identity.authenticated = true;
 
-    auto token = IssueJwt(identity, now);
-    if (!token.ok()) {
-        return token.status();
+    auto password_record = BuildPasswordRecord(request);
+    if (!password_record.ok()) {
+        return password_record.status();
+    }
+    if (!password_record.value().username.empty()) {
+        AuthUserRecord user = std::move(password_record).value();
+        user.user_uuid = identity.user_uuid;
+        user.tenant_id = identity.tenant_id;
+        user.subject = identity.subject;
+        user.created_at = now;
+        user.updated_at = now;
+        auto upsert_user = session_store_->UpsertUser(user);
+        if (!upsert_user.ok()) {
+            return upsert_user;
+        }
     }
 
-    AuthSessionRecord record;
-    record.token_id = identity.token_id;
-    record.user_uuid = identity.user_uuid;
-    record.tenant_id = identity.tenant_id;
-    record.subject = identity.subject;
-    record.issued_at = now;
-    record.expires_at = identity.expires_at;
-    auto upsert = session_store_->UpsertSession(record);
+    AuthSessionRecord session;
+    session.token_id = identity.token_id;
+    session.user_uuid = identity.user_uuid;
+    session.tenant_id = identity.tenant_id;
+    session.subject = identity.subject;
+    session.issued_at = now;
+    session.expires_at = identity.expires_at;
+    auto upsert = session_store_->UpsertSession(session);
     if (!upsert.ok()) {
         return upsert;
     }
 
+    return IssueForIdentity(identity, now);
+}
+
+core::Result<AuthRegistrationResult> JwtAuthRegistrationService::Login(const AuthLoginRequest& request) {
+    if (!options_.enabled) {
+        return core::Status::Error(core::ErrorCode::FailedPrecondition, "gateway auth is not enabled");
+    }
+    if (!session_store_) {
+        return core::Status::Error(core::ErrorCode::FailedPrecondition, "auth session store is not configured");
+    }
+
+    const auto username = Trim(request.username);
+    if (username.empty() || request.password.empty()) {
+        return core::Status::Error(core::ErrorCode::InvalidArgument, "username and password are required");
+    }
+
+    auto user = session_store_->ResolveUserByUsername(username);
+    if (!user.ok()) {
+        return user.status();
+    }
+    if (user.value().disabled) {
+        return core::Status::Error(core::ErrorCode::PermissionDenied, "auth user is disabled");
+    }
+    if (auto verified = VerifyPassword(request.password, user.value()); !verified.ok()) {
+        return verified;
+    }
+
+    const auto now = std::chrono::system_clock::now();
+    const auto ttl = request.ttl.count() > 0 ? request.ttl : options_.token_ttl;
+    if (ttl.count() <= 0) {
+        return core::Status::Error(core::ErrorCode::InvalidArgument, "auth token ttl must be positive");
+    }
+
+    AuthIdentity identity;
+    identity.user_uuid = user.value().user_uuid;
+    identity.tenant_id = user.value().tenant_id.empty() ? std::string("default") : user.value().tenant_id;
+    identity.subject = user.value().subject.empty() ? user.value().user_uuid : user.value().subject;
+    identity.issuer = options_.issuer;
+    identity.audience = options_.audience;
+    identity.token_id = GenerateUuidV4();
+    identity.expires_at = now + ttl;
+    identity.authenticated = true;
+
+    AuthSessionRecord session;
+    session.token_id = identity.token_id;
+    session.user_uuid = identity.user_uuid;
+    session.tenant_id = identity.tenant_id;
+    session.subject = identity.subject;
+    session.issued_at = now;
+    session.expires_at = identity.expires_at;
+    session.revoked = false;
+    auto upsert = session_store_->UpsertSession(session);
+    if (!upsert.ok()) {
+        return upsert;
+    }
+
+    return IssueForIdentity(identity, now);
+}
+
+core::Result<AuthRegistrationResult> JwtAuthRegistrationService::IssueForIdentity(
+    const AuthIdentity& identity,
+    std::chrono::system_clock::time_point issued_at) const {
+    auto token = IssueJwt(identity, issued_at);
+    if (!token.ok()) {
+        return token.status();
+    }
+
     AuthRegistrationResult result;
-    result.identity = std::move(identity);
+    result.identity = identity;
     result.token = std::move(token).value();
     result.cookie_header = BuildCookieHeader(result.token, result.identity.expires_at);
-    result.issued_at = now;
+    result.issued_at = issued_at;
     return result;
 }
 
@@ -636,7 +861,7 @@ core::Status SqliteAuthSessionStore::EnsureSchema() {
     if (!wal.ok()) {
         return wal;
     }
-    return connection.Execute(
+    auto create = connection.Execute(
         "CREATE TABLE IF NOT EXISTS gateway_auth_sessions ("
         "token_id TEXT PRIMARY KEY,"
         "user_uuid TEXT NOT NULL,"
@@ -648,6 +873,23 @@ core::Status SqliteAuthSessionStore::EnsureSchema() {
         "revoked_reason TEXT,"
         "updated_at INTEGER NOT NULL"
         ")");
+    if (!create.ok()) return create;
+    auto create_users = connection.Execute(
+        "CREATE TABLE IF NOT EXISTS gateway_auth_users ("
+        "user_uuid TEXT PRIMARY KEY,"
+        "tenant_id TEXT NOT NULL,"
+        "username TEXT NOT NULL UNIQUE,"
+        "password_hash TEXT NOT NULL,"
+        "password_salt TEXT NOT NULL,"
+        "password_iterations INTEGER NOT NULL,"
+        "subject TEXT,"
+        "created_at INTEGER NOT NULL,"
+        "updated_at INTEGER NOT NULL,"
+        "disabled INTEGER NOT NULL DEFAULT 0"
+        ")");
+    if (!create_users.ok()) return create_users;
+    if (auto status = EnsureColumn(connection, "gateway_auth_users", "disabled", "disabled INTEGER NOT NULL DEFAULT 0"); !status.ok()) return status;
+    return core::Status::Ok();
 }
 
 core::Result<AuthSessionRecord> SqliteAuthSessionStore::ResolveSession(std::string_view token_id) {
@@ -683,6 +925,94 @@ core::Result<AuthSessionRecord> SqliteAuthSessionStore::ResolveSession(std::stri
     record.expires_at = FromUnixSeconds(statement.ColumnInt64(5));
     record.revoked = statement.ColumnInt(6) != 0;
     return record;
+}
+
+core::Result<AuthUserRecord> SqliteAuthSessionStore::ResolveUserByUsername(std::string_view username) {
+    auto connection_result = SqliteConnection::Open(database_path_);
+    if (!connection_result.ok()) {
+        return connection_result.status();
+    }
+    auto connection = std::move(connection_result).value();
+    auto statement_result = connection.Prepare(
+        "SELECT user_uuid,tenant_id,username,password_hash,password_salt,password_iterations,subject,created_at,updated_at,disabled "
+        "FROM gateway_auth_users WHERE username=?1");
+    if (!statement_result.ok()) {
+        return statement_result.status();
+    }
+    auto statement = std::move(statement_result).value();
+    if (auto status = statement.BindText(1, std::string(username)); !status.ok()) {
+        return status;
+    }
+    auto step = statement.Step();
+    if (!step.ok()) {
+        return step.status();
+    }
+    if (step.value() != SqliteStepResult::Row) {
+        return core::Status::Error(core::ErrorCode::NotFound, "auth user not found");
+    }
+    AuthUserRecord record;
+    record.user_uuid = statement.ColumnText(0);
+    record.tenant_id = statement.ColumnText(1);
+    record.username = statement.ColumnText(2);
+    record.password_hash = statement.ColumnText(3);
+    record.password_salt = statement.ColumnText(4);
+    record.password_iterations = statement.ColumnInt(5);
+    record.subject = statement.ColumnText(6);
+    record.created_at = FromUnixSeconds(statement.ColumnInt64(7));
+    record.updated_at = FromUnixSeconds(statement.ColumnInt64(8));
+    record.disabled = statement.ColumnInt(9) != 0;
+    return record;
+}
+
+core::Status SqliteAuthSessionStore::UpsertUser(const AuthUserRecord& record) {
+    if (record.user_uuid.empty() || record.username.empty() ||
+        record.password_hash.empty() || record.password_salt.empty() || record.password_iterations <= 0) {
+        return core::Status::Error(core::ErrorCode::InvalidArgument, "auth user record is incomplete");
+    }
+    auto connection_result = SqliteConnection::Open(database_path_);
+    if (!connection_result.ok()) {
+        return connection_result.status();
+    }
+    auto connection = std::move(connection_result).value();
+    auto existing_result = connection.Prepare("SELECT user_uuid FROM gateway_auth_users WHERE username=?1");
+    if (!existing_result.ok()) {
+        return existing_result.status();
+    }
+    auto existing = std::move(existing_result).value();
+    if (auto status = existing.BindText(1, record.username); !status.ok()) {
+        return status;
+    }
+    auto existing_step = existing.Step();
+    if (!existing_step.ok()) {
+        return existing_step.status();
+    }
+    if (existing_step.value() == SqliteStepResult::Row) {
+        return core::Status::Error(core::ErrorCode::AlreadyExists, "auth user already exists");
+    }
+
+    auto statement_result = connection.Prepare(
+        "INSERT INTO gateway_auth_users(user_uuid,tenant_id,username,password_hash,password_salt,password_iterations,subject,created_at,updated_at,disabled) "
+        "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)");
+    if (!statement_result.ok()) {
+        return statement_result.status();
+    }
+    auto statement = std::move(statement_result).value();
+    const auto now = ToUnixSeconds(std::chrono::system_clock::now());
+    if (auto status = statement.BindText(1, record.user_uuid); !status.ok()) return status;
+    if (auto status = statement.BindText(2, record.tenant_id.empty() ? std::string("default") : record.tenant_id); !status.ok()) return status;
+    if (auto status = statement.BindText(3, record.username); !status.ok()) return status;
+    if (auto status = statement.BindText(4, record.password_hash); !status.ok()) return status;
+    if (auto status = statement.BindText(5, record.password_salt); !status.ok()) return status;
+    if (auto status = statement.BindInt(6, record.password_iterations); !status.ok()) return status;
+    if (auto status = statement.BindText(7, record.subject); !status.ok()) return status;
+    if (auto status = statement.BindInt64(8, ToUnixSeconds(record.created_at) == 0 ? now : ToUnixSeconds(record.created_at)); !status.ok()) return status;
+    if (auto status = statement.BindInt64(9, ToUnixSeconds(record.updated_at) == 0 ? now : ToUnixSeconds(record.updated_at)); !status.ok()) return status;
+    if (auto status = statement.BindInt(10, record.disabled ? 1 : 0); !status.ok()) return status;
+    auto step = statement.Step();
+    if (!step.ok()) {
+        return step.status();
+    }
+    return core::Status::Ok();
 }
 
 core::Status SqliteAuthSessionStore::UpsertSession(const AuthSessionRecord& record) {
@@ -772,13 +1102,54 @@ core::Result<AuthSessionRecord> RedisAuthSessionStore::ResolveSession(std::strin
     return AuthSessionRecordFromJson(payload.value());
 }
 
+core::Result<AuthUserRecord> RedisAuthSessionStore::ResolveUserByUsername(std::string_view username) {
+    if (username.empty()) {
+        return core::Status::Error(core::ErrorCode::InvalidArgument, "username is required");
+    }
+    auto user_uuid = redis_->Get(UsernameKey(username));
+    if (!user_uuid.ok()) {
+        return user_uuid.status();
+    }
+    auto payload = redis_->Get(UserKey(user_uuid.value()));
+    if (!payload.ok()) {
+        return payload.status();
+    }
+    return AuthUserRecordFromJson(payload.value());
+}
+
+core::Status RedisAuthSessionStore::UpsertUser(const AuthUserRecord& record) {
+    if (record.user_uuid.empty() || record.username.empty() ||
+        record.password_hash.empty() || record.password_salt.empty() || record.password_iterations <= 0) {
+        return core::Status::Error(core::ErrorCode::InvalidArgument, "auth user record is incomplete");
+    }
+    const auto username_key = UsernameKey(record.username);
+    auto reserve_username = redis_->SetIfAbsent(username_key, record.user_uuid);
+    if (!reserve_username.ok()) {
+        return reserve_username.status();
+    }
+    if (!reserve_username.value()) {
+        return core::Status::Error(core::ErrorCode::AlreadyExists, "auth user already exists");
+    }
+    auto set_user = redis_->Set(UserKey(record.user_uuid), AuthUserRecordToJson(record).dump());
+    if (!set_user.ok()) {
+        (void)redis_->Del({username_key});
+        return set_user;
+    }
+    return core::Status::Ok();
+}
+
 core::Status RedisAuthSessionStore::UpsertSession(const AuthSessionRecord& record) {
     if (record.token_id.empty() || record.user_uuid.empty()) {
         return core::Status::Error(core::ErrorCode::InvalidArgument, "token_id and user_uuid are required");
     }
-    return redis_->Set(SessionKey(record.token_id),
-                       AuthSessionRecordToJson(record).dump(),
-                       RemainingTtl(record.expires_at));
+    auto ttl = RemainingTtl(record.expires_at);
+    auto set_session = redis_->Set(SessionKey(record.token_id),
+                                  AuthSessionRecordToJson(record).dump(),
+                                  ttl);
+    if (!set_session.ok()) {
+        return set_session;
+    }
+    return core::Status::Ok();
 }
 
 core::Status RedisAuthSessionStore::RevokeSession(std::string_view token_id, std::string_view) {
@@ -795,6 +1166,14 @@ core::Status RedisAuthSessionStore::RevokeSession(std::string_view token_id, std
 
 std::string RedisAuthSessionStore::SessionKey(std::string_view token_id) const {
     return key_prefix_ + ":session:" + std::string(token_id);
+}
+
+std::string RedisAuthSessionStore::UserKey(std::string_view user_uuid) const {
+    return key_prefix_ + ":user:" + std::string(user_uuid);
+}
+
+std::string RedisAuthSessionStore::UsernameKey(std::string_view username) const {
+    return key_prefix_ + ":username:" + std::string(username);
 }
 
 std::optional<std::string> ExtractCookieValue(std::string_view cookie_header, std::string_view name) {

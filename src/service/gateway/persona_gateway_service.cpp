@@ -37,6 +37,17 @@ std::string DefaultPersonaName(std::string_view persona_id) {
     return "default_persona";
 }
 
+core::Status EnsureSessionOwner(const persona::SessionSnapshot& session,
+                                std::string_view authenticated_user_uuid) {
+    if (authenticated_user_uuid.empty()) {
+        return core::Status::Ok();
+    }
+    if (session.user_uuid != authenticated_user_uuid) {
+        return core::Status::Error(core::ErrorCode::PermissionDenied, "session does not belong to authenticated user");
+    }
+    return core::Status::Ok();
+}
+
 } // namespace
 
 PersonaGatewayService::PersonaGatewayService(persona::SessionManager& sessions,
@@ -96,12 +107,16 @@ core::Result<SessionGatewayResponse> PersonaGatewayService::CreateSession(Create
 }
 
 core::Result<SessionGatewayResponse> PersonaGatewayService::GetSession(std::string_view session_id,
-                                                                       std::string trace_id) {
+                                                                       std::string trace_id,
+                                                                       std::string_view authenticated_user_uuid) {
     const auto started = std::chrono::steady_clock::now();
     trace_id = EnsureTrace(std::move(trace_id));
     auto snapshot = sessions_.GetSessionSnapshot(session_id);
     if (!snapshot.ok()) {
         return snapshot.status();
+    }
+    if (auto owner = EnsureSessionOwner(snapshot.value(), authenticated_user_uuid); !owner.ok()) {
+        return owner;
     }
     SessionGatewayResponse response;
     response.trace_id = trace_id;
@@ -117,6 +132,9 @@ core::Result<SessionGatewayResponse> PersonaGatewayService::CloseSession(CloseSe
     auto before = sessions_.GetSessionSnapshot(request.session_id);
     if (!before.ok()) {
         return before.status();
+    }
+    if (auto owner = EnsureSessionOwner(before.value(), request.authenticated_user_uuid); !owner.ok()) {
+        return owner;
     }
     auto close = sessions_.CloseSession(request.session_id, request.trace_id);
     if (!close.ok()) {
@@ -221,6 +239,9 @@ core::Result<TrainingReportGatewayResponse> PersonaGatewayService::TrainingRepor
     if (!snapshot.ok()) {
         return snapshot.status();
     }
+    if (auto owner = EnsureSessionOwner(snapshot.value(), request.authenticated_user_uuid); !owner.ok()) {
+        return owner;
+    }
 
     TrainingReportGatewayResponse response;
     response.trace_id = request.trace_id;
@@ -274,6 +295,9 @@ core::Status PersonaGatewayService::SubmitChat(ChatGatewayRequest request, ChatC
     if (!before.ok()) {
         return before.status();
     }
+    if (auto owner = EnsureSessionOwner(before.value(), request.authenticated_user_uuid); !owner.ok()) {
+        return owner;
+    }
     if (before.value().status != persona::SessionStatus::Active) {
         return core::Status::Error(core::ErrorCode::FailedPrecondition, "session is not active");
     }
@@ -324,6 +348,7 @@ core::Status PersonaGatewayService::SubmitClassroomMessage(ClassroomMessageGatew
     ChatGatewayRequest chat;
     chat.trace_id = request.trace_id;
     chat.session_id = route.value().session_id;
+    chat.authenticated_user_uuid = request.authenticated_user_uuid;
     chat.persona_id = route.value().persona_id;
     chat.mode = request.broadcast ? "classroom_broadcast" : "classroom_message";
     chat.message = std::move(request.message);
@@ -353,6 +378,7 @@ core::Status PersonaGatewayService::SubmitClassroomProactive(ClassroomProactiveG
     ChatGatewayRequest chat;
     chat.trace_id = request.trace_id;
     chat.session_id = route.value().session_id;
+    chat.authenticated_user_uuid = request.authenticated_user_uuid;
     chat.persona_id = route.value().persona_id;
     chat.mode = "classroom_proactive";
     chat.message = "[proactive] frontend requested proactive generation";
@@ -406,6 +432,7 @@ core::Status PersonaGatewayService::SubmitClassroomPoll(ClassroomPollGatewayRequ
     ChatGatewayRequest chat;
     chat.trace_id = request.trace_id;
     chat.session_id = decision.value().session_id;
+    chat.authenticated_user_uuid = request.authenticated_user_uuid;
     chat.persona_id = decision.value().persona_id;
     chat.mode = "classroom_proactive";
     chat.message = decision.value().trigger;

@@ -6,15 +6,24 @@
 #include "embedding_pipeline.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <mutex>
+#include <string>
+#include <unordered_map>
 
 namespace agent::semantic_cache {
 
+class RedisConnectionPool;
+
 struct L0MemoryCacheAdapterOptions {
     std::size_t top_k = 5;
+    std::size_t candidate_multiplier = 4;
     std::size_t neighbors_per_hit = 1;
     float similarity_floor = 0.78f;
+    std::int64_t warm_window_seconds = 3600;
+    std::int64_t half_life_seconds = 172800;
+    std::int64_t max_age_seconds = 604800;
 };
 
 /// L0 short-context memory adapter.
@@ -28,13 +37,26 @@ public:
     L0MemoryCacheAdapter(std::shared_ptr<::vector::EmbeddingPipeline> embedding,
                          std::shared_ptr<cache_vector::VectorIndexManager> index,
                          L0MemoryCacheAdapterOptions options = {});
+    L0MemoryCacheAdapter(std::shared_ptr<::vector::EmbeddingPipeline> embedding,
+                         std::shared_ptr<RedisConnectionPool> redis_pool,
+                         std::string sqlite_path,
+                         std::size_t max_cached_records,
+                         L0MemoryCacheAdapterOptions options = {});
 
     core::Result<CacheLookupResult> Lookup(const CacheLookupRequest& req) override;
     core::Status Store(const CacheStoreRequest& req) override;
+    void ReleaseSession(std::string_view session_id);
 
 private:
+    core::Result<std::shared_ptr<cache_vector::VectorIndexManager>> ResolveIndexLocked(
+        const CacheLookupRequest& req);
+
     std::shared_ptr<::vector::EmbeddingPipeline> embedding_;
     std::shared_ptr<cache_vector::VectorIndexManager> index_;
+    std::shared_ptr<RedisConnectionPool> redis_pool_;
+    std::string sqlite_path_;
+    std::size_t max_cached_records_ = 1000;
+    std::unordered_map<std::string, std::shared_ptr<cache_vector::VectorIndexManager>> per_session_indices_;
     L0MemoryCacheAdapterOptions options_;
     mutable std::mutex mutex_;
 };

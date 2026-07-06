@@ -375,6 +375,35 @@ Json SkillSessionStatusEnvelope(std::string trace_id,
     };
 }
 
+core::Status EnsureSkillSessionOwner(const std::optional<persona::SkillSessionSnapshot>& snapshot,
+                                     const AuthIdentity& identity) {
+    if (!identity.authenticated) {
+        return core::Status::Error(core::ErrorCode::PermissionDenied, "authenticated account is required");
+    }
+    if (!snapshot) {
+        return core::Status::Ok();
+    }
+    return snapshot->user_uuid == identity.user_uuid
+        ? core::Status::Ok()
+        : core::Status::Error(core::ErrorCode::PermissionDenied, "skill session does not belong to authenticated user");
+}
+
+core::Status EnsureDocumentUploadOwner(const PersonaGatewayHttpAdapter::DocumentUploadSession& session,
+                                       const AuthIdentity& identity,
+                                       std::uint64_t connection_id) {
+    if (session.connection_id != connection_id) {
+        return core::Status::Error(
+            core::ErrorCode::PermissionDenied,
+            "upload session does not belong to websocket connection");
+    }
+    if (session.owner_user_uuid != identity.user_uuid) {
+        return core::Status::Error(
+            core::ErrorCode::PermissionDenied,
+            "upload session does not belong to authenticated user");
+    }
+    return core::Status::Ok();
+}
+
 core::Result<Json> ParseJsonBody(const ::net::BeastHttpRequest& req) {
     if (req.body().empty()) {
         return Json::object();
@@ -437,6 +466,31 @@ void SendJsonWithHeaders(const std::shared_ptr<::net::IHttpRequest>& request,
 
 std::int64_t ToUnixSeconds(std::chrono::system_clock::time_point time) {
     return std::chrono::duration_cast<std::chrono::seconds>(time.time_since_epoch()).count();
+}
+
+void SendAuthRegistrationResult(const std::shared_ptr<::net::IHttpRequest>& request,
+                                std::string_view trace_id,
+                                const AuthRegistrationResult& value) {
+    Json body{
+        {"ok", true},
+        {"traceId", trace_id},
+        {"data", {
+            {"authenticated", value.identity.authenticated},
+            {"userUuid", value.identity.user_uuid},
+            {"tenantId", value.identity.tenant_id},
+            {"subject", value.identity.subject},
+            {"tokenId", value.identity.token_id},
+            {"issuedAt", ToUnixSeconds(value.issued_at)},
+            {"expiresAt", ToUnixSeconds(value.identity.expires_at)},
+            {"token", value.token},
+        }},
+    };
+    SendJsonWithHeaders(
+        request,
+        ::net::http::status::ok,
+        body,
+        trace_id,
+        {{"Set-Cookie", value.cookie_header}});
 }
 
 template <typename T, typename Fn>
@@ -614,6 +668,11 @@ core::Status AppendBinaryUploadFrame(
     }
 
     auto& session = it->second;
+    if (session.connection_id != connection_id) {
+        return core::Status::Error(
+            core::ErrorCode::PermissionDenied,
+            "upload session does not belong to websocket connection");
+    }
     if (message.fragments.empty()) {
         return core::Status::Ok();
     }
@@ -658,6 +717,9 @@ struct HttpRouteContext {
     std::shared_ptr<semantic_cache::ISemanticCache> document_semantic_cache;
     std::shared_ptr<persona::ISkillSessionManager> skill_session_manager;
     std::shared_ptr<IAuthRegistrationService> auth_registration;
+    bool enable_dev_registration = false;
+    bool enable_path_register_test_endpoint = false;
+    bool enable_path_analyze_test_endpoint = false;
     std::shared_ptr<::net::IHttpRequest> request;
     const ::net::BeastHttpRequest& message;
     const Json& body;
@@ -689,6 +751,7 @@ public:
     virtual ::net::http::verb Method() const noexcept = 0;
     virtual std::vector<std::string_view> Pattern() const = 0;
     virtual bool RequiresAuth() const noexcept { return true; }
+    virtual bool RequiresAuthenticatedIdentity() const noexcept { return false; }
     virtual void Handle(HttpRouteContext& context) const = 0;
 
     bool Matches(::net::http::verb method,
@@ -723,6 +786,7 @@ public:
     virtual ~IWsRoute() = default;
     virtual std::string_view Type() const noexcept = 0;
     virtual bool RequiresAuth() const noexcept { return true; }
+    virtual bool RequiresAuthenticatedIdentity() const noexcept { return false; }
     virtual void Handle(WsRouteContext& context) const = 0;
 
     bool Matches(std::string_view type) const noexcept {
@@ -832,22 +896,22 @@ public:
     }
 };
 
-#define DECLARE_HTTP_ROUTE(ClassName, MethodValue, ...) \
-class ClassName final : public IHttpRoute { \
-public: \
-    static constexpr std::string_view kRouteName = #ClassName; \
-    ::net::http::verb Method() const noexcept override { return MethodValue; } \
-    std::vector<std::string_view> Pattern() const override { return {__VA_ARGS__}; } \
-    void Handle(HttpRouteContext& context) const override; \
-}; \
-static const HttpRouteRegistrar<ClassName> g_##ClassName##_registrar; \
-void ClassName::Handle(HttpRouteContext& context) const
-
 #define DECLARE_WS_ROUTE(ClassName, TypeValue) \
 class ClassName final : public IWsRoute { \
 public: \
     static constexpr std::string_view kRouteName = #ClassName; \
     std::string_view Type() const noexcept override { return TypeValue; } \
+    void Handle(WsRouteContext& context) const override; \
+}; \
+static const WsRouteRegistrar<ClassName> g_##ClassName##_registrar; \
+void ClassName::Handle(WsRouteContext& context) const
+
+#define DECLARE_AUTHENTICATED_WS_ROUTE(ClassName, TypeValue) \
+class ClassName final : public IWsRoute { \
+public: \
+    static constexpr std::string_view kRouteName = #ClassName; \
+    std::string_view Type() const noexcept override { return TypeValue; } \
+    bool RequiresAuthenticatedIdentity() const noexcept override { return true; } \
     void Handle(WsRouteContext& context) const override; \
 }; \
 static const WsRouteRegistrar<ClassName> g_##ClassName##_registrar; \
@@ -867,60 +931,91 @@ DECLARE_HTTP_ROUTE(AuthMeRoute, ::net::http::verb::get, "api", "auth", "me") {
     SendJson(context.request, ::net::http::status::ok, body, context.trace_id);
 }
 
-class AuthRegisterRoute final : public IHttpRoute {
-public:
-    static constexpr std::string_view kRouteName = "AuthRegisterRoute";
-    ::net::http::verb Method() const noexcept override { return ::net::http::verb::post; }
-    std::vector<std::string_view> Pattern() const override { return {"api", "auth", "register"}; }
-    bool RequiresAuth() const noexcept override { return false; }
-    void Handle(HttpRouteContext& context) const override {
-        if (!context.auth_registration) {
-            const auto status = core::Status::Error(core::ErrorCode::FailedPrecondition, "auth registration service is not configured");
-            SendJson(context.request, HttpStatusFor(status.code()), ErrorEnvelope(context.trace_id, status), context.trace_id);
-            return;
-        }
-
-        AuthRegistrationRequest req;
-        req.user_uuid = context.body.value("userUuid", context.body.value("user_uuid", std::string{}));
-        req.tenant_id = context.body.value("tenantId", context.body.value("tenant_id", std::string{"default"}));
-        req.subject = context.body.value("subject", std::string{});
-        const auto ttl_seconds = context.body.value("ttlSeconds", context.body.value("ttl_seconds", 0));
-        if (ttl_seconds > 0) {
-            req.ttl = std::chrono::seconds(ttl_seconds);
-        }
-
-        auto result = context.auth_registration->Register(req);
-        if (!result.ok()) {
-            SendJson(context.request, HttpStatusFor(result.status().code()), ErrorEnvelope(context.trace_id, result.status()), context.trace_id);
-            return;
-        }
-
-        const auto& value = result.value();
-        Json body{
-            {"ok", true},
-            {"traceId", context.trace_id},
-            {"data", {
-                {"authenticated", value.identity.authenticated},
-                {"userUuid", value.identity.user_uuid},
-                {"tenantId", value.identity.tenant_id},
-                {"subject", value.identity.subject},
-                {"tokenId", value.identity.token_id},
-                {"issuedAt", ToUnixSeconds(value.issued_at)},
-                {"expiresAt", ToUnixSeconds(value.identity.expires_at)},
-                {"token", value.token},
-            }},
-        };
-        SendJsonWithHeaders(
-            context.request,
-            ::net::http::status::ok,
-            body,
-            context.trace_id,
-            {{"Set-Cookie", value.cookie_header}});
+DECLARE_PUBLIC_HTTP_ROUTE(AuthRegisterRoute, ::net::http::verb::post, "api", "auth", "register") {
+    if (!context.auth_registration) {
+        const auto status = core::Status::Error(core::ErrorCode::FailedPrecondition, "auth registration service is not configured");
+        SendJson(context.request, HttpStatusFor(status.code()), ErrorEnvelope(context.trace_id, status), context.trace_id);
+        return;
     }
-};
-static const HttpRouteRegistrar<AuthRegisterRoute> g_AuthRegisterRoute_registrar;
+    if (!context.enable_dev_registration) {
+        const auto status = core::Status::Error(
+            core::ErrorCode::PermissionDenied,
+            "development auth registration is disabled");
+        SendJson(context.request, HttpStatusFor(status.code()), ErrorEnvelope(context.trace_id, status), context.trace_id);
+        return;
+    }
 
-DECLARE_HTTP_ROUTE(CreateSessionRoute, ::net::http::verb::post, "api", "session", "create") {
+    AuthRegistrationRequest req;
+    req.user_uuid = context.body.value("userUuid", context.body.value("user_uuid", std::string{}));
+    req.tenant_id = context.body.value("tenantId", context.body.value("tenant_id", std::string{"default"}));
+    req.subject = context.body.value("subject", std::string{});
+    const auto ttl_seconds = context.body.value("ttlSeconds", context.body.value("ttl_seconds", 0));
+    if (ttl_seconds > 0) {
+        req.ttl = std::chrono::seconds(ttl_seconds);
+    }
+
+    auto result = context.auth_registration->Register(req);
+    if (!result.ok()) {
+        SendJson(context.request, HttpStatusFor(result.status().code()), ErrorEnvelope(context.trace_id, result.status()), context.trace_id);
+        return;
+    }
+
+    SendAuthRegistrationResult(context.request, context.trace_id, result.value());
+}
+
+DECLARE_PUBLIC_HTTP_ROUTE(AuthSignupRoute, ::net::http::verb::post, "api", "auth", "signup") {
+    if (!context.auth_registration) {
+        const auto status = core::Status::Error(core::ErrorCode::FailedPrecondition, "auth registration service is not configured");
+        SendJson(context.request, HttpStatusFor(status.code()), ErrorEnvelope(context.trace_id, status), context.trace_id);
+        return;
+    }
+
+    AuthRegistrationRequest req;
+    req.username = context.body.value(
+        "username",
+        context.body.value("email", std::string{}));
+    req.password = context.body.value("password", std::string{});
+    const auto ttl_seconds = context.body.value("ttlSeconds", context.body.value("ttl_seconds", 0));
+    if (ttl_seconds > 0) {
+        req.ttl = std::chrono::seconds(ttl_seconds);
+    }
+
+    auto result = context.auth_registration->Register(req);
+    if (!result.ok()) {
+        SendJson(context.request, HttpStatusFor(result.status().code()), ErrorEnvelope(context.trace_id, result.status()), context.trace_id);
+        return;
+    }
+
+    SendAuthRegistrationResult(context.request, context.trace_id, result.value());
+}
+
+DECLARE_PUBLIC_HTTP_ROUTE(AuthLoginRoute, ::net::http::verb::post, "api", "auth", "login") {
+    if (!context.auth_registration) {
+        const auto status = core::Status::Error(core::ErrorCode::FailedPrecondition, "auth registration service is not configured");
+        SendJson(context.request, HttpStatusFor(status.code()), ErrorEnvelope(context.trace_id, status), context.trace_id);
+        return;
+    }
+
+    AuthLoginRequest req;
+    req.username = context.body.value(
+        "username",
+        context.body.value("email", std::string{}));
+    req.password = context.body.value("password", std::string{});
+    const auto ttl_seconds = context.body.value("ttlSeconds", context.body.value("ttl_seconds", 0));
+    if (ttl_seconds > 0) {
+        req.ttl = std::chrono::seconds(ttl_seconds);
+    }
+
+    auto result = context.auth_registration->Login(req);
+    if (!result.ok()) {
+        SendJson(context.request, HttpStatusFor(result.status().code()), ErrorEnvelope(context.trace_id, result.status()), context.trace_id);
+        return;
+    }
+
+    SendAuthRegistrationResult(context.request, context.trace_id, result.value());
+}
+
+DECLARE_AUTHENTICATED_HTTP_ROUTE(CreateSessionRoute, ::net::http::verb::post, "api", "session", "create") {
     CreateSessionGatewayRequest req;
     req.trace_id = context.trace_id;
     req.session_id = context.body.value("sessionId", std::string{});
@@ -937,26 +1032,33 @@ DECLARE_HTTP_ROUTE(CreateSessionRoute, ::net::http::verb::post, "api", "session"
     SendResult(context.request, context.service.CreateSession(std::move(req)), context.trace_id, SessionEnvelope);
 }
 
-DECLARE_HTTP_ROUTE(CloseSessionRoute, ::net::http::verb::post, "api", "session", "close") {
+DECLARE_AUTHENTICATED_HTTP_ROUTE(CloseSessionRoute, ::net::http::verb::post, "api", "session", "close") {
     CloseSessionGatewayRequest req;
     req.trace_id = context.trace_id;
     req.session_id = context.body.value("sessionId", std::string{});
+    req.authenticated_user_uuid = context.identity.user_uuid;
     req.reason = context.body.value("reason", std::string{"client_close"});
     SendResult(context.request, context.service.CloseSession(std::move(req)), context.trace_id, SessionEnvelope);
 }
 
-DECLARE_HTTP_ROUTE(GetSessionRoute, ::net::http::verb::get, "api", "session", "{sessionId}") {
+DECLARE_AUTHENTICATED_HTTP_ROUTE(GetSessionRoute, ::net::http::verb::get, "api", "session", "{sessionId}") {
     SendResult(
         context.request,
-        context.service.GetSession(context.path_params.at("sessionId"), context.trace_id),
+        context.service.GetSession(
+            context.path_params.at("sessionId"),
+            context.trace_id,
+            context.identity.user_uuid),
         context.trace_id,
         SessionEnvelope);
 }
 
-DECLARE_HTTP_ROUTE(GetSessionEmotionRoute, ::net::http::verb::get, "api", "session", "{sessionId}", "emotion") {
+DECLARE_AUTHENTICATED_HTTP_ROUTE(GetSessionEmotionRoute, ::net::http::verb::get, "api", "session", "{sessionId}", "emotion") {
     SendResult(
         context.request,
-        context.service.GetSession(context.path_params.at("sessionId"), context.trace_id),
+        context.service.GetSession(
+            context.path_params.at("sessionId"),
+            context.trace_id,
+            context.identity.user_uuid),
         context.trace_id,
         [](const SessionGatewayResponse& r) {
             return Json{
@@ -969,10 +1071,13 @@ DECLARE_HTTP_ROUTE(GetSessionEmotionRoute, ::net::http::verb::get, "api", "sessi
         });
 }
 
-DECLARE_HTTP_ROUTE(GetSessionMetricsRoute, ::net::http::verb::get, "api", "session", "{sessionId}", "metrics") {
+DECLARE_AUTHENTICATED_HTTP_ROUTE(GetSessionMetricsRoute, ::net::http::verb::get, "api", "session", "{sessionId}", "metrics") {
     SendResult(
         context.request,
-        context.service.GetSession(context.path_params.at("sessionId"), context.trace_id),
+        context.service.GetSession(
+            context.path_params.at("sessionId"),
+            context.trace_id,
+            context.identity.user_uuid),
         context.trace_id,
         [](const SessionGatewayResponse& r) {
             return Json{
@@ -985,10 +1090,11 @@ DECLARE_HTTP_ROUTE(GetSessionMetricsRoute, ::net::http::verb::get, "api", "sessi
         });
 }
 
-DECLARE_HTTP_ROUTE(ChatMessageRoute, ::net::http::verb::post, "api", "chat", "message") {
+DECLARE_AUTHENTICATED_HTTP_ROUTE(ChatMessageRoute, ::net::http::verb::post, "api", "chat", "message") {
     ChatGatewayRequest req;
     req.trace_id = context.trace_id;
     req.session_id = context.body.value("sessionId", std::string{});
+    req.authenticated_user_uuid = context.identity.user_uuid;
     req.persona_id = context.body.value("personaId", std::string{});
     req.mode = context.body.value("mode", std::string{"chat"});
     req.message = context.body.value("message", std::string{});
@@ -1006,10 +1112,11 @@ DECLARE_HTTP_ROUTE(ChatMessageRoute, ::net::http::verb::post, "api", "chat", "me
     }
 }
 
-DECLARE_HTTP_ROUTE(ClassroomMessageRoute, ::net::http::verb::post, "api", "classroom", "message") {
+DECLARE_AUTHENTICATED_HTTP_ROUTE(ClassroomMessageRoute, ::net::http::verb::post, "api", "classroom", "message") {
     ClassroomMessageGatewayRequest req;
     req.trace_id = context.trace_id;
     req.session_id = context.body.value("sessionId", std::string{});
+    req.authenticated_user_uuid = context.identity.user_uuid;
     req.classroom_id = context.body.value("classroomId", std::string{});
     req.target_persona_id = context.body.value("targetPersonaId", context.body.value("personaId", std::string{}));
     req.context_id = context.body.value("contextId", std::string{});
@@ -1028,10 +1135,11 @@ DECLARE_HTTP_ROUTE(ClassroomMessageRoute, ::net::http::verb::post, "api", "class
     }
 }
 
-DECLARE_HTTP_ROUTE(ClassroomProactiveRoute, ::net::http::verb::post, "api", "classroom", "proactive") {
+DECLARE_AUTHENTICATED_HTTP_ROUTE(ClassroomProactiveRoute, ::net::http::verb::post, "api", "classroom", "proactive") {
     ClassroomProactiveGatewayRequest req;
     req.trace_id = context.trace_id;
     req.session_id = context.body.value("sessionId", std::string{});
+    req.authenticated_user_uuid = context.identity.user_uuid;
     req.classroom_id = context.body.value("classroomId", std::string{});
     req.persona_id = context.body.value("personaId", std::string{});
     req.context_id = context.body.value("contextId", std::string{});
@@ -1048,9 +1156,10 @@ DECLARE_HTTP_ROUTE(ClassroomProactiveRoute, ::net::http::verb::post, "api", "cla
     }
 }
 
-DECLARE_HTTP_ROUTE(ClassroomPollRoute, ::net::http::verb::post, "api", "classroom", "poll") {
+DECLARE_AUTHENTICATED_HTTP_ROUTE(ClassroomPollRoute, ::net::http::verb::post, "api", "classroom", "poll") {
     ClassroomPollGatewayRequest req;
     req.trace_id = context.trace_id;
+    req.authenticated_user_uuid = context.identity.user_uuid;
     req.classroom_id = context.body.value("classroomId", std::string{});
     req.persona_id = context.body.value("personaId", std::string{});
     req.context_id = context.body.value("contextId", std::string{});
@@ -1069,10 +1178,11 @@ DECLARE_HTTP_ROUTE(ClassroomPollRoute, ::net::http::verb::post, "api", "classroo
     }
 }
 
-DECLARE_HTTP_ROUTE(TrainingReportRoute, ::net::http::verb::post, "api", "report", "training") {
+DECLARE_AUTHENTICATED_HTTP_ROUTE(TrainingReportRoute, ::net::http::verb::post, "api", "report", "training") {
     TrainingReportGatewayRequest req;
     req.trace_id = context.trace_id;
     req.session_id = context.body.value("sessionId", std::string{});
+    req.authenticated_user_uuid = context.identity.user_uuid;
     req.include_raw_turns = context.body.value("includeRawTurns", true);
     SendResult(context.request, context.service.TrainingReport(std::move(req)), context.trace_id, ReportEnvelope);
 }
@@ -1081,7 +1191,7 @@ DECLARE_HTTP_ROUTE(SystemStatsRoute, ::net::http::verb::get, "api", "system", "s
     SendResult(context.request, context.service.SystemStats(context.trace_id), context.trace_id, SystemStatsEnvelope);
 }
 
-DECLARE_HTTP_ROUTE(SkillSessionStartRoute, ::net::http::verb::post, "api", "skill", "session", "start") {
+DECLARE_AUTHENTICATED_HTTP_ROUTE(SkillSessionStartRoute, ::net::http::verb::post, "api", "skill", "session", "start") {
     if (!context.skill_session_manager) {
         const auto status = core::Status::Error(core::ErrorCode::FailedPrecondition, "skill session manager is not configured");
         SendJson(context.request, HttpStatusFor(status.code()), ErrorEnvelope(context.trace_id, status), context.trace_id);
@@ -1091,7 +1201,7 @@ DECLARE_HTTP_ROUTE(SkillSessionStartRoute, ::net::http::verb::post, "api", "skil
     req.trace_id = context.trace_id;
     req.skill_id = context.body.value("skillId", context.body.value("skill_id", std::string{}));
     req.session_id = context.body.value("sessionId", context.body.value("session_id", std::string{}));
-    req.user_uuid = context.body.value("userUuid", context.body.value("user_uuid", context.identity.user_uuid));
+    req.user_uuid = context.identity.user_uuid;
     req.persona_id = context.body.value("personaId", context.body.value("persona_id", std::string{}));
     req.source = context.body.value("source", std::string{"http"});
     req.reason = context.body.value("reason", std::string{});
@@ -1110,7 +1220,7 @@ DECLARE_HTTP_ROUTE(SkillSessionStartRoute, ::net::http::verb::post, "api", "skil
     });
 }
 
-DECLARE_HTTP_ROUTE(SkillSessionStopRoute, ::net::http::verb::post, "api", "skill", "session", "stop") {
+DECLARE_AUTHENTICATED_HTTP_ROUTE(SkillSessionStopRoute, ::net::http::verb::post, "api", "skill", "session", "stop") {
     if (!context.skill_session_manager) {
         const auto status = core::Status::Error(core::ErrorCode::FailedPrecondition, "skill session manager is not configured");
         SendJson(context.request, HttpStatusFor(status.code()), ErrorEnvelope(context.trace_id, status), context.trace_id);
@@ -1120,6 +1230,7 @@ DECLARE_HTTP_ROUTE(SkillSessionStopRoute, ::net::http::verb::post, "api", "skill
     req.trace_id = context.trace_id;
     req.skill_id = context.body.value("skillId", context.body.value("skill_id", std::string{}));
     req.session_id = context.body.value("sessionId", context.body.value("session_id", std::string{}));
+    req.authenticated_user_uuid = context.identity.user_uuid;
     req.source = context.body.value("source", std::string{"http"});
     req.reason = context.body.value("reason", std::string{"client_stop"});
     req.summarize = context.body.value("summarize", true);
@@ -1130,7 +1241,7 @@ DECLARE_HTTP_ROUTE(SkillSessionStopRoute, ::net::http::verb::post, "api", "skill
     });
 }
 
-DECLARE_HTTP_ROUTE(SkillSessionStatusRoute, ::net::http::verb::post, "api", "skill", "session", "status") {
+DECLARE_AUTHENTICATED_HTTP_ROUTE(SkillSessionStatusRoute, ::net::http::verb::post, "api", "skill", "session", "status") {
     if (!context.skill_session_manager) {
         const auto status = core::Status::Error(core::ErrorCode::FailedPrecondition, "skill session manager is not configured");
         SendJson(context.request, HttpStatusFor(status.code()), ErrorEnvelope(context.trace_id, status), context.trace_id);
@@ -1139,14 +1250,28 @@ DECLARE_HTTP_ROUTE(SkillSessionStatusRoute, ::net::http::verb::post, "api", "ski
     const auto skill_id = context.body.value("skillId", context.body.value("skill_id", std::string{}));
     const auto session_id = context.body.value("sessionId", context.body.value("session_id", std::string{}));
     auto result = context.skill_session_manager->Get(session_id, skill_id);
+    if (result.ok()) {
+        auto owner = EnsureSkillSessionOwner(result.value(), context.identity);
+        if (!owner.ok()) {
+            SendJson(context.request, HttpStatusFor(owner.code()), ErrorEnvelope(context.trace_id, owner), context.trace_id);
+            return;
+        }
+    }
     SendResult(context.request, std::move(result), context.trace_id, [&trace_id = context.trace_id](const auto& snapshot) {
         return SkillSessionStatusEnvelope(trace_id, snapshot);
     });
 }
 
-DECLARE_HTTP_ROUTE(DocumentRegisterRoute, ::net::http::verb::post, "api", "document", "register") {
+DECLARE_AUTHENTICATED_HTTP_ROUTE(DocumentRegisterRoute, ::net::http::verb::post, "api", "document", "register") {
     if (!context.document_service) {
         const auto status = core::Status::Error(core::ErrorCode::FailedPrecondition, "document analysis service is not configured");
+        SendJson(context.request, HttpStatusFor(status.code()), ErrorEnvelope(context.trace_id, status), context.trace_id);
+        return;
+    }
+    if (!context.enable_path_register_test_endpoint) {
+        const auto status = core::Status::Error(
+            core::ErrorCode::PermissionDenied,
+            "document path register test endpoint is disabled");
         SendJson(context.request, HttpStatusFor(status.code()), ErrorEnvelope(context.trace_id, status), context.trace_id);
         return;
     }
@@ -1172,7 +1297,7 @@ DECLARE_HTTP_ROUTE(DocumentRegisterRoute, ::net::http::verb::post, "api", "docum
         context.trace_id);
 }
 
-DECLARE_HTTP_ROUTE(DocumentAnalyzeRoute, ::net::http::verb::post, "api", "document", "analyze") {
+DECLARE_AUTHENTICATED_HTTP_ROUTE(DocumentAnalyzeRoute, ::net::http::verb::post, "api", "document", "analyze") {
     if (!context.document_service) {
         const auto status = core::Status::Error(core::ErrorCode::FailedPrecondition, "document analysis service is not configured");
         SendJson(context.request, HttpStatusFor(status.code()), ErrorEnvelope(context.trace_id, status), context.trace_id);
@@ -1181,9 +1306,19 @@ DECLARE_HTTP_ROUTE(DocumentAnalyzeRoute, ::net::http::verb::post, "api", "docume
 
     document::DocumentAnalyzeRequest req;
     req.trace_id = context.trace_id;
-    req.path = PathFromUtf8(context.body.value("path", std::string{}));
+    const auto path_text = context.body.value("path", std::string{});
+    const auto document_id = context.body.value("documentId", context.body.value("document_id", std::string{}));
+    if (!path_text.empty() && !context.enable_path_analyze_test_endpoint) {
+        const auto status = core::Status::Error(
+            core::ErrorCode::PermissionDenied,
+            "document path analyze test endpoint is disabled");
+        SendJson(context.request, HttpStatusFor(status.code()), ErrorEnvelope(context.trace_id, status), context.trace_id);
+        return;
+    }
+    req.path = PathFromUtf8(path_text);
     req.file_name = context.body.value("fileName", context.body.value("file_name", std::string{}));
-    req.document_id = context.body.value("documentId", context.body.value("document_id", std::string{}));
+    req.document_id = document_id;
+    req.authenticated_user_uuid = context.identity.user_uuid;
     req.options.enable_embedding_clustering = context.body.value("enableEmbeddingClustering", true);
     req.options.chunk_similarity_threshold = context.body.value("chunkSimilarityThreshold", req.options.chunk_similarity_threshold);
     req.options.max_chunk_slices = context.body.value("maxChunkSlices", req.options.max_chunk_slices);
@@ -1253,11 +1388,12 @@ public:
 };
 static const HttpRouteRegistrar<HealthRoute> g_HealthRoute_registrar;
 
-DECLARE_WS_ROUTE(ChatMessageWsRoute, "chat.message") {
+DECLARE_AUTHENTICATED_WS_ROUTE(ChatMessageWsRoute, "chat.message") {
     const auto payload = context.body.value("payload", Json::object());
     ChatGatewayRequest req;
     req.trace_id = context.trace_id;
     req.session_id = payload.value("sessionId", std::string{});
+    req.authenticated_user_uuid = context.identity.user_uuid;
     req.persona_id = payload.value("personaId", std::string{});
     req.mode = payload.value("mode", std::string{"ws_chat"});
     req.message = payload.value("message", std::string{});
@@ -1277,11 +1413,12 @@ DECLARE_WS_ROUTE(ChatMessageWsRoute, "chat.message") {
     }
 }
 
-DECLARE_WS_ROUTE(SessionCloseWsRoute, "session.close") {
+DECLARE_AUTHENTICATED_WS_ROUTE(SessionCloseWsRoute, "session.close") {
     const auto payload = context.body.value("payload", Json::object());
     CloseSessionGatewayRequest req;
     req.trace_id = context.trace_id;
     req.session_id = payload.value("sessionId", std::string{});
+    req.authenticated_user_uuid = context.identity.user_uuid;
     req.reason = payload.value("reason", std::string{"client_close"});
     auto result = context.service.CloseSession(std::move(req));
     Json out = result.ok()
@@ -1290,7 +1427,7 @@ DECLARE_WS_ROUTE(SessionCloseWsRoute, "session.close") {
     context.request->Send(TextFrame(context.request->memory_pool(), out.dump()));
 }
 
-DECLARE_WS_ROUTE(SkillSessionStartWsRoute, "skill.session.start") {
+DECLARE_AUTHENTICATED_WS_ROUTE(SkillSessionStartWsRoute, "skill.session.start") {
     if (!context.skill_session_manager) {
         SendWsError(
             context.request,
@@ -1303,7 +1440,7 @@ DECLARE_WS_ROUTE(SkillSessionStartWsRoute, "skill.session.start") {
     req.trace_id = context.trace_id;
     req.skill_id = payload.value("skillId", payload.value("skill_id", std::string{}));
     req.session_id = payload.value("sessionId", payload.value("session_id", std::string{}));
-    req.user_uuid = payload.value("userUuid", payload.value("user_uuid", context.identity.user_uuid));
+    req.user_uuid = context.identity.user_uuid;
     req.persona_id = payload.value("personaId", payload.value("persona_id", std::string{}));
     req.source = payload.value("source", std::string{"websocket"});
     req.reason = payload.value("reason", std::string{});
@@ -1323,7 +1460,7 @@ DECLARE_WS_ROUTE(SkillSessionStartWsRoute, "skill.session.start") {
     context.request->Send(TextFrame(context.request->memory_pool(), out.dump()));
 }
 
-DECLARE_WS_ROUTE(SkillSessionStopWsRoute, "skill.session.stop") {
+DECLARE_AUTHENTICATED_WS_ROUTE(SkillSessionStopWsRoute, "skill.session.stop") {
     if (!context.skill_session_manager) {
         SendWsError(
             context.request,
@@ -1336,6 +1473,7 @@ DECLARE_WS_ROUTE(SkillSessionStopWsRoute, "skill.session.stop") {
     req.trace_id = context.trace_id;
     req.skill_id = payload.value("skillId", payload.value("skill_id", std::string{}));
     req.session_id = payload.value("sessionId", payload.value("session_id", std::string{}));
+    req.authenticated_user_uuid = context.identity.user_uuid;
     req.source = payload.value("source", std::string{"websocket"});
     req.reason = payload.value("reason", std::string{"client_stop"});
     req.summarize = payload.value("summarize", true);
@@ -1347,7 +1485,7 @@ DECLARE_WS_ROUTE(SkillSessionStopWsRoute, "skill.session.stop") {
     context.request->Send(TextFrame(context.request->memory_pool(), out.dump()));
 }
 
-DECLARE_WS_ROUTE(SkillSessionStatusWsRoute, "skill.session.status") {
+DECLARE_AUTHENTICATED_WS_ROUTE(SkillSessionStatusWsRoute, "skill.session.status") {
     if (!context.skill_session_manager) {
         SendWsError(
             context.request,
@@ -1359,13 +1497,20 @@ DECLARE_WS_ROUTE(SkillSessionStatusWsRoute, "skill.session.status") {
     const auto skill_id = payload.value("skillId", payload.value("skill_id", std::string{}));
     const auto session_id = payload.value("sessionId", payload.value("session_id", std::string{}));
     auto result = context.skill_session_manager->Get(session_id, skill_id);
+    if (result.ok()) {
+        auto owner = EnsureSkillSessionOwner(result.value(), context.identity);
+        if (!owner.ok()) {
+            SendWsError(context.request, context.trace_id, owner);
+            return;
+        }
+    }
     Json out = result.ok()
         ? Json{{"type", "skill.session.status"}, {"payload", SkillSessionStatusEnvelope(context.trace_id, result.value())}}
         : Json{{"type", "error"}, {"payload", ErrorEnvelope(context.trace_id, result.status())}};
     context.request->Send(TextFrame(context.request->memory_pool(), out.dump()));
 }
 
-DECLARE_WS_ROUTE(DocumentUploadStartWsRoute, "document.upload.start") {
+DECLARE_AUTHENTICATED_WS_ROUTE(DocumentUploadStartWsRoute, "document.upload.start") {
     if (!context.document_service) {
         SendWsError(
             context.request,
@@ -1437,7 +1582,7 @@ DECLARE_WS_ROUTE(DocumentUploadStartWsRoute, "document.upload.start") {
     context.request->Send(TextFrame(context.request->memory_pool(), out.dump()));
 }
 
-DECLARE_WS_ROUTE(DocumentUploadChunkWsRoute, "document.upload.chunk") {
+DECLARE_AUTHENTICATED_WS_ROUTE(DocumentUploadChunkWsRoute, "document.upload.chunk") {
     const auto payload = context.body.value("payload", Json::object());
     const auto upload_id = payload.value("uploadId", payload.value("upload_id", std::string{}));
     const auto offset = payload.value("offset", std::uint64_t{0});
@@ -1480,6 +1625,14 @@ DECLARE_WS_ROUTE(DocumentUploadChunkWsRoute, "document.upload.chunk") {
                 core::Status::Error(core::ErrorCode::ResourceExhausted, "upload exceeds declared totalBytes"));
             return;
         }
+        if (auto owner = EnsureDocumentUploadOwner(
+                it->second,
+                context.identity,
+                context.request->connection().connection_id);
+            !owner.ok()) {
+            SendWsError(context.request, context.trace_id, owner);
+            return;
+        }
         session = it->second;
     }
 
@@ -1517,7 +1670,7 @@ DECLARE_WS_ROUTE(DocumentUploadChunkWsRoute, "document.upload.chunk") {
     context.request->Send(TextFrame(context.request->memory_pool(), out.dump()));
 }
 
-DECLARE_WS_ROUTE(DocumentUploadFinishWsRoute, "document.upload.finish") {
+DECLARE_AUTHENTICATED_WS_ROUTE(DocumentUploadFinishWsRoute, "document.upload.finish") {
     if (!context.document_service) {
         SendWsError(
             context.request,
@@ -1546,6 +1699,14 @@ DECLARE_WS_ROUTE(DocumentUploadFinishWsRoute, "document.upload.finish") {
                 core::Status::Error(core::ErrorCode::FailedPrecondition, "upload is incomplete"));
             return;
         }
+        if (auto owner = EnsureDocumentUploadOwner(
+                session,
+                context.identity,
+                context.request->connection().connection_id);
+            !owner.ok()) {
+            SendWsError(context.request, context.trace_id, owner);
+            return;
+        }
         context.document_uploads.erase(it);
     }
 
@@ -1567,7 +1728,7 @@ DECLARE_WS_ROUTE(DocumentUploadFinishWsRoute, "document.upload.finish") {
     context.request->Send(TextFrame(context.request->memory_pool(), out.dump()));
 }
 
-DECLARE_WS_ROUTE(DocumentUploadAbortWsRoute, "document.upload.abort") {
+DECLARE_AUTHENTICATED_WS_ROUTE(DocumentUploadAbortWsRoute, "document.upload.abort") {
     const auto payload = context.body.value("payload", Json::object());
     const auto upload_id = payload.value("uploadId", payload.value("upload_id", std::string{}));
     std::filesystem::path temp_path;
@@ -1575,6 +1736,14 @@ DECLARE_WS_ROUTE(DocumentUploadAbortWsRoute, "document.upload.abort") {
         std::lock_guard lock(context.upload_mutex);
         auto it = context.document_uploads.find(upload_id);
         if (it != context.document_uploads.end()) {
+            if (auto owner = EnsureDocumentUploadOwner(
+                    it->second,
+                    context.identity,
+                    context.request->connection().connection_id);
+                !owner.ok()) {
+                SendWsError(context.request, context.trace_id, owner);
+                return;
+            }
             temp_path = it->second.temp_path;
             context.document_uploads.erase(it);
         }
@@ -1603,7 +1772,32 @@ PersonaGatewayHttpAdapter::PersonaGatewayHttpAdapter(PersonaGatewayService& serv
                                                      std::shared_ptr<document::IDocumentEmbeddingProvider> embedding_provider,
                                                      std::shared_ptr<document::IDocumentLlmChunkCache> llm_chunk_cache,
                                                      std::shared_ptr<semantic_cache::ISemanticCache> document_semantic_cache,
-                                                     std::shared_ptr<persona::ISkillSessionManager> skill_session_manager)
+                                                     std::shared_ptr<persona::ISkillSessionManager> skill_session_manager,
+                                                     bool enable_dev_registration)
+    : PersonaGatewayHttpAdapter(service,
+                                std::move(authenticator),
+                                std::move(auth_registration),
+                                std::move(document_service),
+                                std::move(llm_client),
+                                std::move(embedding_provider),
+                                std::move(llm_chunk_cache),
+                                std::move(document_semantic_cache),
+                                std::move(skill_session_manager),
+                                PersonaGatewayHttpAdapterOptions{
+                                    .enable_dev_registration = enable_dev_registration,
+                                    .enable_path_register_test_endpoint = false,
+                                    .enable_path_analyze_test_endpoint = false}) {}
+
+PersonaGatewayHttpAdapter::PersonaGatewayHttpAdapter(PersonaGatewayService& service,
+                                                     std::shared_ptr<IGatewayAuthenticator> authenticator,
+                                                     std::shared_ptr<IAuthRegistrationService> auth_registration,
+                                                     std::shared_ptr<document::DocumentAnalysisService> document_service,
+                                                     std::shared_ptr<llm::ILlmClient> llm_client,
+                                                     std::shared_ptr<document::IDocumentEmbeddingProvider> embedding_provider,
+                                                     std::shared_ptr<document::IDocumentLlmChunkCache> llm_chunk_cache,
+                                                     std::shared_ptr<semantic_cache::ISemanticCache> document_semantic_cache,
+                                                     std::shared_ptr<persona::ISkillSessionManager> skill_session_manager,
+                                                     PersonaGatewayHttpAdapterOptions options)
     : service_(service),
       authenticator_(std::move(authenticator)),
       auth_registration_(std::move(auth_registration)),
@@ -1612,7 +1806,8 @@ PersonaGatewayHttpAdapter::PersonaGatewayHttpAdapter(PersonaGatewayService& serv
       embedding_provider_(std::move(embedding_provider)),
       llm_chunk_cache_(std::move(llm_chunk_cache)),
       document_semantic_cache_(std::move(document_semantic_cache)),
-      skill_session_manager_(std::move(skill_session_manager)) {}
+      skill_session_manager_(std::move(skill_session_manager)),
+      options_(options) {}
 
 bool PersonaGatewayHttpAdapter::IsApiRequest(std::string_view target) noexcept {
     const auto q = target.find('?');
@@ -1620,6 +1815,26 @@ bool PersonaGatewayHttpAdapter::IsApiRequest(std::string_view target) noexcept {
         target = target.substr(0, q);
     }
     return target == "/api" || target.starts_with("/api/");
+}
+
+void PersonaGatewayHttpAdapter::CleanupDocumentUploadsForConnection(std::uint64_t connection_id) {
+    std::vector<std::filesystem::path> temp_paths;
+    {
+        std::lock_guard lock(document_upload_mutex_);
+        for (auto it = document_uploads_.begin(); it != document_uploads_.end();) {
+            if (it->second.connection_id != connection_id) {
+                ++it;
+                continue;
+            }
+            temp_paths.push_back(it->second.temp_path);
+            it = document_uploads_.erase(it);
+        }
+    }
+
+    for (const auto& temp_path : temp_paths) {
+        std::error_code ec;
+        std::filesystem::remove(temp_path, ec);
+    }
 }
 
 void PersonaGatewayHttpAdapter::HandleHttp(std::shared_ptr<::net::IHttpRequest> request) {
@@ -1655,6 +1870,11 @@ void PersonaGatewayHttpAdapter::HandleHttp(std::shared_ptr<::net::IHttpRequest> 
             }
             identity = std::move(auth).value();
         }
+        if (route->RequiresAuthenticatedIdentity() && !identity.authenticated) {
+            const auto status = core::Status::Error(core::ErrorCode::PermissionDenied, "authenticated account is required");
+            SendJson(request, HttpStatusFor(status.code()), ErrorEnvelope(trace_id, status), trace_id);
+            return;
+        }
         HttpRouteContext context{
             service_,
             document_service_,
@@ -1664,6 +1884,9 @@ void PersonaGatewayHttpAdapter::HandleHttp(std::shared_ptr<::net::IHttpRequest> 
             document_semantic_cache_,
             skill_session_manager_,
             auth_registration_,
+            options_.enable_dev_registration,
+            options_.enable_path_register_test_endpoint,
+            options_.enable_path_analyze_test_endpoint,
             std::move(request),
             msg,
             body,
@@ -1748,6 +1971,12 @@ void PersonaGatewayHttpAdapter::HandleWebSocket(std::shared_ptr<::net::IWebSocke
                 return;
             }
             identity = std::move(auth).value();
+        }
+        if (route->RequiresAuthenticatedIdentity() && !identity.authenticated) {
+            const auto status = core::Status::Error(core::ErrorCode::PermissionDenied, "authenticated account is required");
+            Json out{{"type", "error"}, {"payload", ErrorEnvelope(trace_id, status)}};
+            request->Send(TextFrame(request->memory_pool(), out.dump()));
+            return;
         }
         WsRouteContext context{
             service_,

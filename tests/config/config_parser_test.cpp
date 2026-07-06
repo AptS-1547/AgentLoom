@@ -490,6 +490,7 @@ TEST(ConfigGatewayAuthSectionTest, JsonLoadsGatewayAuthAndResolvesRelativeFiles)
             "cookie_same_site": "Strict",
             "require_session_record": true,
             "auto_provision_session": false,
+            "enable_dev_registration": true,
             "session_store_backend": "redis",
             "session_database_path": "gateway_auth.db",
             "redis_host": "127.0.0.1",
@@ -520,6 +521,7 @@ TEST(ConfigGatewayAuthSectionTest, JsonLoadsGatewayAuthAndResolvesRelativeFiles)
     EXPECT_EQ(opts.gateway_auth.cookie_same_site, "Strict");
     EXPECT_TRUE(opts.gateway_auth.require_session_record);
     EXPECT_FALSE(opts.gateway_auth.auto_provision_session);
+    EXPECT_TRUE(opts.gateway_auth.enable_dev_registration);
     EXPECT_EQ(opts.gateway_auth.session_store_backend, "redis");
     EXPECT_EQ(opts.gateway_auth.session_database_path, (tmp.path() / "gateway_auth.db").string());
     EXPECT_EQ(opts.gateway_auth.redis_host, "127.0.0.1");
@@ -559,7 +561,8 @@ TEST(ConfigGatewayAuthSectionTest, CliOverridesGatewayAuthJson) {
         "--gateway-auth-redis-host", "127.0.0.1",
         "--gateway-auth-redis-port", "5000",
         "--gateway-auth-session-db", (tmp.path() / "auth.db").string(),
-        "--gateway-auth-require-session"
+        "--gateway-auth-require-session",
+        "--gateway-auth-enable-dev-registration"
     });
 
     EXPECT_TRUE(opts.gateway_auth.enabled);
@@ -574,6 +577,7 @@ TEST(ConfigGatewayAuthSectionTest, CliOverridesGatewayAuthJson) {
     EXPECT_TRUE(opts.gateway_auth.cookie_secure);
     EXPECT_TRUE(opts.gateway_auth.require_session_record);
     EXPECT_FALSE(opts.gateway_auth.auto_provision_session);
+    EXPECT_TRUE(opts.gateway_auth.enable_dev_registration);
     EXPECT_EQ(opts.gateway_auth.session_store_backend, "redis");
     EXPECT_EQ(opts.gateway_auth.redis_host, "127.0.0.1");
     EXPECT_EQ(opts.gateway_auth.redis_port, "5000");
@@ -610,7 +614,9 @@ TEST(ConfigPersonaGatewaySectionTest, JsonLoadsE2EGatewayOptionsAndResolvesStati
                 "write_connection_count": 1,
                 "busy_timeout_ms": 1500,
                 "retention_hours": 72,
-                "cleanup_interval_seconds": 30
+                "cleanup_interval_seconds": 30,
+                "enable_path_register_test_endpoint": true,
+                "enable_path_analyze_test_endpoint": true
             },
             "compute_pool": {
                 "worker_count": 4,
@@ -651,6 +657,8 @@ TEST(ConfigPersonaGatewaySectionTest, JsonLoadsE2EGatewayOptionsAndResolvesStati
     EXPECT_EQ(opts.persona_gateway.document_store.busy_timeout_ms, 1500);
     EXPECT_EQ(opts.persona_gateway.document_store.retention_hours, 72);
     EXPECT_EQ(opts.persona_gateway.document_store.cleanup_interval_seconds, 30);
+    EXPECT_TRUE(opts.persona_gateway.document_store.enable_path_register_test_endpoint);
+    EXPECT_TRUE(opts.persona_gateway.document_store.enable_path_analyze_test_endpoint);
     EXPECT_EQ(opts.persona_gateway.compute_pool.worker_count, 4u);
     EXPECT_EQ(opts.persona_gateway.compute_pool.queue_capacity, 256u);
     EXPECT_EQ(opts.persona_gateway.io_pool.worker_count, 2u);
@@ -682,6 +690,8 @@ TEST(ConfigPersonaGatewaySectionTest, CliOverridesGatewayJson) {
         "--gateway-document-store-db", (tmp.path() / "document/document_store.sqlite").string(),
         "--gateway-document-store-retention-hours", "96",
         "--gateway-document-store-cleanup-seconds", "45",
+        "--gateway-document-store-enable-path-register-test",
+        "--gateway-document-store-enable-path-analyze-test",
         "--gateway-compute-workers", "3",
         "--gateway-compute-queue", "300",
         "--gateway-io-workers", "2",
@@ -701,6 +711,8 @@ TEST(ConfigPersonaGatewaySectionTest, CliOverridesGatewayJson) {
     EXPECT_EQ(opts.persona_gateway.document_store.database_path, tmp.path() / "document/document_store.sqlite");
     EXPECT_EQ(opts.persona_gateway.document_store.retention_hours, 96);
     EXPECT_EQ(opts.persona_gateway.document_store.cleanup_interval_seconds, 45);
+    EXPECT_TRUE(opts.persona_gateway.document_store.enable_path_register_test_endpoint);
+    EXPECT_TRUE(opts.persona_gateway.document_store.enable_path_analyze_test_endpoint);
     EXPECT_EQ(opts.persona_gateway.compute_pool.worker_count, 3u);
     EXPECT_EQ(opts.persona_gateway.compute_pool.queue_capacity, 300u);
     EXPECT_EQ(opts.persona_gateway.io_pool.worker_count, 2u);

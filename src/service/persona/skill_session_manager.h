@@ -49,6 +49,7 @@ struct SkillSessionStartRequest {
 struct SkillSessionStopRequest {
     std::string skill_id;
     std::string session_id;
+    std::string authenticated_user_uuid;
     std::string trace_id;
     std::string source;
     std::string reason;

@@ -26,6 +26,7 @@ DECLARE_CONFIG_SECTION(GatewayAuthConfigSection, "gateway_auth")
     CONFIG_CLI_STRING(kRedisPort, "--gateway-auth-redis-port");
     CONFIG_CLI_STRING(kRequireSessionRecord, "--gateway-auth-require-session");
     CONFIG_CLI_STRING(kAutoProvisionSession, "--gateway-auth-auto-provision");
+    CONFIG_CLI_STRING(kEnableDevRegistration, "--gateway-auth-enable-dev-registration");
     CONFIG_CLI_STRING(kCookieSecure, "--gateway-auth-cookie-secure");
     void Validate(MultimodalServerOptions& options) const override;
 };
@@ -68,6 +69,7 @@ void GatewayAuthConfigSection::LoadJson(const Json& root, MultimodalServerOption
     SetString(*section, Name(), "cookie_same_site", options.gateway_auth.cookie_same_site);
     SetBool(*section, Name(), "require_session_record", options.gateway_auth.require_session_record);
     SetBool(*section, Name(), "auto_provision_session", options.gateway_auth.auto_provision_session);
+    SetBool(*section, Name(), "enable_dev_registration", options.gateway_auth.enable_dev_registration);
     SetString(*section, Name(), "session_store_backend", options.gateway_auth.session_store_backend);
     SetString(*section, Name(), "session_database_path", options.gateway_auth.session_database_path);
     SetString(*section, Name(), "redis_host", options.gateway_auth.redis_host);
@@ -109,6 +111,7 @@ bool GatewayAuthConfigSection::LoadCli(CliCursor& cursor, MultimodalServerOption
         options.gateway_auth.auto_provision_session = false;
     })
     CONFIG_FLAG_ARG(kAutoProvisionSession, options.gateway_auth.auto_provision_session = true;)
+    CONFIG_FLAG_ARG(kEnableDevRegistration, options.gateway_auth.enable_dev_registration = true;)
     CONFIG_FLAG_ARG(kCookieSecure, options.gateway_auth.cookie_secure = true;)
 
     return false;

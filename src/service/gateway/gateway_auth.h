@@ -43,6 +43,7 @@ struct GatewayAuthOptions {
     std::string cookie_same_site = "Lax";
     bool require_session_record = false;
     bool auto_provision_session = true;
+    bool enable_dev_registration = false;
     std::string session_store_backend = "sqlite";
     std::string session_database_path;
     std::string redis_host = "127.0.0.1";
@@ -68,11 +69,26 @@ struct AuthSessionRecord {
     bool revoked = false;
 };
 
+struct AuthUserRecord {
+    std::string user_uuid;
+    std::string tenant_id = "default";
+    std::string username;
+    std::string password_hash;
+    std::string password_salt;
+    int password_iterations = 0;
+    std::string subject;
+    std::chrono::system_clock::time_point created_at{};
+    std::chrono::system_clock::time_point updated_at{};
+    bool disabled = false;
+};
+
 class IAuthSessionStore {
 public:
     virtual ~IAuthSessionStore() = default;
     virtual core::Status EnsureSchema() = 0;
     virtual core::Result<AuthSessionRecord> ResolveSession(std::string_view token_id) = 0;
+    virtual core::Result<AuthUserRecord> ResolveUserByUsername(std::string_view username) = 0;
+    virtual core::Status UpsertUser(const AuthUserRecord& record) = 0;
     virtual core::Status UpsertSession(const AuthSessionRecord& record) = 0;
     virtual core::Status RevokeSession(std::string_view token_id, std::string_view reason) = 0;
 };
@@ -84,9 +100,17 @@ public:
 };
 
 struct AuthRegistrationRequest {
+    std::string username;
+    std::string password;
     std::string user_uuid;
     std::string tenant_id = "default";
     std::string subject;
+    std::chrono::seconds ttl{0};
+};
+
+struct AuthLoginRequest {
+    std::string username;
+    std::string password;
     std::chrono::seconds ttl{0};
 };
 
@@ -101,6 +125,7 @@ class IAuthRegistrationService {
 public:
     virtual ~IAuthRegistrationService() = default;
     virtual core::Result<AuthRegistrationResult> Register(const AuthRegistrationRequest& request) = 0;
+    virtual core::Result<AuthRegistrationResult> Login(const AuthLoginRequest& request) = 0;
 };
 
 class JwtCookieAuthenticator final : public IGatewayAuthenticator {
@@ -128,8 +153,11 @@ public:
                                         core::LoggerAdapter logger = core::LoggerAdapter::ForModule("gateway-auth"));
 
     core::Result<AuthRegistrationResult> Register(const AuthRegistrationRequest& request) override;
+    core::Result<AuthRegistrationResult> Login(const AuthLoginRequest& request) override;
 
 private:
+    core::Result<AuthRegistrationResult> IssueForIdentity(const AuthIdentity& identity,
+                                                          std::chrono::system_clock::time_point issued_at) const;
     core::Result<std::string> IssueJwt(const AuthIdentity& identity,
                                        std::chrono::system_clock::time_point issued_at) const;
     std::string BuildCookieHeader(std::string_view token,
@@ -146,6 +174,8 @@ public:
 
     core::Status EnsureSchema() override;
     core::Result<AuthSessionRecord> ResolveSession(std::string_view token_id) override;
+    core::Result<AuthUserRecord> ResolveUserByUsername(std::string_view username) override;
+    core::Status UpsertUser(const AuthUserRecord& record) override;
     core::Status UpsertSession(const AuthSessionRecord& record) override;
     core::Status RevokeSession(std::string_view token_id, std::string_view reason) override;
 
@@ -160,11 +190,15 @@ public:
 
     core::Status EnsureSchema() override;
     core::Result<AuthSessionRecord> ResolveSession(std::string_view token_id) override;
+    core::Result<AuthUserRecord> ResolveUserByUsername(std::string_view username) override;
+    core::Status UpsertUser(const AuthUserRecord& record) override;
     core::Status UpsertSession(const AuthSessionRecord& record) override;
     core::Status RevokeSession(std::string_view token_id, std::string_view reason) override;
 
 private:
     std::string SessionKey(std::string_view token_id) const;
+    std::string UserKey(std::string_view user_uuid) const;
+    std::string UsernameKey(std::string_view username) const;
 
     std::shared_ptr<semantic_cache::RedisConnectionPool> redis_;
     std::string key_prefix_;

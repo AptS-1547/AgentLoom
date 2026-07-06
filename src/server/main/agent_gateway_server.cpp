@@ -122,6 +122,7 @@ private:
 
 struct L0MemoryCacheBundle {
     std::shared_ptr<agent::semantic_cache::ISemanticCache> cache;
+    std::shared_ptr<agent::semantic_cache::L0MemoryCacheAdapter> adapter;
     std::shared_ptr<agent::semantic_cache::RedisConnectionPool> redis_pool;
 };
 
@@ -329,28 +330,24 @@ core::Result<L0MemoryCacheBundle> CreateL0MemoryCache(const ToolConfig& config) 
     }
 
     fs::create_directories(config.l0_memory.sqlite_path.parent_path());
-    auto sqlite = storage::sqlite::SqliteConnection::Open(config.l0_memory.sqlite_path.string());
-    if (!sqlite.ok()) {
-        redis->Shutdown();
-        return sqlite.status();
-    }
-
-    auto index = std::make_shared<agent::semantic_cache::cache_vector::VectorIndexManager>(
-        config.l0_memory.user_uuid,
-        redis,
-        std::move(sqlite).value(),
-        config.l0_memory.max_cached_records);
 
     agent::semantic_cache::L0MemoryCacheAdapterOptions options;
     options.top_k = config.l0_memory.top_k;
+    options.candidate_multiplier = config.l0_memory.candidate_multiplier;
     options.neighbors_per_hit = config.l0_memory.neighbors_per_hit;
     options.similarity_floor = config.l0_memory.similarity_floor;
+    options.warm_window_seconds = config.l0_memory.warm_window_seconds;
+    options.half_life_seconds = config.l0_memory.half_life_seconds;
+    options.max_age_seconds = config.l0_memory.max_age_seconds;
     L0MemoryCacheBundle bundle;
     bundle.redis_pool = redis;
-    bundle.cache = std::make_shared<agent::semantic_cache::L0MemoryCacheAdapter>(
+    bundle.adapter = std::make_shared<agent::semantic_cache::L0MemoryCacheAdapter>(
             std::move(embedding),
-            std::move(index),
+            redis,
+            config.l0_memory.sqlite_path.string(),
+            config.l0_memory.max_cached_records,
             options);
+    bundle.cache = bundle.adapter;
     return bundle;
 }
 
@@ -735,6 +732,7 @@ int main(int argc, char** argv) {
         dependencies.document_llm_chunk_cache = std::move(document_llm_chunk_cache).value();
         dependencies.document_semantic_cache = std::move(document_semantic_cache).value();
         dependencies.l0_redis_pool = l0_bundle.redis_pool;
+        dependencies.l0_memory_adapter = l0_bundle.adapter;
         dependencies.evaluation_config_path = repo_root / "config" / "evaluation_indicators.json";
         std::shared_ptr<agent::service::persona::SkillSessionManager> skill_sessions;
         if (config.skill_session.enabled) {
@@ -792,7 +790,9 @@ int main(int argc, char** argv) {
 
         std::cout << "[agent-gateway] started\n";
         std::cout << "[agent-gateway] frontend: http://127.0.0.1:" << server.port() << "/\n";
-        std::cout << "[agent-gateway] auth:     POST http://127.0.0.1:" << server.port() << "/api/auth/register\n";
+        if (config.gateway_auth.enable_dev_registration) {
+            std::cout << "[agent-gateway] dev auth: POST http://127.0.0.1:" << server.port() << "/api/auth/register\n";
+        }
         std::cout << "[agent-gateway] ws:       ws://127.0.0.1:" << server.port() << "/ws/session\n";
         std::cout << "[agent-gateway] press Enter or Ctrl+C to stop\n";
 

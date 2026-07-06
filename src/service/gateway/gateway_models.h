@@ -46,12 +46,14 @@ struct SessionGatewayResponse : GatewayEnvelopeBase {
 struct CloseSessionGatewayRequest {
     std::string trace_id;
     std::string session_id;
+    std::string authenticated_user_uuid;
     std::string reason = "client_close";
 };
 
 struct ChatGatewayRequest {
     std::string trace_id;
     std::string session_id;
+    std::string authenticated_user_uuid;
     std::string persona_id;
     std::string mode = "chat";
     std::string message;
@@ -74,6 +76,7 @@ struct ChatGatewayResponse : GatewayEnvelopeBase {
 struct ClassroomMessageGatewayRequest {
     std::string trace_id;
     std::string session_id;
+    std::string authenticated_user_uuid;
     std::string classroom_id;
     std::string target_persona_id;
     std::string context_id;
@@ -85,6 +88,7 @@ struct ClassroomMessageGatewayRequest {
 struct ClassroomProactiveGatewayRequest {
     std::string trace_id;
     std::string session_id;
+    std::string authenticated_user_uuid;
     std::string classroom_id;
     std::string persona_id;
     std::string context_id;
@@ -93,6 +97,7 @@ struct ClassroomProactiveGatewayRequest {
 
 struct ClassroomPollGatewayRequest {
     std::string trace_id;
+    std::string authenticated_user_uuid;
     std::string classroom_id;
     std::string persona_id;
     std::string context_id;
@@ -114,6 +119,7 @@ struct ClassroomGatewayResponse : GatewayEnvelopeBase {
 struct TrainingReportGatewayRequest {
     std::string trace_id;
     std::string session_id;
+    std::string authenticated_user_uuid;
     bool include_raw_turns = true;
 };
 

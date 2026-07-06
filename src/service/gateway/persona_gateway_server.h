@@ -19,6 +19,7 @@
 #include <vector>
 
 namespace agent::semantic_cache {
+class L0MemoryCacheAdapter;
 class RedisConnectionPool;
 }
 
@@ -37,6 +38,8 @@ struct GatewayDocumentStoreOptions {
     int busy_timeout_ms = 5000;
     int retention_hours = 24 * 7;
     int cleanup_interval_seconds = 60;
+    bool enable_path_register_test_endpoint = false;
+    bool enable_path_analyze_test_endpoint = false;
 };
 
 struct PersonaGatewayServerOptions {
@@ -61,6 +64,7 @@ struct PersonaGatewayServerDependencies {
     std::shared_ptr<document::IDocumentLlmChunkCache> document_llm_chunk_cache;
     std::shared_ptr<semantic_cache::ISemanticCache> document_semantic_cache;
     std::shared_ptr<semantic_cache::RedisConnectionPool> l0_redis_pool;
+    std::shared_ptr<semantic_cache::L0MemoryCacheAdapter> l0_memory_adapter;
     std::filesystem::path evaluation_config_path;
     std::vector<std::shared_ptr<IRuntimeMaintenanceTask>> maintenance_tasks;
 };
@@ -89,6 +93,7 @@ public:
 private:
     void HandleHttp(std::shared_ptr<::net::IHttpRequest> request);
     void HandleWebSocket(std::shared_ptr<::net::IWebSocketStreamRequest> request);
+    void HandleWebSocketClose(const ::net::ConnectionCloseInfo& close_info);
     core::Status ValidateDependencies() const;
     core::Status EnsureAuthSessionStore();
     core::Status EnsureDocumentStore();

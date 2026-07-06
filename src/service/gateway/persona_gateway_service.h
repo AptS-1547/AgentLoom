@@ -28,7 +28,9 @@ public:
                           core::LoggerAdapter logger = core::LoggerAdapter::ForModule("service"));
 
     core::Result<SessionGatewayResponse> CreateSession(CreateSessionGatewayRequest request);
-    core::Result<SessionGatewayResponse> GetSession(std::string_view session_id, std::string trace_id);
+    core::Result<SessionGatewayResponse> GetSession(std::string_view session_id,
+                                                    std::string trace_id,
+                                                    std::string_view authenticated_user_uuid = {});
     core::Result<SessionGatewayResponse> CloseSession(CloseSessionGatewayRequest request);
     core::Result<ChatGatewayResponse> Chat(ChatGatewayRequest request);
     core::Result<ClassroomGatewayResponse> ClassroomMessage(ClassroomMessageGatewayRequest request);

@@ -122,21 +122,20 @@ agent_auth
 
 WebSocket upgrade 时浏览器会自动携带同源 Cookie。前端不要把 JWT 放进 WebSocket query string。
 
-### 2.1 注册/本地登录
+### 2.1 注册/登录
 
 ```http
-POST /api/auth/register
+POST /api/auth/signup
 ```
 
-此接口不要求已登录，用于本地/E2E/比赛演示环境创建认证态。生产部署应由外部注册策略保护。
+正式注册入口不要求已登录，但只接受用户凭据字段。`subject` 是 JWT 语义隔离字段，`tenantId` 是后续管理员/组策略域字段，前端注册时不要传入这两个字段。
 
 Request:
 
 ```json
 {
-  "userUuid": "user-001",
-  "tenantId": "default",
-  "subject": "user-001",
+  "username": "student@example.test",
+  "password": "correct-password",
   "ttlSeconds": 86400
 }
 ```
@@ -145,9 +144,8 @@ Request:
 
 | 字段 | 类型 | 必填 | 说明 |
 |---|---:|---:|---|
-| `userUuid` | string | 否 | 用户 UUID，空时后端按认证服务策略生成或使用默认值 |
-| `tenantId` | string | 否 | 租户 ID，默认 `default` |
-| `subject` | string | 否 | JWT subject |
+| `username` | string | 是 | 登录名；`email` 可作为兼容别名 |
+| `password` | string | 是 | 明文密码只出现在 HTTPS 请求体中，后端保存 PBKDF2 哈希、salt 和迭代次数 |
 | `ttlSeconds` | number | 否 | token 有效期，缺省使用后端配置 |
 
 Response:
@@ -175,16 +173,42 @@ Response:
 Set-Cookie: agent_auth=<jwt>; Path=/; HttpOnly; SameSite=Lax; ...
 ```
 
-前端同源请求应使用：
+Cookie 只保存 JWT/session token，不保存密码。前端同源请求应使用：
 
 ```ts
-fetch("/api/auth/register", {
+fetch("/api/auth/signup", {
   method: "POST",
   credentials: "include",
   headers: { "Content-Type": "application/json" },
   body: JSON.stringify(payload)
 })
 ```
+
+登录入口：
+
+```http
+POST /api/auth/login
+```
+
+Request:
+
+```json
+{
+  "username": "student@example.test",
+  "password": "correct-password",
+  "ttlSeconds": 86400
+}
+```
+
+登录成功返回格式与 `/api/auth/signup` 相同，并重新签发 JWT 与 Cookie。密码校验使用后端注册记录，不从 Cookie 读取密码。
+
+开发/测试兼容入口：
+
+```http
+POST /api/auth/register
+```
+
+此接口仅用于本地/E2E/比赛演示环境创建认证态，默认关闭，需要显式启用 `gateway_auth.enable_dev_registration` 或 CLI `--gateway-auth-enable-dev-registration`。该接口仍可接受 `userUuid`、`tenantId`、`subject` 以支持测试场景；生产入口不要使用它。
 
 ### 2.2 当前认证状态
 

@@ -126,6 +126,7 @@ public:
 class SessionManager final : public ISessionManager {
 public:
     using SessionTask = std::function<core::Status(SessionState&, core::ThreadPoolContext&)>;
+    using SessionClosedCallback = std::function<void(const SessionSnapshot&)>;
 
     SessionManager(core::ThreadPool& compute_pool,
                    core::ThreadPool& io_pool,
@@ -150,6 +151,7 @@ public:
     core::Status SubmitCompute(DispatchOptions options, SessionTask task);
     core::Status SubmitIo(DispatchOptions options, SessionTask task);
     SessionThreadPoolStats PoolStats() const;
+    void SetSessionClosedCallback(SessionClosedCallback callback);
 
 private:
     struct SessionSlot {
@@ -170,6 +172,7 @@ private:
     core::ThreadPool& io_pool_;
     SessionOptions options_;
     core::LoggerAdapter logger_;
+    SessionClosedCallback session_closed_callback_;
     mutable std::shared_mutex sessions_mutex_;
     std::unordered_map<std::string, std::shared_ptr<SessionSlot>> sessions_;
 };

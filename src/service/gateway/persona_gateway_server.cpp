@@ -2,6 +2,7 @@
 
 #include "document_file_store.h"
 #include "http_types.h"
+#include "l0_memory_cache_adapter.h"
 #include "redis_connection_pool.h"
 #include "sqlite/sqlite_connection_pool.h"
 
@@ -93,9 +94,21 @@ PersonaGatewayServer::PersonaGatewayServer(PersonaGatewayServerOptions options,
                dependencies_.document_embedding_provider,
                dependencies_.document_llm_chunk_cache,
                dependencies_.document_semantic_cache,
-               dependencies_.skill_session_manager),
+               dependencies_.skill_session_manager,
+               PersonaGatewayHttpAdapterOptions{
+                   .enable_dev_registration = options_.auth.enable_dev_registration,
+                   .enable_path_register_test_endpoint =
+                       options_.document_store.enable_path_register_test_endpoint,
+                   .enable_path_analyze_test_endpoint =
+                       options_.document_store.enable_path_analyze_test_endpoint}),
       http_server_(ResolveHttpOptions(options_)),
       maintenance_(core::LoggerAdapter::ForModule("gateway")) {
+    if (dependencies_.l0_memory_adapter) {
+        auto l0 = dependencies_.l0_memory_adapter;
+        sessions_.SetSessionClosedCallback([l0 = std::move(l0)](const persona::SessionSnapshot& snapshot) {
+            l0->ReleaseSession(snapshot.session_id);
+        });
+    }
     if (options_.static_files) {
         static_files_ = std::make_shared<::net::StaticFileHandler>(*options_.static_files);
     }
@@ -113,6 +126,9 @@ PersonaGatewayServer::PersonaGatewayServer(PersonaGatewayServerOptions options,
     });
     http_server_.SetWebSocketStreamHandler(options_.websocket_path, [this](std::shared_ptr<::net::IWebSocketStreamRequest> request) {
         HandleWebSocket(std::move(request));
+    });
+    http_server_.SetWebSocketCloseHandler([this](const ::net::ConnectionCloseInfo& close_info) {
+        HandleWebSocketClose(close_info);
     });
 }
 
@@ -321,6 +337,17 @@ void PersonaGatewayServer::HandleHttp(std::shared_ptr<::net::IHttpRequest> reque
 
 void PersonaGatewayServer::HandleWebSocket(std::shared_ptr<::net::IWebSocketStreamRequest> request) {
     adapter_.HandleWebSocket(std::move(request));
+}
+
+void PersonaGatewayServer::HandleWebSocketClose(const ::net::ConnectionCloseInfo& close_info) {
+    if (close_info.target != options_.websocket_path) {
+        return;
+    }
+    if (close_info.reason == ::net::ConnectionCloseReason::RemoteClosed ||
+        close_info.reason == ::net::ConnectionCloseReason::ServerShutdown) {
+        return;
+    }
+    adapter_.CleanupDocumentUploadsForConnection(close_info.connection_id);
 }
 
 core::Status PersonaGatewayServer::ValidateDependencies() const {

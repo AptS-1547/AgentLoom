@@ -7,7 +7,9 @@
 #include <chrono>
 #include <ctime>
 #include <iomanip>
+#include <initializer_list>
 #include <sstream>
+#include <string_view>
 #include <vector>
 #include <utility>
 
@@ -49,6 +51,38 @@ std::string ExtensionOfName(std::string_view name) {
 std::string PathToUtf8(const std::filesystem::path& path) {
     const auto utf8 = path.u8string();
     return std::string(utf8.begin(), utf8.end());
+}
+
+bool ContainsAny(std::string_view value, std::initializer_list<std::string_view> needles) {
+    return std::any_of(needles.begin(), needles.end(), [&](std::string_view needle) {
+        return value.find(needle) != std::string_view::npos;
+    });
+}
+
+bool IsZipVerificationRejection(const core::Status& status) {
+    switch (status.code()) {
+    case core::ErrorCode::InvalidArgument:
+    case core::ErrorCode::PermissionDenied:
+    case core::ErrorCode::ResourceExhausted:
+        break;
+    default:
+        return false;
+    }
+    return ContainsAny(status.message(), {
+        "plain ZIP/OOXML package",
+        "failed to create zip memory source",
+        "failed to open zip archive",
+        "zip archive",
+        "zip entry",
+        "unsafe zip entry path",
+        "OOXML package",
+        "DOCX package",
+        "PPTX package",
+        "self-extracting executable package",
+        "office macro project",
+        "office active content",
+        "embedded executable package",
+    });
 }
 
 std::string FileNameOrPathName(const std::filesystem::path& path, std::string_view file_name) {
@@ -420,6 +454,38 @@ core::Status DocumentAnalysisService::TouchDocumentAccess(const std::string& doc
     return core::Status::Ok();
 }
 
+core::Status DocumentAnalysisService::RemoveDocumentAccess(const std::string& document_id) {
+    if (document_id.empty()) {
+        return core::Status::Error(core::ErrorCode::InvalidArgument, "document_id is required");
+    }
+    std::lock_guard<std::mutex> lock(document_lru_mutex_);
+    auto it = std::remove_if(document_lru_.begin(), document_lru_.end(), [&](const DocumentLruEntry& entry) {
+        return entry.document_id == document_id;
+    });
+    document_lru_.erase(it, document_lru_.end());
+    return core::Status::Ok();
+}
+
+core::Status DocumentAnalysisService::DeleteManagedDocument(const std::string& document_id,
+                                                            const std::string& storage_path) {
+    if (document_id.empty()) {
+        return core::Status::Error(core::ErrorCode::InvalidArgument, "document_id is required");
+    }
+    if (auto status = RemoveDocumentAccess(document_id); !status.ok()) {
+        return status;
+    }
+    if (file_store_ && !storage_path.empty()) {
+        auto remove_status = file_store_->RemoveManagedFile(storage_path);
+        if (!remove_status.ok() && remove_status.code() != core::ErrorCode::NotFound) {
+            return remove_status;
+        }
+    }
+    if (metadata_repository_) {
+        return metadata_repository_->DeleteByDocumentId(document_id);
+    }
+    return core::Status::Ok();
+}
+
 core::Status DocumentAnalysisService::RunRetentionCleanupOnceForTest(std::int64_t now_ms) {
     return RunRetentionCleanupOnce(now_ms);
 }
@@ -546,6 +612,7 @@ core::Status DocumentAnalysisService::SubmitAnalyze(DocumentAnalyzeRequest reque
     if (request.document_id.empty()) {
         request.document_id = request.trace_id;
     }
+    std::string managed_storage_path;
     if (request.path.empty()) {
         if (!metadata_repository_ || !file_store_) {
             return core::Status::Error(
@@ -556,6 +623,13 @@ core::Status DocumentAnalysisService::SubmitAnalyze(DocumentAnalyzeRequest reque
         if (!metadata.ok()) {
             return metadata.status();
         }
+        if (!request.authenticated_user_uuid.empty() &&
+            metadata.value().owner_user_uuid != request.authenticated_user_uuid) {
+            return core::Status::Error(
+                core::ErrorCode::PermissionDenied,
+                "document does not belong to authenticated user");
+        }
+        managed_storage_path = metadata.value().storage_path;
         if (auto status = TouchDocumentAccess(request.document_id); !status.ok()) {
             logger_.warn("[trace={}] [document_analysis] touch access failed code={} reason={}",
                          request.trace_id,
@@ -582,6 +656,7 @@ core::Status DocumentAnalysisService::SubmitAnalyze(DocumentAnalyzeRequest reque
     auto status = compute_pool_.Submit(
         [this,
          request = std::move(request),
+         managed_storage_path = std::move(managed_storage_path),
          callback = std::move(callback),
          submitted_at](core::ThreadPoolContext&) mutable -> core::Status {
             const auto compute_started_at = Clock::now();
@@ -621,6 +696,20 @@ core::Status DocumentAnalysisService::SubmitAnalyze(DocumentAnalyzeRequest reque
                                      request.trace_id,
                                      static_cast<int>(mark_status.code()),
                                      mark_status.message());
+                    }
+                }
+                if (!managed_storage_path.empty() && IsZipVerificationRejection(analyzed.status())) {
+                    auto delete_status = DeleteManagedDocument(request.document_id, managed_storage_path);
+                    if (!delete_status.ok()) {
+                        logger_.warn("[trace={}] [document_analysis] delete zip-rejected managed document failed document_id={} code={} reason={}",
+                                     request.trace_id,
+                                     request.document_id,
+                                     static_cast<int>(delete_status.code()),
+                                     delete_status.message());
+                    } else {
+                        logger_.warn("[trace={}] [document_analysis] deleted zip-rejected managed document document_id={}",
+                                     request.trace_id,
+                                     request.document_id);
                     }
                 }
                 callback(analyzed.status());

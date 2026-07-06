@@ -282,6 +282,7 @@ void WebSocketSession::NotifyClose(const ConnectionCloseInfo& close_info) {
     }
     auto enriched = close_info;
     enriched.connection_id = lease_.context().connection_id;
+    enriched.target = std::string(request_.target());
     lease_.Close(enriched);
     if (callbacks_.close_handler) {
         callbacks_.close_handler(enriched);

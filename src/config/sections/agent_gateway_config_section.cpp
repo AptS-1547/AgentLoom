@@ -143,8 +143,12 @@ void LoadL0Memory(const Json& root, MultimodalServerOptions& options) {
     SetPath(*section, "l0_memory", "sqlite_path", options.l0_memory.sqlite_path);
     SetSize(*section, "l0_memory", "max_cached_records", options.l0_memory.max_cached_records, 1);
     SetSize(*section, "l0_memory", "top_k", options.l0_memory.top_k, 1);
+    SetSize(*section, "l0_memory", "candidate_multiplier", options.l0_memory.candidate_multiplier, 1);
     SetSize(*section, "l0_memory", "neighbors_per_hit", options.l0_memory.neighbors_per_hit, 0);
     SetFloat(*section, "l0_memory", "similarity_floor", options.l0_memory.similarity_floor, 0.0f, 1.0f);
+    SetInt64(*section, "l0_memory", "warm_window_seconds", options.l0_memory.warm_window_seconds, 0);
+    SetInt64(*section, "l0_memory", "half_life_seconds", options.l0_memory.half_life_seconds, 0);
+    SetInt64(*section, "l0_memory", "max_age_seconds", options.l0_memory.max_age_seconds, 0);
     SetString(*section, "l0_memory", "user_uuid", options.l0_memory.user_uuid);
 }
 
@@ -232,7 +236,6 @@ void AgentGatewayConfigSection::Validate(MultimodalServerOptions& options) const
     if (options.l0_memory.user_uuid.empty()) {
         options.l0_memory.user_uuid = "gateway-l0";
     }
-    options.l3_memory.user_uuids.push_back(options.l0_memory.user_uuid);
     std::unordered_set<std::string> seen;
     std::vector<std::string> unique;
     for (auto& user : options.l3_memory.user_uuids) {

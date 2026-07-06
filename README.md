@@ -271,6 +271,7 @@ top < accept_confidence || top1 - top2 < ambiguity_margin
 ### 实现细节
 
 - [配置系统](docs/CONFIG_SYSTEM.md)
+- [C++ 服务端安全工程准则](docs/SECURITY_ENGINEERING_STANDARD.md)
 - [缓存与优化](docs/CACHE_AND_OPTIMIZATION.md)
 - [Net API 设计笔记](docs/NET_API_NOTES.md)
 - [Redis 兼容性](docs/REDIS_COMPATIBILITY.md)

@@ -34,6 +34,9 @@ core::Result<SkillSessionSnapshot> SkillSessionManager::Start(const SkillSession
     const auto key = Key(request.session_id, request.skill_id);
     auto& session = sessions_[key];
     if (!session.session_id.empty() && !Terminal(session.state)) {
+        if (!request.user_uuid.empty() && session.user_uuid != request.user_uuid) {
+            return core::Status::Error(core::ErrorCode::PermissionDenied, "skill session does not belong to authenticated user");
+        }
         if (session.state == SkillSessionState::Closing) {
             return core::Status::Error(core::ErrorCode::FailedPrecondition, "skill session is closing");
         }
@@ -72,6 +75,9 @@ core::Result<SkillSessionSnapshot> SkillSessionManager::Stop(const SkillSessionS
         return core::Status::Error(core::ErrorCode::NotFound, "skill session not found");
     }
     auto& session = it->second;
+    if (!request.authenticated_user_uuid.empty() && session.user_uuid != request.authenticated_user_uuid) {
+        return core::Status::Error(core::ErrorCode::PermissionDenied, "skill session does not belong to authenticated user");
+    }
     session.trace_id = request.trace_id.empty() ? session.trace_id : request.trace_id;
     session.close_reason = request.reason;
     session.status_text = request.reason.empty() ? "skill session closing" : request.reason;

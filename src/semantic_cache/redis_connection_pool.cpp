@@ -137,6 +137,26 @@ core::Status RedisConnectionPool::Set(const std::string& key, const std::string&
     }
 }
 
+core::Result<bool> RedisConnectionPool::SetIfAbsent(const std::string& key,
+                                                    const std::string& value,
+                                                    std::chrono::seconds ttl) {
+    auto status = EnsureConnected();
+    if (!status.ok()) return status;
+
+    try {
+        bool created = false;
+        if (ttl.count() > 0) {
+            created = redis_->set(key, value, ttl, sw::redis::UpdateType::NOT_EXIST);
+        } else {
+            created = redis_->set(key, value, std::chrono::milliseconds(0), sw::redis::UpdateType::NOT_EXIST);
+        }
+        return created;
+    } catch (const sw::redis::Error& e) {
+        return core::Status::Error(core::ErrorCode::InternalError,
+            std::string("SET NX failed: ") + e.what());
+    }
+}
+
 core::Result<std::string> RedisConnectionPool::Get(const std::string& key) {
     auto status = EnsureConnected();
     if (!status.ok()) return status;

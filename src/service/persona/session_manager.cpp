@@ -132,20 +132,21 @@ core::Status SessionManager::CloseSession(std::string_view session_id, std::stri
         sessions_.erase(it);
     }
 
-    std::string user_uuid;
-    std::string persona_id;
+    SessionSnapshot snapshot;
     {
         std::lock_guard lock(removed->mutex);
-        user_uuid = removed->state.user_uuid;
-        persona_id = removed->state.persona_id;
         removed->state.status = SessionStatus::Closed;
+        snapshot = SnapshotLocked(removed->state);
+    }
+    if (session_closed_callback_) {
+        session_closed_callback_(snapshot);
     }
 
     logger_.info("[trace={}] [session] closed session={} user={} persona={}",
                  core::CurrentTraceId(),
                  session_id,
-                 user_uuid,
-                 persona_id);
+                 snapshot.user_uuid,
+                 snapshot.persona_id);
     return core::Status::Ok();
 }
 
@@ -195,14 +196,21 @@ std::vector<SessionSnapshot> SessionManager::CleanupExpired() {
     std::vector<SessionSnapshot> snapshots;
     snapshots.reserve(expired.size());
     for (const auto& slot : expired) {
-        std::lock_guard lock(slot->mutex);
-        snapshots.push_back(SnapshotLocked(slot->state));
-        slot->state.status = SessionStatus::Closed;
+        SessionSnapshot snapshot;
+        {
+            std::lock_guard lock(slot->mutex);
+            slot->state.status = SessionStatus::Closed;
+            snapshot = SnapshotLocked(slot->state);
+        }
+        snapshots.push_back(snapshot);
         logger_.info("[trace={}] [session] expired session={} user={} persona={}",
-                     slot->state.last_trace_id.empty() ? "-" : slot->state.last_trace_id,
-                     slot->state.session_id,
-                     slot->state.user_uuid,
-                     slot->state.persona_id);
+                     snapshot.last_trace_id.empty() ? "-" : snapshot.last_trace_id,
+                     snapshot.session_id,
+                     snapshot.user_uuid,
+                     snapshot.persona_id);
+        if (session_closed_callback_) {
+            session_closed_callback_(snapshot);
+        }
     }
     return snapshots;
 }
@@ -269,6 +277,10 @@ SessionThreadPoolStats SessionManager::PoolStats() const {
     stats.compute = compute_pool_.Stats();
     stats.io = io_pool_.Stats();
     return stats;
+}
+
+void SessionManager::SetSessionClosedCallback(SessionClosedCallback callback) {
+    session_closed_callback_ = std::move(callback);
 }
 
 core::Status SessionManager::Submit(core::ThreadPool& pool,

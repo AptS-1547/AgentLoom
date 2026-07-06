@@ -18,13 +18,17 @@
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <thread>
 
 namespace {
+
+using namespace std::chrono_literals;
 
 using agent::service::gateway::ChatGatewayRequest;
 using agent::service::gateway::AuthIdentity;
 using agent::service::gateway::AuthRegistrationRequest;
 using agent::service::gateway::AuthRegistrationResult;
+using agent::service::gateway::AuthLoginRequest;
 using agent::service::gateway::ClassroomMessageGatewayRequest;
 using agent::service::gateway::ClassroomProactiveGatewayRequest;
 using agent::service::gateway::ClassroomPollGatewayRequest;
@@ -41,7 +45,11 @@ using agent::service::gateway::IAuthRegistrationService;
 using agent::service::gateway::SqliteAuthSessionStore;
 using agent::service::gateway::RedisAuthSessionStore;
 using agent::service::gateway::AuthSessionRecord;
+using agent::service::gateway::AuthUserRecord;
 using agent::service::gateway::TrainingReportGatewayRequest;
+using agent::service::gateway::GatewayAuthOptions;
+using agent::service::gateway::JwtAuthRegistrationService;
+using agent::service::gateway::GenerateDevelopmentRsaKeyPair;
 using agent::document::DocumentAnalysisService;
 using agent::document::DocumentFileStore;
 using agent::document::DocumentFileStoreOptions;
@@ -115,14 +123,44 @@ public:
     }
 };
 
+AuthIdentity TestAuthIdentity(std::string user_uuid = "test-user-001") {
+    AuthIdentity identity;
+    identity.authenticated = true;
+    identity.user_uuid = std::move(user_uuid);
+    identity.tenant_id = "default";
+    identity.subject = identity.user_uuid;
+    return identity;
+}
+
 class FixedAuthRegistrationService final : public IAuthRegistrationService {
 public:
     core::Result<AuthRegistrationResult> Register(const AuthRegistrationRequest& request) override {
         last_request = request;
+        return BuildResult(
+            request.user_uuid.empty() ? "generated-user-001" : request.user_uuid,
+            request.tenant_id.empty() ? "default" : request.tenant_id,
+            request.subject);
+    }
+
+    core::Result<AuthRegistrationResult> Login(const AuthLoginRequest& request) override {
+        last_login_request = request;
+        if (request.username != "student@example.test" || request.password != "correct-password") {
+            return core::Status::Error(core::ErrorCode::PermissionDenied, "invalid username or password");
+        }
+        return BuildResult("generated-user-001", "default", {});
+    }
+
+    AuthRegistrationRequest last_request;
+    AuthLoginRequest last_login_request;
+
+private:
+    AuthRegistrationResult BuildResult(std::string user_uuid,
+                                       std::string tenant_id,
+                                       std::string subject) const {
         AuthRegistrationResult result;
-        result.identity.user_uuid = request.user_uuid.empty() ? "generated-user-001" : request.user_uuid;
-        result.identity.tenant_id = request.tenant_id.empty() ? "default" : request.tenant_id;
-        result.identity.subject = request.subject.empty() ? result.identity.user_uuid : request.subject;
+        result.identity.user_uuid = std::move(user_uuid);
+        result.identity.tenant_id = std::move(tenant_id);
+        result.identity.subject = subject.empty() ? result.identity.user_uuid : std::move(subject);
         result.identity.token_id = "token-001";
         result.identity.authenticated = true;
         result.issued_at = std::chrono::system_clock::now();
@@ -131,8 +169,6 @@ public:
         result.cookie_header = "agent_auth=jwt-token; Path=/; HttpOnly; SameSite=Lax";
         return result;
     }
-
-    AuthRegistrationRequest last_request;
 };
 
 struct GatewayFixture {
@@ -188,7 +224,8 @@ CreateSessionGatewayRequest MakeCreateRequest() {
 ::net::BeastHttpResponse SendJsonRequest(std::uint16_t port,
                                          ::net::http::verb method,
                                          std::string target,
-                                         Json body) {
+                                         Json body,
+                                         std::vector<std::pair<std::string, std::string>> headers = {}) {
     asio::io_context io;
     tcp::resolver resolver(io);
     beast::tcp_stream stream(io);
@@ -198,6 +235,9 @@ CreateSessionGatewayRequest MakeCreateRequest() {
     req.set(::net::http::field::host, "127.0.0.1");
     req.set(::net::http::field::content_type, "application/json");
     req.set("X-Trace-Id", body.value("traceId", "trace-http"));
+    for (const auto& [name, value] : headers) {
+        req.set(name, value);
+    }
     req.body() = body.dump();
     req.prepare_payload();
     ::net::http::write(stream, req);
@@ -209,6 +249,34 @@ CreateSessionGatewayRequest MakeCreateRequest() {
     stream.socket().shutdown(tcp::socket::shutdown_both, ec);
     stream.socket().close(ec);
     return response;
+}
+
+std::string RegisterDevAuthCookie(std::uint16_t port, std::string user_uuid = "test-user-001") {
+    auto response = SendJsonRequest(
+        port,
+        ::net::http::verb::post,
+        "/api/auth/register",
+        Json{
+            {"traceId", "trace-dev-register"},
+            {"userUuid", std::move(user_uuid)},
+            {"tenantId", "default"},
+            {"ttlSeconds", 600},
+        });
+    EXPECT_EQ(response.result(), ::net::http::status::ok);
+    return std::string(response[::net::http::field::set_cookie]);
+}
+
+void EnableGatewayTestAuth(PersonaGatewayServerOptions& options, const std::filesystem::path& database_path) {
+    auto keys = GenerateDevelopmentRsaKeyPair();
+    ASSERT_TRUE(keys.ok()) << keys.status().message();
+    options.auth.enabled = true;
+    options.auth.public_key_pem = keys.value().public_key_pem;
+    options.auth.private_key_pem = keys.value().private_key_pem;
+    options.auth.session_store_backend = "sqlite";
+    options.auth.session_database_path = database_path.string();
+    options.auth.enable_dev_registration = true;
+    options.auth.allow_dev_identity = false;
+    options.auth.require_auth_for_api = true;
 }
 
 Json SendWebSocketJson(std::uint16_t port, std::string target, Json body) {
@@ -283,6 +351,16 @@ std::filesystem::path TempPath(const std::string& name) {
     return std::filesystem::temp_directory_path() / name;
 }
 
+std::filesystem::path UploadTempPathForTest(const std::string& upload_id) {
+    std::string file_name = "agent_document_upload_";
+    for (char ch : upload_id) {
+        const auto safe = std::isalnum(static_cast<unsigned char>(ch)) || ch == '-' || ch == '_';
+        file_name.push_back(safe ? ch : '_');
+    }
+    file_name += ".tmp";
+    return std::filesystem::temp_directory_path() / file_name;
+}
+
 std::string PathUtf8(const std::filesystem::path& path) {
     const auto value = path.u8string();
     return std::string(value.begin(), value.end());
@@ -313,6 +391,14 @@ void WriteMinimalDocx(const std::filesystem::path& path) {
 </w:document>)";
     AddZipText(archive, "word/document.xml", document_xml);
     ASSERT_EQ(zip_close(archive), 0);
+}
+
+void WriteCorruptDocx(const std::filesystem::path& path) {
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    ASSERT_TRUE(out);
+    out << "not a zip archive";
 }
 
 TEST(PersonaGatewayServiceTest, RunsCreateChatReportAndCloseLifecycle) {
@@ -414,9 +500,35 @@ TEST(PersonaGatewayServiceTest, RoutesClassroomMessageByContextAndPollsProactive
     EXPECT_EQ(proactive.value().speaker_persona_id, "xiaozhi");
 }
 
+TEST(PersonaGatewayServiceTest, RejectsChatAndClassroomWhenAuthenticatedUserDoesNotOwnSession) {
+    GatewayFixture f;
+    auto created = f.gateway.CreateSession(MakeCreateRequest());
+    ASSERT_TRUE(created.ok()) << created.status().message();
+
+    ChatGatewayRequest chat;
+    chat.trace_id = "trace-chat-owner-mismatch";
+    chat.session_id = "session-gateway";
+    chat.authenticated_user_uuid = "attacker-user";
+    chat.message = "expensive call";
+    auto rejected_chat = f.gateway.Chat(std::move(chat));
+    EXPECT_FALSE(rejected_chat.ok());
+    EXPECT_EQ(rejected_chat.status().code(), core::ErrorCode::PermissionDenied);
+
+    ClassroomMessageGatewayRequest classroom;
+    classroom.trace_id = "trace-classroom-owner-mismatch";
+    classroom.classroom_id = "classroom-a";
+    classroom.session_id = "session-gateway";
+    classroom.target_persona_id = "dazhi";
+    classroom.authenticated_user_uuid = "attacker-user";
+    classroom.message = "expensive classroom call";
+    auto rejected_classroom = f.gateway.ClassroomMessage(std::move(classroom));
+    EXPECT_FALSE(rejected_classroom.ok());
+    EXPECT_EQ(rejected_classroom.status().code(), core::ErrorCode::PermissionDenied);
+}
+
 TEST(PersonaGatewayHttpAdapterTest, HandlesSessionCreateAndChatJsonRoutes) {
     GatewayFixture f;
-    PersonaGatewayHttpAdapter adapter(f.gateway);
+    PersonaGatewayHttpAdapter adapter(f.gateway, std::make_shared<FixedAuthenticator>(TestAuthIdentity("user-http")));
     ::net::HttpServer server({.address = "127.0.0.1", .port = 0, .io_threads = 1});
     server.SetHttpRequestHandler([&adapter](std::shared_ptr<::net::IHttpRequest> request) {
         adapter.HandleHttp(std::move(request));
@@ -459,7 +571,7 @@ TEST(PersonaGatewayHttpAdapterTest, HandlesSessionCreateAndChatJsonRoutes) {
 
 TEST(PersonaGatewayHttpAdapterTest, RoutesWebSocketMessagesThroughRegistry) {
     GatewayFixture f;
-    PersonaGatewayHttpAdapter adapter(f.gateway);
+    PersonaGatewayHttpAdapter adapter(f.gateway, std::make_shared<FixedAuthenticator>(TestAuthIdentity("user-gateway")));
     ::net::HttpServer server({.address = "127.0.0.1", .port = 0, .io_threads = 1});
     server.SetWebSocketStreamHandler("/ws/session", [&adapter](std::shared_ptr<::net::IWebSocketStreamRequest> request) {
         adapter.HandleWebSocket(std::move(request));
@@ -500,7 +612,16 @@ TEST(PersonaGatewayHttpAdapterTest, RoutesWebSocketMessagesThroughRegistry) {
 
 TEST(PersonaGatewayHttpAdapterTest, HandlesSkillSessionHttpControlRoutes) {
     GatewayFixture f;
-    PersonaGatewayHttpAdapter adapter(f.gateway, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, f.skill_sessions);
+    PersonaGatewayHttpAdapter adapter(
+        f.gateway,
+        std::make_shared<FixedAuthenticator>(TestAuthIdentity("skill-user-001")),
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        f.skill_sessions);
     ::net::HttpServer server({.address = "127.0.0.1", .port = 0, .io_threads = 1});
     server.SetHttpRequestHandler([&adapter](std::shared_ptr<::net::IHttpRequest> request) {
         adapter.HandleHttp(std::move(request));
@@ -515,7 +636,7 @@ TEST(PersonaGatewayHttpAdapterTest, HandlesSkillSessionHttpControlRoutes) {
             {"traceId", "trace-skill-http-start"},
             {"skillId", "vision.observe"},
             {"sessionId", "session-skill-http"},
-            {"userUuid", "user-skill-http"},
+            {"userUuid", "forged-skill-user"},
             {"personaId", "dazhi"},
             {"source", "test"},
             {"reason", "start vision"},
@@ -527,6 +648,7 @@ TEST(PersonaGatewayHttpAdapterTest, HandlesSkillSessionHttpControlRoutes) {
     ASSERT_TRUE(started_body["ok"].get<bool>());
     EXPECT_EQ(started_body["data"]["skillId"], "vision.observe");
     EXPECT_EQ(started_body["data"]["sessionId"], "session-skill-http");
+    EXPECT_EQ(started_body["data"]["userUuid"], "skill-user-001");
     EXPECT_EQ(started_body["data"]["state"], "starting");
 
     auto status = SendJsonRequest(
@@ -565,7 +687,16 @@ TEST(PersonaGatewayHttpAdapterTest, HandlesSkillSessionHttpControlRoutes) {
 
 TEST(PersonaGatewayHttpAdapterTest, HandlesSkillSessionWebSocketControlRoutes) {
     GatewayFixture f;
-    PersonaGatewayHttpAdapter adapter(f.gateway, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, f.skill_sessions);
+    PersonaGatewayHttpAdapter adapter(
+        f.gateway,
+        std::make_shared<FixedAuthenticator>(TestAuthIdentity("skill-ws-user-001")),
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        f.skill_sessions);
     ::net::HttpServer server({.address = "127.0.0.1", .port = 0, .io_threads = 1});
     server.SetWebSocketStreamHandler("/ws/session", [&adapter](std::shared_ptr<::net::IWebSocketStreamRequest> request) {
         adapter.HandleWebSocket(std::move(request));
@@ -581,11 +712,12 @@ TEST(PersonaGatewayHttpAdapterTest, HandlesSkillSessionWebSocketControlRoutes) {
             {"payload", {
                 {"skillId", "vision.observe"},
                 {"sessionId", "session-skill-ws"},
-                {"userUuid", "user-skill-ws"},
+                {"userUuid", "forged-skill-ws-user"},
                 {"personaId", "dazhi"},
             }},
         });
     ASSERT_EQ(started["type"], "skill.session.started");
+    EXPECT_EQ(started["payload"]["data"]["userUuid"], "skill-ws-user-001");
     EXPECT_EQ(started["payload"]["data"]["state"], "starting");
 
     auto status = SendWebSocketJson(
@@ -622,10 +754,246 @@ TEST(PersonaGatewayHttpAdapterTest, HandlesSkillSessionWebSocketControlRoutes) {
     server.Stop();
 }
 
+TEST(PersonaGatewayHttpAdapterTest, RejectsSkillSessionAccessWhenJwtUserDoesNotOwnSession) {
+    GatewayFixture f;
+    PersonaGatewayHttpAdapter owner_adapter(
+        f.gateway,
+        std::make_shared<FixedAuthenticator>(TestAuthIdentity("skill-owner")),
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        f.skill_sessions);
+    ::net::HttpServer owner_server({.address = "127.0.0.1", .port = 0, .io_threads = 1});
+    owner_server.SetHttpRequestHandler([&owner_adapter](std::shared_ptr<::net::IHttpRequest> request) {
+        owner_adapter.HandleHttp(std::move(request));
+    });
+    ASSERT_TRUE(owner_server.Start().ok());
+    auto started = SendJsonRequest(
+        owner_server.port(),
+        ::net::http::verb::post,
+        "/api/skill/session/start",
+        Json{
+            {"traceId", "trace-skill-owner-start"},
+            {"skillId", "vision.observe"},
+            {"sessionId", "session-skill-owned"},
+            {"personaId", "dazhi"},
+        });
+    ASSERT_EQ(started.result(), ::net::http::status::ok);
+    owner_server.Stop();
+
+    PersonaGatewayHttpAdapter attacker_adapter(
+        f.gateway,
+        std::make_shared<FixedAuthenticator>(TestAuthIdentity("skill-attacker")),
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        f.skill_sessions);
+    ::net::HttpServer attacker_server({.address = "127.0.0.1", .port = 0, .io_threads = 1});
+    attacker_server.SetHttpRequestHandler([&attacker_adapter](std::shared_ptr<::net::IHttpRequest> request) {
+        attacker_adapter.HandleHttp(std::move(request));
+    });
+    ASSERT_TRUE(attacker_server.Start().ok());
+
+    auto status = SendJsonRequest(
+        attacker_server.port(),
+        ::net::http::verb::post,
+        "/api/skill/session/status",
+        Json{
+            {"traceId", "trace-skill-attacker-status"},
+            {"skillId", "vision.observe"},
+            {"sessionId", "session-skill-owned"},
+        });
+    EXPECT_EQ(status.result(), ::net::http::status::forbidden);
+    EXPECT_EQ(Json::parse(status.body())["error"]["code"], "PERMISSION_DENIED");
+
+    auto stopped = SendJsonRequest(
+        attacker_server.port(),
+        ::net::http::verb::post,
+        "/api/skill/session/stop",
+        Json{
+            {"traceId", "trace-skill-attacker-stop"},
+            {"skillId", "vision.observe"},
+            {"sessionId", "session-skill-owned"},
+        });
+    EXPECT_EQ(stopped.result(), ::net::http::status::forbidden);
+    EXPECT_EQ(Json::parse(stopped.body())["error"]["code"], "PERMISSION_DENIED");
+    attacker_server.Stop();
+}
+
+TEST(PersonaGatewayHttpAdapterTest, RejectsUnauthenticatedSkillSessionRoutes) {
+    GatewayFixture f;
+    AuthIdentity unauthenticated;
+    unauthenticated.authenticated = false;
+    PersonaGatewayHttpAdapter adapter(
+        f.gateway,
+        std::make_shared<FixedAuthenticator>(unauthenticated),
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        f.skill_sessions);
+    ::net::HttpServer server({.address = "127.0.0.1", .port = 0, .io_threads = 1});
+    server.SetHttpRequestHandler([&adapter](std::shared_ptr<::net::IHttpRequest> request) {
+        adapter.HandleHttp(std::move(request));
+    });
+    server.SetWebSocketStreamHandler("/ws/session", [&adapter](std::shared_ptr<::net::IWebSocketStreamRequest> request) {
+        adapter.HandleWebSocket(std::move(request));
+    });
+    ASSERT_TRUE(server.Start().ok());
+
+    auto started = SendJsonRequest(
+        server.port(),
+        ::net::http::verb::post,
+        "/api/skill/session/start",
+        Json{
+            {"traceId", "trace-unauth-skill-start"},
+            {"skillId", "vision.observe"},
+            {"sessionId", "session-unauth-skill"},
+        });
+    EXPECT_EQ(started.result(), ::net::http::status::forbidden);
+    EXPECT_EQ(Json::parse(started.body())["error"]["code"], "PERMISSION_DENIED");
+
+    auto ws_started = SendWebSocketJson(
+        server.port(),
+        "/ws/session",
+        Json{
+            {"type", "skill.session.start"},
+            {"traceId", "trace-unauth-skill-ws-start"},
+            {"payload", {
+                {"skillId", "vision.observe"},
+                {"sessionId", "session-unauth-skill-ws"},
+            }},
+        });
+    EXPECT_EQ(ws_started["type"], "error");
+    EXPECT_EQ(ws_started["payload"]["error"]["code"], "PERMISSION_DENIED");
+    server.Stop();
+}
+
+TEST(PersonaGatewayHttpAdapterTest, RejectsUnauthenticatedDocumentUploadWebSocketRoute) {
+    GatewayFixture f;
+    auto document_service = std::make_shared<DocumentAnalysisService>(f.compute, f.io);
+    AuthIdentity unauthenticated;
+    unauthenticated.authenticated = false;
+    PersonaGatewayHttpAdapter adapter(
+        f.gateway,
+        std::make_shared<FixedAuthenticator>(unauthenticated),
+        nullptr,
+        document_service,
+        f.llm);
+    ::net::HttpServer server({.address = "127.0.0.1", .port = 0, .io_threads = 1});
+    server.SetWebSocketStreamHandler("/ws/session", [&adapter](std::shared_ptr<::net::IWebSocketStreamRequest> request) {
+        adapter.HandleWebSocket(std::move(request));
+    });
+    ASSERT_TRUE(server.Start().ok());
+
+    auto response = SendWebSocketJson(
+        server.port(),
+        "/ws/session",
+        Json{
+            {"type", "document.upload.start"},
+            {"traceId", "trace-unauth-ws-upload"},
+            {"payload", {
+                {"fileName", "blocked.docx"},
+                {"totalBytes", 10},
+            }},
+        });
+    EXPECT_EQ(response["type"], "error");
+    EXPECT_EQ(response["payload"]["error"]["code"], "PERMISSION_DENIED");
+    server.Stop();
+}
+
+TEST(PersonaGatewayHttpAdapterTest, RejectsDocumentUploadChunkFromDifferentWebSocketConnection) {
+    GatewayFixture f;
+    auto document_service = std::make_shared<DocumentAnalysisService>(f.compute, f.io);
+    PersonaGatewayHttpAdapter adapter(
+        f.gateway,
+        std::make_shared<FixedAuthenticator>(TestAuthIdentity("doc-user-001")),
+        nullptr,
+        document_service,
+        f.llm,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        agent::service::gateway::PersonaGatewayHttpAdapterOptions{
+            .enable_path_analyze_test_endpoint = true});
+    ::net::HttpServer server({.address = "127.0.0.1", .port = 0, .io_threads = 1});
+    server.SetWebSocketStreamHandler("/ws/session", [&adapter](std::shared_ptr<::net::IWebSocketStreamRequest> request) {
+        adapter.HandleWebSocket(std::move(request));
+    });
+    ASSERT_TRUE(server.Start().ok());
+
+    asio::io_context io;
+    tcp::resolver resolver(io);
+    auto connect_ws = [&]() {
+        beast::websocket::stream<tcp::socket> ws(io);
+        auto endpoints = resolver.resolve("127.0.0.1", std::to_string(server.port()));
+        asio::connect(ws.next_layer(), endpoints);
+        ws.handshake("127.0.0.1", "/ws/session");
+        ws.text(true);
+        return ws;
+    };
+    auto send_ws = [](beast::websocket::stream<tcp::socket>& ws, Json body) {
+        ws.write(asio::buffer(body.dump()));
+        beast::flat_buffer buffer;
+        ws.read(buffer);
+        return Json::parse(beast::buffers_to_string(buffer.data()));
+    };
+
+    auto owner_ws = connect_ws();
+    auto attacker_ws = connect_ws();
+    auto started = send_ws(owner_ws, Json{
+        {"type", "document.upload.start"},
+        {"traceId", "trace-ws-upload-owner-start"},
+        {"payload", {
+            {"fileName", "owner-upload.docx"},
+            {"totalBytes", 3},
+        }},
+    });
+    ASSERT_EQ(started["type"], "document.upload.started");
+    const auto upload_id = started["payload"]["uploadId"].get<std::string>();
+
+    auto rejected = send_ws(attacker_ws, Json{
+        {"type", "document.upload.chunk"},
+        {"traceId", "trace-ws-upload-cross-connection"},
+        {"payload", {
+            {"uploadId", upload_id},
+            {"offset", 0},
+            {"data", Base64Encode("abc")},
+        }},
+    });
+    EXPECT_EQ(rejected["type"], "error");
+    EXPECT_EQ(rejected["payload"]["error"]["code"], "PERMISSION_DENIED");
+
+    beast::error_code ec;
+    owner_ws.close(beast::websocket::close_code::normal, ec);
+    attacker_ws.close(beast::websocket::close_code::normal, ec);
+    server.Stop();
+}
+
 TEST(PersonaGatewayHttpAdapterTest, HandlesDocumentAnalyzeRoute) {
     GatewayFixture f;
     auto document_service = std::make_shared<DocumentAnalysisService>(f.compute, f.io);
-    PersonaGatewayHttpAdapter adapter(f.gateway, nullptr, nullptr, document_service, f.llm);
+    PersonaGatewayHttpAdapter adapter(
+        f.gateway,
+        std::make_shared<FixedAuthenticator>(TestAuthIdentity("doc-user-001")),
+        nullptr,
+        document_service,
+        f.llm,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        agent::service::gateway::PersonaGatewayHttpAdapterOptions{
+            .enable_path_analyze_test_endpoint = true});
     ::net::HttpServer server({.address = "127.0.0.1", .port = 0, .io_threads = 1});
     server.SetHttpRequestHandler([&adapter](std::shared_ptr<::net::IHttpRequest> request) {
         adapter.HandleHttp(std::move(request));
@@ -662,6 +1030,41 @@ TEST(PersonaGatewayHttpAdapterTest, HandlesDocumentAnalyzeRoute) {
     std::filesystem::remove(path, ec);
 }
 
+TEST(PersonaGatewayHttpAdapterTest, RejectsDocumentPathAnalyzeWhenTestEndpointDisabled) {
+    GatewayFixture f;
+    auto document_service = std::make_shared<DocumentAnalysisService>(f.compute, f.io);
+    PersonaGatewayHttpAdapter adapter(
+        f.gateway,
+        std::make_shared<FixedAuthenticator>(TestAuthIdentity("doc-user-001")),
+        nullptr,
+        document_service,
+        f.llm);
+    ::net::HttpServer server({.address = "127.0.0.1", .port = 0, .io_threads = 1});
+    server.SetHttpRequestHandler([&adapter](std::shared_ptr<::net::IHttpRequest> request) {
+        adapter.HandleHttp(std::move(request));
+    });
+    ASSERT_TRUE(server.Start().ok());
+
+    const auto path = TempPath("agent_gateway_document_path_analyze_disabled.docx");
+    WriteMinimalDocx(path);
+
+    auto response = SendJsonRequest(
+        server.port(),
+        ::net::http::verb::post,
+        "/api/document/analyze",
+        Json{
+            {"traceId", "trace-document-path-analyze-disabled"},
+            {"path", PathUtf8(path)},
+            {"fileName", "blocked-doc.docx"},
+        });
+    EXPECT_EQ(response.result(), ::net::http::status::forbidden);
+    EXPECT_EQ(Json::parse(response.body())["error"]["code"], "PERMISSION_DENIED");
+
+    server.Stop();
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+}
+
 TEST(PersonaGatewayHttpAdapterTest, RegistersManagedDocumentAndAnalyzesByDocumentId) {
     GatewayFixture f;
     const auto source_path = TempPath("agent_gateway_document_register.docx");
@@ -684,16 +1087,18 @@ TEST(PersonaGatewayHttpAdapterTest, RegistersManagedDocumentAndAnalyzesByDocumen
     ASSERT_TRUE(document_service->SetRepository(repository).ok());
     ASSERT_TRUE(document_service->SetFileStore(std::make_shared<DocumentFileStore>(DocumentFileStoreOptions{store_root})).ok());
 
-    AuthIdentity identity;
-    identity.authenticated = true;
-    identity.user_uuid = "doc-user-001";
-    identity.tenant_id = "default";
     PersonaGatewayHttpAdapter adapter(
         f.gateway,
-        std::make_shared<FixedAuthenticator>(identity),
+        std::make_shared<FixedAuthenticator>(TestAuthIdentity("doc-user-001")),
         nullptr,
         document_service,
-        f.llm);
+        f.llm,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        agent::service::gateway::PersonaGatewayHttpAdapterOptions{
+            .enable_path_register_test_endpoint = true});
     ::net::HttpServer server({.address = "127.0.0.1", .port = 0, .io_threads = 1});
     server.SetHttpRequestHandler([&adapter](std::shared_ptr<::net::IHttpRequest> request) {
         adapter.HandleHttp(std::move(request));
@@ -736,6 +1141,84 @@ TEST(PersonaGatewayHttpAdapterTest, RegistersManagedDocumentAndAnalyzesByDocumen
     EXPECT_EQ(analyzed_body["data"]["fileType"], "docx");
     EXPECT_TRUE(analyzed_body["data"].contains("mindmap"));
 
+    PersonaGatewayHttpAdapter attacker_adapter(
+        f.gateway,
+        std::make_shared<FixedAuthenticator>(TestAuthIdentity("doc-attacker-001")),
+        nullptr,
+        document_service,
+        f.llm);
+    ::net::HttpServer attacker_server({.address = "127.0.0.1", .port = 0, .io_threads = 1});
+    attacker_server.SetHttpRequestHandler([&attacker_adapter](std::shared_ptr<::net::IHttpRequest> request) {
+        attacker_adapter.HandleHttp(std::move(request));
+    });
+    ASSERT_TRUE(attacker_server.Start().ok());
+
+    auto rejected = SendJsonRequest(
+        attacker_server.port(),
+        ::net::http::verb::post,
+        "/api/document/analyze",
+        Json{
+            {"traceId", "trace-document-attacker-analyze"},
+            {"documentId", document_id},
+        });
+    EXPECT_EQ(rejected.result(), ::net::http::status::forbidden);
+    EXPECT_EQ(Json::parse(rejected.body())["error"]["code"], "PERMISSION_DENIED");
+    attacker_server.Stop();
+
+    server.Stop();
+    repository->Close();
+    std::filesystem::remove(source_path, ec);
+    std::filesystem::remove_all(store_root, ec);
+    std::filesystem::remove(db_path, ec);
+    std::filesystem::remove(db_path.string() + "-wal", ec);
+    std::filesystem::remove(db_path.string() + "-shm", ec);
+}
+
+TEST(PersonaGatewayHttpAdapterTest, RejectsDocumentPathRegisterWhenTestEndpointDisabled) {
+    GatewayFixture f;
+    const auto source_path = TempPath("agent_gateway_document_register_disabled.docx");
+    const auto db_path = TempPath("agent_gateway_document_register_disabled.sqlite");
+    const auto store_root = TempPath("agent_gateway_document_register_disabled_store");
+    WriteMinimalDocx(source_path);
+    std::error_code ec;
+    std::filesystem::remove(db_path, ec);
+    std::filesystem::remove_all(store_root, ec);
+
+    storage::sqlite::SqliteConnectionPoolOptions pool_options;
+    pool_options.path = db_path.string();
+    pool_options.read_connection_count = 1;
+    pool_options.write_connection_count = 1;
+    pool_options.busy_timeout_ms = 250;
+    auto repository = std::make_shared<storage::sqlite::SqliteConnectionPool>(pool_options);
+    ASSERT_TRUE(repository->Start().ok());
+
+    auto document_service = std::make_shared<DocumentAnalysisService>(f.compute, f.io);
+    ASSERT_TRUE(document_service->SetRepository(repository).ok());
+    ASSERT_TRUE(document_service->SetFileStore(std::make_shared<DocumentFileStore>(DocumentFileStoreOptions{store_root})).ok());
+
+    PersonaGatewayHttpAdapter adapter(
+        f.gateway,
+        std::make_shared<FixedAuthenticator>(TestAuthIdentity("doc-user-001")),
+        nullptr,
+        document_service,
+        f.llm);
+    ::net::HttpServer server({.address = "127.0.0.1", .port = 0, .io_threads = 1});
+    server.SetHttpRequestHandler([&adapter](std::shared_ptr<::net::IHttpRequest> request) {
+        adapter.HandleHttp(std::move(request));
+    });
+    ASSERT_TRUE(server.Start().ok());
+
+    auto response = SendJsonRequest(
+        server.port(),
+        ::net::http::verb::post,
+        "/api/document/register",
+        Json{
+            {"traceId", "trace-document-register-disabled"},
+            {"path", PathUtf8(source_path)},
+            {"fileName", "registered-doc.docx"},
+        });
+    EXPECT_EQ(response.result(), ::net::http::status::forbidden);
+
     server.Stop();
     repository->Close();
     std::filesystem::remove(source_path, ec);
@@ -747,7 +1230,7 @@ TEST(PersonaGatewayHttpAdapterTest, RegistersManagedDocumentAndAnalyzesByDocumen
 
 TEST(PersonaGatewayHttpAdapterTest, PassesEmotionPromptsIntoSessionPromptBuilder) {
     GatewayFixture f;
-    PersonaGatewayHttpAdapter adapter(f.gateway);
+    PersonaGatewayHttpAdapter adapter(f.gateway, std::make_shared<FixedAuthenticator>(TestAuthIdentity("user-emotion-prompt")));
     ::net::HttpServer server({.address = "127.0.0.1", .port = 0, .io_threads = 1});
     server.SetHttpRequestHandler([&adapter](std::shared_ptr<::net::IHttpRequest> request) {
         adapter.HandleHttp(std::move(request));
@@ -794,9 +1277,7 @@ TEST(PersonaGatewayHttpAdapterTest, PassesEmotionPromptsIntoSessionPromptBuilder
 
 TEST(PersonaGatewayHttpAdapterTest, AuthIdentityOverridesCreateSessionUserUuid) {
     GatewayFixture f;
-    AuthIdentity identity;
-    identity.authenticated = true;
-    identity.user_uuid = "jwt-user-001";
+    auto identity = TestAuthIdentity("jwt-user-001");
     identity.tenant_id = "tenant-a";
     PersonaGatewayHttpAdapter adapter(f.gateway, std::make_shared<FixedAuthenticator>(identity));
     ::net::HttpServer server({.address = "127.0.0.1", .port = 0, .io_threads = 1});
@@ -822,6 +1303,102 @@ TEST(PersonaGatewayHttpAdapterTest, AuthIdentityOverridesCreateSessionUserUuid) 
     server.Stop();
 }
 
+TEST(PersonaGatewayHttpAdapterTest, RejectsChatWhenJwtUserDoesNotOwnSession) {
+    GatewayFixture f;
+    {
+        PersonaGatewayHttpAdapter adapter(f.gateway, std::make_shared<FixedAuthenticator>(TestAuthIdentity("owner-user")));
+        ::net::HttpServer server({.address = "127.0.0.1", .port = 0, .io_threads = 1});
+        server.SetHttpRequestHandler([&adapter](std::shared_ptr<::net::IHttpRequest> request) {
+            adapter.HandleHttp(std::move(request));
+        });
+        ASSERT_TRUE(server.Start().ok());
+        auto create = SendJsonRequest(
+            server.port(),
+            ::net::http::verb::post,
+            "/api/session/create",
+            Json{
+                {"traceId", "trace-owner-create"},
+                {"sessionId", "session-owner-bound"},
+                {"personaId", "dazhi"},
+                {"personality", {{"name", "dazhi"}, {"description", "student"}}},
+            });
+        ASSERT_EQ(create.result(), ::net::http::status::ok);
+        server.Stop();
+    }
+
+    PersonaGatewayHttpAdapter attacker_adapter(f.gateway, std::make_shared<FixedAuthenticator>(TestAuthIdentity("attacker-user")));
+    ::net::HttpServer attacker_server({.address = "127.0.0.1", .port = 0, .io_threads = 1});
+    attacker_server.SetHttpRequestHandler([&attacker_adapter](std::shared_ptr<::net::IHttpRequest> request) {
+        attacker_adapter.HandleHttp(std::move(request));
+    });
+    ASSERT_TRUE(attacker_server.Start().ok());
+
+    auto chat = SendJsonRequest(
+        attacker_server.port(),
+        ::net::http::verb::post,
+        "/api/chat/message",
+        Json{
+            {"traceId", "trace-attacker-chat"},
+            {"sessionId", "session-owner-bound"},
+            {"personaId", "dazhi"},
+            {"message", "steal expensive LLM call"},
+        });
+    EXPECT_EQ(chat.result(), ::net::http::status::forbidden);
+    EXPECT_EQ(Json::parse(chat.body())["error"]["code"], "PERMISSION_DENIED");
+    attacker_server.Stop();
+}
+
+TEST(PersonaGatewayHttpAdapterTest, RejectsSessionReadAndCloseWhenJwtUserDoesNotOwnSession) {
+    GatewayFixture f;
+    {
+        PersonaGatewayHttpAdapter adapter(f.gateway, std::make_shared<FixedAuthenticator>(TestAuthIdentity("session-owner")));
+        ::net::HttpServer server({.address = "127.0.0.1", .port = 0, .io_threads = 1});
+        server.SetHttpRequestHandler([&adapter](std::shared_ptr<::net::IHttpRequest> request) {
+            adapter.HandleHttp(std::move(request));
+        });
+        ASSERT_TRUE(server.Start().ok());
+        auto create = SendJsonRequest(
+            server.port(),
+            ::net::http::verb::post,
+            "/api/session/create",
+            Json{
+                {"traceId", "trace-session-owner-create"},
+                {"sessionId", "session-owner-read-close"},
+                {"personaId", "dazhi"},
+                {"personality", {{"name", "dazhi"}, {"description", "student"}}},
+            });
+        ASSERT_EQ(create.result(), ::net::http::status::ok);
+        server.Stop();
+    }
+
+    PersonaGatewayHttpAdapter attacker_adapter(f.gateway, std::make_shared<FixedAuthenticator>(TestAuthIdentity("session-attacker")));
+    ::net::HttpServer attacker_server({.address = "127.0.0.1", .port = 0, .io_threads = 1});
+    attacker_server.SetHttpRequestHandler([&attacker_adapter](std::shared_ptr<::net::IHttpRequest> request) {
+        attacker_adapter.HandleHttp(std::move(request));
+    });
+    ASSERT_TRUE(attacker_server.Start().ok());
+
+    auto read = SendJsonRequest(
+        attacker_server.port(),
+        ::net::http::verb::get,
+        "/api/session/session-owner-read-close",
+        Json{{"traceId", "trace-session-attacker-read"}});
+    EXPECT_EQ(read.result(), ::net::http::status::forbidden);
+    EXPECT_EQ(Json::parse(read.body())["error"]["code"], "PERMISSION_DENIED");
+
+    auto close = SendJsonRequest(
+        attacker_server.port(),
+        ::net::http::verb::post,
+        "/api/session/close",
+        Json{
+            {"traceId", "trace-session-attacker-close"},
+            {"sessionId", "session-owner-read-close"},
+        });
+    EXPECT_EQ(close.result(), ::net::http::status::forbidden);
+    EXPECT_EQ(Json::parse(close.body())["error"]["code"], "PERMISSION_DENIED");
+    attacker_server.Stop();
+}
+
 TEST(PersonaGatewayHttpAdapterTest, RejectsApiWhenAuthenticatorRejects) {
     GatewayFixture f;
     PersonaGatewayHttpAdapter adapter(f.gateway, std::make_shared<RejectingAuthenticator>());
@@ -845,6 +1422,48 @@ TEST(PersonaGatewayHttpAdapterTest, RejectsApiWhenAuthenticatorRejects) {
     auto body = Json::parse(create.body());
     EXPECT_FALSE(body["ok"].get<bool>());
     EXPECT_EQ(body["error"]["code"], "PERMISSION_DENIED");
+    server.Stop();
+}
+
+TEST(PersonaGatewayHttpAdapterTest, RejectsUnauthenticatedSessionCreateAndDocumentRequests) {
+    GatewayFixture f;
+    auto document_service = std::make_shared<DocumentAnalysisService>(f.compute, f.io);
+    AuthIdentity unauthenticated;
+    unauthenticated.authenticated = false;
+    PersonaGatewayHttpAdapter adapter(
+        f.gateway,
+        std::make_shared<FixedAuthenticator>(unauthenticated),
+        nullptr,
+        document_service,
+        f.llm);
+    ::net::HttpServer server({.address = "127.0.0.1", .port = 0, .io_threads = 1});
+    server.SetHttpRequestHandler([&adapter](std::shared_ptr<::net::IHttpRequest> request) {
+        adapter.HandleHttp(std::move(request));
+    });
+    ASSERT_TRUE(server.Start().ok());
+
+    auto create = SendJsonRequest(
+        server.port(),
+        ::net::http::verb::post,
+        "/api/session/create",
+        Json{
+            {"traceId", "trace-unauth-create"},
+            {"sessionId", "session-unauth"},
+            {"personaId", "dazhi"},
+        });
+    EXPECT_EQ(create.result(), ::net::http::status::forbidden);
+    EXPECT_EQ(Json::parse(create.body())["error"]["code"], "PERMISSION_DENIED");
+
+    auto document = SendJsonRequest(
+        server.port(),
+        ::net::http::verb::post,
+        "/api/document/analyze",
+        Json{
+            {"traceId", "trace-unauth-document"},
+            {"documentId", "doc-unauth"},
+        });
+    EXPECT_EQ(document.result(), ::net::http::status::forbidden);
+    EXPECT_EQ(Json::parse(document.body())["error"]["code"], "PERMISSION_DENIED");
     server.Stop();
 }
 
@@ -874,10 +1493,132 @@ TEST(PersonaGatewayHttpAdapterTest, HealthRouteBypassesAuthenticatorAndReportsRe
     server.Stop();
 }
 
-TEST(PersonaGatewayHttpAdapterTest, RegisterRouteBypassesAuthenticatorAndSetsCookie) {
+TEST(PersonaGatewayHttpAdapterTest, RegisterRouteRejectsWhenDevRegistrationDisabled) {
     GatewayFixture f;
     auto registration = std::make_shared<FixedAuthRegistrationService>();
     PersonaGatewayHttpAdapter adapter(f.gateway, std::make_shared<RejectingAuthenticator>(), registration);
+    ::net::HttpServer server({.address = "127.0.0.1", .port = 0, .io_threads = 1});
+    server.SetHttpRequestHandler([&adapter](std::shared_ptr<::net::IHttpRequest> request) {
+        adapter.HandleHttp(std::move(request));
+    });
+    ASSERT_TRUE(server.Start().ok());
+
+    auto response = SendJsonRequest(
+        server.port(),
+        ::net::http::verb::post,
+        "/api/auth/register",
+        Json{
+            {"traceId", "trace-register"},
+            {"userUuid", "e2e-user-001"},
+            {"tenantId", "default"},
+            {"subject", "student@example.test"},
+            {"ttlSeconds", 600},
+        });
+    EXPECT_EQ(response.result(), ::net::http::status::forbidden);
+    auto body = Json::parse(response.body());
+    EXPECT_FALSE(body["ok"].get<bool>());
+    EXPECT_EQ(body["error"]["code"], "PERMISSION_DENIED");
+    EXPECT_EQ(registration->last_request.ttl.count(), 0);
+    server.Stop();
+}
+
+TEST(PersonaGatewayHttpAdapterTest, SignupRouteIssuesGeneratedIdentityAndIgnoresClientClaims) {
+    GatewayFixture f;
+    auto registration = std::make_shared<FixedAuthRegistrationService>();
+    PersonaGatewayHttpAdapter adapter(f.gateway, std::make_shared<RejectingAuthenticator>(), registration);
+    ::net::HttpServer server({.address = "127.0.0.1", .port = 0, .io_threads = 1});
+    server.SetHttpRequestHandler([&adapter](std::shared_ptr<::net::IHttpRequest> request) {
+        adapter.HandleHttp(std::move(request));
+    });
+    ASSERT_TRUE(server.Start().ok());
+
+    auto response = SendJsonRequest(
+        server.port(),
+        ::net::http::verb::post,
+        "/api/auth/signup",
+        Json{
+            {"traceId", "trace-signup"},
+            {"userUuid", "attacker-user"},
+            {"tenantId", "admin-tenant"},
+            {"subject", "should-not-be-used"},
+            {"username", "student@example.test"},
+            {"password", "correct-password"},
+            {"ttlSeconds", 600},
+        });
+    EXPECT_EQ(response.result(), ::net::http::status::ok);
+    EXPECT_NE(std::string(response[::net::http::field::set_cookie]).find("agent_auth=jwt-token"), std::string::npos);
+    auto body = Json::parse(response.body());
+    EXPECT_TRUE(body["ok"].get<bool>());
+    EXPECT_EQ(body["data"]["authenticated"], true);
+    EXPECT_EQ(body["data"]["userUuid"], "generated-user-001");
+    EXPECT_EQ(body["data"]["tenantId"], "default");
+    EXPECT_EQ(body["data"]["subject"], "generated-user-001");
+    EXPECT_EQ(body["data"]["token"], "jwt-token");
+    EXPECT_EQ(registration->last_request.username, "student@example.test");
+    EXPECT_EQ(registration->last_request.password, "correct-password");
+    EXPECT_TRUE(registration->last_request.user_uuid.empty());
+    EXPECT_EQ(registration->last_request.tenant_id, "default");
+    EXPECT_TRUE(registration->last_request.subject.empty());
+    EXPECT_EQ(registration->last_request.ttl.count(), 600);
+    server.Stop();
+}
+
+TEST(PersonaGatewayHttpAdapterTest, LoginRouteChecksPasswordAndSetsCookie) {
+    GatewayFixture f;
+    auto registration = std::make_shared<FixedAuthRegistrationService>();
+    PersonaGatewayHttpAdapter adapter(f.gateway, std::make_shared<RejectingAuthenticator>(), registration);
+    ::net::HttpServer server({.address = "127.0.0.1", .port = 0, .io_threads = 1});
+    server.SetHttpRequestHandler([&adapter](std::shared_ptr<::net::IHttpRequest> request) {
+        adapter.HandleHttp(std::move(request));
+    });
+    ASSERT_TRUE(server.Start().ok());
+
+    auto rejected = SendJsonRequest(
+        server.port(),
+        ::net::http::verb::post,
+        "/api/auth/login",
+        Json{
+            {"traceId", "trace-login-reject"},
+            {"username", "student@example.test"},
+            {"password", "wrong-password"},
+        });
+    EXPECT_EQ(rejected.result(), ::net::http::status::forbidden);
+
+    auto accepted = SendJsonRequest(
+        server.port(),
+        ::net::http::verb::post,
+        "/api/auth/login",
+        Json{
+            {"traceId", "trace-login"},
+            {"username", "student@example.test"},
+            {"password", "correct-password"},
+            {"ttlSeconds", 600},
+        });
+    EXPECT_EQ(accepted.result(), ::net::http::status::ok);
+    EXPECT_NE(std::string(accepted[::net::http::field::set_cookie]).find("agent_auth=jwt-token"), std::string::npos);
+    auto body = Json::parse(accepted.body());
+    EXPECT_TRUE(body["ok"].get<bool>());
+    EXPECT_EQ(body["data"]["userUuid"], "generated-user-001");
+    EXPECT_EQ(registration->last_login_request.username, "student@example.test");
+    EXPECT_EQ(registration->last_login_request.password, "correct-password");
+    EXPECT_EQ(registration->last_login_request.ttl.count(), 600);
+    server.Stop();
+}
+
+TEST(PersonaGatewayHttpAdapterTest, DevRegisterRouteBypassesAuthenticatorAndSetsCookieWhenEnabled) {
+    GatewayFixture f;
+    auto registration = std::make_shared<FixedAuthRegistrationService>();
+    PersonaGatewayHttpAdapter adapter(
+        f.gateway,
+        std::make_shared<RejectingAuthenticator>(),
+        registration,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        true);
     ::net::HttpServer server({.address = "127.0.0.1", .port = 0, .io_threads = 1});
     server.SetHttpRequestHandler([&adapter](std::shared_ptr<::net::IHttpRequest> request) {
         adapter.HandleHttp(std::move(request));
@@ -943,6 +1684,73 @@ TEST(GatewayAuthSessionStoreTest, PersistsResolvesAndRevokesSessions) {
     std::filesystem::remove(path.string() + "-shm", ec);
 }
 
+TEST(GatewayAuthRegistrationServiceTest, StoresUsernameAndPasswordHashWithoutUsingSubject) {
+    const auto path = std::filesystem::temp_directory_path() / "agent_gateway_auth_registration_test.db";
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    std::filesystem::remove(path.string() + "-wal", ec);
+    std::filesystem::remove(path.string() + "-shm", ec);
+
+    auto keys = GenerateDevelopmentRsaKeyPair();
+    ASSERT_TRUE(keys.ok()) << keys.status().message();
+
+    auto store = std::make_shared<SqliteAuthSessionStore>(path.string());
+    ASSERT_TRUE(store->EnsureSchema().ok());
+
+    GatewayAuthOptions options;
+    options.enabled = true;
+    options.public_key_pem = keys.value().public_key_pem;
+    options.private_key_pem = keys.value().private_key_pem;
+    options.token_ttl = std::chrono::minutes(30);
+    JwtAuthRegistrationService service(options, store);
+
+    AuthRegistrationRequest req;
+    req.username = "student@example.test";
+    req.password = "correct-password";
+    auto registered = service.Register(req);
+    ASSERT_TRUE(registered.ok()) << registered.status().message();
+    EXPECT_EQ(registered.value().identity.tenant_id, "default");
+    EXPECT_EQ(registered.value().identity.subject, registered.value().identity.user_uuid);
+
+    auto duplicate = service.Register(req);
+    EXPECT_FALSE(duplicate.ok());
+    EXPECT_EQ(duplicate.status().code(), core::ErrorCode::AlreadyExists);
+
+    auto record = store->ResolveSession(registered.value().identity.token_id);
+    ASSERT_TRUE(record.ok()) << record.status().message();
+    EXPECT_EQ(record.value().subject, registered.value().identity.user_uuid);
+
+    auto user = store->ResolveUserByUsername("student@example.test");
+    ASSERT_TRUE(user.ok()) << user.status().message();
+    EXPECT_EQ(user.value().user_uuid, registered.value().identity.user_uuid);
+    EXPECT_EQ(user.value().username, "student@example.test");
+    EXPECT_FALSE(user.value().password_hash.empty());
+    EXPECT_NE(user.value().password_hash, "correct-password");
+    EXPECT_FALSE(user.value().password_salt.empty());
+    EXPECT_GT(user.value().password_iterations, 0);
+    EXPECT_EQ(user.value().subject, registered.value().identity.user_uuid);
+
+    AuthLoginRequest bad_login;
+    bad_login.username = "student@example.test";
+    bad_login.password = "wrong-password";
+    auto rejected = service.Login(bad_login);
+    EXPECT_FALSE(rejected.ok());
+    EXPECT_EQ(rejected.status().code(), core::ErrorCode::PermissionDenied);
+
+    AuthLoginRequest login;
+    login.username = "student@example.test";
+    login.password = "correct-password";
+    auto accepted = service.Login(login);
+    ASSERT_TRUE(accepted.ok()) << accepted.status().message();
+    EXPECT_EQ(accepted.value().identity.user_uuid, registered.value().identity.user_uuid);
+    EXPECT_EQ(accepted.value().identity.tenant_id, "default");
+    EXPECT_NE(accepted.value().identity.token_id, registered.value().identity.token_id);
+
+    std::filesystem::remove(path, ec);
+    std::filesystem::remove(path.string() + "-wal", ec);
+    std::filesystem::remove(path.string() + "-shm", ec);
+}
+
 TEST(GatewayAuthSessionStoreTest, RedisPersistsResolvesAndRevokesSessionsWhenAvailable) {
     agent::semantic_cache::RedisPoolOptions options;
     options.host = "127.0.0.1";
@@ -974,18 +1782,45 @@ TEST(GatewayAuthSessionStoreTest, RedisPersistsResolvesAndRevokesSessionsWhenAva
     EXPECT_EQ(resolved.value().tenant_id, "tenant-a");
     EXPECT_FALSE(resolved.value().revoked);
 
+    AuthUserRecord user;
+    user.user_uuid = "redis-uuid-001";
+    user.tenant_id = "tenant-a";
+    user.username = "redis-student@example.test";
+    user.password_hash = "redis-hash";
+    user.password_salt = "redis-salt";
+    user.password_iterations = 120000;
+    user.subject = "subject-001";
+    user.created_at = record.issued_at;
+    user.updated_at = record.issued_at;
+    ASSERT_TRUE(store.UpsertUser(user).ok());
+    auto duplicate_user = store.UpsertUser(user);
+    EXPECT_FALSE(duplicate_user.ok());
+    EXPECT_EQ(duplicate_user.code(), core::ErrorCode::AlreadyExists);
+    auto resolved_user = store.ResolveUserByUsername("redis-student@example.test");
+    ASSERT_TRUE(resolved_user.ok()) << resolved_user.status().message();
+    EXPECT_EQ(resolved_user.value().user_uuid, "redis-uuid-001");
+    EXPECT_EQ(resolved_user.value().password_hash, "redis-hash");
+
     ASSERT_TRUE(store.RevokeSession("redis-token-001", "logout").ok());
     auto revoked = store.ResolveSession("redis-token-001");
     ASSERT_TRUE(revoked.ok()) << revoked.status().message();
     EXPECT_TRUE(revoked.value().revoked);
 
-    auto del = redis->Del({"agent:test:gateway:auth:session:redis-token-001"});
+    auto del = redis->Del({
+        "agent:test:gateway:auth:session:redis-token-001",
+        "agent:test:gateway:auth:user:redis-uuid-001",
+        "agent:test:gateway:auth:username:redis-student@example.test"});
     EXPECT_TRUE(del.ok()) << del.status().message();
     redis->Shutdown();
 }
 
 TEST(PersonaGatewayServerTest, HostsApiWebSocketAdapterAndStaticDistOnOneHttpServer) {
     const auto static_root = std::filesystem::current_path() / "persona_gateway_static_test";
+    const auto auth_db_path = TempPath("agent_gateway_server_static_auth.sqlite");
+    std::error_code cleanup_error;
+    std::filesystem::remove(auth_db_path, cleanup_error);
+    std::filesystem::remove(auth_db_path.string() + "-wal", cleanup_error);
+    std::filesystem::remove(auth_db_path.string() + "-shm", cleanup_error);
     std::filesystem::create_directories(static_root);
     {
         std::ofstream index(static_root / "index.html", std::ios::trunc);
@@ -1007,6 +1842,7 @@ TEST(PersonaGatewayServerTest, HostsApiWebSocketAdapterAndStaticDistOnOneHttpSer
     options.io_pool.queue_capacity = 64;
     options.runtime.default_model = "test-model";
     options.static_files = ::net::StaticFileOptions{.root = static_root, .index_file = "index.html", .spa_fallback = true};
+    EnableGatewayTestAuth(options, auth_db_path);
 
     PersonaGatewayServerDependencies dependencies;
     dependencies.memory_provider = memory;
@@ -1015,6 +1851,7 @@ TEST(PersonaGatewayServerTest, HostsApiWebSocketAdapterAndStaticDistOnOneHttpSer
    {
     PersonaGatewayServer server(std::move(options), std::move(dependencies));
     ASSERT_TRUE(server.Start().ok());
+    const auto auth_cookie = RegisterDevAuthCookie(server.port(), "user-server");
 
     auto create = SendJsonRequest(
         server.port(),
@@ -1026,7 +1863,8 @@ TEST(PersonaGatewayServerTest, HostsApiWebSocketAdapterAndStaticDistOnOneHttpSer
             {"userUuid", "user-server"},
             {"personaId", "dazhi"},
             {"personality", {{"name", "dazhi"}, {"description", "student"}}},
-        });
+        },
+        {{"Cookie", auth_cookie}});
     EXPECT_EQ(create.result(), ::net::http::status::ok);
     EXPECT_TRUE(Json::parse(create.body())["ok"].get<bool>());
 
@@ -1036,17 +1874,23 @@ TEST(PersonaGatewayServerTest, HostsApiWebSocketAdapterAndStaticDistOnOneHttpSer
 
     server.Stop();
    }
-    std::error_code cleanup_error;
     std::filesystem::remove_all(static_root, cleanup_error);
+    std::filesystem::remove(auth_db_path, cleanup_error);
+    std::filesystem::remove(auth_db_path.string() + "-wal", cleanup_error);
+    std::filesystem::remove(auth_db_path.string() + "-shm", cleanup_error);
 }
 
 TEST(PersonaGatewayServerTest, EnablesConfiguredDocumentStoreForRegisterAndAnalyze) {
     const auto source_path = TempPath("agent_gateway_server_document.docx");
     const auto db_path = TempPath("agent_gateway_server_document.sqlite");
+    const auto auth_db_path = TempPath("agent_gateway_server_document_auth.sqlite");
     const auto store_root = TempPath("agent_gateway_server_document_store");
     WriteMinimalDocx(source_path);
     std::error_code ec;
     std::filesystem::remove(db_path, ec);
+    std::filesystem::remove(auth_db_path, ec);
+    std::filesystem::remove(auth_db_path.string() + "-wal", ec);
+    std::filesystem::remove(auth_db_path.string() + "-shm", ec);
     std::filesystem::remove_all(store_root, ec);
 
     auto cache = std::make_shared<FakeSemanticCache>();
@@ -1069,6 +1913,8 @@ TEST(PersonaGatewayServerTest, EnablesConfiguredDocumentStoreForRegisterAndAnaly
     options.document_store.read_connection_count = 1;
     options.document_store.write_connection_count = 1;
     options.document_store.busy_timeout_ms = 250;
+    options.document_store.enable_path_register_test_endpoint = true;
+    EnableGatewayTestAuth(options, auth_db_path);
 
     PersonaGatewayServerDependencies dependencies;
     dependencies.memory_provider = memory;
@@ -1078,6 +1924,7 @@ TEST(PersonaGatewayServerTest, EnablesConfiguredDocumentStoreForRegisterAndAnaly
     {
         PersonaGatewayServer server(std::move(options), std::move(dependencies));
         ASSERT_TRUE(server.Start().ok());
+        const auto auth_cookie = RegisterDevAuthCookie(server.port(), "doc-user-001");
 
         auto registered = SendJsonRequest(
             server.port(),
@@ -1087,7 +1934,8 @@ TEST(PersonaGatewayServerTest, EnablesConfiguredDocumentStoreForRegisterAndAnaly
                 {"traceId", "trace-server-document-register"},
                 {"path", PathUtf8(source_path)},
                 {"fileName", "server-managed.docx"},
-            });
+            },
+            {{"Cookie", auth_cookie}});
         ASSERT_EQ(registered.result(), ::net::http::status::ok);
         auto registered_body = Json::parse(registered.body());
         ASSERT_TRUE(registered_body["ok"].get<bool>());
@@ -1100,7 +1948,8 @@ TEST(PersonaGatewayServerTest, EnablesConfiguredDocumentStoreForRegisterAndAnaly
             Json{
                 {"traceId", "trace-server-document-analyze"},
                 {"documentId", document_id},
-            });
+            },
+            {{"Cookie", auth_cookie}});
         ASSERT_EQ(analyzed.result(), ::net::http::status::ok);
         auto analyzed_body = Json::parse(analyzed.body());
         EXPECT_TRUE(analyzed_body["ok"].get<bool>());
@@ -1115,16 +1964,22 @@ TEST(PersonaGatewayServerTest, EnablesConfiguredDocumentStoreForRegisterAndAnaly
     std::filesystem::remove(db_path, ec);
     std::filesystem::remove(db_path.string() + "-wal", ec);
     std::filesystem::remove(db_path.string() + "-shm", ec);
+    std::filesystem::remove(auth_db_path, ec);
+    std::filesystem::remove(auth_db_path.string() + "-wal", ec);
+    std::filesystem::remove(auth_db_path.string() + "-shm", ec);
 }
 
-TEST(PersonaGatewayServerTest, UploadsDocumentOverWebSocketAndAnalyzesByDocumentId) {
-    const auto source_path = TempPath("agent_gateway_server_ws_upload.docx");
-    const auto db_path = TempPath("agent_gateway_server_ws_upload.sqlite");
-    const auto store_root = TempPath("agent_gateway_server_ws_upload_store");
-    WriteMinimalDocx(source_path);
-    const auto file_bytes = ReadBinaryFile(source_path);
+TEST(PersonaGatewayServerTest, DeletesManagedDocumentRejectedByZipVerification) {
+    const auto source_path = TempPath("agent_gateway_server_corrupt_document.docx");
+    const auto db_path = TempPath("agent_gateway_server_corrupt_document.sqlite");
+    const auto auth_db_path = TempPath("agent_gateway_server_corrupt_document_auth.sqlite");
+    const auto store_root = TempPath("agent_gateway_server_corrupt_document_store");
+    WriteCorruptDocx(source_path);
     std::error_code ec;
     std::filesystem::remove(db_path, ec);
+    std::filesystem::remove(auth_db_path, ec);
+    std::filesystem::remove(auth_db_path.string() + "-wal", ec);
+    std::filesystem::remove(auth_db_path.string() + "-shm", ec);
     std::filesystem::remove_all(store_root, ec);
 
     auto cache = std::make_shared<FakeSemanticCache>();
@@ -1147,6 +2002,8 @@ TEST(PersonaGatewayServerTest, UploadsDocumentOverWebSocketAndAnalyzesByDocument
     options.document_store.read_connection_count = 1;
     options.document_store.write_connection_count = 1;
     options.document_store.busy_timeout_ms = 250;
+    options.document_store.enable_path_register_test_endpoint = true;
+    EnableGatewayTestAuth(options, auth_db_path);
 
     PersonaGatewayServerDependencies dependencies;
     dependencies.memory_provider = memory;
@@ -1156,12 +2013,115 @@ TEST(PersonaGatewayServerTest, UploadsDocumentOverWebSocketAndAnalyzesByDocument
     {
         PersonaGatewayServer server(std::move(options), std::move(dependencies));
         ASSERT_TRUE(server.Start().ok());
+        const auto auth_cookie = RegisterDevAuthCookie(server.port(), "doc-corrupt-user-001");
+
+        auto registered = SendJsonRequest(
+            server.port(),
+            ::net::http::verb::post,
+            "/api/document/register",
+            Json{
+                {"traceId", "trace-corrupt-document-register"},
+                {"path", PathUtf8(source_path)},
+                {"fileName", "corrupt-managed.docx"},
+            },
+            {{"Cookie", auth_cookie}});
+        ASSERT_EQ(registered.result(), ::net::http::status::ok);
+        auto registered_body = Json::parse(registered.body());
+        ASSERT_TRUE(registered_body["ok"].get<bool>());
+        const auto document_id = registered_body["documentId"].get<std::string>();
+        const auto managed_path = store_root / (document_id + ".docx");
+        ASSERT_TRUE(std::filesystem::exists(managed_path));
+
+        auto analyzed = SendJsonRequest(
+            server.port(),
+            ::net::http::verb::post,
+            "/api/document/analyze",
+            Json{
+                {"traceId", "trace-corrupt-document-analyze"},
+                {"documentId", document_id},
+            },
+            {{"Cookie", auth_cookie}});
+        EXPECT_EQ(analyzed.result(), ::net::http::status::bad_request);
+        EXPECT_FALSE(std::filesystem::exists(managed_path));
+
+        auto second_analyze = SendJsonRequest(
+            server.port(),
+            ::net::http::verb::post,
+            "/api/document/analyze",
+            Json{
+                {"traceId", "trace-corrupt-document-analyze-again"},
+                {"documentId", document_id},
+            },
+            {{"Cookie", auth_cookie}});
+        EXPECT_EQ(second_analyze.result(), ::net::http::status::not_found);
+
+        server.Stop();
+    }
+
+    std::filesystem::remove(source_path, ec);
+    std::filesystem::remove_all(store_root, ec);
+    std::filesystem::remove(db_path, ec);
+    std::filesystem::remove(db_path.string() + "-wal", ec);
+    std::filesystem::remove(db_path.string() + "-shm", ec);
+    std::filesystem::remove(auth_db_path, ec);
+    std::filesystem::remove(auth_db_path.string() + "-wal", ec);
+    std::filesystem::remove(auth_db_path.string() + "-shm", ec);
+}
+
+TEST(PersonaGatewayServerTest, UploadsDocumentOverWebSocketAndAnalyzesByDocumentId) {
+    const auto source_path = TempPath("agent_gateway_server_ws_upload.docx");
+    const auto db_path = TempPath("agent_gateway_server_ws_upload.sqlite");
+    const auto auth_db_path = TempPath("agent_gateway_server_ws_upload_auth.sqlite");
+    const auto store_root = TempPath("agent_gateway_server_ws_upload_store");
+    WriteMinimalDocx(source_path);
+    const auto file_bytes = ReadBinaryFile(source_path);
+    std::error_code ec;
+    std::filesystem::remove(db_path, ec);
+    std::filesystem::remove(auth_db_path, ec);
+    std::filesystem::remove(auth_db_path.string() + "-wal", ec);
+    std::filesystem::remove(auth_db_path.string() + "-shm", ec);
+    std::filesystem::remove_all(store_root, ec);
+
+    auto cache = std::make_shared<FakeSemanticCache>();
+    auto memory = std::make_shared<SemanticMemoryContextProvider>(cache);
+    auto emotion = std::make_shared<NeutralEmotionAnalyzer>();
+    auto llm = std::make_shared<FakeLlmClient>();
+
+    PersonaGatewayServerOptions options;
+    options.http.address = "127.0.0.1";
+    options.http.port = 0;
+    options.http.io_threads = 1;
+    options.compute_pool.worker_count = 1;
+    options.compute_pool.queue_capacity = 64;
+    options.io_pool.worker_count = 1;
+    options.io_pool.queue_capacity = 64;
+    options.runtime.default_model = "test-model";
+    options.document_store.enabled = true;
+    options.document_store.root = store_root;
+    options.document_store.database_path = db_path;
+    options.document_store.read_connection_count = 1;
+    options.document_store.write_connection_count = 1;
+    options.document_store.busy_timeout_ms = 250;
+    EnableGatewayTestAuth(options, auth_db_path);
+
+    PersonaGatewayServerDependencies dependencies;
+    dependencies.memory_provider = memory;
+    dependencies.emotion_analyzer = emotion;
+    dependencies.llm_client = llm;
+
+    {
+        PersonaGatewayServer server(std::move(options), std::move(dependencies));
+        ASSERT_TRUE(server.Start().ok());
+        const auto auth_cookie = RegisterDevAuthCookie(server.port(), "ws-doc-user-001");
 
         asio::io_context io;
         tcp::resolver resolver(io);
         beast::websocket::stream<tcp::socket> ws(io);
         auto endpoints = resolver.resolve("127.0.0.1", std::to_string(server.port()));
         asio::connect(ws.next_layer(), endpoints);
+        ws.set_option(beast::websocket::stream_base::decorator([&auth_cookie](beast::websocket::request_type& req) {
+            req.set(::net::http::field::cookie, auth_cookie);
+        }));
         ws.handshake("127.0.0.1", "/ws/session");
         ws.text(true);
 
@@ -1219,7 +2179,8 @@ TEST(PersonaGatewayServerTest, UploadsDocumentOverWebSocketAndAnalyzesByDocument
             Json{
                 {"traceId", "trace-ws-upload-analyze"},
                 {"documentId", document_id},
-            });
+            },
+            {{"Cookie", auth_cookie}});
         ASSERT_EQ(analyzed.result(), ::net::http::status::ok);
         auto analyzed_body = Json::parse(analyzed.body());
         EXPECT_TRUE(analyzed_body["ok"].get<bool>());
@@ -1233,16 +2194,23 @@ TEST(PersonaGatewayServerTest, UploadsDocumentOverWebSocketAndAnalyzesByDocument
     std::filesystem::remove(db_path, ec);
     std::filesystem::remove(db_path.string() + "-wal", ec);
     std::filesystem::remove(db_path.string() + "-shm", ec);
+    std::filesystem::remove(auth_db_path, ec);
+    std::filesystem::remove(auth_db_path.string() + "-wal", ec);
+    std::filesystem::remove(auth_db_path.string() + "-shm", ec);
 }
 
 TEST(PersonaGatewayServerTest, UploadsBinaryDocumentOverWebSocketAndAnalyzesByDocumentId) {
     const auto source_path = TempPath("agent_gateway_server_ws_binary_upload.docx");
     const auto db_path = TempPath("agent_gateway_server_ws_binary_upload.sqlite");
+    const auto auth_db_path = TempPath("agent_gateway_server_ws_binary_upload_auth.sqlite");
     const auto store_root = TempPath("agent_gateway_server_ws_binary_upload_store");
     WriteMinimalDocx(source_path);
     const auto file_bytes = ReadBinaryFile(source_path);
     std::error_code ec;
     std::filesystem::remove(db_path, ec);
+    std::filesystem::remove(auth_db_path, ec);
+    std::filesystem::remove(auth_db_path.string() + "-wal", ec);
+    std::filesystem::remove(auth_db_path.string() + "-shm", ec);
     std::filesystem::remove_all(store_root, ec);
 
     auto cache = std::make_shared<FakeSemanticCache>();
@@ -1266,6 +2234,7 @@ TEST(PersonaGatewayServerTest, UploadsBinaryDocumentOverWebSocketAndAnalyzesByDo
     options.document_store.read_connection_count = 1;
     options.document_store.write_connection_count = 1;
     options.document_store.busy_timeout_ms = 250;
+    EnableGatewayTestAuth(options, auth_db_path);
 
     PersonaGatewayServerDependencies dependencies;
     dependencies.memory_provider = memory;
@@ -1275,12 +2244,16 @@ TEST(PersonaGatewayServerTest, UploadsBinaryDocumentOverWebSocketAndAnalyzesByDo
     {
         PersonaGatewayServer server(std::move(options), std::move(dependencies));
         ASSERT_TRUE(server.Start().ok());
+        const auto auth_cookie = RegisterDevAuthCookie(server.port(), "ws-binary-doc-user-001");
 
         asio::io_context io;
         tcp::resolver resolver(io);
         beast::websocket::stream<tcp::socket> ws(io);
         auto endpoints = resolver.resolve("127.0.0.1", std::to_string(server.port()));
         asio::connect(ws.next_layer(), endpoints);
+        ws.set_option(beast::websocket::stream_base::decorator([&auth_cookie](beast::websocket::request_type& req) {
+            req.set(::net::http::field::cookie, auth_cookie);
+        }));
         ws.handshake("127.0.0.1", "/ws/session");
 
         auto read_json = [&]() {
@@ -1337,7 +2310,8 @@ TEST(PersonaGatewayServerTest, UploadsBinaryDocumentOverWebSocketAndAnalyzesByDo
             Json{
                 {"traceId", "trace-ws-binary-analyze"},
                 {"documentId", document_id},
-            });
+            },
+            {{"Cookie", auth_cookie}});
         ASSERT_EQ(analyzed.result(), ::net::http::status::ok);
         auto analyzed_body = Json::parse(analyzed.body());
         EXPECT_TRUE(analyzed_body["ok"].get<bool>());
@@ -1351,6 +2325,117 @@ TEST(PersonaGatewayServerTest, UploadsBinaryDocumentOverWebSocketAndAnalyzesByDo
     std::filesystem::remove(db_path, ec);
     std::filesystem::remove(db_path.string() + "-wal", ec);
     std::filesystem::remove(db_path.string() + "-shm", ec);
+    std::filesystem::remove(auth_db_path, ec);
+    std::filesystem::remove(auth_db_path.string() + "-wal", ec);
+    std::filesystem::remove(auth_db_path.string() + "-shm", ec);
+}
+
+TEST(PersonaGatewayServerTest, CleansUnfinishedBinaryDocumentUploadWhenWebSocketCloses) {
+    const auto source_path = TempPath("agent_gateway_server_ws_binary_upload_cleanup.docx");
+    const auto db_path = TempPath("agent_gateway_server_ws_binary_upload_cleanup.sqlite");
+    const auto auth_db_path = TempPath("agent_gateway_server_ws_binary_upload_cleanup_auth.sqlite");
+    const auto store_root = TempPath("agent_gateway_server_ws_binary_upload_cleanup_store");
+    WriteMinimalDocx(source_path);
+    const auto file_bytes = ReadBinaryFile(source_path);
+    std::error_code ec;
+    std::filesystem::remove(db_path, ec);
+    std::filesystem::remove(auth_db_path, ec);
+    std::filesystem::remove(auth_db_path.string() + "-wal", ec);
+    std::filesystem::remove(auth_db_path.string() + "-shm", ec);
+    std::filesystem::remove_all(store_root, ec);
+
+    auto cache = std::make_shared<FakeSemanticCache>();
+    auto memory = std::make_shared<SemanticMemoryContextProvider>(cache);
+    auto emotion = std::make_shared<NeutralEmotionAnalyzer>();
+    auto llm = std::make_shared<FakeLlmClient>();
+
+    PersonaGatewayServerOptions options;
+    options.http.address = "127.0.0.1";
+    options.http.port = 0;
+    options.http.io_threads = 1;
+    options.websocket_path = "/ws/session";
+    options.compute_pool.worker_count = 1;
+    options.compute_pool.queue_capacity = 64;
+    options.io_pool.worker_count = 1;
+    options.io_pool.queue_capacity = 64;
+    options.runtime.default_model = "test-model";
+    options.document_store.enabled = true;
+    options.document_store.root = store_root;
+    options.document_store.database_path = db_path;
+    options.document_store.read_connection_count = 1;
+    options.document_store.write_connection_count = 1;
+    options.document_store.busy_timeout_ms = 250;
+    EnableGatewayTestAuth(options, auth_db_path);
+
+    PersonaGatewayServerDependencies dependencies;
+    dependencies.memory_provider = memory;
+    dependencies.emotion_analyzer = emotion;
+    dependencies.llm_client = llm;
+
+    {
+        PersonaGatewayServer server(std::move(options), std::move(dependencies));
+        ASSERT_TRUE(server.Start().ok());
+        const auto auth_cookie = RegisterDevAuthCookie(server.port(), "ws-binary-cleanup-user-001");
+
+        asio::io_context io;
+        tcp::resolver resolver(io);
+        beast::websocket::stream<tcp::socket> ws(io);
+        auto endpoints = resolver.resolve("127.0.0.1", std::to_string(server.port()));
+        asio::connect(ws.next_layer(), endpoints);
+        ws.set_option(beast::websocket::stream_base::decorator([&auth_cookie](beast::websocket::request_type& req) {
+            req.set(::net::http::field::cookie, auth_cookie);
+        }));
+        ws.handshake("127.0.0.1", "/ws/session");
+
+        auto read_json = [&]() {
+            beast::flat_buffer buffer;
+            ws.read(buffer);
+            EXPECT_TRUE(ws.got_text());
+            return Json::parse(beast::buffers_to_string(buffer.data()));
+        };
+
+        ws.text(true);
+        ws.write(asio::buffer(Json{
+                {"type", "document.upload.start"},
+                {"traceId", "trace-ws-binary-cleanup-start"},
+                {"payload", {
+                    {"fileName", "ws-binary-cleanup.docx"},
+                    {"totalBytes", file_bytes.size()},
+                    {"mode", "binary"},
+                }},
+        }.dump()));
+        auto started = read_json();
+        ASSERT_EQ(started["type"], "document.upload.started");
+        const auto upload_id = started["payload"]["uploadId"].get<std::string>();
+        const auto temp_path = UploadTempPathForTest(upload_id);
+
+        ws.binary(true);
+        ws.write(asio::buffer(file_bytes));
+        auto ack = read_json();
+        ASSERT_EQ(ack["type"], "document.upload.chunk_ack");
+        ASSERT_TRUE(std::filesystem::exists(temp_path));
+
+        beast::error_code ws_ec;
+        auto& socket = beast::get_lowest_layer(ws);
+        socket.shutdown(tcp::socket::shutdown_both, ws_ec);
+        socket.close(ws_ec);
+
+        for (int attempt = 0; attempt < 20 && std::filesystem::exists(temp_path); ++attempt) {
+            std::this_thread::sleep_for(10ms);
+        }
+        EXPECT_FALSE(std::filesystem::exists(temp_path));
+
+        server.Stop();
+    }
+
+    std::filesystem::remove(source_path, ec);
+    std::filesystem::remove(db_path, ec);
+    std::filesystem::remove(db_path.string() + "-wal", ec);
+    std::filesystem::remove(db_path.string() + "-shm", ec);
+    std::filesystem::remove(auth_db_path, ec);
+    std::filesystem::remove(auth_db_path.string() + "-wal", ec);
+    std::filesystem::remove(auth_db_path.string() + "-shm", ec);
+    std::filesystem::remove_all(store_root, ec);
 }
 
 } // namespace

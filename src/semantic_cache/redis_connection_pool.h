@@ -58,6 +58,11 @@ public:
     /// SET key value [EX seconds]. Returns OK status.
     core::Status Set(const std::string& key, const std::string& value, std::chrono::seconds ttl = std::chrono::seconds::zero());
 
+    /// SET key value NX [EX seconds]. Returns true when the key was created.
+    core::Result<bool> SetIfAbsent(const std::string& key,
+                                   const std::string& value,
+                                   std::chrono::seconds ttl = std::chrono::seconds::zero());
+
     /// GET key. Returns value or NotFound if key doesn't exist.
     core::Result<std::string> Get(const std::string& key);
 

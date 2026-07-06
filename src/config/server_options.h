@@ -153,8 +153,12 @@ struct L0MemoryConfigOptions {
     std::filesystem::path sqlite_path = "../data/persona_gateway_e2e/l0_memory.db";
     std::size_t max_cached_records = 1000;
     std::size_t top_k = 5;
+    std::size_t candidate_multiplier = 4;
     std::size_t neighbors_per_hit = 1;
     float similarity_floor = 0.78f;
+    int64_t warm_window_seconds = 3600;
+    int64_t half_life_seconds = 172800;
+    int64_t max_age_seconds = 604800;
     std::string user_uuid = "e2e-l0";
 };
 
@@ -222,6 +226,7 @@ struct GatewayAuthConfigOptions {
     std::string cookie_same_site = "Lax";
     bool require_session_record = false;
     bool auto_provision_session = true;
+    bool enable_dev_registration = false;
     std::string session_store_backend = "sqlite";
     std::string session_database_path;
     std::string redis_host = "127.0.0.1";
@@ -254,6 +259,8 @@ struct GatewayDocumentStoreConfigOptions {
     int busy_timeout_ms = 5000;
     int retention_hours = 24 * 7;
     int cleanup_interval_seconds = 60;
+    bool enable_path_register_test_endpoint = false;
+    bool enable_path_analyze_test_endpoint = false;
 };
 
 struct PersonaGatewayConfigOptions {
@@ -299,6 +306,7 @@ GatewayAuthOptionsT ToGatewayAuthOptions(const GatewayAuthConfigOptions& config)
     options.cookie_same_site = config.cookie_same_site;
     options.require_session_record = config.require_session_record;
     options.auto_provision_session = config.auto_provision_session;
+    options.enable_dev_registration = config.enable_dev_registration;
     options.session_store_backend = config.session_store_backend;
     options.session_database_path = config.session_database_path;
     options.redis_host = config.redis_host;
@@ -378,5 +386,9 @@ PersonaGatewayServerOptionsT ToPersonaGatewayServerOptions(const MultimodalServe
     options.document_store.busy_timeout_ms = config.persona_gateway.document_store.busy_timeout_ms;
     options.document_store.retention_hours = config.persona_gateway.document_store.retention_hours;
     options.document_store.cleanup_interval_seconds = config.persona_gateway.document_store.cleanup_interval_seconds;
+    options.document_store.enable_path_register_test_endpoint =
+        config.persona_gateway.document_store.enable_path_register_test_endpoint;
+    options.document_store.enable_path_analyze_test_endpoint =
+        config.persona_gateway.document_store.enable_path_analyze_test_endpoint;
     return options;
 }

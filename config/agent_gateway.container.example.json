@@ -122,8 +122,12 @@
     "sqlite_path": "/app/data/agent_gateway/l0_memory.db",
     "max_cached_records": 1000,
     "top_k": 5,
+    "candidate_multiplier": 4,
     "neighbors_per_hit": 1,
     "similarity_floor": 0.78,
+    "warm_window_seconds": 3600,
+    "half_life_seconds": 172800,
+    "max_age_seconds": 604800,
     "user_uuid": "gateway-l0"
   },
   "document_store": {

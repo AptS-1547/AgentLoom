@@ -818,6 +818,7 @@ TEST(HttpServerRuntimeTest, ReportsOversizedWebSocketMessageWithoutClosingConnec
         if (!close_recorded.exchange(true)) {
             EXPECT_NE(close_info.reason, net::ConnectionCloseReason::BackpressureLimit);
             EXPECT_GT(close_info.connection_id, 0u);
+            EXPECT_EQ(close_info.target, "/ws");
         }
     });
 

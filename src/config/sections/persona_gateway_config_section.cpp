@@ -16,6 +16,8 @@ DECLARE_CONFIG_SECTION(PersonaGatewayConfigSection, "persona_gateway")
     CONFIG_CLI_STRING(kDocumentStoreDb, "--gateway-document-store-db");
     CONFIG_CLI_STRING(kDocumentStoreRetentionHours, "--gateway-document-store-retention-hours");
     CONFIG_CLI_STRING(kDocumentStoreCleanupSeconds, "--gateway-document-store-cleanup-seconds");
+    CONFIG_CLI_STRING(kDocumentStoreEnablePathRegisterTest, "--gateway-document-store-enable-path-register-test");
+    CONFIG_CLI_STRING(kDocumentStoreEnablePathAnalyzeTest, "--gateway-document-store-enable-path-analyze-test");
     CONFIG_CLI_STRING(kComputeWorkers, "--gateway-compute-workers");
     CONFIG_CLI_STRING(kComputeQueue, "--gateway-compute-queue");
     CONFIG_CLI_STRING(kIoWorkers, "--gateway-io-workers");
@@ -91,6 +93,14 @@ void PersonaGatewayConfigSection::LoadJson(const Json& root, MultimodalServerOpt
         SetInt(*document_store, "document_store", "busy_timeout_ms", options.persona_gateway.document_store.busy_timeout_ms, 1, 60000);
         SetInt(*document_store, "document_store", "retention_hours", options.persona_gateway.document_store.retention_hours, 1, 24 * 365);
         SetInt(*document_store, "document_store", "cleanup_interval_seconds", options.persona_gateway.document_store.cleanup_interval_seconds, 1, 24 * 3600);
+        SetBool(*document_store,
+                "document_store",
+                "enable_path_register_test_endpoint",
+                options.persona_gateway.document_store.enable_path_register_test_endpoint);
+        SetBool(*document_store,
+                "document_store",
+                "enable_path_analyze_test_endpoint",
+                options.persona_gateway.document_store.enable_path_analyze_test_endpoint);
     }
     LoadThreadPoolJson(*section, Name(), "compute_pool", options.persona_gateway.compute_pool);
     LoadThreadPoolJson(*section, Name(), "io_pool", options.persona_gateway.io_pool);
@@ -137,6 +147,14 @@ bool PersonaGatewayConfigSection::LoadCli(CliCursor& cursor, MultimodalServerOpt
     CONFIG_VALUE_ARG(kDocumentStoreCleanupSeconds, value, {
         options.persona_gateway.document_store.enabled = true;
         options.persona_gateway.document_store.cleanup_interval_seconds = ParsePositiveOption(kDocumentStoreCleanupSeconds, *value);
+    })
+    CONFIG_FLAG_ARG(kDocumentStoreEnablePathRegisterTest, {
+        options.persona_gateway.document_store.enabled = true;
+        options.persona_gateway.document_store.enable_path_register_test_endpoint = true;
+    })
+    CONFIG_FLAG_ARG(kDocumentStoreEnablePathAnalyzeTest, {
+        options.persona_gateway.document_store.enabled = true;
+        options.persona_gateway.document_store.enable_path_analyze_test_endpoint = true;
     })
     CONFIG_VALUE_ARG(kComputeWorkers, value, options.persona_gateway.compute_pool.worker_count = ParseNonNegativeOption(kComputeWorkers, *value);)
     CONFIG_VALUE_ARG(kComputeQueue, value, options.persona_gateway.compute_pool.queue_capacity = ParseNonNegativeOption(kComputeQueue, *value);)

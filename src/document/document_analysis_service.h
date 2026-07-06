@@ -21,6 +21,7 @@ struct DocumentAnalyzeRequest {
     std::string file_name;
     std::string trace_id;
     std::string document_id;
+    std::string authenticated_user_uuid;
     DocumentAnalysisOptions options;
     std::shared_ptr<llm::ILlmClient> llm_client;
     std::shared_ptr<IDocumentEmbeddingProvider> embedding_provider;
@@ -68,6 +69,9 @@ private:
         std::string document_id;
         std::int64_t last_accessed_at_ms = 0;
     };
+
+    core::Status RemoveDocumentAccess(const std::string& document_id);
+    core::Status DeleteManagedDocument(const std::string& document_id, const std::string& storage_path);
 
     core::ThreadPool& compute_pool_;
     core::ThreadPool& io_pool_;

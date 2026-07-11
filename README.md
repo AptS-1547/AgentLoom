@@ -2,6 +2,8 @@
 
 > 可组合的 C++20 Agent Runtime、网关与推理基础设施
 
+中文 | [English](README_EN.md)
+
 [![C++20](https://img.shields.io/badge/C%2B%2B-20-blue.svg)](https://isocpp.org/)
 [![CMake](https://img.shields.io/badge/CMake-3.20+-green.svg)](https://cmake.org/)
 [![Tests](https://img.shields.io/badge/tests-70%2B%20passing-brightgreen.svg)](#测试覆盖)
@@ -273,7 +275,7 @@ top < accept_confidence || top1 - top2 < ambiguity_margin
 
 ## 📚 文档索引
 
-完整分类、文档状态和推荐阅读顺序见 [AgentLoom Documentation](docs/README.md)。
+完整目录见 [docs/README.md](docs/README.md)。
 
 常用入口：
 
@@ -281,10 +283,7 @@ top < accept_confidence || top1 - top2 < ambiguity_margin
 - [配置系统](docs/CONFIG_SYSTEM.md)
 - [部署指南](docs/DEPLOYMENT.md)
 - [Frontend/Backend API](docs/FRONTEND_BACKEND_API_PROTOCOL.md)
-- [Skill Session Protocol](docs/SKILL_SESSION_PROTOCOL.md)
-- [多模态感知分层](docs/MULTIMODAL_PERCEPTION_LAYERS.md)
 - [扩展 AgentLoom](docs/EXTENDING_AGENTLOOM.md)
-- [安全工程准则](docs/SECURITY_ENGINEERING_STANDARD.md)
 
 ---
 

@@ -1,5 +1,7 @@
 # Frontend Refactor and E2E Plan
 
+> Document status: historical migration plan. Current routes and payloads are documented in `FRONTEND_BACKEND_API_PROTOCOL.md`.
+
 ## 1. Purpose
 
 This document defines the frontend refactor direction for the competition E2E phase.

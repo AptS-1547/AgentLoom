@@ -1,6 +1,7 @@
 #include "webrtc_media_pipeline.h"
 
 #include <gst/app/gstappsink.h>
+#include <gst/video/video-info.h>
 
 #include <cstring>
 #include <string_view>
@@ -151,6 +152,11 @@ VideoPixelFormat ParsePixelFormat(const GstStructure* structure) {
 } // namespace
 
 core::Result<std::shared_ptr<WebRtcMediaPipeline>> WebRtcMediaPipeline::Create(WebRtcMediaPipelineOptions options) {
+    if (static_cast<bool>(options.frame_encoder) != static_cast<bool>(options.encoded_frame_sink)) {
+        return core::Status::Error(
+            core::ErrorCode::InvalidArgument,
+            "frame_encoder and encoded_frame_sink must be configured together");
+    }
     auto init_status = GstInitializer::EnsureInitialized();
     if (!init_status.ok()) {
         return init_status;
@@ -388,6 +394,12 @@ core::Status WebRtcMediaPipeline::HandleSample(GstSample* sample) {
     frame.frame_id = ++frame_id_;
     frame.width = static_cast<std::uint32_t>(width > 0 ? width : 0);
     frame.height = static_cast<std::uint32_t>(height > 0 ? height : 0);
+    GstVideoInfo video_info;
+    gst_video_info_init(&video_info);
+    if (gst_video_info_from_caps(&video_info, caps)) {
+        const auto stride = GST_VIDEO_INFO_PLANE_STRIDE(&video_info, 0);
+        frame.row_stride_bytes = stride > 0 ? static_cast<std::size_t>(stride) : 0;
+    }
     frame.format = ParsePixelFormat(structure);
     frame.buffer = std::move(frame_buffer).value();
     frame.bytes = frame.buffer->bytes();
@@ -405,8 +417,11 @@ void WebRtcMediaPipeline::SubmitFrame(VideoFrameView frame) {
 
     auto sampler = options_.frame_sampler;
     auto event_sink = options_.vision_event_sink;
+    auto encoder = options_.frame_encoder;
+    auto encoded_sink = options_.encoded_frame_sink;
+    auto io_pool = options_.io_pool;
     auto status = options_.compute_pool->Submit(
-        [sampler, event_sink, frame = std::move(frame)]() mutable -> core::Status {
+        [sampler, event_sink, encoder, encoded_sink, io_pool, frame = std::move(frame)]() mutable -> core::Status {
             if (frame.buffer) {
                 frame.bytes = frame.buffer->bytes();
             }
@@ -426,7 +441,25 @@ void WebRtcMediaPipeline::SubmitFrame(VideoFrameView frame) {
                 event.metrics["saliency_score"] = decision.value().saliency_score;
                 event.metrics["width"] = static_cast<double>(frame.width);
                 event.metrics["height"] = static_cast<double>(frame.height);
-                static_cast<void>(event_sink->Publish(std::move(event)));
+                const auto event_status = event_sink->Publish(std::move(event));
+                if (!event_status.ok()) {
+                    return event_status;
+                }
+            }
+            if (decision.value().submit_to_vlm && encoder && encoded_sink) {
+                auto encoded = encoder->Encode(frame, decision.value().saliency_score);
+                if (!encoded.ok()) {
+                    return encoded.status();
+                }
+                if (!io_pool) {
+                    return encoded_sink->Publish(std::move(encoded).value());
+                }
+                return io_pool->Submit(
+                    [encoded_sink, encoded_frame = std::move(encoded).value()]() mutable -> core::Status {
+                        return encoded_sink->Publish(std::move(encoded_frame));
+                    },
+                    {},
+                    "vision-frame-ipc-publish");
             }
             return core::Status::Ok();
         },

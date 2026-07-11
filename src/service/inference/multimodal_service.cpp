@@ -3,6 +3,7 @@
 #include "llama_runner.h"
 #include "onnx_model.h"
 #include "onnx_session_utils.h"
+#include "redis_connection_pool.h"
 #include "vector_cache.h"
 #include "vlm_cache.h"
 #include "../../core/logger_adapter.h"
@@ -10,14 +11,18 @@
 #include <algorithm>
 #include <chrono>
 #include <cctype>
+#include <cstring>
+#include <deque>
 #include <filesystem>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -85,6 +90,161 @@ double BytesToMiB(std::size_t bytes) {
     return static_cast<double>(bytes) / (1024.0 * 1024.0);
 }
 
+class MemoryPromptKvCache final : public llm::IPromptKvCache {
+public:
+    explicit MemoryPromptKvCache(std::size_t max_bytes)
+        : max_bytes_(max_bytes) {}
+
+    std::optional<llm::PromptKvCacheEntry> Load(const std::string& key) override {
+        std::lock_guard lock(mutex_);
+        auto it = entries_.find(key);
+        if (it == entries_.end()) {
+            return std::nullopt;
+        }
+        return it->second;
+    }
+
+    void Store(const std::string& key, const llm::PromptKvCacheEntry& entry) override {
+        if (key.empty() || entry.state.empty() || entry.prefix_tokens <= 0) {
+            return;
+        }
+        const auto entry_bytes = entry.state.size();
+        if (max_bytes_ > 0 && entry_bytes > max_bytes_) {
+            spdlog::warn("[PromptKvCache] skip oversized memory state: key={} bytes={} max_bytes={}",
+                         key, entry_bytes, max_bytes_);
+            return;
+        }
+
+        std::lock_guard lock(mutex_);
+        if (auto existing = entries_.find(key); existing != entries_.end()) {
+            current_bytes_ -= existing->second.state.size();
+            existing->second = entry;
+            current_bytes_ += entry_bytes;
+        } else {
+            entries_.emplace(key, entry);
+            order_.push_back(key);
+            current_bytes_ += entry_bytes;
+        }
+        EvictIfNeeded();
+    }
+
+private:
+    void EvictIfNeeded() {
+        if (max_bytes_ == 0) {
+            return;
+        }
+        while (current_bytes_ > max_bytes_ && !order_.empty()) {
+            auto key = std::move(order_.front());
+            order_.pop_front();
+            auto it = entries_.find(key);
+            if (it == entries_.end()) {
+                continue;
+            }
+            current_bytes_ -= it->second.state.size();
+            entries_.erase(it);
+        }
+    }
+
+    std::mutex mutex_;
+    std::unordered_map<std::string, llm::PromptKvCacheEntry> entries_;
+    std::deque<std::string> order_;
+    std::size_t current_bytes_ = 0;
+    std::size_t max_bytes_ = 0;
+};
+
+class RedisPromptKvCache final : public llm::IPromptKvCache {
+public:
+    RedisPromptKvCache(std::shared_ptr<agent::semantic_cache::RedisConnectionPool> redis,
+                       std::string key_prefix,
+                       std::chrono::seconds ttl,
+                       std::size_t max_bytes)
+        : redis_(std::move(redis)),
+          key_prefix_(std::move(key_prefix)),
+          ttl_(ttl),
+          max_bytes_(max_bytes) {}
+
+    std::optional<llm::PromptKvCacheEntry> Load(const std::string& key) override {
+        if (!redis_ || !redis_->running()) {
+            return std::nullopt;
+        }
+        auto value = redis_->Get(Key(key));
+        if (!value.ok()) {
+            return std::nullopt;
+        }
+        return Decode(value.value());
+    }
+
+    void Store(const std::string& key, const llm::PromptKvCacheEntry& entry) override {
+        if (!redis_ || !redis_->running() || entry.state.empty() || entry.prefix_tokens <= 0) {
+            return;
+        }
+        auto payload = Encode(entry);
+        if (payload.size() > max_bytes_) {
+            spdlog::warn("[PromptKvCache] skip oversized state: key={} bytes={} max_bytes={}",
+                         key, payload.size(), max_bytes_);
+            return;
+        }
+        auto status = redis_->Set(Key(key), payload, ttl_);
+        if (!status.ok()) {
+            spdlog::warn("[PromptKvCache] redis store failed: key={} error={}", key, status.message());
+        }
+    }
+
+private:
+    static constexpr std::string_view kMagic = "VLMKV1";
+
+    std::string Key(const std::string& key) const {
+        return key_prefix_ + ":" + key;
+    }
+
+    static void AppendU32(std::string& out, std::uint32_t value) {
+        for (int i = 0; i < 4; ++i) {
+            out.push_back(static_cast<char>((value >> (i * 8)) & 0xff));
+        }
+    }
+
+    static std::uint32_t ReadU32(const std::string& value, std::size_t offset) {
+        std::uint32_t result = 0;
+        for (int i = 0; i < 4; ++i) {
+            result |= static_cast<std::uint32_t>(
+                static_cast<unsigned char>(value[offset + i])) << (i * 8);
+        }
+        return result;
+    }
+
+    static std::string Encode(const llm::PromptKvCacheEntry& entry) {
+        std::string out;
+        out.reserve(kMagic.size() + 8 + entry.state.size());
+        out.append(kMagic);
+        AppendU32(out, static_cast<std::uint32_t>(entry.prefix_tokens));
+        AppendU32(out, static_cast<std::uint32_t>(entry.state.size()));
+        out.append(reinterpret_cast<const char*>(entry.state.data()), entry.state.size());
+        return out;
+    }
+
+    static std::optional<llm::PromptKvCacheEntry> Decode(const std::string& value) {
+        if (value.size() < kMagic.size() + 8 ||
+            std::string_view(value.data(), kMagic.size()) != kMagic) {
+            return std::nullopt;
+        }
+        const auto prefix_tokens = ReadU32(value, kMagic.size());
+        const auto state_size = ReadU32(value, kMagic.size() + 4);
+        if (prefix_tokens == 0 || value.size() != kMagic.size() + 8 + state_size) {
+            return std::nullopt;
+        }
+        llm::PromptKvCacheEntry entry;
+        entry.prefix_tokens = static_cast<int32_t>(prefix_tokens);
+        entry.state.resize(state_size);
+        std::memcpy(entry.state.data(), value.data() + kMagic.size() + 8, state_size);
+        return entry;
+    }
+
+    std::shared_ptr<agent::semantic_cache::RedisConnectionPool> redis_;
+    std::string key_prefix_;
+    std::chrono::seconds ttl_;
+    std::size_t max_bytes_ = 0;
+};
+
 } // namespace
 
 class MultimodalService::Impl {
@@ -95,10 +255,16 @@ public:
         : vram_options_(options.vram),
           vlm_cache_(ToVlmCacheOptions(options.vlm_cache)),
           vector_index_(ToVlmCacheVectorOptions(options.vlm_cache_vector)),
+          prompt_kv_options_(options.vlm_prompt_kv_cache),
           llm_model_path_(options.llm_model),
           mmproj_path_(options.mmproj),
           model_fingerprint_(BuildModelFingerprint(options.llm_model, options.mmproj, options.n_gpu_layers)),
-          n_gpu_layers_(options.n_gpu_layers) {
+          n_gpu_layers_(options.n_gpu_layers),
+          runner_pool_size_(options.runner_pool_size),
+          llama_threads_(options.llama_threads),
+          mmproj_threads_(options.mmproj_threads) {
+        InitializePromptKvCache();
+
         if (!options.bert_model.empty()) {
             logger.info("Loading BERT model: {}", options.bert_model);
             if (!bert_model_.LoadModel(options.bert_model, ToModelRuntimeOptions(options.bert_runtime))) {
@@ -115,6 +281,12 @@ public:
             vram_thread_ = std::jthread([this](std::stop_token stop_token) {
                 VramMonitorLoop(stop_token);
             });
+        }
+    }
+
+    ~Impl() {
+        if (prompt_kv_redis_) {
+            prompt_kv_redis_->Shutdown();
         }
     }
 
@@ -201,6 +373,7 @@ public:
 
         auto params = BuildGenerateParamsWithEmbedding(request);
         auto image_data = ExtractImageData(request);
+        ConfigurePromptKvCache(request, image_data, &params);
         auto key = BuildVLMCacheKey(image_data, request.prompt(), params);
         const bool use_cache = ShouldUseVLMCache(request);
 
@@ -236,17 +409,25 @@ public:
         last_llm_request_time_ = std::chrono::steady_clock::now();
 
         bool stream_wrote_token = false;
-        auto result = llm_runner_.Generate(
-            image_data,
-            request.prompt(),
-            params,
-            [&emit, &stream_wrote_token](const std::string& token) {
-                stream_wrote_token = true;
-                VLMToken event;
-                event.set_token(token);
-                event.set_is_final(false);
-                emit(std::move(event));
-            });
+        llm::VLMResult result;
+        {
+            auto runner = llm_runner_pool_.Acquire();
+            if (!runner) {
+                return Error(core::ErrorCode::FailedPrecondition, "LLM runner pool not loaded");
+            }
+
+            result = runner->Generate(
+                image_data,
+                request.prompt(),
+                params,
+                [&emit, &stream_wrote_token](const std::string& token) {
+                    stream_wrote_token = true;
+                    VLMToken event;
+                    event.set_token(token);
+                    event.set_is_final(false);
+                    emit(std::move(event));
+                });
+        }
 
         if (result.success) {
             StoreVLMCacheResult(request, image_data, params, key, result);
@@ -277,6 +458,7 @@ public:
     core::Status GenerateVLMSync(const VLMRequest& request, VLMResponse& response) {
         auto params = BuildGenerateParamsWithEmbedding(request);
         auto image_data = ExtractImageData(request);
+        ConfigurePromptKvCache(request, image_data, &params);
         auto key = BuildVLMCacheKey(image_data, request.prompt(), params);
         const bool use_cache = ShouldUseVLMCache(request);
 
@@ -312,7 +494,16 @@ public:
 
         last_llm_request_time_ = std::chrono::steady_clock::now();
 
-        auto result = llm_runner_.Generate(image_data, request.prompt(), params);
+        llm::VLMResult result;
+        {
+            auto runner = llm_runner_pool_.Acquire();
+            if (!runner) {
+                response.set_error("LLM runner pool not loaded");
+                return Error(core::ErrorCode::FailedPrecondition, "LLM runner pool not loaded");
+            }
+
+            result = runner->Generate(image_data, request.prompt(), params);
+        }
         FillVLMResponseFromResult(&response, result);
 
         if (result.success) {
@@ -382,6 +573,71 @@ private:
             return {};
         }
         return vlm_cache_.BuildKey(image_data, prompt, params, model_fingerprint_);
+    }
+
+    void InitializePromptKvCache() {
+        if (!prompt_kv_options_.enabled) {
+            return;
+        }
+
+        if (prompt_kv_options_.backend == "memory") {
+            prompt_kv_cache_ = std::make_shared<MemoryPromptKvCache>(prompt_kv_options_.max_bytes);
+            logger.info("[PromptKvCache] enabled: backend=memory max_mb={}",
+                        prompt_kv_options_.max_bytes / (1024 * 1024));
+            return;
+        }
+
+        agent::semantic_cache::RedisPoolOptions redis_options;
+        redis_options.host = prompt_kv_options_.redis_host;
+        redis_options.port = std::to_string(prompt_kv_options_.redis_port);
+        redis_options.password = prompt_kv_options_.redis_password;
+        redis_options.pool_size = prompt_kv_options_.redis_pool_size;
+        redis_options.command_timeout = std::chrono::milliseconds(prompt_kv_options_.redis_command_timeout_ms);
+
+        prompt_kv_redis_ = std::make_shared<agent::semantic_cache::RedisConnectionPool>(redis_options);
+        auto status = prompt_kv_redis_->Start();
+        if (!status.ok()) {
+            logger.warn("[PromptKvCache] disabled: {}", status.message());
+            prompt_kv_redis_.reset();
+            return;
+        }
+
+        prompt_kv_cache_ = std::make_shared<RedisPromptKvCache>(
+            prompt_kv_redis_,
+            prompt_kv_options_.key_prefix,
+            std::chrono::seconds(prompt_kv_options_.ttl_seconds),
+            prompt_kv_options_.max_bytes);
+        logger.info("[PromptKvCache] enabled: backend=redis redis={}:{} prefix={} ttl_seconds={} max_mb={}",
+                    prompt_kv_options_.redis_host,
+                    prompt_kv_options_.redis_port,
+                    prompt_kv_options_.key_prefix,
+                    prompt_kv_options_.ttl_seconds,
+                    prompt_kv_options_.max_bytes / (1024 * 1024));
+    }
+
+    std::string BuildPromptKvCacheKey(
+        const VLMRequest& request,
+        const std::vector<std::uint8_t>& image_data) const {
+        if (!prompt_kv_cache_ || image_data.empty() || request.session_id().empty()) {
+            return {};
+        }
+        std::ostringstream out;
+        out << "prompt-kv-v1\n"
+            << model_fingerprint_ << '\n'
+            << request.session_id() << '\n'
+            << vlm_cache::Sha256Hex(image_data.data(), image_data.size()) << '\n';
+        return vlm_cache::Sha256Hex(out.str());
+    }
+
+    void ConfigurePromptKvCache(
+        const VLMRequest& request,
+        const std::vector<std::uint8_t>& image_data,
+        llm::GenerateParams* params) const {
+        if (!params) {
+            return;
+        }
+        params->prompt_kv_cache_key = BuildPromptKvCacheKey(request, image_data);
+        params->enable_prompt_kv_cache = !params->prompt_kv_cache_key.empty();
     }
 
     std::optional<vlm_cache::Result> GetStaleVLMFallback(
@@ -534,11 +790,15 @@ private:
         if (!vector_index_.options().enabled || image_data.empty()) {
             return false;
         }
-        if (!llm_runner_.IsLoaded()) {
+        if (!llm_runner_pool_.IsLoaded()) {
             return false;
         }
 
-        auto encode_result = llm_runner_.EncodeImageOnly(image_data);
+        auto runner = llm_runner_pool_.Acquire();
+        if (!runner) {
+            return false;
+        }
+        auto encode_result = runner->EncodeImageOnly(image_data);
         if (!encode_result.success || encode_result.image_embedding.empty()) {
             logger.debug("[VectorCache] EncodeImageOnly failed: {}", encode_result.error_message);
             return false;
@@ -587,7 +847,7 @@ private:
     }
 
     std::optional<llm::DeviceMemoryInfo> LowestFreeGpuDevice() const {
-        auto snapshot = llm_runner_.GetMemorySnapshot();
+        auto snapshot = llm_runner_pool_.GetMemorySnapshot();
         std::optional<llm::DeviceMemoryInfo> lowest;
         for (const auto& device : snapshot.devices) {
             if (!device.is_gpu || device.total_bytes == 0) {
@@ -621,19 +881,21 @@ private:
 
     void UnloadLLMForVramPressure(const std::string& reason) {
         std::lock_guard lock(llm_load_mutex_);
-        if (!llm_runner_.IsLoaded()) {
+        if (!llm_runner_pool_.IsLoaded()) {
             return;
         }
 
-        auto snapshot = llm_runner_.GetMemorySnapshot();
+        auto snapshot = llm_runner_pool_.GetMemorySnapshot();
         spdlog::warn("[VramGuard] unloading LLM: reason={} model_size_mb={:.2f}",
                      reason,
                      BytesToMiB(static_cast<std::size_t>(snapshot.model_size_bytes)));
-        llm_runner_.Unload();
+        llm_runner_pool_.Unload();
 
         if (vram_options_.reload_after_unload) {
             spdlog::info("[VramGuard] reloading LLM after unload");
-            if (!llm_runner_.LoadModel(llm_model_path_, mmproj_path_, n_gpu_layers_)) {
+            if (!llm_runner_pool_.Load(llm_model_path_, mmproj_path_, n_gpu_layers_,
+                                       runner_pool_size_, llama_threads_, mmproj_threads_,
+                                       prompt_kv_cache_)) {
                 spdlog::error("[VramGuard] LLM reload failed after unload");
             } else {
                 last_llm_request_time_ = std::chrono::steady_clock::now();
@@ -682,12 +944,12 @@ private:
     }
 
     bool EnsureLLMLoaded(std::string& error_message) {
-        if (llm_runner_.IsLoaded()) {
+        if (llm_runner_pool_.IsLoaded()) {
             return true;
         }
 
         std::lock_guard lock(llm_load_mutex_);
-        if (llm_runner_.IsLoaded()) {
+        if (llm_runner_pool_.IsLoaded()) {
             return true;
         }
 
@@ -696,8 +958,13 @@ private:
             return false;
         }
 
-        spdlog::info("Lazy loading LLM model");
-        if (!llm_runner_.LoadModel(llm_model_path_, mmproj_path_, n_gpu_layers_)) {
+        spdlog::info("Lazy loading LLM model runner pool: slots={} llama_threads={} mmproj_threads={}",
+                     runner_pool_size_,
+                     llama_threads_,
+                     mmproj_threads_);
+        if (!llm_runner_pool_.Load(llm_model_path_, mmproj_path_, n_gpu_layers_,
+                                   runner_pool_size_, llama_threads_, mmproj_threads_,
+                                   prompt_kv_cache_)) {
             error_message = "Failed to load LLM";
             return false;
         }
@@ -738,28 +1005,34 @@ private:
                 std::this_thread::sleep_for(std::chrono::seconds(1));
             }
 
-            if (llm_runner_.IsLoaded()) {
+            if (llm_runner_pool_.IsLoaded()) {
                 auto now = std::chrono::steady_clock::now();
                 auto idle_time = now - last_llm_request_time_;
 
                 if (idle_time > idle_timeout) {
                     spdlog::info("LLM idle for {} minutes, unloading to free VRAM",
                                  std::chrono::duration_cast<std::chrono::minutes>(idle_time).count());
-                    llm_runner_.Unload();
+                    llm_runner_pool_.Unload();
                 }
             }
         }
     }
 
     bert::OnnxBERTModel bert_model_;
-    llm::LlamaRunner llm_runner_;
+    llm::LlamaRunnerPool llm_runner_pool_;
     VramGuardOptions vram_options_;
     vlm_cache::VLMCache vlm_cache_;
     vlm_cache::VectorIndex vector_index_;
+    VlmPromptKvCacheOptions prompt_kv_options_;
+    std::shared_ptr<agent::semantic_cache::RedisConnectionPool> prompt_kv_redis_;
+    std::shared_ptr<llm::IPromptKvCache> prompt_kv_cache_;
     std::string llm_model_path_;
     std::string mmproj_path_;
     std::string model_fingerprint_;
     int n_gpu_layers_ = -1;
+    std::size_t runner_pool_size_ = 1;
+    int llama_threads_ = 8;
+    int mmproj_threads_ = 8;
     std::mutex llm_load_mutex_;
     std::chrono::steady_clock::time_point last_llm_request_time_;
     std::jthread idle_thread_;

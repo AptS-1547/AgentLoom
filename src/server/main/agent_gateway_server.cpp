@@ -42,6 +42,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <optional>
 #include <unordered_set>
@@ -90,6 +91,58 @@ public:
         return core::Status::Ok();
     }
 };
+
+template <typename T>
+std::map<std::string, T> OrderedMap(const std::unordered_map<std::string, T>& input) {
+    return std::map<std::string, T>(input.begin(), input.end());
+}
+
+std::vector<agent::service::gateway::PersonaMetadataRecord> BuildDefaultPersonas(
+    const std::vector<GatewayPersonaConfigOptions>& configs) {
+    std::vector<agent::service::gateway::PersonaMetadataRecord> records;
+    records.reserve(configs.size());
+    for (const auto& config : configs) {
+        agent::service::gateway::PersonaMetadataRecord record;
+        record.tenant_id = "server";
+        record.user_uuid = "server";
+        record.persona_id = config.persona_id;
+        record.personality.name = config.persona_id;
+        record.personality.description = config.description;
+        record.personality.traits = config.traits;
+        record.personality.openness = config.openness;
+        record.personality.extraversion = config.extraversion;
+        record.personality.humor_tendency = config.humor_tendency;
+        record.personality.empathy_level = config.empathy_level;
+        record.personality.curiosity_level = config.curiosity_level;
+        record.personality.formality = config.formality;
+        if (config.emotion_prompts) {
+            agent::service::persona::EmotionPromptConfig prompts;
+            prompts.emotion_map = OrderedMap(config.emotion_prompts->emotion_map);
+            prompts.emotion_reliability = OrderedMap(config.emotion_prompts->emotion_reliability);
+            if (!config.emotion_prompts->confidence_thresholds.empty()) {
+                prompts.confidence_thresholds = OrderedMap(config.emotion_prompts->confidence_thresholds);
+            }
+            if (!config.emotion_prompts->intensity_levels.empty()) {
+                prompts.intensity_levels = OrderedMap(config.emotion_prompts->intensity_levels);
+            }
+            record.emotion_prompt_config = std::move(prompts);
+        }
+        record.emotion_state_config.alpha = config.emotion_state.alpha;
+        record.emotion_state_config.beta = config.emotion_state.beta;
+        record.emotion_state_config.gamma = config.emotion_state.gamma;
+        record.emotion_state_config.delta = config.emotion_state.delta;
+        record.emotion_state_config.baseline_valence = config.emotion_state.baseline_valence;
+        record.emotion_state_config.baseline_arousal = config.emotion_state.baseline_arousal;
+        record.emotion_state_config.kappa = config.emotion_state.kappa;
+        record.emotion_state_config.negativity_bias = config.emotion_state.negativity_bias;
+        record.emotion_state_config.noise_sigma = config.emotion_state.noise_sigma;
+        record.emotion_state_config.injection_threshold = config.emotion_state.injection_threshold;
+        record.emotion_state_config.save_interval_turns = config.emotion_state.save_interval_turns;
+        record.emotion_state_config.persist_to_l4 = config.emotion_state.persist_to_l4;
+        records.push_back(std::move(record));
+    }
+    return records;
+}
 
 class PlaceholderLlmClient final : public agent::llm::ILlmClient {
 public:
@@ -623,6 +676,7 @@ int main(int argc, char** argv) {
 
         auto config = ParseMultimodalOptions(argc, argv);
         auto gateway_options = ToPersonaGatewayServerOptions<agent::service::gateway::PersonaGatewayServerOptions, net::StaticFileOptions>(config);
+        gateway_options.default_personas = BuildDefaultPersonas(config.persona_gateway.personas);
         if (gateway_options.auth.enabled &&
             config.gateway_auth.generate_dev_keys &&
             (gateway_options.auth.public_key_pem.empty() || gateway_options.auth.private_key_pem.empty())) {
@@ -731,9 +785,7 @@ int main(int argc, char** argv) {
         dependencies.document_embedding_provider = std::move(document_embedding).value();
         dependencies.document_llm_chunk_cache = std::move(document_llm_chunk_cache).value();
         dependencies.document_semantic_cache = std::move(document_semantic_cache).value();
-        dependencies.l0_redis_pool = l0_bundle.redis_pool;
         dependencies.l0_memory_adapter = l0_bundle.adapter;
-        dependencies.evaluation_config_path = repo_root / "config" / "evaluation_indicators.json";
         std::shared_ptr<agent::service::persona::SkillSessionManager> skill_sessions;
         if (config.skill_session.enabled) {
             skill_sessions = std::make_shared<agent::service::persona::SkillSessionManager>(

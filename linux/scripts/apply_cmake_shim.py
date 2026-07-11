@@ -13,8 +13,8 @@ shutil.copytree(source, target, ignore=ignore)
 cmake = target / "CMakeLists.txt"
 text = cmake.read_text(encoding="utf-8")
 text = text.replace(
-    "project(MultimodalInferenceService VERSION 2.0.0 LANGUAGES CXX)",
-    "project(MultimodalInferenceService VERSION 2.0.0 LANGUAGES C CXX)",
+    "project(AgentLoom VERSION 0.1.0 LANGUAGES CXX)",
+    "project(AgentLoom VERSION 0.1.0 LANGUAGES C CXX)",
 )
 text = text.replace(
     "target_link_libraries(agent_semantic_cache PUBLIC\n"

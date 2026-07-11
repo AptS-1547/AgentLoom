@@ -19,6 +19,8 @@ namespace agent::document {
 class IDocumentEmbeddingProvider {
 public:
     virtual ~IDocumentEmbeddingProvider() = default;
+    /// @param text 待编码的 UTF-8 文本，仅在调用期间借用。
+    /// @return 维度稳定且可用于当前索引的归一化向量。
     virtual core::Result<std::vector<float>> EmbedText(std::string_view text) = 0;
 };
 
@@ -115,7 +117,9 @@ struct DocumentLlmChunkCacheKey {
 class IDocumentLlmChunkCache {
 public:
     virtual ~IDocumentLlmChunkCache() = default;
+    /// 使用 prompt/model/text 指纹查询结构化 chunk。
     virtual core::Result<ChunkTrunk> Lookup(const DocumentLlmChunkCacheKey& key) = 0;
+    /// 保存成功生成的 chunk；实现负责 TTL、容量和损坏 payload 处理。
     virtual core::Status Store(const DocumentLlmChunkCacheKey& key, const ChunkTrunk& chunk) = 0;
 };
 
@@ -140,6 +144,11 @@ nlohmann::json BuildDiagnosis(const std::vector<DocumentBlock>& blocks,
                               const nlohmann::json& mindmap,
                               const std::vector<ChunkTrunk>& chunks = {},
                               const nlohmann::json& knowledge_coverage = {});
+/// 解析并分析本地 OOXML 文档。
+/// @param path UTF-8 语义的本地文件路径；调用方负责授权和根目录约束。
+/// @param file_name 对外展示名称；为空时从 path 推导。
+/// @param options ZIP 安全限制、chunk 和可选 LLM 策略。
+/// @return mindmap、diagnosis、chunks 和元数据组成的 JSON。
 core::Result<nlohmann::json> AnalyzeDocument(const std::filesystem::path& path,
                                              std::string_view file_name = {},
                                              const DocumentAnalysisOptions& options = {},

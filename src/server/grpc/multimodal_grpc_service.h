@@ -13,7 +13,7 @@ class MultimodalGrpcService final : public multimodal_inference::MultimodalInfer
 public:
     MultimodalGrpcService(const MultimodalServerOptions& options,
                           server_common::RuntimeStats& stats,
-                          service::MultimodalService& service);
+                          service::IMultimodalService& service);
 
     grpc::Status PredictEmotion(grpc::ServerContext* context,
                                 const multimodal_inference::EmotionRequest* request,
@@ -36,11 +36,10 @@ public:
                                  multimodal_inference::VLMResponse* response) override;
 
 private:
-    grpc::Status CheckAuth(const grpc::ServerContext& context,
-                           server_common::ScopedRequestStats& request_stats) const;
+    core::Status CheckAuth(const grpc::ServerContext& context) const;
 
     server_common::RuntimeStats& stats_;
-    service::MultimodalService& service_;
+    service::IMultimodalService& service_;
     int slow_request_ms_ = 250;
     request_validation::AuthOptions auth_options_;
     request_validation::RequestLimits request_limits_;

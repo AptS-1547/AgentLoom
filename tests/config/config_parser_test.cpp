@@ -630,6 +630,29 @@ TEST(ConfigPersonaGatewaySectionTest, JsonLoadsE2EGatewayOptionsAndResolvesStati
             "session_max_recent_turns": 24,
             "runtime_recent_raw_turns": 10,
             "runtime_default_model": "e2e-model",
+            "personas": {
+                "dazhi": {
+                    "description": "default teacher persona",
+                    "traits": ["patient", "structured"],
+                    "humorTendency": 0.2,
+                    "emotionPrompts": {
+                        "emotionMap": {
+                            "neutral": "保持稳定教学节奏"
+                        },
+                        "emotionReliability": {
+                            "neutral": 1.0
+                        }
+                    }
+                },
+                "xiaozhi": {
+                    "description": "default assistant persona",
+                    "empathyLevel": 0.9,
+                    "emotionState": {
+                        "noiseSigma": 0.0,
+                        "persistToL4": false
+                    }
+                }
+            },
             "request_filter": {
                 "enabled": true,
                 "reject_control_chars": true,
@@ -667,6 +690,16 @@ TEST(ConfigPersonaGatewaySectionTest, JsonLoadsE2EGatewayOptionsAndResolvesStati
     EXPECT_EQ(opts.persona_gateway.session_max_recent_turns, 24u);
     EXPECT_EQ(opts.persona_gateway.runtime_recent_raw_turns, 10u);
     EXPECT_EQ(opts.persona_gateway.runtime_default_model, "e2e-model");
+    ASSERT_EQ(opts.persona_gateway.personas.size(), 2u);
+    EXPECT_EQ(opts.persona_gateway.personas[0].persona_id, "dazhi");
+    EXPECT_EQ(opts.persona_gateway.personas[0].description, "default teacher persona");
+    EXPECT_EQ(opts.persona_gateway.personas[0].traits.size(), 2u);
+    ASSERT_TRUE(opts.persona_gateway.personas[0].emotion_prompts.has_value());
+    EXPECT_EQ(opts.persona_gateway.personas[0].emotion_prompts->emotion_map.at("neutral"), "保持稳定教学节奏");
+    EXPECT_EQ(opts.persona_gateway.personas[1].persona_id, "xiaozhi");
+    EXPECT_EQ(opts.persona_gateway.personas[1].empathy_level, 0.9);
+    EXPECT_EQ(opts.persona_gateway.personas[1].emotion_state.noise_sigma, 0.0);
+    EXPECT_FALSE(opts.persona_gateway.personas[1].emotion_state.persist_to_l4);
     EXPECT_TRUE(opts.persona_gateway.request_filter_enabled);
 }
 

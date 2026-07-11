@@ -134,11 +134,13 @@ ScopedRequestStats::ScopedRequestStats(
     std::string method_name,
     size_t sample_count,
     bool is_batch,
-    int slow_request_ms)
+    int slow_request_ms,
+    std::string trace_id)
     : stats_(stats),
       method_name_(std::move(method_name)),
       sample_count_(sample_count),
       slow_request_ms_(slow_request_ms),
+      trace_id_(std::move(trace_id)),
       started_at_(std::chrono::steady_clock::now()) {
     stats_.BeginRequest(sample_count_, is_batch);
 }
@@ -161,8 +163,9 @@ ScopedRequestStats::~ScopedRequestStats() {
     if (slow_request_ms_ > 0 && latency_us >= static_cast<int64_t>(slow_request_ms_) * 1000) {
         if (!error_message_.empty()) {
             spdlog::warn(
-                "[ServerSlowRequest] method={} samples={} latency_ms={:.3f} success={} error={}",
+                "[ServerSlowRequest] method={} trace_id={} samples={} latency_ms={:.3f} success={} error={}",
                 method_name_,
+                trace_id_.empty() ? "-" : trace_id_,
                 sample_count_,
                 static_cast<double>(latency_us) / 1000.0,
                 success_,
@@ -170,8 +173,9 @@ ScopedRequestStats::~ScopedRequestStats() {
             );
         } else {
             spdlog::warn(
-                "[ServerSlowRequest] method={} samples={} latency_ms={:.3f} success={}",
+                "[ServerSlowRequest] method={} trace_id={} samples={} latency_ms={:.3f} success={}",
                 method_name_,
+                trace_id_.empty() ? "-" : trace_id_,
                 sample_count_,
                 static_cast<double>(latency_us) / 1000.0,
                 success_

@@ -1,7 +1,9 @@
 #include "config_section.h"
 
+#include <map>
 #include <filesystem>
 #include <stdexcept>
+#include <unordered_set>
 
 namespace server_config {
 namespace {
@@ -52,6 +54,201 @@ void LoadThreadPoolJson(const Json& section,
     }
     SetSize(*pool, field_name, "worker_count", options.worker_count, 0);
     SetSize(*pool, field_name, "queue_capacity", options.queue_capacity, 0);
+}
+
+void SetDoubleField(const Json& section,
+                    std::string_view section_name,
+                    std::string_view field_name,
+                    double& target,
+                    double min_value,
+                    double max_value) {
+    const Json* field = FindField(section, section_name, field_name);
+    if (!field) {
+        return;
+    }
+    if (!field->is_number()) {
+        throw std::runtime_error(std::string(section_name) + "." + std::string(field_name) + " must be a number");
+    }
+    const auto value = field->get<double>();
+    if (value < min_value || value > max_value) {
+        throw std::runtime_error(std::string(section_name) + "." + std::string(field_name) + " is out of range");
+    }
+    target = value;
+}
+
+std::unordered_map<std::string, double> DoubleMapFromJson(const Json& json, std::string_view label) {
+    if (!json.is_object()) {
+        throw std::runtime_error(std::string(label) + " must be an object");
+    }
+    std::unordered_map<std::string, double> out;
+    for (const auto& item : json.items()) {
+        if (!item.value().is_number()) {
+            throw std::runtime_error(std::string(label) + "." + item.key() + " must be a number");
+        }
+        out[item.key()] = item.value().get<double>();
+    }
+    return out;
+}
+
+std::unordered_map<std::string, std::string> StringMapFromJson(const Json& json, std::string_view label) {
+    if (!json.is_object()) {
+        throw std::runtime_error(std::string(label) + " must be an object");
+    }
+    std::unordered_map<std::string, std::string> out;
+    for (const auto& item : json.items()) {
+        if (!item.value().is_string()) {
+            throw std::runtime_error(std::string(label) + "." + item.key() + " must be a string");
+        }
+        out[item.key()] = item.value().get<std::string>();
+    }
+    return out;
+}
+
+void LoadEmotionStateJson(const Json& json, GatewayEmotionStateConfigOptions& options) {
+    if (!json.is_object()) {
+        throw std::runtime_error("persona_gateway.personas[].emotionState must be an object");
+    }
+    SetDoubleField(json, "emotionState", "alpha", options.alpha, 0.0, 1000000.0);
+    SetDoubleField(json, "emotionState", "beta", options.beta, 0.0, 1000000.0);
+    SetDoubleField(json, "emotionState", "gamma", options.gamma, 0.0, 1000000.0);
+    SetDoubleField(json, "emotionState", "delta", options.delta, 0.0, 1000000.0);
+    if (const Json* value = FindField(json, "emotionState", "baselineValence")) {
+        options.baseline_valence = value->get<double>();
+    }
+    if (const Json* value = FindField(json, "emotionState", "baseline_valence")) {
+        options.baseline_valence = value->get<double>();
+    }
+    if (const Json* value = FindField(json, "emotionState", "baselineArousal")) {
+        options.baseline_arousal = value->get<double>();
+    }
+    if (const Json* value = FindField(json, "emotionState", "baseline_arousal")) {
+        options.baseline_arousal = value->get<double>();
+    }
+    SetDoubleField(json, "emotionState", "kappa", options.kappa, 0.0, 1000000.0);
+    if (const Json* value = FindField(json, "emotionState", "negativityBias")) {
+        options.negativity_bias = value->get<double>();
+    }
+    if (const Json* value = FindField(json, "emotionState", "negativity_bias")) {
+        options.negativity_bias = value->get<double>();
+    }
+    if (const Json* value = FindField(json, "emotionState", "noiseSigma")) {
+        options.noise_sigma = value->get<double>();
+    }
+    if (const Json* value = FindField(json, "emotionState", "noise_sigma")) {
+        options.noise_sigma = value->get<double>();
+    }
+    if (const Json* value = FindField(json, "emotionState", "injectionThreshold")) {
+        options.injection_threshold = value->get<double>();
+    }
+    if (const Json* value = FindField(json, "emotionState", "injection_threshold")) {
+        options.injection_threshold = value->get<double>();
+    }
+    SetInt(json, "emotionState", "save_interval_turns", options.save_interval_turns, 1, 1000000);
+    if (const Json* value = FindField(json, "emotionState", "saveIntervalTurns")) {
+        options.save_interval_turns = value->get<int>();
+    }
+    SetBool(json, "emotionState", "persist_to_l4", options.persist_to_l4);
+    if (const Json* value = FindField(json, "emotionState", "persistToL4")) {
+        if (!value->is_boolean()) {
+            throw std::runtime_error("emotionState.persistToL4 must be a boolean");
+        }
+        options.persist_to_l4 = value->get<bool>();
+    }
+}
+
+std::optional<GatewayEmotionPromptConfigOptions> LoadEmotionPromptsJson(const Json& json) {
+    if (!json.is_object()) {
+        throw std::runtime_error("persona_gateway.personas[].emotionPrompts must be an object");
+    }
+    GatewayEmotionPromptConfigOptions options;
+    if (const Json* value = FindField(json, "emotionPrompts", "emotionMap")) {
+        options.emotion_map = StringMapFromJson(*value, "emotionPrompts.emotionMap");
+    }
+    if (const Json* value = FindField(json, "emotionPrompts", "emotion_map")) {
+        options.emotion_map = StringMapFromJson(*value, "emotionPrompts.emotion_map");
+    }
+    if (const Json* value = FindField(json, "emotionPrompts", "emotionReliability")) {
+        options.emotion_reliability = DoubleMapFromJson(*value, "emotionPrompts.emotionReliability");
+    }
+    if (const Json* value = FindField(json, "emotionPrompts", "emotion_reliability")) {
+        options.emotion_reliability = DoubleMapFromJson(*value, "emotionPrompts.emotion_reliability");
+    }
+    if (const Json* value = FindField(json, "emotionPrompts", "confidenceThresholds")) {
+        options.confidence_thresholds = DoubleMapFromJson(*value, "emotionPrompts.confidenceThresholds");
+    }
+    if (const Json* value = FindField(json, "emotionPrompts", "confidence_thresholds")) {
+        options.confidence_thresholds = DoubleMapFromJson(*value, "emotionPrompts.confidence_thresholds");
+    }
+    if (const Json* value = FindField(json, "emotionPrompts", "intensityLevels")) {
+        options.intensity_levels = DoubleMapFromJson(*value, "emotionPrompts.intensityLevels");
+    }
+    if (const Json* value = FindField(json, "emotionPrompts", "intensity_levels")) {
+        options.intensity_levels = DoubleMapFromJson(*value, "emotionPrompts.intensity_levels");
+    }
+    return options;
+}
+
+GatewayPersonaConfigOptions LoadPersonaJson(std::string persona_id, const Json& json) {
+    if (!json.is_object()) {
+        throw std::runtime_error("persona_gateway.personas entry must be an object");
+    }
+    GatewayPersonaConfigOptions options;
+    options.persona_id = std::move(persona_id);
+    if (options.persona_id.empty()) {
+        options.persona_id = json.value("personaId", json.value("persona_id", json.value("name", std::string{})));
+    }
+    options.description = json.value("description", std::string{});
+    options.traits = json.value("traits", std::vector<std::string>{});
+    options.openness = json.value("openness", options.openness);
+    options.extraversion = json.value("extraversion", options.extraversion);
+    options.humor_tendency = json.value("humorTendency", json.value("humor_tendency", options.humor_tendency));
+    options.empathy_level = json.value("empathyLevel", json.value("empathy_level", options.empathy_level));
+    options.curiosity_level = json.value("curiosityLevel", json.value("curiosity_level", options.curiosity_level));
+    options.formality = json.value("formality", options.formality);
+    if (const Json* prompts = FindField(json, "persona", "emotionPrompts")) {
+        options.emotion_prompts = LoadEmotionPromptsJson(*prompts);
+    }
+    if (const Json* prompts = FindField(json, "persona", "emotion_prompts")) {
+        options.emotion_prompts = LoadEmotionPromptsJson(*prompts);
+    }
+    if (const Json* emotion_state = FindField(json, "persona", "emotionState")) {
+        LoadEmotionStateJson(*emotion_state, options.emotion_state);
+    }
+    if (const Json* emotion_state = FindField(json, "persona", "emotion_state")) {
+        LoadEmotionStateJson(*emotion_state, options.emotion_state);
+    }
+    if (options.persona_id.empty()) {
+        throw std::runtime_error("persona_gateway.personas entry requires personaId or name");
+    }
+    return options;
+}
+
+void LoadPersonasJson(const Json& section, PersonaGatewayConfigOptions& gateway) {
+    const Json* personas = FindField(section, "persona_gateway", "personas");
+    if (!personas) {
+        return;
+    }
+    gateway.personas.clear();
+    if (personas->is_object()) {
+        for (const auto& item : personas->items()) {
+            gateway.personas.push_back(LoadPersonaJson(item.key(), item.value()));
+        }
+        return;
+    }
+    if (!personas->is_array()) {
+        throw std::runtime_error("persona_gateway.personas must be an object or array");
+    }
+    for (const auto& item : *personas) {
+        if (!item.is_object()) {
+            throw std::runtime_error("persona_gateway.personas[] must be an object");
+        }
+        if (item.size() == 1 && !item.contains("personaId") && !item.contains("persona_id") && !item.contains("name")) {
+            const auto& entry = *item.begin();
+            gateway.personas.push_back(LoadPersonaJson(item.begin().key(), entry));
+        } else {
+            gateway.personas.push_back(LoadPersonaJson({}, item));
+        }
+    }
 }
 
 void PersonaGatewayConfigSection::LoadJson(const Json& root, MultimodalServerOptions& options) const {
@@ -116,6 +313,7 @@ void PersonaGatewayConfigSection::LoadJson(const Json& root, MultimodalServerOpt
         SetBool(*filter, "request_filter", "reject_control_chars", options.persona_gateway.reject_control_chars);
         SetBool(*filter, "request_filter", "reject_suspicious_patterns", options.persona_gateway.reject_suspicious_patterns);
     }
+    LoadPersonasJson(*section, options.persona_gateway);
 }
 
 bool PersonaGatewayConfigSection::LoadCli(CliCursor& cursor, MultimodalServerOptions& options) const {
@@ -193,6 +391,15 @@ void PersonaGatewayConfigSection::Validate(MultimodalServerOptions& options) con
         }
         gateway.document_store.root = ResolveRelativeToConfig(gateway.document_store.root, options.config_file_path);
         gateway.document_store.database_path = ResolveRelativeToConfig(gateway.document_store.database_path, options.config_file_path);
+    }
+    std::unordered_set<std::string> persona_ids;
+    for (const auto& persona : gateway.personas) {
+        if (persona.persona_id.empty()) {
+            throw std::runtime_error("persona_gateway.personas persona_id must not be empty");
+        }
+        if (!persona_ids.insert(persona.persona_id).second) {
+            throw std::runtime_error("duplicate persona_gateway.personas id: " + persona.persona_id);
+        }
     }
 }
 

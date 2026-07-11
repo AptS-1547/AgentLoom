@@ -2,6 +2,7 @@
 
 #include "result.h"
 #include "vector_cache.h"
+#include "vision_inference_interfaces.h"
 
 #include <gst/gst.h>
 
@@ -20,6 +21,8 @@ namespace media {
 
 class GstMappedFrameBuffer {
 public:
+    /// 映射 GstBuffer 并持有其引用；返回对象销毁前 bytes() 始终有效。
+    /// @param buffer 借用的 GStreamer buffer，Create 成功后由返回对象延长生命周期。
     static core::Result<std::shared_ptr<GstMappedFrameBuffer>> Create(GstBuffer* buffer);
 
     ~GstMappedFrameBuffer();
@@ -59,6 +62,7 @@ struct VideoFrameView {
     std::chrono::steady_clock::time_point captured_at = std::chrono::steady_clock::now();
     std::uint32_t width = 0;
     std::uint32_t height = 0;
+    std::size_t row_stride_bytes = 0;
     VideoPixelFormat format = VideoPixelFormat::Unknown;
     std::shared_ptr<const GstMappedFrameBuffer> buffer;
     std::string_view bytes;
@@ -76,37 +80,9 @@ class IFrameSampler {
 public:
     virtual ~IFrameSampler() = default;
 
-    // Runs in the compute pool after decoded frames leave GStreamer/appsink.
+    /// 在 decoded frame 离开 GStreamer/appsink 后由 compute pool 调用。
+    /// @param frame 借用的帧视图，不得保存其中 string_view；需要异步使用时必须复制。
     virtual core::Result<FrameSamplingDecision> Evaluate(const VideoFrameView& frame) = 0;
-};
-
-struct VisionInferenceRequest {
-    std::string session_id;
-    std::uint64_t frame_id = 0;
-    std::vector<std::byte> encoded_image;
-    std::string mime_type = "image/jpeg";
-    std::optional<std::string> prompt_hint;
-};
-
-struct VisionInferenceResult {
-    std::string scene_hint;
-    std::string action_hint;
-    std::string object_hint;
-    std::string agent_hint;
-    std::string memory_candidate;
-    std::vector<std::string> facts;
-    std::vector<std::string> weak_interpretations;
-    std::string raw_text;
-    std::vector<float> image_embedding;
-    double confidence = 0.0;
-};
-
-class IVlmVisionClient {
-public:
-    virtual ~IVlmVisionClient() = default;
-
-    // Runs in the IO pool because this normally calls a local/remote VLM service.
-    virtual core::Result<VisionInferenceResult> Analyze(const VisionInferenceRequest& request) = 0;
 };
 
 struct VisionAnalysis {
@@ -250,12 +226,15 @@ struct VisionContextSnapshot {
 class IVisionEventSink {
 public:
     virtual ~IVisionEventSink() = default;
+    /// 发布视觉事件；按值传递允许 sink 接管较大的 analysis/embedding 数据。
     virtual core::Status Publish(VisionEvent event) = 0;
 };
 
 class IVisionContextProvider {
 public:
     virtual ~IVisionContextProvider() = default;
+    /// @param session_id 目标 Persona session。
+    /// @param max_age 允许返回的视觉事件最大年龄。
     virtual core::Result<VisionContextSnapshot> Snapshot(const std::string& session_id,
                                                          std::chrono::milliseconds max_age) = 0;
 };

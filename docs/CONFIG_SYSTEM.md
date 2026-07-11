@@ -2,9 +2,26 @@
 
 ## 概述
 
-配置系统已扩展支持：
-1. **HTTP/WebSocket 服务器配置** (`http` section)
-2. **语义向量化模型配置** (`embedding` section)
+AgentLoom 使用 JSON 配置、CLI override 和 section registry 组合加载 Server 配置。配置解析集中在 `src/config/`，每个 section 独立负责字段加载、CLI 参数和校验，最终统一写入 `MultimodalServerOptions`。
+
+当前已注册的主要 section：
+
+| Section | 职责 |
+|---------|------|
+| `models` | BERT、VLM、mmproj、ViT 和运行时模型路径 |
+| `grpc` | gRPC 地址、端口、消息限制和统计阈值 |
+| `auth` | inference server metadata token |
+| `limits` | 图片、prompt、token 和温度限制 |
+| `vram_guard` | GPU 内存监控和 OOM 卸载策略 |
+| `embedding` | tokenizer、ONNX embedding 和 pooling |
+| `vlm_cache` | 结果缓存、vector cache 和 Prompt KV Cache |
+| `llm` | OpenAI-compatible LLM backend 和凭据来源 |
+| `http` | HTTP/WebSocket runtime |
+| `gateway_auth` | Gateway JWT、cookie、SQLite/Redis session store |
+| `persona_gateway` | Persona 默认配置、线程池、静态文件和文档存储 |
+| `skill_session` | Skill Session timeout、容量和维护周期 |
+
+> 文档状态：当前配置入口说明。新增字段时以相应 `src/config/sections/*_section.cpp` 为实现真值，并同步更新 example JSON 和本文件。
 
 ## HTTP 服务器配置
 

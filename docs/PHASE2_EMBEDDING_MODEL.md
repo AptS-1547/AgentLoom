@@ -15,15 +15,15 @@ Phase 2 实现了基于 ONNX Runtime 的文本 embedding 推理能力，支持 s
 
 ### 1. 导出 ONNX 模型
 
-使用原项目虚拟环境：
+使用带有 Python 导出依赖的虚拟环境：
 
 ```powershell
 # 激活虚拟环境
-cd D:\Users\21405\source\repos\MyNeuroLikeSystem
+cd <python-environment-root>
 .\venv\Scripts\Activate.ps1
 
 # 导出 MiniLM embedding 模型
-cd D:\Users\21405\source\repos\AgentBackendPredict
+cd <agentloom-repository>
 python scripts\export_embedding_onnx.py `
     --model sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2 `
     --output .\onnx_models\minilm `
@@ -36,14 +36,14 @@ python scripts\export_embedding_onnx.py `
 - `onnx_models/minilm/model_metadata.json` — 元数据（维度、pooling 策略）
 - tokenizer.json 已在 HF 缓存中，路径：
   ```
-  C:\Users\21405\.cache\huggingface\hub\models--sentence-transformers--paraphrase-multilingual-MiniLM-L12-v2\snapshots\e8f8c211226b894fcb81acc59f3b34ba3efd5f42\tokenizer.json
+  <huggingface-cache>/models--sentence-transformers--paraphrase-multilingual-MiniLM-L12-v2/snapshots/<revision>/tokenizer.json
   ```
 
 ### 2. 运行 E2E 测试
 
 ```powershell
-$env:HF_TOKENIZER_FIXTURE_JSON = "C:/Users/21405/.cache/huggingface/hub/models--sentence-transformers--paraphrase-multilingual-MiniLM-L12-v2/snapshots/e8f8c211226b894fcb81acc59f3b34ba3efd5f42/tokenizer.json"
-$env:HF_TEXT_EMBEDDING_ONNX = "D:/Users/21405/source/repos/AgentBackendPredict/onnx_models/minilm/model.onnx"
+$env:HF_TOKENIZER_FIXTURE_JSON = "<huggingface-cache>/models--sentence-transformers--paraphrase-multilingual-MiniLM-L12-v2/snapshots/<revision>/tokenizer.json"
+$env:HF_TEXT_EMBEDDING_ONNX = "<agentloom-repository>/onnx_models/minilm/model.onnx"
 
 ctest --test-dir build -C Release --output-on-failure -R "Embedding"
 ```

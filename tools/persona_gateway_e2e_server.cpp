@@ -833,8 +833,6 @@ int main(int argc, char** argv) {
         dependencies.memory_provider = std::move(memory);
         dependencies.emotion_analyzer = std::move(emotion).value();
         dependencies.llm_client = std::move(llm).value();
-        dependencies.l0_redis_pool = l0_bundle.redis_pool;
-        dependencies.evaluation_config_path = config.repo_root / "config" / "evaluation_indicators.json";
         std::shared_ptr<agent::service::persona::SkillSessionManager> skill_sessions;
         if (config.skill_session_enabled) {
             skill_sessions = std::make_shared<agent::service::persona::SkillSessionManager>(

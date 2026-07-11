@@ -1,5 +1,6 @@
 #vs及git缓存
 .vs/
+.clangd
 .git/
 #编译输出和CMake缓存
 build/
@@ -20,23 +21,29 @@ third_party/nlohmann/*
 *.log
 test/
 logs/
+dumps/
+tmp/
 #临时文件
 *.tmp
 # Claude/Codex cache
 .claude/
 .codex/
 CLAUDE.md
+.claude/settings.local.json
 # Python cache
 __pycache__/
 *.py[cod]
 # CMake生成的文件
 CMakeFiles/
+CMakeCache.txt
+CMakePresets.json.bak-*
 # ONNX Model
 onnx_models/
 # LLM smoke test secrets (real API keys / config, never commit)
 tools/llm_smoke_test.json
 tools/llm_smoke_test.key
 tools/llm_smoke_prompt.txt
+config/e2e_test.json
 # dev_notes
 dev_note/
 # Test output

@@ -1,13 +1,18 @@
-# AgentBackendPredict 推理服务端部署文档
+# AgentLoom 推理服务端部署文档
 
 ## 概述
 
-统一多模态推理服务端，整合：
-- **BERT 情绪分类**（ONNX Runtime）
-- **VLM 视觉语言推理**（llama.cpp + mtmd）
-- **ViT 显著度检测**（预留接口）
+本文档主要说明推理服务部署。AgentLoom 当前提供三个正式 Server 边界：
 
-单一 gRPC 服务端，支持流式/同步推理、健康检查、运行时统计、跨平台内存监控。
+| Server | 职责 |
+|--------|------|
+| `agent_gateway_server` | HTTP/WebSocket、Persona Runtime、记忆、文档和 Skill 编排 |
+| `emotion_inference_server` | CPU/ONNX BERT 情绪推理 gRPC 服务 |
+| `multimodal_inference_server` | BERT + llama.cpp/mtmd VLM 多模态 gRPC 服务 |
+
+推理 Server 支持健康检查、统一 `core::Status`/gRPC 错误映射、trace metadata、运行时统计和受控关闭。VLM 与 Gateway 默认保持进程隔离；共享内存 IPC 用于同机帧数据面，gRPC 继续承担协议、健康检查和诊断边界。
+
+> 文档状态：当前部署参考。具体字段以 `config/*.example.json`、`src/config/sections/` 和 Server `--help` 输出为准。
 
 ## 快速开始
 
@@ -15,12 +20,14 @@
 
 ```powershell
 # Windows
-cmake -B build -G "Visual Studio 17 2022" -A x64 `
+& "C:\Program Files\CMake\bin\cmake.exe" -B build/x64-Release -G "Visual Studio 18 2026" -A x64 `
   -DCMAKE_CONFIGURATION_TYPES=Release `
   -DBERT_VCPKG_TRIPLET=x64-windows `
-  -DBERT_USE_ONNXRUNTIME_GPU=OFF
+  -DBERT_USE_ONNXRUNTIME_GPU=OFF `
+  -DLLAMA_CPP_ROOT="<path-to-llama.cpp>"
 
-cmake --build build --config Release --parallel
+& "C:\Program Files\CMake\bin\cmake.exe" --build build/x64-Release `
+  --config Release --parallel
 ```
 
 ```bash
@@ -35,10 +42,10 @@ cmake --build build --parallel
 ### 2. 启动服务端
 
 ```powershell
-cd build/Release
+cd build/x64-Release/Release
 
-# 最小启动（仅 LLM）
-./multimodal_inference_server.exe --llm "D:/path/to/model.gguf"
+# 最小启动（配置文件）
+./multimodal_inference_server.exe --config ../../../config/server.example.json
 
 # 完整启动（BERT + VLM）
 ./multimodal_inference_server.exe `
@@ -387,21 +394,19 @@ img.save("output.jpg", quality=85)
 
 ## 架构说明
 
-### 目录结构
+### 主要源码边界
 
 ```
 src/
-├── common/                    # 公共基础设施
-│   ├── server_common.h/.cpp   # 统计、内存监控、参数解析
-│   └── logger.h/.cpp          # 日志系统
-├── models/                    # 模型封装层
-│   ├── onnx_model.h/.cpp      # ONNX Runtime（BERT/ViT）
-│   └── llama_runner.h/.cpp    # llama.cpp VLM 封装
-├── server/                    # 服务端入口
-│   └── multimodal_inference_server.cpp
-└── client/                    # 测试客户端
-    ├── client_test.cpp
-    └── benchmark_client.cpp
+├── core/                      # Status/Result、线程池、内存池和 RAII
+├── config/                    # section registry、JSON/CLI 配置
+├── models/                    # ONNX Runtime、llama.cpp/mtmd 和 runner pool
+├── service/inference/         # 推理业务校验与服务接口
+├── server/grpc/               # gRPC handler、错误和 trace 映射
+├── server/main/               # Gateway、Emotion、Multimodal 进程入口
+├── server/runtime/            # 日志和 Server 公共生命周期
+├── media/                     # WebRTC、抽帧、编码和 VLM coordinator
+└── ipc/                       # 共享内存帧数据面
 ```
 
 ### 关键特性

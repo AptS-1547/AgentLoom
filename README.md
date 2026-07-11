@@ -1,17 +1,17 @@
-# AgentBackendPredict
+# AgentLoom
 
-> 教育智能体的 C++ 后端基础设施与推理服务
+> 可组合的 C++20 Agent Runtime、网关与推理基础设施
 
 [![C++20](https://img.shields.io/badge/C%2B%2B-20-blue.svg)](https://isocpp.org/)
 [![CMake](https://img.shields.io/badge/CMake-3.20+-green.svg)](https://cmake.org/)
-[![Tests](https://img.shields.io/badge/tests-59%2B%20passing-brightgreen.svg)](#测试覆盖)
+[![Tests](https://img.shields.io/badge/tests-70%2B%20passing-brightgreen.svg)](#测试覆盖)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 ## 📖 项目简介
 
-AgentBackendPredict 是教育智能体项目的 C++ 后端基础设施，提供高性能推理服务、语义缓存、多级记忆管理和网关层服务编排能力。
+AgentLoom 是一个面向智能体服务端的 C++20 基础设施项目，提供高性能推理服务、语义缓存、多级记忆管理、实时多模态输入和网关层服务编排能力。
 
-从早期的单体推理服务演进为 **生产级 C++20 服务端基础设施**，以 `core / net / config / cache / vector / models / service / server` 分层架构，支撑教育智能体的热路径、资源管理和协议层能力。
+项目从教育智能体的单体推理服务演进为分层的服务端 Runtime，以 `core / net / config / cache / vector / models / service / server` 为主要边界。教育场景仍是重要参考实现，但核心库、推理协议和基础 Server 可以被其他智能体项目复用。
 
 推理模块的复用边界是独立 gRPC server：迁移时优先交付已编译的 `emotion_inference_server` / `multimodal_inference_server`、生成的 protobuf/gRPC 头文件与客户端协议头，而不是把模型推理内部继续拆成网关侧库目标。Gateway 与 Persona Runtime 通过 gRPC/adapter 对接推理服务。
 
@@ -39,22 +39,28 @@ AgentBackendPredict 是教育智能体项目的 C++ 后端基础设施，提供�
 
 ### 前置依赖
 
-- **编译器**：Visual Studio 2022 (MSVC) / GCC 11+ / Clang 14+
+- **编译器**：Visual Studio 2026/v145（Windows）/ GCC 11+ / Clang 14+
 - **CMake**：3.20+
 - **vcpkg**：用于管理 gRPC、Protobuf、OpenSSL、spdlog 等依赖
 - **预编译库**：ONNX Runtime、OpenCV、Boost 1.85、llama.cpp
 
 ### 构建服务
 
+本机模型与工具链路径不要提交到仓库。复制 `config/e2e_test.example.json` 为
+`config/e2e_test.json` 后填写本地模型路径；`.clangd.example` 也可复制为本地
+`.clangd`。这两个本地文件默认由 Git 忽略。
+
 **Windows Release 构建**
 
 ```powershell
-cmake -B build/x64-Release -G "Visual Studio 17 2022" -A x64 `
+& "C:\Program Files\CMake\bin\cmake.exe" -B build/x64-Release -G "Visual Studio 18 2026" -A x64 `
   -DCMAKE_CONFIGURATION_TYPES=Release `
   -DBERT_VCPKG_TRIPLET=x64-windows `
-  -DBERT_USE_ONNXRUNTIME_GPU=OFF
+  -DBERT_USE_ONNXRUNTIME_GPU=OFF `
+  -DLLAMA_CPP_ROOT="<path-to-llama.cpp>"
 
-cmake --build build/x64-Release --target multimodal_inference_server --config Release --parallel
+& "C:\Program Files\CMake\bin\cmake.exe" --build build/x64-Release `
+  --target multimodal_inference_server --config Release --parallel
 ```
 
 **Linux Release 构建（WSL2）**
@@ -128,14 +134,17 @@ build\x64-Release\Release\emotion_inference_server.exe --config config\emotion.j
 
 ```powershell
 # 构建测试
-cmake -B build/tests -G "Visual Studio 17 2022" -A x64 `
+& "C:\Program Files\CMake\bin\cmake.exe" -B build/x64-Release-Tests-v145 `
+  -G "Visual Studio 18 2026" -A x64 `
   -DBERT_BUILD_TESTS=ON `
-  -DBERT_VCPKG_TRIPLET=x64-windows
+  -DBERT_VCPKG_TRIPLET=x64-windows `
+  -DLLAMA_CPP_ROOT="<path-to-llama.cpp>"
 
-cmake --build build/tests --config Release --parallel
+& "C:\Program Files\CMake\bin\cmake.exe" --build build/x64-Release-Tests-v145 `
+  --config Release --parallel
 
 # 运行所有测试
-ctest --test-dir build/tests -C Release --output-on-failure
+ctest --test-dir build/x64-Release-Tests-v145 -C Release --output-on-failure
 ```
 
 ---
@@ -264,35 +273,18 @@ top < accept_confidence || top1 - top2 < ambiguity_margin
 
 ## 📚 文档索引
 
-### 架构与设计
+完整分类、文档状态和推荐阅读顺序见 [AgentLoom Documentation](docs/README.md)。
 
-- [基础设施开发计划](docs/INFRASTRUCTURE_PLAN.md)
-- [商业化架构方案](docs/COMMERCIAL_ARCHITECTURE.md)
-- [对话热路径缓存与推理引擎路由](docs/CONVERSATION_CACHE_AND_INFERENCE_STRATEGY.md)
-- [架构图](docs/ARCHITECTURE_DIAGRAM.md)
-- [流式架构](docs/STREAMING_ARCHITECTURE.md)
+常用入口：
 
-### 实现细节
-
+- [当前 Runtime 路线图](docs/CURRENT_RUNTIME_ROADMAP_2026_06.md)
 - [配置系统](docs/CONFIG_SYSTEM.md)
-- [C++ 服务端安全工程准则](docs/SECURITY_ENGINEERING_STANDARD.md)
-- [缓存与优化](docs/CACHE_AND_OPTIMIZATION.md)
-- [Net API 设计笔记](docs/NET_API_NOTES.md)
-- [Redis 兼容性](docs/REDIS_COMPATIBILITY.md)
-- [向量化 Embedding 模型](docs/PHASE2_EMBEDDING_MODEL.md)
-
-### 迁移与部署
-
 - [部署指南](docs/DEPLOYMENT.md)
-- [视觉模型迁移](docs/VISION_MIGRATION.md)
-- [Redis++ 迁移](docs/REDIS_PLUSPLUS_MIGRATION_COMPLETE.md)
-- [网关前端对齐](docs/GATEWAY_FRONTEND_SESSION_ALIGNMENT.md)
-
-### 其他
-
-- [性能报告](docs/PERFORMANCE_REPORT.md)
-- [E2E 测试与情绪管道](docs/E2E_TEST_AND_EMOTION_PIPELINE.md)
-- [团队实施计划](docs/TEAM_IMPLEMENTATION_PLAN.md)
+- [Frontend/Backend API](docs/FRONTEND_BACKEND_API_PROTOCOL.md)
+- [Skill Session Protocol](docs/SKILL_SESSION_PROTOCOL.md)
+- [多模态感知分层](docs/MULTIMODAL_PERCEPTION_LAYERS.md)
+- [扩展 AgentLoom](docs/EXTENDING_AGENTLOOM.md)
+- [安全工程准则](docs/SECURITY_ENGINEERING_STANDARD.md)
 
 ---
 
@@ -433,28 +425,33 @@ multimodal_inference_server.exe `
 
 依赖按 `deps/` 和 `vcpkg_installed/` 两种方式集成。Linux 构建脚本自动下载和配置所有依赖。
 
+下游源码工程可通过 `add_subdirectory()` 使用稳定别名，例如
+`AgentLoom::core`、`AgentLoom::service`、`AgentLoom::gateway`、
+`AgentLoom::media` 和 `AgentLoom::ipc`。安装式 `find_package(AgentLoom)`
+导出将在后续稳定公共头文件边界后提供。
+
 ---
 
-## 🎯 与 EducationalAgentProject 的关系
+## 🎯 复用与扩展边界
 
-**EducationalAgentProject** 是教育智能体主项目，负责 Persona、Prompt、OpenAI-compatible API、Python 侧业务编排和多 persona 调度。
+AgentLoom 同时提供可复用核心库和基础 Server。推理模块以独立 gRPC 进程和 protobuf/gRPC 协议为主要交付边界；Persona Runtime、Session、Gateway、Memory、Media 和 IPC 等能力可以作为源码 target 被上层项目组合。
 
-**AgentBackendPredict** 负责 C++ 后端基础设施、推理服务、协议层 runtime、缓存和高性能服务端能力。
+领域功能通过接口注入。例如基础报告始终提供 session metrics，项目特有的质量评估通过 `IReportEvaluator` 接入；AgentLoom 不包含特定组织的指标、权重、数据集或评估实现。
 
-### 职责划分
+### 推荐职责划分
 
-| 层 | 负责方 | 内容 |
-|----|--------|------|
-| 业务逻辑 | Python | Persona、Prompt、记忆策略、业务编排 |
-| 热路径 | C++ | 推理、缓存、向量检索、网关、连接池 |
-| 主力 LLM | vLLM | 高 QPS 对话主路径 |
-| 备用/VLM | llama.cpp | VLM、低显存、边缘设备、OOM 降级 |
+| 层 | 推荐边界 | 内容 |
+|----|----------|------|
+| 领域业务 | 下游项目 | Persona、Prompt、领域评估、产品编排 |
+| Runtime 热路径 | AgentLoom 库 | Session、缓存、向量检索、记忆、媒体和 IPC |
+| 服务入口 | AgentLoom 基础 Server | HTTP/WebSocket/WebRTC、gRPC、配置和生命周期 |
+| 模型服务 | 独立进程 | BERT、VLM、vLLM 或 OpenAI-compatible backend |
 
 ---
 
 ## 🚧 路线图
 
-### 当前阶段（v2.0）
+### 当前阶段（v0.1）
 
 - ✅ 基础设施分层架构
 - ✅ HTTP/WebSocket runtime
@@ -473,7 +470,7 @@ multimodal_inference_server.exe `
 - 🎯 性能优化（SIMD 向量运算、零拷贝传输）
 - 🎯 多机部署与负载均衡
 
-详见 [下一阶段 Runtime 路线图](docs/NEXT_RUNTIME_ROADMAP.md)。
+详见 [当前 Runtime 路线图](docs/CURRENT_RUNTIME_ROADMAP_2026_06.md)。历史演进记录见 [旧 Runtime 路线图](docs/NEXT_RUNTIME_ROADMAP.md)。
 
 ---
 
@@ -523,7 +520,6 @@ multimodal_inference_server.exe `
 ## 📧 联系方式
 
 - **项目维护**：Orange20000922
-- **主项目**：[EducationalAgentProject](../EducationalAgentProject)
 - **相关项目**：[Filerestore_CLI](https://github.com/Orange20000922/Filerestore_CLI)
 
 ---

@@ -11,6 +11,9 @@ DECLARE_CONFIG_SECTION(ModelsConfigSection, "models")
     CONFIG_CLI_STRING(kLlm, "--llm");
     CONFIG_CLI_STRING(kMmproj, "--mmproj");
     CONFIG_CLI_STRING(kGpuLayers, "--ngl");
+    CONFIG_CLI_STRING(kRunnerPoolSize, "--runner-pool-size");
+    CONFIG_CLI_STRING(kLlamaThreads, "--llama-threads");
+    CONFIG_CLI_STRING(kMmprojThreads, "--mmproj-threads");
     CONFIG_CLI_STRING(kProvider, "--provider");
     CONFIG_CLI_STRING(kCudaDevice, "--cuda-device");
     void Validate(MultimodalServerOptions& options) const override;
@@ -26,6 +29,9 @@ void ModelsConfigSection::LoadJson(const Json& root, MultimodalServerOptions& op
     SetString(*section, Name(), "bert", options.bert_model);
     SetString(*section, Name(), "vit", options.vit_model);
     SetInt(*section, Name(), "n_gpu_layers", options.n_gpu_layers);
+    SetSize(*section, Name(), "runner_pool_size", options.runner_pool_size);
+    SetInt(*section, Name(), "llama_threads", options.llama_threads, 1);
+    SetInt(*section, Name(), "mmproj_threads", options.mmproj_threads, 1);
     SetString(*section, Name(), "provider", options.bert_runtime.execution_provider);
     SetInt(*section, Name(), "cuda_device", options.bert_runtime.cuda_device_id, 0);
 }
@@ -37,6 +43,9 @@ bool ModelsConfigSection::LoadCli(CliCursor& cursor, MultimodalServerOptions& op
     CONFIG_VALUE_ARG(kLlm, value, options.llm_model = *value;)
     CONFIG_VALUE_ARG(kMmproj, value, options.mmproj = *value;)
     CONFIG_VALUE_ARG(kGpuLayers, value, options.n_gpu_layers = ParseCliInt(kGpuLayers, *value);)
+    CONFIG_VALUE_ARG(kRunnerPoolSize, value, options.runner_pool_size = static_cast<std::size_t>(ParsePositiveOption(kRunnerPoolSize, *value));)
+    CONFIG_VALUE_ARG(kLlamaThreads, value, options.llama_threads = ParsePositiveOption(kLlamaThreads, *value);)
+    CONFIG_VALUE_ARG(kMmprojThreads, value, options.mmproj_threads = ParsePositiveOption(kMmprojThreads, *value);)
     CONFIG_VALUE_ARG(kProvider, value, options.bert_runtime.execution_provider = *value;)
     CONFIG_VALUE_ARG(kCudaDevice, value, options.bert_runtime.cuda_device_id = ParseCliInt(kCudaDevice, *value);)
     return false;
@@ -46,6 +55,9 @@ void ModelsConfigSection::Validate(MultimodalServerOptions& options) const {
     // Emotion-only targets can run with just the BERT ONNX model.
     if (options.llm_model.empty() && options.bert_model.empty()) {
         throw std::runtime_error("--llm or --bert is required");
+    }
+    if (options.runner_pool_size == 0) {
+        throw std::runtime_error("models.runner_pool_size must be at least 1");
     }
 }
 

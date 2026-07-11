@@ -13,6 +13,7 @@
 #include "multimodal_service.h"
 #include "option_parser.h"
 #include "server_common.h"
+#include "../../../tools/crash_dump.h"
 
 #include <grpc/grpc.h>
 #include <grpcpp/health_check_service_interface.h>
@@ -21,12 +22,22 @@
 #include <grpcpp/server_builder.h>
 
 #include <exception>
+#include <filesystem>
 #include <iostream>
 #include <memory>
 #include <string>
 #include <thread>
 
 int main(int argc, char** argv) {
+#ifdef _WIN32
+    try {
+        std::filesystem::create_directories("dumps");
+        crash_dump::Install("dumps");
+    } catch (...) {
+        crash_dump::Install(".");
+    }
+#endif
+
     if (IsHelpRequested(argc, argv)) {
         PrintUsage(argv[0]);
         return 0;
@@ -84,8 +95,18 @@ int main(int argc, char** argv) {
              options.vlm_cache.ttl_seconds,
              options.vlm_cache.allow_stale_on_failure,
              options.vlm_cache.default_allow_cache);
-    LOG_INFO("[Server] GPU layers: {}, gRPC CQs: {}, pollers: {}-{}, stats_interval: {}s, slow_request: {}ms",
+    LOG_INFO("[Server] VLM prompt KV cache: enabled={} redis={}:{} prefix={} ttl_seconds={} max_mb={}",
+             options.vlm_prompt_kv_cache.enabled,
+             options.vlm_prompt_kv_cache.redis_host,
+             options.vlm_prompt_kv_cache.redis_port,
+             options.vlm_prompt_kv_cache.key_prefix,
+             options.vlm_prompt_kv_cache.ttl_seconds,
+             options.vlm_prompt_kv_cache.max_bytes / (1024 * 1024));
+    LOG_INFO("[Server] GPU layers: {}, runner_pool_size: {}, llama_threads: {}, mmproj_threads: {}, gRPC CQs: {}, pollers: {}-{}, stats_interval: {}s, slow_request: {}ms",
              options.n_gpu_layers,
+             options.runner_pool_size,
+             options.llama_threads,
+             options.mmproj_threads,
              options.grpc.grpc_num_cqs,
              options.grpc.grpc_min_pollers,
              options.grpc.grpc_max_pollers,

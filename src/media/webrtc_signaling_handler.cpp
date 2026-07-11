@@ -107,6 +107,8 @@ WebRtcSignalingHandler::WebRtcSignalingHandler(WebRtcSignalingOptions options)
             .io_pool = options.io_pool,
             .frame_sampler = options.frame_sampler,
             .vlm_client = options.vlm_client,
+            .frame_encoder = options.frame_encoder,
+            .encoded_frame_sink = options.encoded_frame_sink,
             .frame_observer = options.frame_observer,
             .vision_event_sink = options.vision_event_sink,
             .status_observer = [registry_ref](std::string failed_session_id, core::Status status, bool fatal) {

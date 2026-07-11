@@ -1,6 +1,7 @@
 #include "persona_gateway_service.h"
 
 #include "redis_connection_pool.h"
+#include "result.h"
 #include "sqlite/sqlite_connection.h"
 #include "sqlite/sqlite_statement.h"
 #include "trace_context.h"
@@ -12,6 +13,7 @@
 #include <ctime>
 #include <iomanip>
 #include <sstream>
+#include <unordered_set>
 #include <utility>
 
 namespace agent::service::gateway {
@@ -238,6 +240,139 @@ core::Result<std::vector<PersonaMetadataRecord>> InMemoryPersonaMetadataStore::L
     for (const auto& [key, record] : records_) {
         if (record.tenant_id == tenant_id && record.user_uuid == user_uuid) {
             out.push_back(record);
+        }
+    }
+    std::sort(out.begin(), out.end(), [](const auto& lhs, const auto& rhs) {
+        return lhs.persona_id < rhs.persona_id;
+    });
+    return out;
+}
+
+ServerDefaultPersonaMetadataStore::ServerDefaultPersonaMetadataStore(std::vector<PersonaMetadataRecord> records) {
+    for (auto& record : records) {
+        if (record.persona_id.empty() && !record.personality.name.empty()) {
+            record.persona_id = record.personality.name;
+        }
+        if (!record.persona_id.empty()) {
+            if (record.personality.name.empty()) {
+                record.personality.name = record.persona_id;
+            }
+            records_[record.persona_id] = std::move(record);
+        }
+    }
+}
+
+core::Status ServerDefaultPersonaMetadataStore::EnsureSchema() {
+    return core::Status::Ok();
+}
+
+core::Status ServerDefaultPersonaMetadataStore::Upsert(PersonaMetadataRecord record) {
+    if (record.persona_id.empty()) {
+        return core::Status::Error(core::ErrorCode::InvalidArgument, "persona_id is required");
+    }
+    if (record.personality.name.empty()) {
+        record.personality.name = record.persona_id;
+    }
+    std::lock_guard lock(mutex_);
+    records_[record.persona_id] = std::move(record);
+    return core::Status::Ok();
+}
+
+core::Result<PersonaMetadataRecord> ServerDefaultPersonaMetadataStore::Get(std::string_view tenant_id,
+                                                                           std::string_view user_uuid,
+                                                                           std::string_view persona_id) const {
+    if (persona_id.empty()) {
+        return core::Status::Error(core::ErrorCode::InvalidArgument, "persona_id is required");
+    }
+    std::lock_guard lock(mutex_);
+    auto it = records_.find(std::string(persona_id));
+    if (it == records_.end()) {
+        return core::Status::Error(core::ErrorCode::NotFound, "server default persona metadata not found");
+    }
+    auto record = it->second;
+    record.tenant_id = tenant_id.empty() ? "default" : std::string(tenant_id);
+    record.user_uuid = std::string(user_uuid);
+    return record;
+}
+
+core::Result<std::vector<PersonaMetadataRecord>> ServerDefaultPersonaMetadataStore::ListByAccount(
+    std::string_view tenant_id,
+    std::string_view user_uuid) const {
+    std::vector<PersonaMetadataRecord> out;
+    std::lock_guard lock(mutex_);
+    out.reserve(records_.size());
+    for (const auto& [id, record] : records_) {
+        auto copy = record;
+        copy.tenant_id = tenant_id.empty() ? "default" : std::string(tenant_id);
+        copy.user_uuid = std::string(user_uuid);
+        out.push_back(std::move(copy));
+    }
+    std::sort(out.begin(), out.end(), [](const auto& lhs, const auto& rhs) {
+        return lhs.persona_id < rhs.persona_id;
+    });
+    return out;
+}
+
+OverlayPersonaMetadataStore::OverlayPersonaMetadataStore(std::shared_ptr<IPersonaMetadataStore> defaults,
+                                                         std::shared_ptr<IPersonaMetadataStore> account)
+    : defaults_(std::move(defaults)),
+      account_(std::move(account)) {}
+
+core::Status OverlayPersonaMetadataStore::EnsureSchema() {
+    if (defaults_) {
+        if (auto status = defaults_->EnsureSchema(); !status.ok()) {
+            return status;
+        }
+    }
+    return account_ ? account_->EnsureSchema() : core::Status::Ok();
+}
+
+core::Status OverlayPersonaMetadataStore::Upsert(PersonaMetadataRecord record) {
+    if (!account_) {
+        return core::Status::Error(core::ErrorCode::FailedPrecondition, "account persona metadata store is not configured");
+    }
+    return account_->Upsert(std::move(record));
+}
+
+core::Result<PersonaMetadataRecord> OverlayPersonaMetadataStore::Get(std::string_view tenant_id,
+                                                                     std::string_view user_uuid,
+                                                                     std::string_view persona_id) const {
+    if (defaults_) {
+        auto record = defaults_->Get(tenant_id, user_uuid, persona_id);
+        if (record.ok() || record.status().code() != core::ErrorCode::NotFound) {
+            return record;
+        }
+    }
+    if (!account_) {
+        return core::Status::Error(core::ErrorCode::NotFound, "persona metadata not found");
+    }
+    return account_->Get(tenant_id, user_uuid, persona_id);
+}
+
+core::Result<std::vector<PersonaMetadataRecord>> OverlayPersonaMetadataStore::ListByAccount(
+    std::string_view tenant_id,
+    std::string_view user_uuid) const {
+    std::vector<PersonaMetadataRecord> out;
+    std::unordered_set<std::string> default_ids;
+    if (defaults_) {
+        auto defaults = defaults_->ListByAccount(tenant_id, user_uuid);
+        if (!defaults.ok()) {
+            return defaults.status();
+        }
+        for (auto& record : defaults.value()) {
+            default_ids.insert(record.persona_id);
+            out.push_back(std::move(record));
+        }
+    }
+    if (account_) {
+        auto account = account_->ListByAccount(tenant_id, user_uuid);
+        if (!account.ok()) {
+            return account.status();
+        }
+        for (auto& record : account.value()) {
+            if (!default_ids.contains(record.persona_id)) {
+                out.push_back(std::move(record));
+            }
         }
     }
     std::sort(out.begin(), out.end(), [](const auto& lhs, const auto& rhs) {
@@ -530,18 +665,14 @@ core::Result<std::vector<PersonaMetadataRecord>> CachedPersonaMetadataStore::Lis
 PersonaGatewayService::PersonaGatewayService(persona::SessionManager& sessions,
                                              persona::PersonaRuntime& runtime,
                                              IClassroomScheduler* classroom_scheduler,
-                                             std::shared_ptr<evaluation::TeachingEvaluator> evaluator,
-                                             std::shared_ptr<semantic_cache::RedisConnectionPool> l0_redis_pool,
+                                             std::shared_ptr<IReportEvaluator> report_evaluator,
                                              std::shared_ptr<IPersonaMetadataStore> persona_metadata_store,
-                                             std::filesystem::path evaluation_config_path,
                                              core::LoggerAdapter logger)
     : sessions_(sessions),
       runtime_(runtime),
       classroom_scheduler_(classroom_scheduler),
-      evaluator_(std::move(evaluator)),
-      l0_redis_pool_(std::move(l0_redis_pool)),
+      report_evaluator_(std::move(report_evaluator)),
       persona_metadata_store_(std::move(persona_metadata_store)),
-      evaluation_config_path_(std::move(evaluation_config_path)),
       logger_(std::move(logger)) {}
 
 core::Result<PersonaMetadataGatewayResponse> PersonaGatewayService::UpsertPersonaMetadata(
@@ -596,6 +727,22 @@ core::Result<PersonaMetadataGatewayResponse> PersonaGatewayService::GetPersonaMe
     response.latency = Since(started);
     response.persona = std::move(record).value();
     return response;
+}
+
+core::Result<std::vector<PersonaMetadataRecord>> PersonaGatewayService::ListPersonaMetadataByAccount(
+    std::string_view tenant_id,
+    std::string_view user_uuid,
+    std::string trace_id) {
+    const auto started = std::chrono::steady_clock::now();
+    trace_id = EnsureTrace(std::move(trace_id));
+    if (!persona_metadata_store_) {
+        return core::Status::Error(core::ErrorCode::FailedPrecondition, "persona metadata store is not configured");
+    }
+    auto records = persona_metadata_store_->ListByAccount(tenant_id.empty() ? "default" : tenant_id, user_uuid);
+    if (!records.ok()) {
+        return records.status();
+    }
+    return records.value();
 }
 
 core::Result<SessionGatewayResponse> PersonaGatewayService::CreateSession(CreateSessionGatewayRequest request) {
@@ -845,23 +992,25 @@ core::Result<TrainingReportGatewayResponse> PersonaGatewayService::TrainingRepor
     response.generated_at = NowIso8601Utc();
     response.total_turns = snapshot.value().metrics.turn_count;
     response.metrics = snapshot.value().metrics;
-    response.summary = "Training report evaluation pipeline is pending; session metrics are available.";
-    if (evaluator_ && l0_redis_pool_ && !evaluation_config_path_.empty()) {
-        evaluation::TeachingEvaluationRequest eval_req;
-        eval_req.user_uuid = snapshot.value().user_uuid;
-        eval_req.session_id = snapshot.value().session_id;
-        eval_req.trace_id = request.trace_id;
-        eval_req.config_path = evaluation_config_path_;
-        eval_req.redis_pool = l0_redis_pool_;
-        auto evaluated = evaluator_->Evaluate(eval_req);
+    response.summary = "Session metrics report generated.";
+    if (report_evaluator_) {
+        ReportEvaluationRequest evaluation_request;
+        evaluation_request.user_uuid = snapshot.value().user_uuid;
+        evaluation_request.session_id = snapshot.value().session_id;
+        evaluation_request.trace_id = request.trace_id;
+        auto evaluated = report_evaluator_->Evaluate(evaluation_request);
         if (evaluated.ok()) {
             response.evaluation = std::move(evaluated).value();
-            response.summary = "Training report evaluation completed.";
+            response.summary = "Session report evaluation completed.";
         } else {
+            logger_.warn("report evaluation failed trace_id={} session_id={} error={}",
+                         request.trace_id,
+                         snapshot.value().session_id,
+                         evaluated.status().message());
             response.evaluation = {
                 {"error", evaluated.status().message()},
             };
-            response.summary = "Training report evaluation unavailable; session metrics are available.";
+            response.summary = "Session report evaluation unavailable; metrics are available.";
         }
     }
     return response;

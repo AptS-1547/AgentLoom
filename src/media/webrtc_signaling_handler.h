@@ -1,5 +1,6 @@
 #pragma once
 
+#include "frame_encoding.h"
 #include "request_interfaces.h"
 #include "result.h"
 #include "thread_pool.h"
@@ -27,6 +28,8 @@ struct WebRtcSignalingOptions {
     std::shared_ptr<core::ThreadPool> io_pool;
     std::shared_ptr<IFrameSampler> frame_sampler;
     std::shared_ptr<IVlmVisionClient> vlm_client;
+    std::shared_ptr<IVideoFrameEncoder> frame_encoder;
+    std::shared_ptr<IEncodedVideoFrameSink> encoded_frame_sink;
     FrameObserver frame_observer;
     std::shared_ptr<IVisionEventSink> vision_event_sink;
     std::vector<WebRtcIceServerConfig> ice_servers;

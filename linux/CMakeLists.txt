@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(AgentBackendPredictLinuxControl LANGUAGES NONE)
+project(AgentLoomLinuxControl LANGUAGES NONE)
 
 find_program(BASH_EXECUTABLE bash REQUIRED)
 

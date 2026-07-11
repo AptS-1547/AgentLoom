@@ -1,5 +1,7 @@
 # 旧架构问题分析与重构方向
 
+> 文档状态：历史分析。本文有意保留旧仓库名、旧路径和当时的系统判断，用于解释 AgentLoom 的架构来源。
+
 > 面向团队内部开发人员的历史架构复盘
 > 分析日期：2026-05-16
 > 依据范围：`D:\Users\21405\source\repos\EducationalAgentProject` 后端、`D:\front_end\Train` 前端关键文档与关键代码

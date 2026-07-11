@@ -53,22 +53,37 @@ std::shared_ptr<IAuthSessionStore> MakeAuthSessionStore(
 
 std::shared_ptr<IPersonaMetadataStore> MakePersonaMetadataStore(
     const GatewayAuthOptions& options,
+    const std::vector<PersonaMetadataRecord>& default_personas,
     const PersonaGatewayServerDependencies& dependencies,
     const std::shared_ptr<agent::semantic_cache::RedisConnectionPool>& auth_redis) {
     if (dependencies.persona_metadata_store) {
-        return dependencies.persona_metadata_store;
+        if (default_personas.empty()) {
+            return dependencies.persona_metadata_store;
+        }
+        return std::make_shared<OverlayPersonaMetadataStore>(
+            std::make_shared<ServerDefaultPersonaMetadataStore>(default_personas),
+            dependencies.persona_metadata_store);
     }
+    std::shared_ptr<IPersonaMetadataStore> account_store;
     if (options.session_database_path.empty()) {
-        return std::make_shared<InMemoryPersonaMetadataStore>();
+        account_store = std::make_shared<InMemoryPersonaMetadataStore>();
+    } else {
+        auto primary = std::make_shared<SqlitePersonaMetadataStore>(options.session_database_path);
+        if (!auth_redis) {
+            account_store = std::move(primary);
+        } else {
+            auto cache = std::make_shared<RedisPersonaMetadataCache>(
+                auth_redis,
+                options.redis_key_prefix.empty() ? "agent:gateway:persona" : options.redis_key_prefix + ":persona");
+            account_store = std::make_shared<CachedPersonaMetadataStore>(std::move(primary), std::move(cache));
+        }
     }
-    auto primary = std::make_shared<SqlitePersonaMetadataStore>(options.session_database_path);
-    if (!auth_redis) {
-        return primary;
+    if (default_personas.empty()) {
+        return account_store;
     }
-    auto cache = std::make_shared<RedisPersonaMetadataCache>(
-        auth_redis,
-        options.redis_key_prefix.empty() ? "agent:gateway:persona" : options.redis_key_prefix + ":persona");
-    return std::make_shared<CachedPersonaMetadataStore>(std::move(primary), std::move(cache));
+    return std::make_shared<OverlayPersonaMetadataStore>(
+        std::make_shared<ServerDefaultPersonaMetadataStore>(default_personas),
+        std::move(account_store));
 }
 
 } // namespace
@@ -93,14 +108,12 @@ PersonaGatewayServer::PersonaGatewayServer(PersonaGatewayServerOptions options,
                logger_),
       classroom_scheduler_({}, core::LoggerAdapter::ForModule("classroom")),
       auth_session_store_(MakeAuthSessionStore(options_.auth, auth_redis_)),
-      persona_metadata_store_(MakePersonaMetadataStore(options_.auth, dependencies_, auth_redis_)),
+      persona_metadata_store_(MakePersonaMetadataStore(options_.auth, options_.default_personas, dependencies_, auth_redis_)),
       service_(sessions_,
                runtime_,
                &classroom_scheduler_,
-               std::make_shared<evaluation::TeachingEvaluator>(),
-               dependencies_.l0_redis_pool,
+               dependencies_.report_evaluator,
                persona_metadata_store_,
-               dependencies_.evaluation_config_path,
                logger_),
       document_service_(std::make_shared<document::DocumentAnalysisService>(
           compute_pool_,

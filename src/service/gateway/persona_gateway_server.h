@@ -5,7 +5,6 @@
 #include "persona_runtime.h"
 #include "runtime_maintenance_service.h"
 #include "document_analysis_service.h"
-#include "teaching_evaluator.h"
 #include "http_server.h"
 #include "static_file_handler.h"
 #include "thread_pool.h"
@@ -51,10 +50,12 @@ struct PersonaGatewayServerOptions {
     persona::PersonaRuntimeOptions runtime;
     std::optional<::net::StaticFileOptions> static_files;
     GatewayDocumentStoreOptions document_store;
+    std::vector<PersonaMetadataRecord> default_personas;
     std::string websocket_path = "/ws/session";
 };
 
 struct PersonaGatewayServerDependencies {
+    /// 以下 shared_ptr 均由 Server 共享持有；未标为可选的主链路 provider 应在 Start 前配置。
     std::shared_ptr<persona::IMemoryContextProvider> memory_provider;
     std::shared_ptr<persona::IEmotionAnalyzer> emotion_analyzer;
     std::shared_ptr<persona::IToolMemoryProvider> tool_memory_provider;
@@ -63,15 +64,18 @@ struct PersonaGatewayServerDependencies {
     std::shared_ptr<document::IDocumentEmbeddingProvider> document_embedding_provider;
     std::shared_ptr<document::IDocumentLlmChunkCache> document_llm_chunk_cache;
     std::shared_ptr<semantic_cache::ISemanticCache> document_semantic_cache;
-    std::shared_ptr<semantic_cache::RedisConnectionPool> l0_redis_pool;
     std::shared_ptr<semantic_cache::L0MemoryCacheAdapter> l0_memory_adapter;
     std::shared_ptr<IPersonaMetadataStore> persona_metadata_store;
-    std::filesystem::path evaluation_config_path;
+    std::shared_ptr<IReportEvaluator> report_evaluator;
     std::vector<std::shared_ptr<IRuntimeMaintenanceTask>> maintenance_tasks;
 };
 
 class PersonaGatewayServer final {
 public:
+    /// 创建 Gateway 及其线程池、Session Runtime 和协议适配器。
+    /// @param options HTTP、认证、线程池、session 和文档存储配置。
+    /// @param dependencies 外部 provider 与维护任务，Server 共享持有其所有权。
+    /// @param logger Gateway 生命周期和业务失败日志适配器。
     PersonaGatewayServer(PersonaGatewayServerOptions options,
                          PersonaGatewayServerDependencies dependencies,
                          core::LoggerAdapter logger = core::LoggerAdapter::ForModule("gateway"));
@@ -80,8 +84,12 @@ public:
     PersonaGatewayServer(const PersonaGatewayServer&) = delete;
     PersonaGatewayServer& operator=(const PersonaGatewayServer&) = delete;
 
+    /// 启动依赖校验、存储、维护任务和 HTTP/WebSocket listener。
     core::Status Start();
+    /// 幂等停止 listener、维护任务和文档存储。
     void Stop();
+    /// 注册随 Server 启停的维护任务；Server 已启动时按实现规则立即纳入调度。
+    /// @param task 共享持有的维护任务，不得为空。
     core::Status RegisterMaintenanceTask(std::shared_ptr<IRuntimeMaintenanceTask> task);
 
     bool running() const noexcept;

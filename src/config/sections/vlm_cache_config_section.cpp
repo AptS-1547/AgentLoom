@@ -17,6 +17,16 @@ DECLARE_CONFIG_SECTION(VlmCacheConfigSection, "vlm_cache")
     CONFIG_CLI_STRING(kNoStorePrompts, "--no-vlm-cache-store-prompts");
     CONFIG_CLI_STRING(kNoStaleOnFailure, "--no-vlm-cache-stale-on-failure");
     CONFIG_CLI_STRING(kNoDefault, "--no-vlm-cache-default");
+    CONFIG_CLI_STRING(kPromptKvEnabled, "--vlm-prompt-kv-cache-enabled");
+    CONFIG_CLI_STRING(kPromptKvBackend, "--vlm-prompt-kv-backend");
+    CONFIG_CLI_STRING(kPromptKvRedisHost, "--vlm-prompt-kv-redis-host");
+    CONFIG_CLI_STRING(kPromptKvRedisPort, "--vlm-prompt-kv-redis-port");
+    CONFIG_CLI_STRING(kPromptKvRedisPassword, "--vlm-prompt-kv-redis-password");
+    CONFIG_CLI_STRING(kPromptKvRedisPoolSize, "--vlm-prompt-kv-redis-pool-size");
+    CONFIG_CLI_STRING(kPromptKvRedisTimeoutMs, "--vlm-prompt-kv-redis-timeout-ms");
+    CONFIG_CLI_STRING(kPromptKvKeyPrefix, "--vlm-prompt-kv-key-prefix");
+    CONFIG_CLI_STRING(kPromptKvTtlSeconds, "--vlm-prompt-kv-ttl-seconds");
+    CONFIG_CLI_STRING(kPromptKvMaxMb, "--vlm-prompt-kv-max-mb");
     void Validate(MultimodalServerOptions& options) const override;
 };
 
@@ -51,6 +61,20 @@ void VlmCacheConfigSection::LoadJson(const Json& root, MultimodalServerOptions& 
                  options.vlm_cache_vector.ttl_seconds, 0);
         SetPath(*vec, "vlm_cache.vector", "dir", options.vlm_cache_vector.vector_dir);
     }
+
+    const Json* prompt_kv = FindSection(*section, "prompt_kv");
+    if (prompt_kv) {
+        SetBool(*prompt_kv, "vlm_cache.prompt_kv", "enabled", options.vlm_prompt_kv_cache.enabled);
+        SetString(*prompt_kv, "vlm_cache.prompt_kv", "backend", options.vlm_prompt_kv_cache.backend);
+        SetString(*prompt_kv, "vlm_cache.prompt_kv", "redis_host", options.vlm_prompt_kv_cache.redis_host);
+        SetInt(*prompt_kv, "vlm_cache.prompt_kv", "redis_port", options.vlm_prompt_kv_cache.redis_port, 1, 65535);
+        SetString(*prompt_kv, "vlm_cache.prompt_kv", "redis_password", options.vlm_prompt_kv_cache.redis_password);
+        SetSize(*prompt_kv, "vlm_cache.prompt_kv", "redis_pool_size", options.vlm_prompt_kv_cache.redis_pool_size, 1);
+        SetInt(*prompt_kv, "vlm_cache.prompt_kv", "redis_command_timeout_ms", options.vlm_prompt_kv_cache.redis_command_timeout_ms, 1);
+        SetString(*prompt_kv, "vlm_cache.prompt_kv", "key_prefix", options.vlm_prompt_kv_cache.key_prefix);
+        SetInt64(*prompt_kv, "vlm_cache.prompt_kv", "ttl_seconds", options.vlm_prompt_kv_cache.ttl_seconds, 1);
+        SetMegabytes(*prompt_kv, "vlm_cache.prompt_kv", "max_mb", options.vlm_prompt_kv_cache.max_bytes, 1);
+    }
 }
 
 bool VlmCacheConfigSection::LoadCli(CliCursor& cursor, MultimodalServerOptions& options) const {
@@ -65,12 +89,30 @@ bool VlmCacheConfigSection::LoadCli(CliCursor& cursor, MultimodalServerOptions& 
     CONFIG_FLAG_ARG(kNoStorePrompts, options.vlm_cache.store_prompts = false;)
     CONFIG_FLAG_ARG(kNoStaleOnFailure, options.vlm_cache.allow_stale_on_failure = false;)
     CONFIG_FLAG_ARG(kNoDefault, options.vlm_cache.default_allow_cache = false;)
+    CONFIG_FLAG_ARG(kPromptKvEnabled, options.vlm_prompt_kv_cache.enabled = true;)
+    CONFIG_VALUE_ARG(kPromptKvBackend, value, options.vlm_prompt_kv_cache.backend = *value;)
+    CONFIG_VALUE_ARG(kPromptKvRedisHost, value, options.vlm_prompt_kv_cache.redis_host = *value;)
+    CONFIG_VALUE_ARG(kPromptKvRedisPort, value, options.vlm_prompt_kv_cache.redis_port = ParsePositiveOption(kPromptKvRedisPort, *value);)
+    CONFIG_VALUE_ARG(kPromptKvRedisPassword, value, options.vlm_prompt_kv_cache.redis_password = *value;)
+    CONFIG_VALUE_ARG(kPromptKvRedisPoolSize, value, options.vlm_prompt_kv_cache.redis_pool_size = static_cast<std::size_t>(ParsePositiveOption(kPromptKvRedisPoolSize, *value));)
+    CONFIG_VALUE_ARG(kPromptKvRedisTimeoutMs, value, options.vlm_prompt_kv_cache.redis_command_timeout_ms = ParsePositiveOption(kPromptKvRedisTimeoutMs, *value);)
+    CONFIG_VALUE_ARG(kPromptKvKeyPrefix, value, options.vlm_prompt_kv_cache.key_prefix = *value;)
+    CONFIG_VALUE_ARG(kPromptKvTtlSeconds, value, options.vlm_prompt_kv_cache.ttl_seconds = ParsePositiveOption(kPromptKvTtlSeconds, *value);)
+    CONFIG_VALUE_ARG(kPromptKvMaxMb, value, options.vlm_prompt_kv_cache.max_bytes = ParseMegabytesOption(kPromptKvMaxMb, *value);)
     return false;
 }
 
 void VlmCacheConfigSection::Validate(MultimodalServerOptions& options) const {
     if (options.vlm_cache.persist && options.vlm_cache.cache_dir.empty()) {
         throw std::runtime_error("--vlm-cache-dir must not be empty when persistence is enabled");
+    }
+    if (options.vlm_prompt_kv_cache.enabled && options.vlm_prompt_kv_cache.key_prefix.empty()) {
+        throw std::runtime_error("vlm_cache.prompt_kv.key_prefix must not be empty when prompt KV cache is enabled");
+    }
+    if (options.vlm_prompt_kv_cache.enabled &&
+        options.vlm_prompt_kv_cache.backend != "redis" &&
+        options.vlm_prompt_kv_cache.backend != "memory") {
+        throw std::runtime_error("vlm_cache.prompt_kv.backend must be redis or memory");
     }
 }
 

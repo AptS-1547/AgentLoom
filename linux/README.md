@@ -50,7 +50,7 @@ The CUDA archive must contain `libllama.so`, `libmtmd.so`, `libggml.so`, `libggm
 When using the current Windows checkout from WSL2, enter it through `/mnt`, for example:
 
 ```bash
-cd /mnt/d/Users/21405/source/repos/AgentBackendPredict
+cd /path/to/AgentLoom
 bash linux/scripts/prepare_deps.sh
 bash linux/scripts/configure.sh
 bash linux/scripts/build.sh
@@ -62,8 +62,8 @@ For better WSL2 filesystem performance, clone or copy the repository into a Linu
 ```bash
 mkdir -p ~/repos
 cd ~/repos
-git clone <repo-url> AgentBackendPredict
-cd AgentBackendPredict
+git clone <repo-url> AgentLoom
+cd AgentLoom
 ```
 
 The scripts derive paths from the current checkout root, so both `/mnt/d/...` and `~/repos/...` work.

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(MultimodalInferenceService VERSION 2.0.0 LANGUAGES CXX)
+project(AgentLoom VERSION 0.1.0 LANGUAGES CXX)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -146,8 +146,12 @@ if(WIN32)
 endif()
 
 # llama.cpp 预编译路径
-set(LLAMA_CPP_ROOT "D:/Users/21405/source/repos/LocalLLMPredict/llama.cpp" CACHE PATH "Path to llama.cpp repository")
-set(LLAMA_CPP_BUILD "${LLAMA_CPP_ROOT}/build")
+if(NOT DEFINED LLAMA_CPP_ROOT)
+    set(LLAMA_CPP_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp" CACHE PATH "Path to llama.cpp repository")
+endif()
+if(NOT DEFINED LLAMA_CPP_BUILD)
+    set(LLAMA_CPP_BUILD "${LLAMA_CPP_ROOT}/build" CACHE PATH "Path to llama.cpp build directory")
+endif()
 
 set(LLAMA_CPP_INCLUDE_DIRS
     "${LLAMA_CPP_ROOT}/include"
@@ -157,11 +161,19 @@ set(LLAMA_CPP_INCLUDE_DIRS
 )
 
 if(WIN32)
-    set(LLAMA_CPP_LIB_DIR "${LLAMA_CPP_BUILD}/src/Release")
-    set(LLAMA_CPP_COMMON_LIB_DIR "${LLAMA_CPP_BUILD}/common/Release")
-    set(LLAMA_CPP_MTMD_LIB_DIR "${LLAMA_CPP_BUILD}/tools/mtmd/Release")
-    set(LLAMA_CPP_GGML_LIB_DIR "${LLAMA_CPP_BUILD}/ggml/src/Release")
-    set(LLAMA_CPP_BIN_DIR "${LLAMA_CPP_BUILD}/bin/Release")
+    if(EXISTS "${LLAMA_CPP_BUILD}/src/Release/llama.lib")
+        set(LLAMA_CPP_LIB_DIR "${LLAMA_CPP_BUILD}/src/Release")
+        set(LLAMA_CPP_COMMON_LIB_DIR "${LLAMA_CPP_BUILD}/common/Release")
+        set(LLAMA_CPP_MTMD_LIB_DIR "${LLAMA_CPP_BUILD}/tools/mtmd/Release")
+        set(LLAMA_CPP_GGML_LIB_DIR "${LLAMA_CPP_BUILD}/ggml/src/Release")
+        set(LLAMA_CPP_BIN_DIR "${LLAMA_CPP_BUILD}/bin/Release")
+    else()
+        set(LLAMA_CPP_LIB_DIR "${LLAMA_CPP_BUILD}/src")
+        set(LLAMA_CPP_COMMON_LIB_DIR "${LLAMA_CPP_BUILD}/common")
+        set(LLAMA_CPP_MTMD_LIB_DIR "${LLAMA_CPP_BUILD}/tools/mtmd")
+        set(LLAMA_CPP_GGML_LIB_DIR "${LLAMA_CPP_BUILD}/ggml/src")
+        set(LLAMA_CPP_BIN_DIR "${LLAMA_CPP_BUILD}/bin")
+    endif()
     set(LLAMA_CPP_LIBS
         "${LLAMA_CPP_LIB_DIR}/llama.lib"
         "${LLAMA_CPP_MTMD_LIB_DIR}/mtmd.lib"
@@ -244,6 +256,9 @@ endif()
 
 add_library(boost_redis_headers INTERFACE)
 target_link_libraries(boost_redis_headers INTERFACE boost_asio_headers OpenSSL::SSL OpenSSL::Crypto)
+
+add_library(boost_interprocess_headers INTERFACE)
+target_include_directories(boost_interprocess_headers INTERFACE "${BERT_BOOST_ROOT}")
 
 set(BERT_EIGEN_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/deps/eigen-5.0.1" CACHE PATH "Path to Eigen header package")
 require_path("${BERT_EIGEN_ROOT}/Eigen/Dense" "Eigen headers")
@@ -914,12 +929,56 @@ target_link_libraries(agent_vector_storage PUBLIC
     OpenSSL::Crypto
 )
 
+add_library(agent_ipc STATIC
+    src/ipc/inference_frame_ipc_lifecycle.cpp
+    src/ipc/inference_frame_ipc_lifecycle.h
+    src/ipc/inference_frame_shared_memory.cpp
+    src/ipc/inference_frame_shared_memory.h
+)
+
+target_include_directories(agent_ipc PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/ipc
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/core
+)
+
+target_link_libraries(agent_ipc PUBLIC
+    agent_core
+    boost_interprocess_headers
+    spdlog::spdlog
+)
+
+add_library(agent_media_inference STATIC
+    src/media/inference_frame_backlog.cpp
+    src/media/inference_frame_backlog.h
+    src/media/inference_frame_coordinator.cpp
+    src/media/inference_frame_coordinator.h
+    src/media/inference_frame_ipc_receiver.cpp
+    src/media/inference_frame_ipc_receiver.h
+    src/media/vision_inference_interfaces.h
+)
+
+target_include_directories(agent_media_inference PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/media
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/core
+)
+
+target_link_libraries(agent_media_inference PUBLIC
+    agent_core
+    agent_ipc
+    spdlog::spdlog
+)
+
 if(TARGET gstreamer_core)
     add_library(agent_media STATIC
+        src/media/frame_encoding.cpp
+        src/media/frame_encoding.h
+        src/media/inference_frame_gateway_producer.cpp
+        src/media/inference_frame_gateway_producer.h
         src/media/opencv_frame_sampler.cpp
         src/media/opencv_frame_sampler.h
         src/media/vision_runtime_interfaces.cpp
         src/media/vision_runtime_interfaces.h
+        src/media/vision_inference_interfaces.h
         src/media/webrtc_media_pipeline.cpp
         src/media/webrtc_media_pipeline.h
         src/media/webrtc_session_registry.cpp
@@ -938,12 +997,14 @@ if(TARGET gstreamer_core)
 
     target_link_libraries(agent_media PUBLIC
         agent_core
+        agent_ipc
         agent_net
         agent_semantic_cache
         agent_vector
         ${OpenCV_LIBS}
         gstreamer_core
         "${GSTREAMER_ROOT}/lib/gstapp-1.0.lib"
+        "${GSTREAMER_ROOT}/lib/gstvideo-1.0.lib"
         "${GSTREAMER_ROOT}/lib/gstsdp-1.0.lib"
         "${GSTREAMER_ROOT}/lib/gstwebrtc-1.0.lib"
     )
@@ -1053,6 +1114,35 @@ if(BERT_BUILD_TESTS)
 
     gtest_discover_tests(core_tests DISCOVERY_MODE PRE_TEST)
 
+    add_executable(media_inference_tests
+        tests/media/inference_frame_backlog_test.cpp
+        tests/media/inference_frame_coordinator_test.cpp
+        tests/media/inference_frame_ipc_test.cpp
+    )
+
+    target_link_libraries(media_inference_tests PRIVATE
+        agent_media_inference
+        GTest::gtest_main
+    )
+
+    gtest_discover_tests(media_inference_tests DISCOVERY_MODE PRE_TEST)
+
+    add_executable(media_inference_bench
+        tests/media/inference_frame_backlog_bench.cpp
+    )
+
+    target_link_libraries(media_inference_bench PRIVATE
+        agent_media_inference
+    )
+
+    add_executable(media_inference_ipc_bench
+        tests/media/inference_frame_ipc_bench.cpp
+    )
+
+    target_link_libraries(media_inference_ipc_bench PRIVATE
+        agent_media_inference
+    )
+
     add_executable(net_tests
         tests/net/net_protocol_test.cpp
     )
@@ -1066,6 +1156,7 @@ if(BERT_BUILD_TESTS)
 
     if(TARGET agent_media)
         add_executable(media_tests
+            tests/media/frame_encoding_test.cpp
             tests/media/opencv_frame_sampler_test.cpp
             tests/media/webrtc_media_pipeline_test.cpp
             tests/media/webrtc_signaling_handler_test.cpp
@@ -1086,6 +1177,56 @@ if(BERT_BUILD_TESTS)
         endif()
 
         gtest_discover_tests(media_tests DISCOVERY_MODE PRE_TEST)
+
+        add_executable(media_frame_encoding_bench
+            tests/media/frame_encoding_bench.cpp
+        )
+
+        target_link_libraries(media_frame_encoding_bench PRIVATE
+            agent_media
+        )
+
+        add_executable(media_rtc_ipc_fake_vlm_stress
+            tests/media/rtc_ipc_fake_vlm_stress.cpp
+        )
+
+        target_link_libraries(media_rtc_ipc_fake_vlm_stress PRIVATE
+            agent_media
+            agent_media_inference
+        )
+
+        copy_runtime_files(media_rtc_ipc_fake_vlm_stress ${BERT_OPENCV_RUNTIME_FILES})
+
+        if(WIN32)
+            set_target_properties(media_rtc_ipc_fake_vlm_stress PROPERTIES
+                VS_DEBUGGER_ENVIRONMENT "PATH=${GSTREAMER_ROOT}/bin;%PATH%;GST_PLUGIN_PATH=${GSTREAMER_ROOT}/lib/gstreamer-1.0"
+            )
+        endif()
+
+        add_executable(media_ipc_e2e_peer
+            tests/media/inference_frame_ipc_e2e_peer.cpp
+        )
+
+        target_link_libraries(media_ipc_e2e_peer PRIVATE
+            agent_media_inference
+        )
+
+        add_executable(media_ipc_process_e2e_tests
+            tests/media/inference_frame_ipc_process_e2e_test.cpp
+        )
+
+        target_link_libraries(media_ipc_process_e2e_tests PRIVATE
+            agent_media
+            GTest::gtest_main
+        )
+
+        target_compile_definitions(media_ipc_process_e2e_tests PRIVATE
+            BOOST_PROCESS_USE_STD_FS
+            MEDIA_IPC_E2E_PEER_PATH="$<TARGET_FILE:media_ipc_e2e_peer>"
+        )
+
+        add_dependencies(media_ipc_process_e2e_tests media_ipc_e2e_peer)
+        gtest_discover_tests(media_ipc_process_e2e_tests DISCOVERY_MODE PRE_TEST)
     endif()
 
     add_executable(storage_tests
@@ -1375,26 +1516,11 @@ target_link_libraries(agent_gateway_auth PUBLIC
     spdlog::spdlog
 )
 
-add_library(agent_teaching_gateway STATIC
-    src/service/evaluation/teaching_evaluator.cpp
-    src/service/evaluation/teaching_evaluator.h
-)
-
-target_include_directories(agent_teaching_gateway PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/service/evaluation
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/semantic_cache
-)
-
-target_link_libraries(agent_teaching_gateway PUBLIC
-    agent_core
-    agent_semantic_cache
-    nlohmann_json::nlohmann_json
-)
-
 add_library(agent_agent_gateway STATIC
     src/service/gateway/gateway_models.h
     src/service/gateway/persona_gateway_service.cpp
     src/service/gateway/persona_gateway_service.h
+    src/service/gateway/report_evaluator.h
     src/service/gateway/persona_gateway_agent_routes.cpp
     src/service/gateway/persona_gateway_route_core.h
     src/service/gateway/persona_gateway_route_helpers.h
@@ -1403,14 +1529,12 @@ add_library(agent_agent_gateway STATIC
 target_include_directories(agent_agent_gateway PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src/service/gateway
     ${CMAKE_CURRENT_SOURCE_DIR}/src/service/persona
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/service/evaluation
     ${CMAKE_CURRENT_SOURCE_DIR}/src/semantic_cache
     ${CMAKE_CURRENT_SOURCE_DIR}/src/storage
 )
 
 target_link_libraries(agent_agent_gateway PUBLIC
     agent_agent_runtime
-    agent_teaching_gateway
     agent_gateway_auth
     agent_service_core
     agent_storage
@@ -1447,7 +1571,6 @@ target_include_directories(agent_training_report_gateway PUBLIC
 
 target_link_libraries(agent_training_report_gateway PUBLIC
     agent_agent_gateway
-    agent_teaching_gateway
     agent_service_core
 )
 
@@ -1487,7 +1610,6 @@ target_include_directories(agent_gateway_server_lib PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src/document
     ${CMAKE_CURRENT_SOURCE_DIR}/src/document/ooxml
     ${CMAKE_CURRENT_SOURCE_DIR}/src/service/persona
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/service/evaluation
     ${CMAKE_CURRENT_SOURCE_DIR}/src/service/gateway
     ${CMAKE_CURRENT_SOURCE_DIR}/src/net
     ${CMAKE_CURRENT_SOURCE_DIR}/src/llm
@@ -1526,7 +1648,6 @@ target_link_libraries(agent_service INTERFACE
     agent_service_core
     agent_agent_runtime
     agent_gateway_auth
-    agent_teaching_gateway
     agent_agent_gateway
     agent_classroom_gateway
     agent_training_report_gateway
@@ -1569,7 +1690,6 @@ if(BERT_BUILD_TESTS)
         tests/service/session_manager_test.cpp
         tests/service/persona_runtime_test.cpp
         tests/service/emotion_fusion_analyzer_test.cpp
-        tests/service/teaching_evaluator_test.cpp
         tests/service/persona_gateway_service_test.cpp
     )
 
@@ -1649,9 +1769,11 @@ target_include_directories(agent_server PUBLIC
 target_link_libraries(agent_server PUBLIC
     multimodal_proto
     agent_core
+    agent_media_inference
     agent_service
     agent_models
     agent_cache
+    agent_semantic_cache
     agent_vector
     server_runtime
     agent_config
@@ -1677,6 +1799,34 @@ if(BERT_BUILD_MULTIMODAL_INFERENCE_SERVER)
     link_whole_archive(multimodal_inference_server agent_config)
 
     copy_runtime_files(multimodal_inference_server ${LLAMA_CPP_RUNTIME_FILES})
+endif()
+
+if(BERT_BUILD_TESTS)
+    add_executable(inference_grpc_tests
+        tests/server/inference_grpc_service_test.cpp
+        src/server/grpc/grpc_error.cpp
+        src/server/grpc/emotion_grpc_service.cpp
+        src/server/grpc/multimodal_grpc_service.cpp
+        src/service/inference/request_validation.cpp
+    )
+
+    target_include_directories(inference_grpc_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/server/grpc
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/service/inference
+    )
+
+    target_link_libraries(inference_grpc_tests PRIVATE
+        multimodal_proto
+        agent_core
+        server_runtime
+        agent_config
+        gRPC::grpc++
+        spdlog::spdlog
+        GTest::gtest_main
+    )
+
+    copy_runtime_files(inference_grpc_tests ${VCPKG_RUNTIME_DLLS})
+    gtest_discover_tests(inference_grpc_tests DISCOVERY_MODE PRE_TEST)
 endif()
 
 # ==================== 客户端工具（BERT 协议，用于向后兼容测试） ====================
@@ -1851,3 +2001,31 @@ if(EXISTS "${CUDA_RUNTIME_DLL_ROOT}")
         copy_runtime_files(emotion_fusion_map_calibrator ${CUDA_RUNTIME_LIBS})
     endif()
 endif()
+
+# Stable build-tree aliases for downstream projects using add_subdirectory().
+function(agentloom_add_alias public_name internal_target)
+    if(TARGET ${internal_target} AND NOT TARGET AgentLoom::${public_name})
+        add_library(AgentLoom::${public_name} ALIAS ${internal_target})
+    endif()
+endfunction()
+
+agentloom_add_alias(core agent_core)
+agentloom_add_alias(net agent_net)
+agentloom_add_alias(tls agent_tls)
+agentloom_add_alias(http_client agent_http_client)
+agentloom_add_alias(config agent_config)
+agentloom_add_alias(storage agent_storage)
+agentloom_add_alias(vector_storage agent_vector_storage)
+agentloom_add_alias(vector agent_vector)
+agentloom_add_alias(semantic_cache agent_semantic_cache)
+agentloom_add_alias(memory agent_memory)
+agentloom_add_alias(document agent_document)
+agentloom_add_alias(llm agent_llm)
+agentloom_add_alias(models agent_models)
+agentloom_add_alias(cache agent_cache)
+agentloom_add_alias(ipc agent_ipc)
+agentloom_add_alias(media_inference agent_media_inference)
+agentloom_add_alias(media agent_media)
+agentloom_add_alias(runtime agent_agent_runtime)
+agentloom_add_alias(gateway agent_gateway_server_lib)
+agentloom_add_alias(service agent_service)

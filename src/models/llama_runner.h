@@ -11,10 +11,16 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
+struct llama_model;
+struct mtmd_context;
+
 namespace llm {
+
+class LlamaSharedRuntime;
 
 /**
  * VLM 推理结果
@@ -27,6 +33,7 @@ struct VLMResult {
     float eval_ms = 0.0f;
     int32_t prompt_tokens = 0;
     int32_t generated_tokens = 0;
+    bool prompt_kv_cache_hit = false;
 
     std::vector<float> image_embedding;
     int32_t image_embedding_dim = 0;
@@ -46,6 +53,8 @@ struct GenerateParams {
     float top_p = 0.9f;
     int32_t top_k = 40;
     bool capture_image_embedding = false;
+    bool enable_prompt_kv_cache = false;
+    std::string prompt_kv_cache_key;
 };
 
 struct DeviceMemoryInfo {
@@ -62,11 +71,22 @@ struct MemorySnapshot {
     std::vector<DeviceMemoryInfo> devices;
 };
 
+struct PromptKvCacheEntry {
+    std::vector<uint8_t> state;
+    int32_t prefix_tokens = 0;
+};
+
+class IPromptKvCache {
+public:
+    virtual ~IPromptKvCache() = default;
+    virtual std::optional<PromptKvCacheEntry> Load(const std::string& key) = 0;
+    virtual void Store(const std::string& key, const PromptKvCacheEntry& entry) = 0;
+};
+
 /**
  * llama.cpp VLM 推理封装
  *
  * 线程安全，支持 lazy load。
- * 同一时刻只能有一个推理任务（单飞行锁）。
  */
 class LlamaRunner {
 public:
@@ -86,7 +106,13 @@ public:
      */
     bool LoadModel(const std::filesystem::path& model_path,
                    const std::filesystem::path& mmproj_path = {},
-                   int n_gpu_layers = -1);
+                   int n_gpu_layers = -1,
+                   int llama_threads = 8,
+                   int mmproj_threads = 8);
+
+    bool LoadFromRuntime(std::shared_ptr<LlamaSharedRuntime> runtime,
+                         int llama_threads = 8);
+    void SetPromptKvCache(std::shared_ptr<IPromptKvCache> cache);
 
     /**
      * 推理生成
@@ -112,6 +138,83 @@ private:
     std::unique_ptr<Impl> impl_;
     bool loaded_ = false;
     mutable std::mutex mutex_;
+};
+
+class LlamaSharedRuntime {
+public:
+    LlamaSharedRuntime();
+    ~LlamaSharedRuntime();
+
+    LlamaSharedRuntime(const LlamaSharedRuntime&) = delete;
+    LlamaSharedRuntime& operator=(const LlamaSharedRuntime&) = delete;
+
+    bool Load(const std::filesystem::path& model_path,
+              const std::filesystem::path& mmproj_path = {},
+              int n_gpu_layers = -1,
+              int mmproj_threads = 8);
+    void Unload();
+    bool IsLoaded() const;
+
+    llama_model* Model() const;
+    mtmd_context* MtmdContext() const;
+    std::mutex& MtmdMutex() const;
+    const std::filesystem::path& ModelPath() const;
+    const std::filesystem::path& MmprojPath() const;
+    int GpuLayers() const;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+class LlamaRunnerPool {
+public:
+    class Lease {
+    public:
+        Lease() = default;
+        ~Lease();
+
+        Lease(const Lease&) = delete;
+        Lease& operator=(const Lease&) = delete;
+        Lease(Lease&& other) noexcept;
+        Lease& operator=(Lease&& other) noexcept;
+
+        LlamaRunner* operator->() const;
+        LlamaRunner& operator*() const;
+        explicit operator bool() const noexcept;
+
+    private:
+        friend class LlamaRunnerPool;
+        Lease(LlamaRunnerPool* pool, std::size_t index, LlamaRunner* runner);
+
+        LlamaRunnerPool* pool_ = nullptr;
+        std::size_t index_ = 0;
+        LlamaRunner* runner_ = nullptr;
+    };
+
+    LlamaRunnerPool();
+    ~LlamaRunnerPool();
+
+    LlamaRunnerPool(const LlamaRunnerPool&) = delete;
+    LlamaRunnerPool& operator=(const LlamaRunnerPool&) = delete;
+
+    bool Load(const std::filesystem::path& model_path,
+              const std::filesystem::path& mmproj_path = {},
+              int n_gpu_layers = -1,
+              std::size_t pool_size = 1,
+              int llama_threads = 8,
+              int mmproj_threads = 8,
+              std::shared_ptr<IPromptKvCache> prompt_kv_cache = nullptr);
+    void Unload();
+    bool IsLoaded() const;
+    Lease Acquire();
+    MemorySnapshot GetMemorySnapshot() const;
+
+private:
+    void Release(std::size_t index);
+
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
 };
 
 } // namespace llm

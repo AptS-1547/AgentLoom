@@ -131,6 +131,27 @@ DECLARE_AUTHENTICATED_HTTP_ROUTE(GetPersonaMetadataRoute, ::net::http::verb::get
         PersonaMetadataEnvelope);
 }
 
+DECLARE_AUTHENTICATED_HTTP_ROUTE(ListPersonaMetadataByAccountRoute, ::net::http::verb::get, "api", "personas") {
+    SendResult(
+        context.request,
+        context.service.ListPersonaMetadataByAccount(
+            context.identity.tenant_id.empty() ? "default" : context.identity.tenant_id,
+            context.identity.user_uuid,
+            context.trace_id),
+        context.trace_id,
+        [&context](const std::vector<PersonaMetadataRecord>& records) {
+            Json data = Json::array();
+            for (const auto& record : records) {
+                data.push_back(PersonaMetadataToJson(record));
+            }
+            return Json{
+                {"ok", true},
+                {"traceId", context.trace_id},
+                {"data", std::move(data)},
+            };
+        });
+}
+
 DECLARE_AUTHENTICATED_HTTP_ROUTE(CreateSessionRoute, ::net::http::verb::post, "api", "session", "create") {
     CreateSessionGatewayRequest req;
     req.trace_id = context.trace_id;

@@ -2,7 +2,7 @@
 
 本文档用于前端和当前 C++ Gateway 后端对齐接口。内容以 `agent_gateway_server` / `PersonaGatewayHttpAdapter` 当前实现为准，覆盖 HTTP API、WebSocket 消息、认证、主对话链路、文档链路和 Skill Session 控制接口。
 
-更新时间：2026-06-24
+更新时间：2026-07-11
 
 ## 1. 基础约定
 
@@ -655,7 +655,7 @@ Response:
   "data": {
     "generatedAt": "2026-06-24T12:00:00Z",
     "totalTurns": 8,
-    "summary": "本轮训练主要讨论...",
+    "summary": "Session metrics report generated.",
     "evaluation": {},
     "metrics": {
       "turnCount": 8,
@@ -669,6 +669,8 @@ Response:
   }
 }
 ```
+
+`evaluation` 是可选领域扩展结果。AgentLoom 基础 Server 未注入 `IReportEvaluator` 时返回空对象并保留 session metrics；下游项目可以注入自己的 evaluator。评估 provider 失败不会让基础报告请求失败，响应会保留 metrics，并通过 `summary`/`evaluation` 表示评估不可用。
 
 ## 7. 系统状态接口
 

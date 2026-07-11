@@ -76,9 +76,9 @@ class ILlmClient {
 public:
     virtual ~ILlmClient() = default;
 
-    /// Synchronous chat completion.  Returns a non-ok Status for transport
-    /// failures, API errors, or malformed responses.  HTTP 4xx/5xx are
-    /// reported as errors with the status code in the message.
+    /// 同步执行一次 chat completion。
+    /// @param req 模型、消息和生成参数；调用期间只读。
+    /// @return 传输失败、API 错误或响应格式错误时返回失败 Status。
     virtual core::Result<ChatCompletionResponse> Complete(
         const ChatCompletionRequest& req) = 0;
 };
@@ -92,7 +92,9 @@ public:
 /// concurrently from multiple threads.
 class OpenAiLlmClient : public ILlmClient {
 public:
-    /// `http_client` must outlive this object.
+    /// 创建 OpenAI-compatible 客户端。
+    /// @param options endpoint、认证、超时和重试配置。
+    /// @param http_client 借用的 HTTP 客户端，生命周期必须长于返回对象。
     static core::Result<std::unique_ptr<OpenAiLlmClient>> Create(
         OpenAiLlmClientOptions options,
         net::IHttpClient& http_client);
@@ -122,6 +124,9 @@ struct FallbackLlmClientOptions {
 
 class FallbackLlmClient final : public ILlmClient {
 public:
+    /// @param primary 首选客户端，可为空并按 options 决定是否直接降级。
+    /// @param fallback 降级客户端；需要降级但为空时返回原始失败。
+    /// @param options 连续失败阈值、探测间隔和允许降级的错误类型。
     FallbackLlmClient(std::shared_ptr<ILlmClient> primary,
                       std::shared_ptr<ILlmClient> fallback,
                       FallbackLlmClientOptions options = {});

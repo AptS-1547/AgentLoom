@@ -115,9 +115,13 @@ class ISessionManager {
 public:
     virtual ~ISessionManager() = default;
 
+    /// 创建并注册 session；request 可按值移动较大的 personality 配置。
     virtual core::Result<SessionSnapshot> CreateSession(CreateSessionRequest request) = 0;
+    /// 获取线程安全快照，不暴露内部可变 SessionState。
     virtual core::Result<SessionSnapshot> GetSessionSnapshot(std::string_view session_id) const = 0;
+    /// 幂等关闭 session，并触发已注册的关闭回调。
     virtual core::Status CloseSession(std::string_view session_id, std::string_view trace_id = {}) = 0;
+    /// 更新最后活动时间；不存在的 session 返回失败 Status。
     virtual core::Status TouchSession(std::string_view session_id, std::string_view trace_id = {}) = 0;
     virtual std::vector<SessionSnapshot> CleanupExpired() = 0;
     virtual std::size_t SessionCount() const = 0;
@@ -128,6 +132,9 @@ public:
     using SessionTask = std::function<core::Status(SessionState&, core::ThreadPoolContext&)>;
     using SessionClosedCallback = std::function<void(const SessionSnapshot&)>;
 
+    /// @param compute_pool 借用的计算线程池，生命周期必须长于 SessionManager。
+    /// @param io_pool 借用的 IO 线程池，生命周期必须长于 SessionManager。
+    /// @param options 空闲超时和最近回合容量。
     SessionManager(core::ThreadPool& compute_pool,
                    core::ThreadPool& io_pool,
                    SessionOptions options = {},
@@ -148,9 +155,12 @@ public:
                                       bool success,
                                       std::string_view trace_id = {});
 
+    /// 向 compute pool 提交持有目标 session 锁的任务。
     core::Status SubmitCompute(DispatchOptions options, SessionTask task);
+    /// 向 IO pool 提交持有目标 session 锁的任务。
     core::Status SubmitIo(DispatchOptions options, SessionTask task);
     SessionThreadPoolStats PoolStats() const;
+    /// 设置 session 关闭通知；callback 在内部资源移除后调用，不应执行长时间阻塞操作。
     void SetSessionClosedCallback(SessionClosedCallback callback);
 
 private:

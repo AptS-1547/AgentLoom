@@ -24,6 +24,7 @@ enum class ErrorCode {
     InternalError
 };
 
+/// 跨模块统一状态；成功状态的 code 为 ErrorCode::Ok。
 class Status {
 public:
     Status() noexcept = default;
@@ -34,6 +35,9 @@ public:
         return Status();
     }
 
+    /// 构造失败状态。
+    /// @param code 错误分类，不应传入 ErrorCode::Ok。
+    /// @param message 面向日志和诊断的安全错误摘要，不应包含凭据。
     static Status Error(ErrorCode code, std::string message = {}) noexcept {
         return Status(code, std::move(message));
     }
@@ -60,6 +64,7 @@ private:
 };
 
 template <typename T>
+/// 携带成功值或失败 Status 的 move-only 返回类型。
 class Result {
 public:
     Result() = delete;
@@ -97,10 +102,12 @@ public:
         return value_.has_value();
     }
 
+    /// 返回状态；成功结果返回 Status::Ok()。
     const Status& status() const noexcept {
         return status_;
     }
 
+    /// 取得成功值；调用前必须确认 ok()，失败时会抛出 bad_optional_access。
     T& value() & {
         return value_.value();
     }
@@ -119,6 +126,7 @@ private:
 };
 
 template <>
+/// 无返回值操作的 Result 特化。
 class Result<void> {
 public:
     Result() noexcept = default;

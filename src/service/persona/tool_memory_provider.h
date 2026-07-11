@@ -42,6 +42,9 @@ struct ToolMemoryContext {
 class IToolMemoryProvider {
 public:
     virtual ~IToolMemoryProvider() = default;
+    /// 查询与本轮文本相关的工具记忆。
+    /// @param request session/user/persona scope、trace 和 UTF-8 查询文本。
+    /// @return 命中列表及可注入 prompt block；provider 必须执行租户和用户隔离。
     virtual core::Result<ToolMemoryContext> Query(const ToolMemoryQuery& request) = 0;
 };
 

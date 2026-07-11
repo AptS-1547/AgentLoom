@@ -37,7 +37,11 @@ class IMemoryContextProvider {
 public:
     virtual ~IMemoryContextProvider() = default;
 
+    /// 构造本轮 L0/L3/L4 上下文。
+    /// @param request session、用户、查询和当前会话最近回合；span 仅在调用期间有效。
     virtual core::Result<RecalledContext> BuildContext(const MemoryContextRequest& request) = 0;
+    /// 在回复成功后接纳一个完整回合。
+    /// @param turn 已完成的用户输入、回复和情绪元数据。
     virtual core::Status AdmitTurn(std::string_view session_id,
                                    std::string_view user_uuid,
                                    const ConversationTurn& turn,
@@ -71,6 +75,9 @@ private:
 class IEmotionAnalyzer {
 public:
     virtual ~IEmotionAnalyzer() = default;
+    /// @param text 待分析 UTF-8 文本。
+    /// @param trace_id 用于跨服务日志关联。
+    /// @param personality 可选的人格配置，只读共享所有权。
     virtual core::Result<EmotionAnalysis> Analyze(std::string_view text,
                                                   std::string_view trace_id,
                                                   std::shared_ptr<const PersonalityConfig> personality = nullptr) = 0;
@@ -167,7 +174,9 @@ class IAnswerCacheProvider {
 public:
     virtual ~IAnswerCacheProvider() = default;
 
+    /// 查询是否可以绕过本轮 LLM；provider 必须自行执行 scope 和风险校验。
     virtual core::Result<AnswerCacheLookupResult> Lookup(const AnswerCacheLookupRequest& request) = 0;
+    /// 保存一次成功生成结果；失败应记录日志但不改变已经返回的对话结果。
     virtual core::Status Store(const AnswerCacheStoreRequest& request) = 0;
 };
 
@@ -196,6 +205,14 @@ struct PersonaRuntimeOptions {
 
 class PersonaRuntime {
 public:
+    /// 组装 Persona 对话运行时。
+    /// @param sessions 借用的会话管理器，生命周期必须长于 PersonaRuntime。
+    /// @param memory_provider 记忆上下文 provider，SubmitChat 前必须非空。
+    /// @param emotion_analyzer 情绪分析 provider；无需情绪能力时可传 NeutralEmotionAnalyzer。
+    /// @param llm_client 主对话 LLM provider，SubmitChat 前必须非空。
+    /// @param answer_cache_provider 可选的答案直返缓存，不同于 L0 reference 注入。
+    /// @param tool_memory_provider 可选的工具记忆和 Skill 触发 provider。
+    /// @param skill_session_manager 可选的有限 Skill 会话管理器。
     PersonaRuntime(SessionManager& sessions,
                    std::shared_ptr<IMemoryContextProvider> memory_provider,
                    std::shared_ptr<IEmotionAnalyzer> emotion_analyzer,
@@ -207,6 +224,9 @@ public:
                    core::LoggerAdapter logger = core::LoggerAdapter::ForModule("service"),
                    std::shared_ptr<IEmotionCalibrationSampleSink> emotion_calibration_sink = nullptr);
 
+    /// 异步提交对话；callback 恰好调用一次并携带最终 Result。
+    /// @param request 本轮 session、输入、trace 和生成参数。
+    /// @param callback 完成回调，不得为空；可能在线程池工作线程执行。
     core::Status SubmitChat(ChatRequest request, ChatCallback callback);
 
 private:

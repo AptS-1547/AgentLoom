@@ -35,7 +35,7 @@ http::message_generator MakeStatusResponse(const BeastHttpRequest& request,
     auto response = HttpResponse::Text(status, std::move(body));
     response.message.version(request.version());
     response.message.keep_alive(request.keep_alive());
-    response.message.set(http::field::server, "AgentBackendPredict");
+    response.message.set(http::field::server, "AgentLoom");
     response.message.prepare_payload();
     return std::move(response.message);
 }
@@ -47,7 +47,7 @@ http::message_generator MakeStatusResponse(unsigned version,
     auto response = HttpResponse::Text(status, std::move(body));
     response.message.version(version);
     response.message.keep_alive(keep_alive);
-    response.message.set(http::field::server, "AgentBackendPredict");
+    response.message.set(http::field::server, "AgentLoom");
     response.message.prepare_payload();
     return std::move(response.message);
 }

@@ -22,7 +22,7 @@ http::response<http::string_body> MakeStringResponse(const BeastHttpRequest& req
                                                      std::string body,
                                                      std::string_view content_type = "text/plain; charset=utf-8") {
     http::response<http::string_body> response{status, request.version()};
-    response.set(http::field::server, "AgentBackendPredict");
+    response.set(http::field::server, "AgentLoom");
     response.set(http::field::content_type, content_type);
     response.keep_alive(request.keep_alive());
     response.body() = std::move(body);
@@ -68,7 +68,7 @@ http::message_generator StaticFileHandler::Handle(const BeastHttpRequest& reques
     const auto size = body.size();
     if (request.method() == http::verb::head) {
         http::response<http::empty_body> response{http::status::ok, request.version()};
-        response.set(http::field::server, "AgentBackendPredict");
+        response.set(http::field::server, "AgentLoom");
         response.set(http::field::content_type, MimeType(path.string()));
         response.content_length(size);
         response.keep_alive(request.keep_alive());
@@ -79,7 +79,7 @@ http::message_generator StaticFileHandler::Handle(const BeastHttpRequest& reques
         std::piecewise_construct,
         std::make_tuple(std::move(body)),
         std::make_tuple(http::status::ok, request.version())};
-    response.set(http::field::server, "AgentBackendPredict");
+    response.set(http::field::server, "AgentLoom");
     response.set(http::field::content_type, MimeType(path.string()));
     response.content_length(size);
     response.keep_alive(request.keep_alive());

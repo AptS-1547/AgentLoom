@@ -1,0 +1,126 @@
+# Extending AgentLoom
+
+本文档说明下游项目如何复用 AgentLoom 核心库、基础 Server 和扩展接口，同时保持领域代码与开源 Runtime 解耦。
+
+## 1. 源码依赖
+
+当前稳定支持通过 `add_subdirectory()` 使用构建树 target：
+
+```cmake
+add_subdirectory(path/to/AgentLoom)
+
+target_link_libraries(my_agent_backend PRIVATE
+    AgentLoom::core
+    AgentLoom::service
+    AgentLoom::gateway
+)
+```
+
+可用的主要别名包括：
+
+```text
+AgentLoom::core
+AgentLoom::net
+AgentLoom::tls
+AgentLoom::http_client
+AgentLoom::config
+AgentLoom::storage
+AgentLoom::vector
+AgentLoom::vector_storage
+AgentLoom::semantic_cache
+AgentLoom::memory
+AgentLoom::document
+AgentLoom::llm
+AgentLoom::models
+AgentLoom::cache
+AgentLoom::ipc
+AgentLoom::media
+AgentLoom::media_inference
+AgentLoom::runtime
+AgentLoom::gateway
+AgentLoom::service
+```
+
+这些 alias 不改变内部 `agent_*` target，方便现有工程逐步迁移。安装式 `find_package(AgentLoom)` 尚未作为稳定接口承诺；在公共 header install/export 边界完成前，下游应锁定具体 commit 或 release tag。
+
+## 2. 推理服务边界
+
+BERT/VLM 模型实现默认通过独立 gRPC Server 复用：
+
+```text
+commercial gateway
+  -> generated protobuf/gRPC client
+  -> emotion_inference_server / multimodal_inference_server
+```
+
+建议交付：
+
+- Server 可执行文件；
+- protobuf/gRPC 生成头和客户端协议；
+- example 配置；
+- 所需动态库、模型和许可证清单；
+- health check、deadline、认证 metadata 和 trace 约定。
+
+不建议让业务 Gateway 直接链接推理 Server 内部的可变模型 context。模型、GPU 驱动、CUDA 和故障恢复应保持独立生命周期。
+
+## 3. 领域评估扩展
+
+AgentLoom 不包含特定组织的指标、权重或教学评估实现。下游可以实现 `IReportEvaluator`：
+
+```cpp
+class CommercialReportEvaluator final
+    : public agent::service::gateway::IReportEvaluator {
+public:
+    core::Result<nlohmann::json> Evaluate(
+        const agent::service::gateway::ReportEvaluationRequest& request) override;
+};
+```
+
+provider 自行持有数据库、缓存和领域配置：
+
+```cpp
+agent::service::gateway::PersonaGatewayServerDependencies dependencies;
+dependencies.report_evaluator = std::make_shared<CommercialReportEvaluator>(/* ... */);
+```
+
+未配置 provider 时，Gateway 仍返回基础 session metrics。provider 失败时，Gateway 记录安全日志并保留基础报告，不让领域评估失败破坏 session 主链路。
+
+## 4. 其他扩展接口
+
+常见扩展点包括：
+
+- `llm::ILlmClient`：本地或 OpenAI-compatible LLM；
+- `persona::IEmotionAnalyzer`：BERT gRPC、融合层或领域模型；
+- `persona::IMemoryContextProvider`：L0/L3/L4 上下文；
+- `persona::IToolMemoryProvider`：工具记忆和 Skill 触发；
+- `persona::ISkillSessionManager`：有限工具会话；
+- `gateway::IPersonaMetadataStore`：账号级 Persona 元数据；
+- `document::IDocumentEmbeddingProvider`：文档 embedding；
+- `document::IDocumentLlmChunkCache`：文档 chunk LLM cache；
+- `media::IVlmVisionClient`：VLM coordinator 的真实推理 adapter。
+
+新增业务模块应优先增加窄接口，避免让核心库依赖领域配置、具体数据库 schema 或产品路由。
+
+## 5. 本地配置
+
+机器相关配置不进入 Git：
+
+```text
+.clangd
+CMakeCache.txt
+CMakePresets.json.bak-*
+config/e2e_test.json
+tools/llm_smoke_test.json
+tools/llm_smoke_test.key
+```
+
+公开仓只保留 `.example` 文件。商业项目可以维护自己的私有配置仓或部署系统，不应把真实 key、模型绝对路径和合作方配置提交回 AgentLoom。
+
+## 6. 兼容性建议
+
+- 下游锁定 AgentLoom commit/tag，并记录 MSVC/vcpkg/CMake ABI 组合。
+- 公共接口变化应通过编译期 consumer test 验证。
+- 进程协议优先保持向后兼容；新增 protobuf 字段使用可选语义。
+- 不跨 runner/context 共享可变 llama KV state。
+- 不把单帧 VLM 输出直接写入长期事实或情绪状态机。
+- 对下游 evaluator、LLM、memory 和 media adapter 覆盖成功、失败、超时和关闭路径。

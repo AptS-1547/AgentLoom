@@ -10,7 +10,20 @@
 
 namespace service {
 
-class EmotionInferenceService {
+class IEmotionInferenceService {
+public:
+    virtual ~IEmotionInferenceService() = default;
+
+    virtual core::Status PredictEmotion(
+        const multimodal_inference::EmotionRequest& request,
+        multimodal_inference::EmotionResponse& response) = 0;
+
+    virtual core::Status PredictEmotionBatch(
+        const multimodal_inference::EmotionBatchRequest& request,
+        multimodal_inference::EmotionBatchResponse& response) = 0;
+};
+
+class EmotionInferenceService final : public IEmotionInferenceService {
 public:
     explicit EmotionInferenceService(const MultimodalServerOptions& options);
     ~EmotionInferenceService();
@@ -19,10 +32,10 @@ public:
     EmotionInferenceService& operator=(const EmotionInferenceService&) = delete;
 
     core::Status PredictEmotion(const multimodal_inference::EmotionRequest& request,
-                                multimodal_inference::EmotionResponse& response);
+                                multimodal_inference::EmotionResponse& response) override;
 
     core::Status PredictEmotionBatch(const multimodal_inference::EmotionBatchRequest& request,
-                                     multimodal_inference::EmotionBatchResponse& response);
+                                     multimodal_inference::EmotionBatchResponse& response) override;
 
 private:
     class Impl;

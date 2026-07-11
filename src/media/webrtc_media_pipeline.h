@@ -1,5 +1,6 @@
 #pragma once
 
+#include "frame_encoding.h"
 #include "thread_pool.h"
 #include "vision_runtime_interfaces.h"
 #include "webrtc_bin.h"
@@ -22,6 +23,8 @@ struct WebRtcMediaPipelineOptions {
     std::shared_ptr<core::ThreadPool> io_pool;
     std::shared_ptr<IFrameSampler> frame_sampler;
     std::shared_ptr<IVlmVisionClient> vlm_client;
+    std::shared_ptr<IVideoFrameEncoder> frame_encoder;
+    std::shared_ptr<IEncodedVideoFrameSink> encoded_frame_sink;
     FrameObserver frame_observer;
     std::shared_ptr<IVisionEventSink> vision_event_sink;
     std::function<void(std::string session_id, core::Status status, bool fatal)> status_observer;

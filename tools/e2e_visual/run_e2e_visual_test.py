@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import os
 import sys
 import time
 from dataclasses import dataclass, field
@@ -35,8 +36,11 @@ import multimodal_inference_pb2 as pb2
 import multimodal_inference_pb2_grpc as pb2_grpc
 import grpc
 
-# ── MyNeuroLikeSystem imports ──
-_NEURO_ROOT = Path("D:/Users/21405/source/repos/MyNeuroLikeSystem/project_src")
+# ── External visual pipeline imports ──
+_visual_pipeline_root = os.environ.get("AGENTLOOM_VISUAL_PIPELINE_ROOT")
+if not _visual_pipeline_root:
+    raise RuntimeError("AGENTLOOM_VISUAL_PIPELINE_ROOT must point to the external visual pipeline source root")
+_NEURO_ROOT = Path(_visual_pipeline_root)
 sys.path.insert(0, str(_NEURO_ROOT))
 
 from src.vision import (

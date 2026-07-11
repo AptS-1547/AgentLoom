@@ -469,12 +469,12 @@ Recommended boundary:
 PersonaRuntime
   -> normal dialogue, emotion, prompt, memory
 
-ReportEvaluationService
-  -> session turns, emotion timeline, teacher actions, indicators,
-     vector/keyword matching, LLM summary, structured scoring
+IReportEvaluator provider
+  -> downstream-owned session data, indicators, domain scoring,
+     optional LLM summary and structured evaluation
 ```
 
-Reports may reuse session history, emotion state, memory facts, and LLM clients, but the report pipeline should be a separate service path.
+AgentLoom always provides base session metrics through the report route. Domain evaluation remains a separate provider path injected through `IReportEvaluator`; the core Gateway does not own organization-specific indicators, weights, datasets, Redis queries or evaluation configuration.
 
 Document analysis should also be redesigned as a first-party flow, not a continuation of ADP/COS/qbot:
 

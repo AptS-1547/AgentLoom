@@ -139,7 +139,7 @@ for elf in "${copied_elfs[@]}"; do
 done
 
 cat > "$PACKAGE_DIR/README.txt" <<EOF
-AgentBackendPredict Linux package
+AgentLoom Linux package
 
 Run from this directory or set LD_LIBRARY_PATH to bin:
 

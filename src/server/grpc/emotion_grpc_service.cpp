@@ -7,39 +7,35 @@
 #include <grpcpp/support/status_code_enum.h>
 
 #include <cstddef>
+#include <string>
 #include <utility>
 
 namespace server::grpc_service {
 
 namespace {
 
-grpc::Status ToGrpc(const core::Status& status) {
-    return grpc_error::ToGrpcStatus(status);
+core::Status InvalidRpcArguments() {
+    return core::Status::Error(core::ErrorCode::InvalidArgument, "invalid gRPC request arguments");
 }
 
-void SetError(multimodal_inference::EmotionResponse& response, const core::Status& status) {
-    if (!status.ok() && response.error().empty()) {
-        response.set_error(status.message());
-    }
-}
-
-void SetError(multimodal_inference::EmotionBatchResponse& response, const core::Status& status) {
-    if (!status.ok() && response.error().empty()) {
-        response.set_error(status.message());
-    }
-}
-
-grpc::Status Unimplemented(std::string method) {
-    return grpc::Status(
-        grpc::StatusCode::UNIMPLEMENTED,
+core::Status UnimplementedStatus(std::string method) {
+    return core::Status::Error(
+        core::ErrorCode::Unimplemented,
         std::move(method) + " is not available in emotion_inference_server");
+}
+
+template <typename Response>
+void SetError(Response& response, const core::Status& status) {
+    if (!status.ok() && response.error().empty()) {
+        response.set_error(status.message());
+    }
 }
 
 } // namespace
 
 EmotionGrpcService::EmotionGrpcService(const MultimodalServerOptions& options,
                                        server_common::RuntimeStats& stats,
-                                       service::EmotionInferenceService& service)
+                                       service::IEmotionInferenceService& service)
     : stats_(stats),
       service_(service),
       slow_request_ms_(options.grpc.slow_request_ms),
@@ -50,28 +46,30 @@ grpc::Status EmotionGrpcService::PredictEmotion(
     grpc::ServerContext* context,
     const multimodal_inference::EmotionRequest* request,
     multimodal_inference::EmotionResponse* response) {
-    return grpc_error::GuardRpc([&] {
-        server_common::ScopedRequestStats request_stats(stats_, "PredictEmotion", 1, false, slow_request_ms_);
-
-        if (auto auth_status = CheckAuth(*context, request_stats); !auth_status.ok()) {
-            response->set_error(auth_status.error_message());
-            return auth_status;
+    grpc_error::RpcCall rpc(*context, stats_, "PredictEmotion", 1, false, slow_request_ms_);
+    return rpc.Run([&] {
+        if (!request || !response) {
+            return rpc.Failure(InvalidRpcArguments());
+        }
+        if (auto status = CheckAuth(*context); !status.ok()) {
+            SetError(*response, status);
+            return rpc.Failure(status, grpc::StatusCode::UNAUTHENTICATED);
         }
         if (auto validation = request_validation::ValidateEmotionRequest(*request, request_limits_); !validation.ok) {
-            response->set_error(validation.error);
-            request_stats.MarkFailure(validation.error);
-            return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, validation.error);
+            const auto status = core::Status::Error(core::ErrorCode::InvalidArgument, validation.error);
+            SetError(*response, status);
+            return rpc.Failure(status);
+        }
+        if (auto status = rpc.CancellationStatus(); !status.ok()) {
+            return rpc.Failure(status);
         }
 
         auto status = service_.PredictEmotion(*request, *response);
         if (!status.ok()) {
             SetError(*response, status);
-            request_stats.MarkFailure(status.message());
-            return ToGrpc(status);
+            return rpc.Failure(status);
         }
-
-        request_stats.MarkSuccess();
-        return grpc::Status::OK;
+        return rpc.Success();
     });
 }
 
@@ -79,67 +77,119 @@ grpc::Status EmotionGrpcService::PredictEmotionBatch(
     grpc::ServerContext* context,
     const multimodal_inference::EmotionBatchRequest* request,
     multimodal_inference::EmotionBatchResponse* response) {
-    return grpc_error::GuardRpc([&] {
-        const std::size_t reported_batch_size =
-            request->batch_size() > 0 ? static_cast<std::size_t>(request->batch_size()) : 0;
-        server_common::ScopedRequestStats request_stats(
-            stats_, "PredictEmotionBatch", reported_batch_size, true, slow_request_ms_);
-
-        if (auto auth_status = CheckAuth(*context, request_stats); !auth_status.ok()) {
-            response->set_error(auth_status.error_message());
-            return auth_status;
+    const std::size_t reported_batch_size = request && request->batch_size() > 0
+        ? static_cast<std::size_t>(request->batch_size())
+        : 0;
+    grpc_error::RpcCall rpc(
+        *context,
+        stats_,
+        "PredictEmotionBatch",
+        reported_batch_size,
+        true,
+        slow_request_ms_);
+    return rpc.Run([&] {
+        if (!request || !response) {
+            return rpc.Failure(InvalidRpcArguments());
+        }
+        if (auto status = CheckAuth(*context); !status.ok()) {
+            SetError(*response, status);
+            return rpc.Failure(status, grpc::StatusCode::UNAUTHENTICATED);
         }
         if (auto validation = request_validation::ValidateEmotionBatchRequest(*request, request_limits_); !validation.ok) {
-            response->set_error(validation.error);
-            request_stats.MarkFailure(validation.error);
-            return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, validation.error);
+            const auto status = core::Status::Error(core::ErrorCode::InvalidArgument, validation.error);
+            SetError(*response, status);
+            return rpc.Failure(status);
+        }
+        if (auto status = rpc.CancellationStatus(); !status.ok()) {
+            return rpc.Failure(status);
         }
 
         auto status = service_.PredictEmotionBatch(*request, *response);
         if (!status.ok()) {
             SetError(*response, status);
-            request_stats.MarkFailure(status.message());
-            return ToGrpc(status);
+            return rpc.Failure(status);
         }
-
-        request_stats.MarkSuccess();
-        return grpc::Status::OK;
+        return rpc.Success();
     });
 }
 
 grpc::Status EmotionGrpcService::DetectSaliency(
-    grpc::ServerContext*,
+    grpc::ServerContext* context,
     const multimodal_inference::SaliencyRequest*,
     multimodal_inference::SaliencyResponse*) {
-    return Unimplemented("DetectSaliency");
+    grpc_error::RpcCall rpc(*context, stats_, "DetectSaliency", 1, false, slow_request_ms_);
+    return rpc.Run([&] {
+        if (auto status = CheckAuth(*context); !status.ok()) {
+            return rpc.Failure(status, grpc::StatusCode::UNAUTHENTICATED);
+        }
+        return rpc.Failure(UnimplementedStatus("DetectSaliency"));
+    });
 }
 
 grpc::Status EmotionGrpcService::GenerateVLM(
-    grpc::ServerContext*,
-    const multimodal_inference::VLMRequest*,
+    grpc::ServerContext* context,
+    const multimodal_inference::VLMRequest* request,
     grpc::ServerWriter<multimodal_inference::VLMToken>*) {
-    return Unimplemented("GenerateVLM");
+    grpc_error::RpcLogContext log_context;
+    if (request) {
+        log_context.request_id = request->request_id();
+        log_context.session_id = request->session_id();
+        log_context.task_type = request->task_type();
+    }
+    grpc_error::RpcCall rpc(
+        *context,
+        stats_,
+        "GenerateVLM",
+        1,
+        false,
+        slow_request_ms_,
+        std::move(log_context));
+    return rpc.Run([&] {
+        if (auto status = CheckAuth(*context); !status.ok()) {
+            return rpc.Failure(status, grpc::StatusCode::UNAUTHENTICATED);
+        }
+        return rpc.Failure(UnimplementedStatus("GenerateVLM"));
+    });
 }
 
 grpc::Status EmotionGrpcService::GenerateVLMSync(
-    grpc::ServerContext*,
-    const multimodal_inference::VLMRequest*,
+    grpc::ServerContext* context,
+    const multimodal_inference::VLMRequest* request,
     multimodal_inference::VLMResponse* response) {
-    if (response) {
-        response->set_error("GenerateVLMSync is not available in emotion_inference_server");
+    grpc_error::RpcLogContext log_context;
+    if (request) {
+        log_context.request_id = request->request_id();
+        log_context.session_id = request->session_id();
+        log_context.task_type = request->task_type();
     }
-    return Unimplemented("GenerateVLMSync");
+    grpc_error::RpcCall rpc(
+        *context,
+        stats_,
+        "GenerateVLMSync",
+        1,
+        false,
+        slow_request_ms_,
+        std::move(log_context));
+    return rpc.Run([&] {
+        if (!response) {
+            return rpc.Failure(InvalidRpcArguments());
+        }
+        if (auto status = CheckAuth(*context); !status.ok()) {
+            SetError(*response, status);
+            return rpc.Failure(status, grpc::StatusCode::UNAUTHENTICATED);
+        }
+        const auto status = UnimplementedStatus("GenerateVLMSync");
+        SetError(*response, status);
+        return rpc.Failure(status);
+    });
 }
 
-grpc::Status EmotionGrpcService::CheckAuth(
-    const grpc::ServerContext& context,
-    server_common::ScopedRequestStats& request_stats) const {
+core::Status EmotionGrpcService::CheckAuth(const grpc::ServerContext& context) const {
     auto validation = request_validation::ValidateAuth(context, auth_options_);
     if (!validation.ok) {
-        request_stats.MarkFailure(validation.error);
-        return grpc::Status(grpc::StatusCode::UNAUTHENTICATED, validation.error);
+        return core::Status::Error(core::ErrorCode::PermissionDenied, validation.error);
     }
-    return grpc::Status::OK;
+    return core::Status::Ok();
 }
 
 } // namespace server::grpc_service

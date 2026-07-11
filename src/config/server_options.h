@@ -70,6 +70,19 @@ struct VlmCacheVectorOptions {
     std::filesystem::path vector_dir = "cache/vlm/vectors";
 };
 
+struct VlmPromptKvCacheOptions {
+    bool enabled = false;
+    std::string backend = "redis";
+    std::string redis_host = "127.0.0.1";
+    int redis_port = 6379;
+    std::string redis_password;
+    std::size_t redis_pool_size = 4;
+    int redis_command_timeout_ms = 5000;
+    std::string key_prefix = "agent:vlm:prompt_kv";
+    std::int64_t ttl_seconds = 3600;
+    std::size_t max_bytes = 512ULL * 1024ULL * 1024ULL;
+};
+
 struct LlmOptions {
     bool enabled = true;
     std::string base_url;
@@ -263,6 +276,42 @@ struct GatewayDocumentStoreConfigOptions {
     bool enable_path_analyze_test_endpoint = false;
 };
 
+struct GatewayEmotionStateConfigOptions {
+    double alpha = 0.75;
+    double beta = 0.25;
+    double gamma = 0.25;
+    double delta = 0.15;
+    double baseline_valence = 0.15;
+    double baseline_arousal = 0.28;
+    double kappa = 0.05;
+    double negativity_bias = 1.3;
+    double noise_sigma = 0.05;
+    double injection_threshold = 0.12;
+    int save_interval_turns = 5;
+    bool persist_to_l4 = true;
+};
+
+struct GatewayEmotionPromptConfigOptions {
+    std::unordered_map<std::string, std::string> emotion_map;
+    std::unordered_map<std::string, double> emotion_reliability;
+    std::unordered_map<std::string, double> confidence_thresholds;
+    std::unordered_map<std::string, double> intensity_levels;
+};
+
+struct GatewayPersonaConfigOptions {
+    std::string persona_id;
+    std::string description;
+    std::vector<std::string> traits;
+    double openness = 0.5;
+    double extraversion = 0.5;
+    double humor_tendency = 0.5;
+    double empathy_level = 0.5;
+    double curiosity_level = 0.5;
+    double formality = 0.5;
+    std::optional<GatewayEmotionPromptConfigOptions> emotion_prompts;
+    GatewayEmotionStateConfigOptions emotion_state;
+};
+
 struct PersonaGatewayConfigOptions {
     std::string websocket_path = "/ws/session";
     GatewayStaticFilesConfigOptions static_files;
@@ -276,6 +325,7 @@ struct PersonaGatewayConfigOptions {
     bool request_filter_enabled = true;
     bool reject_control_chars = true;
     bool reject_suspicious_patterns = true;
+    std::vector<GatewayPersonaConfigOptions> personas;
 };
 
 struct SkillSessionConfigOptions {
@@ -341,6 +391,7 @@ struct MultimodalServerOptions {
     VramGuardOptions vram;
     VlmCacheConfigOptions vlm_cache;
     VlmCacheVectorOptions vlm_cache_vector;
+    VlmPromptKvCacheOptions vlm_prompt_kv_cache;
     std::string auth_token_file;
     std::string auth_token_env = "AGENT_BACKEND_AUTH_TOKEN";
     std::string auth_source;
@@ -349,6 +400,9 @@ struct MultimodalServerOptions {
     std::string llm_model;
     std::string mmproj;
     int n_gpu_layers = -1;
+    std::size_t runner_pool_size = 1;
+    int llama_threads = 8;
+    int mmproj_threads = 8;
     std::filesystem::path config_file_path;
 };
 

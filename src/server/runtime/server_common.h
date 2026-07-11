@@ -102,7 +102,8 @@ public:
         std::string method_name,
         size_t sample_count,
         bool is_batch,
-        int slow_request_ms);
+        int slow_request_ms,
+        std::string trace_id = {});
 
     void MarkSuccess();
     void MarkFailure(const std::string& error_message);
@@ -116,6 +117,7 @@ private:
     std::string method_name_;
     size_t sample_count_ = 0;
     int slow_request_ms_ = 0;
+    std::string trace_id_;
     std::chrono::steady_clock::time_point started_at_;
     bool success_ = false;
     std::string error_message_;

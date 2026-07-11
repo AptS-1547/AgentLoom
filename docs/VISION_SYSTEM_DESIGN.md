@@ -1,6 +1,6 @@
 # Vision System Design
 
-本文档定义 AgentBackendPredict 后续视觉系统的整体实现与优化架构。核心方案是：
+本文档定义 AgentLoom 后续视觉系统的整体实现与优化架构。核心方案是：
 
 ```text
 VisualSkill 生命周期控制

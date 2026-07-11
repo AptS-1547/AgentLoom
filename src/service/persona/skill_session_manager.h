@@ -91,25 +91,37 @@ class ISkillSessionManager {
 public:
     virtual ~ISkillSessionManager() = default;
 
+    /// 创建有限 Skill 会话。
+    /// @param request skill/session/user 标识、触发来源和可选最大持续时间。
     virtual core::Result<SkillSessionSnapshot> Start(const SkillSessionStartRequest& request) = 0;
+    /// 请求会话进入关闭流程；具体实现可在 Closing 阶段等待 drain/finalize。
     virtual core::Result<SkillSessionSnapshot> Stop(const SkillSessionStopRequest& request) = 0;
+    /// 查询会话快照；不存在时成功返回 std::nullopt。
     virtual core::Result<std::optional<SkillSessionSnapshot>> Get(std::string_view session_id,
                                                                   std::string_view skill_id) const = 0;
+    /// 标记外部资源已就绪。
+    /// @param status_text 面向用户或诊断的简短状态文本。
     virtual core::Status MarkReady(std::string_view session_id,
                                    std::string_view skill_id,
                                    std::string status_text,
                                    std::string_view trace_id) = 0;
+    /// 将会话置为失败终态并保存安全错误摘要。
     virtual core::Status MarkFailed(std::string_view session_id,
                                     std::string_view skill_id,
                                     std::string error,
                                     std::string_view trace_id) = 0;
+    /// 记录一次 observation；实现负责 recent_observations 容量限制。
     virtual core::Status RecordObservation(const SkillObservation& observation) = 0;
+    /// 清理超时会话。
+    /// @param stop_token 允许维护任务协作式取消扫描。
+    /// @return 本轮转换为 Expired 的会话数量。
     virtual std::size_t CleanupExpired(std::stop_token stop_token) = 0;
 };
 
 class ISkillObservationSink {
 public:
     virtual ~ISkillObservationSink() = default;
+    /// 发布 observation；按值传递允许实现接管字符串和 metadata 所有权。
     virtual core::Status Publish(SkillObservation observation) = 0;
 };
 

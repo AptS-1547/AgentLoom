@@ -1,0 +1,52 @@
+{
+  "models": {
+    "llm": "D:/path/to/Qwen2.5-VL-3B-Instruct-Q8_0.gguf",
+    "mmproj": "D:/path/to/mmproj-Qwen2.5-VL-3B-Instruct-Q8_0.gguf",
+    "bert": "",
+    "vit": "",
+    "n_gpu_layers": 99
+  },
+  "grpc": {
+    "host": "127.0.0.1",
+    "port": "50051",
+    "max_receive_message_mb": 100,
+    "max_send_message_mb": 10,
+    "stats_log_interval_seconds": 15,
+    "slow_request_ms": 5000
+  },
+  "auth": {
+    "token": ""
+  },
+  "limits": {
+    "max_image_mb": 20,
+    "max_prompt_bytes": 8192,
+    "max_vlm_tokens": 512,
+    "max_temperature": 2.0
+  },
+  "vram_guard": {
+    "monitor_interval_seconds": 10,
+    "warning_free_mb": 512,
+    "unload_free_mb": 256,
+    "unload_on_oom_error": true
+  },
+  "vlm_cache": {
+    "enabled": true,
+    "persist": false,
+    "dir": "cache/vlm",
+    "max_entries": 512,
+    "max_mb": 1024,
+    "ttl_seconds": 3600,
+    "store_images": false,
+    "store_prompts": true,
+    "stale_on_failure": true,
+    "default_allow_cache": true,
+    "vector": {
+      "enabled": true,
+      "sim_threshold_high": 0.97,
+      "sim_threshold_mid": 0.93,
+      "max_saliency_for_mid": 0.15,
+      "max_entries_per_bucket": 256,
+      "ttl_seconds": 3600
+    }
+  }
+}

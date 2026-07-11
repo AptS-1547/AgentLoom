@@ -140,7 +140,12 @@ core::Result<cv::Mat> OpenCvFrameSampler::BuildRgbMat(const VideoFrameView& fram
         return core::Status::Error(core::ErrorCode::InvalidArgument, "frame is empty");
     }
 
-    const auto expected = static_cast<std::size_t>(frame.width) * static_cast<std::size_t>(frame.height) * 3;
+    const auto packed_stride = static_cast<std::size_t>(frame.width) * 3;
+    const auto row_stride = frame.row_stride_bytes == 0 ? packed_stride : frame.row_stride_bytes;
+    if (row_stride < packed_stride) {
+        return core::Status::Error(core::ErrorCode::InvalidArgument, "RGB frame stride is smaller than width*3");
+    }
+    const auto expected = row_stride * static_cast<std::size_t>(frame.height);
     if (frame.bytes.size() < expected) {
         return core::Status::Error(core::ErrorCode::InvalidArgument, "RGB frame buffer is smaller than width*height*3");
     }
@@ -149,7 +154,8 @@ core::Result<cv::Mat> OpenCvFrameSampler::BuildRgbMat(const VideoFrameView& fram
         static_cast<int>(frame.height),
         static_cast<int>(frame.width),
         CV_8UC3,
-        const_cast<char*>(frame.bytes.data()));
+        const_cast<char*>(frame.bytes.data()),
+        row_stride);
 }
 
 OpenCvFrameSampler::SessionState OpenCvFrameSampler::MakeSessionState() const {

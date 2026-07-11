@@ -1,6 +1,6 @@
 # Skill Session Protocol
 
-本文档定义 AgentBackendPredict 中可复用的 Skill 会话协议。视觉观察 `vision.observe` 是第一个复杂 profile，但协议本身应适用于任意具有触发、执行、状态反馈、错误处理和资源回收需求的 Skill。
+本文档定义 AgentLoom 中可复用的 Skill 会话协议。视觉观察 `vision.observe` 是第一个复杂 profile，但协议本身应适用于任意具有触发、执行、状态反馈、错误处理和资源回收需求的 Skill。
 
 ## 1. 背景
 
@@ -43,6 +43,12 @@ Skill 必须具备：
 Skill Session 是一次有生命周期的 Skill 执行实例。它不同于一次性函数调用。
 
 一次性 Skill 可以在很短时间内 `Starting -> Running -> Closed`。复杂 Skill，例如视觉观察，可能长时间处于 `Ready` 或 `Running`，并持续产出 observation。
+
+仓库当前所有媒体 Skill 都必须是有限流，并受 `max_duration` 约束；不支持无限媒体监控，也不允许通过异常大的 duration 等价构造无限流。媒体 Skill 的 selected-frame 映射缓存、Seal、drain 和关闭屏障设计见：
+
+```text
+docs/SKILL_MEDIA_DRAIN_SPOOL_DESIGN.md
+```
 
 ### 2.3 L4 Tool Memory
 
@@ -164,6 +170,8 @@ Starting|Ready|Running|WaitingInput|Closing -> Failed
 Starting|Ready|Running|WaitingInput|Closing -> Expired
   maintenance timeout
 ```
+
+当前代码尚未完整实现上述 `Closing` 转移：`SkillSessionManager::Stop()` 目前直接进入 `Closed`。需要异步资源 drain 的 Skill 必须先扩展为 `BeginClosing -> CompleteClosing`，不能把本节推荐状态机误认为当前实现行为。
 
 ## 5. 通用信令
 
@@ -539,16 +547,32 @@ docs/VISUAL_TOOL_SESSION_PROTOCOL.md
 
 已完成：
 
-- L4 Tool Memory Provider 基础接口。
-- 正则触发视觉 capability。
-- 全局 L4 向量近邻查询。
-- 主链路短 `<tool_memory_l4>` 注入。
+- `ISkillSessionManager`、`SkillSessionManager` 与通用状态枚举。
+- Start/Get/MarkReady/MarkFailed/RecordObservation/CleanupExpired。
+- HTTP/WS `skill.session.start`、`skill.session.stop` 和 status 路由。
+- startup/max-duration/idle/closing timeout 配置与 maintenance task。
+- `SkillVisionEventSink` 将 `VisionEvent` 转换为 `SkillObservation`。
+- Persona Runtime 注入 Skill status 或最近 observation。
+- L4 Tool Memory Provider、正则触发视觉 capability、全局 L4 向量近邻查询和短 Prompt 注入。
 
 待实现：
 
-- 通用 `ISkillSessionManager` 或视觉专用 manager。
-- 维护任务。
 - tool_call parser。
-- observation/result 注入。
-- Skill session 前端信令桥接。
 - L4 状态写回与 L3 确认写入。
+- execution generation，避免迟到回调污染重新启动的同名 Skill。
+- `Closing` 的 Begin/Complete 两阶段关闭；当前 Stop 直接 Closed。
+- Closing 期间 observation 不回退到 Running 的状态保护。
+- 通用 progress/result 与异步 close participant。
+- 媒体 Skill mapped spool、Seal/Drain gRPC 控制面和 final aggregation barrier。
+
+当前实现校准：
+
+- session key 是 `(session_id, skill_id)`，尚无 `execution_id`；
+- 活动 session 重复 Start 为幂等刷新；terminal session 再次 Start 会重置同一 key；
+- Stop 当前同步进入 `Closed`，`summarize/write_l3` 尚未驱动 close workflow；
+- `WaitingInput` 和 `Closing` 已定义，但尚无完整业务转移接口；
+- `closing_timeout` 已配置和检查，但正常 Stop 当前不会停留在 Closing。
+
+---
+
+**最后更新**: 2026-07-11

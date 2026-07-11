@@ -1,5 +1,7 @@
 # 教育智能体商业化架构图
 
+> 文档状态：历史架构图。当前 Runtime 边界和完成度以 `README.md`、`docs/README.md` 与 `CURRENT_RUNTIME_ROADMAP_2026_06.md` 为准。
+
 ## 总体架构
 
 ```

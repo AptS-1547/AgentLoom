@@ -38,6 +38,8 @@ using agent::service::gateway::CreateSessionGatewayRequest;
 using agent::service::gateway::PersonaMetadataGatewayRequest;
 using agent::service::gateway::PersonaGatewayHttpAdapter;
 using agent::service::gateway::InMemoryPersonaMetadataStore;
+using agent::service::gateway::OverlayPersonaMetadataStore;
+using agent::service::gateway::ServerDefaultPersonaMetadataStore;
 using agent::service::gateway::SqlitePersonaMetadataStore;
 using agent::service::gateway::RedisPersonaMetadataCache;
 using agent::service::gateway::CachedPersonaMetadataStore;
@@ -47,6 +49,8 @@ using agent::service::gateway::PersonaGatewayServerOptions;
 using agent::service::gateway::PersonaGatewayService;
 using agent::service::gateway::IGatewayAuthenticator;
 using agent::service::gateway::IAuthRegistrationService;
+using agent::service::gateway::IReportEvaluator;
+using agent::service::gateway::ReportEvaluationRequest;
 using agent::service::gateway::SqliteAuthSessionStore;
 using agent::service::gateway::RedisAuthSessionStore;
 using agent::service::gateway::AuthSessionRecord;
@@ -106,6 +110,24 @@ public:
 
     std::mutex mutex_;
     agent::llm::ChatCompletionRequest last_request;
+};
+
+class FakeReportEvaluator final : public IReportEvaluator {
+public:
+    explicit FakeReportEvaluator(bool fail = false) : fail_(fail) {}
+
+    core::Result<Json> Evaluate(const ReportEvaluationRequest& request) override {
+        last_request = request;
+        if (fail_) {
+            return core::Status::Error(core::ErrorCode::Unavailable, "evaluation backend unavailable");
+        }
+        return Json{{"provider", "test"}, {"score", 0.8}};
+    }
+
+    ReportEvaluationRequest last_request;
+
+private:
+    bool fail_ = false;
 };
 
 class FixedAuthenticator final : public IGatewayAuthenticator {
@@ -190,7 +212,8 @@ struct GatewayFixture {
     std::shared_ptr<InMemoryPersonaMetadataStore> persona_metadata_store;
     PersonaGatewayService gateway;
 
-    explicit GatewayFixture(bool enable_persona_metadata_store = false)
+    explicit GatewayFixture(bool enable_persona_metadata_store = false,
+                            std::shared_ptr<IReportEvaluator> report_evaluator = nullptr)
         : sessions(compute, io),
           cache(std::make_shared<FakeSemanticCache>()),
           emotion(std::make_shared<NeutralEmotionAnalyzer>()),
@@ -199,7 +222,7 @@ struct GatewayFixture {
           skill_sessions(std::make_shared<SkillSessionManager>()),
           runtime(sessions, memory, emotion, llm, PersonaRuntimeOptions{.recent_raw_turns = 10, .default_model = "test-model"}, nullptr, nullptr, skill_sessions),
           persona_metadata_store(enable_persona_metadata_store ? std::make_shared<InMemoryPersonaMetadataStore>() : nullptr),
-          gateway(sessions, runtime, &classroom_scheduler, nullptr, nullptr, persona_metadata_store) {
+          gateway(sessions, runtime, &classroom_scheduler, std::move(report_evaluator), persona_metadata_store) {
         EXPECT_TRUE(compute.Start().ok());
         EXPECT_TRUE(io.Start().ok());
     }
@@ -478,6 +501,44 @@ TEST(PersonaGatewayServiceTest, RunsCreateChatReportAndCloseLifecycle) {
     EXPECT_FALSE(rejected.ok());
 }
 
+TEST(PersonaGatewayServiceTest, UsesInjectedReportEvaluatorWithoutOwningDomainConfiguration) {
+    auto evaluator = std::make_shared<FakeReportEvaluator>();
+    GatewayFixture f(false, evaluator);
+
+    auto created = f.gateway.CreateSession(MakeCreateRequest());
+    ASSERT_TRUE(created.ok()) << created.status().message();
+
+    TrainingReportGatewayRequest report;
+    report.trace_id = "trace-evaluation";
+    report.session_id = "session-gateway";
+    auto result = f.gateway.TrainingReport(std::move(report));
+
+    ASSERT_TRUE(result.ok()) << result.status().message();
+    EXPECT_EQ(result.value().evaluation["provider"], "test");
+    EXPECT_DOUBLE_EQ(result.value().evaluation["score"].get<double>(), 0.8);
+    EXPECT_EQ(evaluator->last_request.trace_id, "trace-evaluation");
+    EXPECT_EQ(evaluator->last_request.session_id, "session-gateway");
+    EXPECT_EQ(evaluator->last_request.user_uuid, "user-gateway");
+}
+
+TEST(PersonaGatewayServiceTest, KeepsSessionMetricsWhenInjectedReportEvaluatorFails) {
+    auto evaluator = std::make_shared<FakeReportEvaluator>(true);
+    GatewayFixture f(false, evaluator);
+
+    auto created = f.gateway.CreateSession(MakeCreateRequest());
+    ASSERT_TRUE(created.ok()) << created.status().message();
+
+    TrainingReportGatewayRequest report;
+    report.trace_id = "trace-evaluation-failure";
+    report.session_id = "session-gateway";
+    auto result = f.gateway.TrainingReport(std::move(report));
+
+    ASSERT_TRUE(result.ok()) << result.status().message();
+    EXPECT_EQ(result.value().total_turns, 0u);
+    EXPECT_EQ(result.value().evaluation["error"], "evaluation backend unavailable");
+    EXPECT_EQ(result.value().summary, "Session report evaluation unavailable; metrics are available.");
+}
+
 TEST(PersonaGatewayServiceTest, RequiresAccountPersonaMetadataWhenStoreIsConfigured) {
     GatewayFixture f(true);
 
@@ -706,6 +767,20 @@ TEST(PersonaGatewayHttpAdapterTest, ManagesPersonaMetadataByAuthenticatedAccount
         Json{{"traceId", "trace-http-persona-get"}});
     ASSERT_EQ(get.result(), ::net::http::status::ok);
     EXPECT_EQ(Json::parse(get.body())["data"]["personality"]["description"], "stored http persona");
+
+    auto list = SendJsonRequest(
+        server.port(),
+        ::net::http::verb::get,
+        "/api/personas",
+        Json{{"traceId", "trace-http-persona-list"}});
+    ASSERT_EQ(list.result(), ::net::http::status::ok);
+    auto list_body = Json::parse(list.body());
+    ASSERT_TRUE(list_body["ok"].get<bool>());
+    ASSERT_TRUE(list_body["data"].is_array());
+    ASSERT_EQ(list_body["data"].size(), 1u);
+    EXPECT_EQ(list_body["data"][0]["userUuid"], "persona-http-user");
+    EXPECT_EQ(list_body["data"][0]["personaId"], "dazhi");
+    EXPECT_EQ(list_body["data"][0]["personality"]["description"], "stored http persona");
 
     auto create = SendJsonRequest(
         server.port(),
@@ -1881,6 +1956,80 @@ TEST(PersonaMetadataStoreTest, SqlitePersistsPersonaMetadataAcrossInstances) {
     std::filesystem::remove(path, ec);
     std::filesystem::remove(path.string() + "-wal", ec);
     std::filesystem::remove(path.string() + "-shm", ec);
+}
+
+TEST(PersonaMetadataStoreTest, OverlayPrefersServerDefaultPersonasBeforeAccountRecords) {
+    auto defaults = std::make_shared<ServerDefaultPersonaMetadataStore>(std::vector<agent::service::gateway::PersonaMetadataRecord>{
+        agent::service::gateway::PersonaMetadataRecord{
+            "server",
+            "server",
+            "dazhi",
+            agent::service::persona::PersonalityConfig{
+                "dazhi",
+                "server default persona",
+                {},
+                0.5,
+                0.5,
+                0.5,
+                0.5,
+                0.5,
+                0.5,
+            },
+            std::nullopt,
+            {},
+        },
+    });
+    auto account = std::make_shared<InMemoryPersonaMetadataStore>();
+    ASSERT_TRUE(account->Upsert(agent::service::gateway::PersonaMetadataRecord{
+        "default",
+        "owner",
+        "dazhi",
+        agent::service::persona::PersonalityConfig{
+            "dazhi",
+            "account persona should not win",
+            {},
+            0.5,
+            0.5,
+            0.5,
+            0.5,
+            0.5,
+            0.5,
+        },
+        std::nullopt,
+        {},
+    }).ok());
+    ASSERT_TRUE(account->Upsert(agent::service::gateway::PersonaMetadataRecord{
+        "default",
+        "owner",
+        "xiaozhi",
+        agent::service::persona::PersonalityConfig{
+            "xiaozhi",
+            "account only persona",
+            {},
+            0.5,
+            0.5,
+            0.5,
+            0.5,
+            0.5,
+            0.5,
+        },
+        std::nullopt,
+        {},
+    }).ok());
+
+    OverlayPersonaMetadataStore store(defaults, account);
+    auto dazhi = store.Get("default", "owner", "dazhi");
+    ASSERT_TRUE(dazhi.ok()) << dazhi.status().message();
+    EXPECT_EQ(dazhi.value().user_uuid, "owner");
+    EXPECT_EQ(dazhi.value().personality.description, "server default persona");
+
+    auto listed = store.ListByAccount("default", "owner");
+    ASSERT_TRUE(listed.ok()) << listed.status().message();
+    ASSERT_EQ(listed.value().size(), 2u);
+    EXPECT_EQ(listed.value()[0].persona_id, "dazhi");
+    EXPECT_EQ(listed.value()[0].personality.description, "server default persona");
+    EXPECT_EQ(listed.value()[1].persona_id, "xiaozhi");
+    EXPECT_EQ(listed.value()[1].personality.description, "account only persona");
 }
 
 TEST(GatewayAuthRegistrationServiceTest, StoresUsernameAndPasswordHashWithoutUsingSubject) {

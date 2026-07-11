@@ -1,5 +1,7 @@
 # AgentBackendPredict 性能测试报告
 
+> 文档状态：历史性能记录。结果只适用于文中版本、输入和硬件条件，不代表当前 AgentLoom 的稳定回归指标。
+
 > 测试日期：2026-05-25  
 > 测试环境：Windows 11 Home China 10.0.26200  
 > 编译配置：Release, MSVC, C++20, AVX2 SIMD  

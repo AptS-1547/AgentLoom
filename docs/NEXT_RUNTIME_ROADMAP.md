@@ -1,6 +1,8 @@
 # Next Runtime Roadmap
 
-> Working roadmap for the next AgentBackendPredict runtime phase.  
+> Document status: historical roadmap. Use `CURRENT_RUNTIME_ROADMAP_2026_06.md` for current priorities and implementation status.
+
+> Working roadmap for the next AgentLoom runtime phase.
 > Status: active planning note  
 > Date: 2026-05-24
 
@@ -45,7 +47,7 @@ text
 
 ## 2. Runtime Ownership Model
 
-AgentBackendPredict should keep the same language boundary policy:
+AgentLoom should keep the same language boundary policy:
 
 - C++ owns online hot paths, resource governance, protocol infrastructure,
   storage access, vector search, model wrappers, cache routing, and degradation.

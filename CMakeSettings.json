@@ -2,7 +2,7 @@
   "configurations": [
     {
       "name": "x64-Release",
-      "generator": "Visual Studio 17 2022",
+      "generator": "Visual Studio 18 2026",
       "configurationType": "Release",
       "inheritEnvironments": [ "msvc_x86_x64" ],
       "buildRoot": "${projectDir}\\build\\${name}",
@@ -13,13 +13,12 @@
       "intelliSenseMode": "windows-msvc-x64",
       "variables": [
         { "name": "BERT_VCPKG_TRIPLET", "value": "x64-windows", "type": "STRING" },
-        { "name": "BERT_USE_ONNXRUNTIME_GPU", "value": "OFF", "type": "STRING" },
-        { "name": "LLAMA_CPP_ROOT", "value": "D:/Users/21405/source/repos/LocalLLMPredict/llama.cpp", "type": "PATH" }
+        { "name": "BERT_USE_ONNXRUNTIME_GPU", "value": "OFF", "type": "STRING" }
       ]
     },
     {
       "name": "x64-Debug",
-      "generator": "Visual Studio 17 2022",
+      "generator": "Visual Studio 18 2026",
       "configurationType": "Debug",
       "inheritEnvironments": [ "msvc_x86_x64" ],
       "buildRoot": "${projectDir}\\build\\${name}",
@@ -30,8 +29,7 @@
       "intelliSenseMode": "windows-msvc-x64",
       "variables": [
         { "name": "BERT_VCPKG_TRIPLET", "value": "x64-windows", "type": "STRING" },
-        { "name": "BERT_USE_ONNXRUNTIME_GPU", "value": "OFF", "type": "STRING" },
-        { "name": "LLAMA_CPP_ROOT", "value": "D:/Users/21405/source/repos/LocalLLMPredict/llama.cpp", "type": "PATH" }
+        { "name": "BERT_USE_ONNXRUNTIME_GPU", "value": "OFF", "type": "STRING" }
       ]
     }
   ]

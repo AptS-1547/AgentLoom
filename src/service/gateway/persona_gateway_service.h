@@ -4,11 +4,10 @@
 #include "gateway_models.h"
 #include "logger_adapter.h"
 #include "persona_runtime.h"
+#include "report_evaluator.h"
 #include "session_manager.h"
-#include "teaching_evaluator.h"
 
 #include <functional>
-#include <filesystem>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -43,6 +42,41 @@ private:
 
     mutable std::mutex mutex_;
     std::unordered_map<std::string, PersonaMetadataRecord> records_;
+};
+
+class ServerDefaultPersonaMetadataStore final : public IPersonaMetadataStore {
+public:
+    explicit ServerDefaultPersonaMetadataStore(std::vector<PersonaMetadataRecord> records = {});
+
+    core::Status EnsureSchema() override;
+    core::Status Upsert(PersonaMetadataRecord record) override;
+    core::Result<PersonaMetadataRecord> Get(std::string_view tenant_id,
+                                            std::string_view user_uuid,
+                                            std::string_view persona_id) const override;
+    core::Result<std::vector<PersonaMetadataRecord>> ListByAccount(std::string_view tenant_id,
+                                                                   std::string_view user_uuid) const override;
+
+private:
+    mutable std::mutex mutex_;
+    std::unordered_map<std::string, PersonaMetadataRecord> records_;
+};
+
+class OverlayPersonaMetadataStore final : public IPersonaMetadataStore {
+public:
+    OverlayPersonaMetadataStore(std::shared_ptr<IPersonaMetadataStore> defaults,
+                                std::shared_ptr<IPersonaMetadataStore> account);
+
+    core::Status EnsureSchema() override;
+    core::Status Upsert(PersonaMetadataRecord record) override;
+    core::Result<PersonaMetadataRecord> Get(std::string_view tenant_id,
+                                            std::string_view user_uuid,
+                                            std::string_view persona_id) const override;
+    core::Result<std::vector<PersonaMetadataRecord>> ListByAccount(std::string_view tenant_id,
+                                                                   std::string_view user_uuid) const override;
+
+private:
+    std::shared_ptr<IPersonaMetadataStore> defaults_;
+    std::shared_ptr<IPersonaMetadataStore> account_;
 };
 
 class SqlitePersonaMetadataStore final : public IPersonaMetadataStore {
@@ -107,10 +141,8 @@ public:
     PersonaGatewayService(persona::SessionManager& sessions,
                           persona::PersonaRuntime& runtime,
                           IClassroomScheduler* classroom_scheduler = nullptr,
-                          std::shared_ptr<evaluation::TeachingEvaluator> evaluator = nullptr,
-                          std::shared_ptr<semantic_cache::RedisConnectionPool> l0_redis_pool = nullptr,
+                          std::shared_ptr<IReportEvaluator> report_evaluator = nullptr,
                           std::shared_ptr<IPersonaMetadataStore> persona_metadata_store = nullptr,
-                          std::filesystem::path evaluation_config_path = {},
                           core::LoggerAdapter logger = core::LoggerAdapter::ForModule("service"));
 
     core::Result<PersonaMetadataGatewayResponse> UpsertPersonaMetadata(PersonaMetadataGatewayRequest request);
@@ -129,7 +161,9 @@ public:
     core::Result<ClassroomGatewayResponse> ClassroomPoll(ClassroomPollGatewayRequest request);
     core::Result<TrainingReportGatewayResponse> TrainingReport(TrainingReportGatewayRequest request);
     core::Result<SystemStatsGatewayResponse> SystemStats(std::string trace_id);
-
+    core::Result<std::vector<PersonaMetadataRecord>> ListPersonaMetadataByAccount(std::string_view tenant_id,
+                                                              std::string_view user_uuid,
+                                                              std::string trace_id);
     core::Status SubmitChat(ChatGatewayRequest request, ChatCallback callback);
     core::Status SubmitClassroomMessage(ClassroomMessageGatewayRequest request, ClassroomCallback callback);
     core::Status SubmitClassroomProactive(ClassroomProactiveGatewayRequest request, ClassroomCallback callback);
@@ -152,10 +186,8 @@ private:
     persona::SessionManager& sessions_;
     persona::PersonaRuntime& runtime_;
     IClassroomScheduler* classroom_scheduler_ = nullptr;
-    std::shared_ptr<evaluation::TeachingEvaluator> evaluator_;
-    std::shared_ptr<semantic_cache::RedisConnectionPool> l0_redis_pool_;
+    std::shared_ptr<IReportEvaluator> report_evaluator_;
     std::shared_ptr<IPersonaMetadataStore> persona_metadata_store_;
-    std::filesystem::path evaluation_config_path_;
     core::LoggerAdapter logger_;
 };
 

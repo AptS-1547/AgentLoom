@@ -38,6 +38,25 @@ media::VideoFrameView MakeFrame(std::vector<std::byte>& bytes,
     return frame;
 }
 
+TEST(OpenCvFrameSamplerTest, AcceptsRgbRowsWithPadding) {
+    media::OpenCvFrameSampler sampler;
+    constexpr std::uint32_t width = 5;
+    constexpr std::uint32_t height = 8;
+    constexpr std::size_t stride = 20;
+    std::vector<std::byte> bytes(stride * height, std::byte{0x20});
+    media::VideoFrameView frame;
+    frame.session_id = "session-stride";
+    frame.frame_id = 1;
+    frame.width = width;
+    frame.height = height;
+    frame.row_stride_bytes = stride;
+    frame.format = media::VideoPixelFormat::Rgb;
+    frame.bytes = {reinterpret_cast<const char*>(bytes.data()), bytes.size()};
+
+    auto decision = sampler.Evaluate(frame);
+    ASSERT_TRUE(decision.ok()) << decision.status().message();
+}
+
 } // namespace
 
 TEST(OpenCvFrameSamplerTest, EmitsDecisionForLargeSyntheticChange) {

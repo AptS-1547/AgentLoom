@@ -1,528 +1,218 @@
 # AgentLoom
 
-> 可组合的 C++20 Agent Runtime、网关与推理基础设施
+> 可组合的 C++20 Agent Runtime、Gateway 与多模态推理基础设施
 
 中文 | [English](README_EN.md)
 
 [![C++20](https://img.shields.io/badge/C%2B%2B-20-blue.svg)](https://isocpp.org/)
 [![CMake](https://img.shields.io/badge/CMake-3.20+-green.svg)](https://cmake.org/)
-[![Tests](https://img.shields.io/badge/tests-70%2B%20passing-brightgreen.svg)](#测试覆盖)
+[![Tests](https://img.shields.io/badge/CTest-420_passing-brightgreen.svg)](#测试)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-## 📖 项目简介
+## 项目定位
 
-AgentLoom 是一个面向智能体服务端的 C++20 基础设施项目，提供高性能推理服务、语义缓存、多级记忆管理、实时多模态输入和网关层服务编排能力。
+AgentLoom 是一个面向服务端智能体的 C++20 Runtime。它把 HTTP/WebSocket Gateway、Persona 与 Session Runtime、语义缓存、长期记忆、文档分析、实时媒体链路以及 BERT/VLM 推理组织成可组合的库目标和基础 Server。
 
-项目从教育智能体的单体推理服务演进为分层的服务端 Runtime，以 `core / net / config / cache / vector / models / service / server` 为主要边界。教育场景仍是重要参考实现，但核心库、推理协议和基础 Server 可以被其他智能体项目复用。
+项目源自教育智能体后端，但开源边界不绑定教育产品：通用 Runtime、协议和基础 Server 留在 AgentLoom；Persona、Prompt、领域评估、数据集与产品编排由下游项目持有。领域报告评估可通过 `IReportEvaluator` 注入，仓库不包含特定组织的评估器实现。
 
-推理模块的复用边界是独立 gRPC server：迁移时优先交付已编译的 `emotion_inference_server` / `multimodal_inference_server`、生成的 protobuf/gRPC 头文件与客户端协议头，而不是把模型推理内部继续拆成网关侧库目标。Gateway 与 Persona Runtime 通过 gRPC/adapter 对接推理服务。
+当前版本为 `0.1.0`。接口仍在活跃开发中，适合用于二次开发、系统集成和面向生产的工程验证，不保证ABI的绝对稳定。
 
-### ✨ 核心特性
+## 已实现能力
 
-- 🚀 **高性能推理**：ONNX Runtime + llama.cpp/mtmd 多模态推理，支持 BERT/VLM
-- 🧠 **多级记忆系统**：L0 上下文记忆 + L3 长期压缩记忆，支持向量化语义检索
-- ❤️ **情感层融合**：BERT 主干 + 关键词/向量证据 + softmax 融合头 + V-A 情绪状态机
-- 🎯 **语义缓存**：多层缓存策略（本地热缓存 + Redis 共享缓存 + Faiss 向量索引）
-- 🌐 **完整网关层**：HTTP/WebSocket 服务器、连接池、背压控制、静态文件托管
-- 📚 **文档分析**：DOCX/PPTX 解析、文档分块、元数据管理和 LLM 缓存
-- 🎭 **课堂调度器**：多人格并发调度、主动发言状态机、Trace 链路追踪
-- 🧩 **基础设施完善**：内存池、线程池、对象池、RAII 封装、统一错误处理
+- **Gateway Runtime**：统一 HTTP/WebSocket 入口、JWT/cookie 认证、静态文件托管、请求过滤、背压和运行时维护任务。
+- **Agent Runtime**：Persona、Session、Skill Session、多人格调度、主动发言状态机、trace 和情绪状态持久化。
+- **模型服务**：ONNX Runtime BERT 情绪推理，以及基于 llama.cpp/mtmd 的流式与同步 VLM 推理。
+- **情感融合**：BERT 主干结合关键词等证据，通过可配置 fusion head、置信度和 margin gate 更新 V-A 状态。
+- **记忆与缓存**：Redis/SQLite L0 记忆、L3 压缩记忆、Exact/Faiss 检索、VLM 结果缓存和 Prompt KV Cache。
+- **文档链路**：DOCX/PPTX OOXML 提取、受管文件存储、分块分析、元数据和 LLM/语义缓存。
+- **实时多模态**：WebRTC signaling、GStreamer media pipeline、OpenCV 抽帧、共享内存帧 IPC、backlog 和 VLM coordinator。
+- **基础设施**：`core::Status`/`Result`、RAII、内存池、线程池、对象池、线程安全队列、TLS 和并发 HTTP client。
 
-### 🎯 适用场景
+## 运行时边界
 
-- 教育智能体多模态推理后端
-- 高性能对话服务热路径缓存
-- 语义搜索与 RAG 检索增强
-- 生产级 C++ 服务端基础设施参考
+```text
+Browser / Downstream Application
+              |
+              v
+ agent_gateway_server  <---->  OpenAI-compatible / local LLM
+   HTTP · WebSocket              backend
+   Persona · Session
+   Memory · Document
+   Media · Skill
+              |
+              +---- gRPC ----> emotion_inference_server
+              |
+              +---- gRPC ----> multimodal_inference_server
+              |
+              +---- shared memory IPC ----> local frame/VLM data plane
+```
 
----
+模型推理默认以独立进程和 protobuf/gRPC 协议作为复用边界。Gateway、Persona、Session、Memory、Media 与 IPC 也可以通过 CMake target 直接组合到下游源码工程。
 
-## 🚀 快速开始
+### 基础 Server
 
-### 前置依赖
+| Target | 当前职责 |
+| --- | --- |
+| `agent_gateway_server` | HTTP/WebSocket Gateway，组合 Persona、认证、记忆、文档、Skill 与静态前端 |
+| `emotion_inference_server` | ONNX BERT 情绪推理 gRPC Server |
+| `multimodal_inference_server` | BERT + llama.cpp/mtmd VLM gRPC Server |
+| `persona_gateway_e2e_server` | 用于手动集成验证的 Gateway E2E Server |
 
-- **编译器**：Visual Studio 2026/v145（Windows）/ GCC 11+ / Clang 14+
-- **CMake**：3.20+
-- **vcpkg**：用于管理 gRPC、Protobuf、OpenSSL、spdlog 等依赖
-- **预编译库**：ONNX Runtime、OpenCV、Boost 1.85、llama.cpp
+### 可复用 CMake 目标
 
-### 构建服务
+下游项目使用 `add_subdirectory()` 时可以链接稳定别名：
 
-本机模型与工具链路径不要提交到仓库。复制 `config/e2e_test.example.json` 为
-`config/e2e_test.json` 后填写本地模型路径；`.clangd.example` 也可复制为本地
-`.clangd`。这两个本地文件默认由 Git 忽略。
+```cmake
+add_subdirectory(path/to/AgentLoom)
 
-**Windows Release 构建**
+target_link_libraries(my_agent PRIVATE
+    AgentLoom::core
+    AgentLoom::runtime
+    AgentLoom::service
+    AgentLoom::gateway
+)
+```
+
+当前公开别名包括 `core`、`net`、`tls`、`http_client`、`config`、`storage`、`vector_storage`、`vector`、`semantic_cache`、`memory`、`document`、`llm`、`models`、`cache`、`ipc`、`media_inference`、`media`、`runtime`、`gateway` 和 `service`。安装式 `find_package(AgentLoom)` 导出尚未提供。
+
+## 构建
+
+### 依赖
+
+- Visual Studio 2026/v145（Windows），或 GCC 11+/Clang 14+（Linux）
+- CMake 3.20+
+- vcpkg manifest 依赖：gRPC、Protobuf、OpenSSL、spdlog、Redis clients、libzip、pugixml、nlohmann/json；测试另需 GTest
+- 预编译/外部依赖：ONNX Runtime、llama.cpp（含 mtmd）、OpenCV、Boost、SQLite、Faiss、Eigen、MKL 和 HuggingFace Tokenizers C API
+- **工具链说明**：截至 2026-07-11，使用最新 VS2026/v145 工具链构建启用 CUDA 的 llama.cpp 会在 CUDA 编译阶段因兼容性问题直接失败，表明当前 CUDA Toolkit 对 VS2026/v145 的支持仍不充分。因此，本仓库测试基线使用的 llama.cpp 依赖由 VS2022/v143 构建。理论上这可能引入 ABI 兼容风险，但现有单元测试、压力测试和集成测试均未复现相关问题。在官方支持完善前，建议对启用 CUDA 的依赖统一使用 VS2022/v143 构建。
+
+仓库的 `deps/` 与 `vcpkg_installed/` 是本地依赖目录，不随源码分发。Linux 脚本可以准备对应依赖；Windows 需要按本机路径准备依赖，并确保 CMake generator、MSVC 工具集和 vcpkg ABI 一致。
+
+### Windows
+
+VS2026/v145 必须使用支持 `Visual Studio 18 2026` generator 的 CMake，例如 `C:\Program Files\CMake\bin\cmake.exe`：
 
 ```powershell
-& "C:\Program Files\CMake\bin\cmake.exe" -B build/x64-Release -G "Visual Studio 18 2026" -A x64 `
+& "C:\Program Files\CMake\bin\cmake.exe" -B build/x64-Release `
+  -G "Visual Studio 18 2026" -A x64 `
   -DCMAKE_CONFIGURATION_TYPES=Release `
   -DBERT_VCPKG_TRIPLET=x64-windows `
   -DBERT_USE_ONNXRUNTIME_GPU=OFF `
-  -DLLAMA_CPP_ROOT="<path-to-llama.cpp>"
+  -DLLAMA_CPP_ROOT="<path-to-llama.cpp>" `
+  -DLLAMA_CPP_BUILD="<path-to-llama.cpp-build>"
 
 & "C:\Program Files\CMake\bin\cmake.exe" --build build/x64-Release `
-  --target multimodal_inference_server --config Release --parallel
+  --config Release --parallel
 ```
 
-**Linux Release 构建（WSL2）**
+### Linux / WSL2
 
-Linux 构建使用 WSL2 环境和自动化脚本：
+默认脚本构建 CPU Runtime、Gateway、Emotion Server 和测试；VLM Server 需要预先准备 CUDA llama.cpp：
 
 ```bash
-# 1. 准备工具链和依赖
 linux/scripts/bootstrap_toolchain.sh
 linux/scripts/prepare_deps.sh
-
-# 2. 配置构建
 linux/scripts/configure.sh
-
-# 3. 构建（不包含推理服务器）
 linux/scripts/build.sh
-
-# 4. 构建推理服务器（需要 CUDA llama.cpp）
-linux/scripts/configure.sh --inference
-linux/scripts/build.sh --inference
-
-# 5. 运行测试
 linux/scripts/test.sh
 
-# 6. 打包产物
-linux/scripts/package.sh
+# 可选：启用 VLM inference target
+linux/scripts/configure.sh --inference
+linux/scripts/build.sh --inference
 ```
 
-脚本会自动处理：
-- Python venv 创建
-- ONNX Runtime、Boost、Eigen、SQLite、Faiss、MKL 依赖下载
-- vcpkg 依赖安装（gRPC、Protobuf、OpenSSL、spdlog 等）
-- llama.cpp CUDA 构建（如需推理服务器）
-- CMake 配置和 Ninja 构建
+Linux 使用独立的 `build/linux-vcpkg-installed`，不会复用或写入 Windows 的仓库根 `vcpkg_installed/`。
 
-### 运行服务
+## 配置与启动
 
-**Agent Gateway Server（推荐生产部署）**
+配置系统使用 JSON section，并允许 CLI 覆盖。实际字段以 `src/config/sections/` 和公开样例为准：
 
-统一网关服务，集成 Persona Gateway、HTTP/WS、静态文件托管、文档分析：
+| 进程 | 配置样例 |
+| --- | --- |
+| Gateway | [`config/agent_gateway.example.json`](config/agent_gateway.example.json) |
+| Multimodal inference | [`config/server.example.json`](config/server.example.json) |
+| Container emotion inference | [`config/emotion.container.example.json`](config/emotion.container.example.json) |
+
+API Key 和认证 token 应通过环境变量或本地文件注入，不要写入受 Git 跟踪的 JSON。模型路径同理使用本地配置；`config/e2e_test.json` 和 `.clangd` 已忽略，仓库分别提供 example 文件。
 
 ```powershell
-build\x64-Release\Release\agent_gateway_server.exe config\gateway.json
+# Gateway：当前入口同时使用位置参数定位工作目录，并由 --config 加载统一配置
+build\x64-Release\Release\agent_gateway_server.exe `
+  config\agent_gateway.example.json `
+  --config config\agent_gateway.example.json `
+  --no-stdin-stop
+
+# Multimodal gRPC inference
+build\x64-Release\Release\multimodal_inference_server.exe `
+  --config config\server.example.json
+
+# Emotion gRPC inference；按需覆盖模型和端口
+build\x64-Release\Release\emotion_inference_server.exe `
+  --config config\emotion.container.example.json
 ```
 
-服务监听：
-- `0.0.0.0:8080` - HTTP API + WebSocket + 静态文件
-- 集成 Persona Runtime、L0/L3 记忆、语义缓存、课堂调度
+公开样例包含占位模型路径，运行前必须改为本机文件。Gateway 样例默认要求 `AGENT_LLM_API_KEY`；认证、Redis、embedding、emotion analyzer、L0/L3 memory 和 document cache 都可以按部署环境配置。
 
-**Multimodal Inference Server**
+## 模块结构
 
-gRPC 多模态推理服务（BERT + VLM）：
+| 目录 | 职责 |
+| --- | --- |
+| `src/core` | `Status`/`Result`、RAII、内存/对象/线程池和并发队列 |
+| `src/net` | HTTP/WebSocket Server、TLS、HTTP client、连接管理和背压 |
+| `src/config` | JSON/CLI section registry、配置解析与跨 section 校验 |
+| `src/models` | ONNX Runtime、llama.cpp/mtmd、runner pool 和模型生命周期 |
+| `src/service` | Persona/Session Runtime、Gateway routes、调度与 inference service |
+| `src/semantic_cache` | Redis 连接池、L0 adapter、缓存策略和 context risk detector |
+| `src/storage` / `src/vector` | SQLite、向量元数据、embedding pipeline 与 Exact/Faiss index |
+| `src/memory` / `src/document` | L3 压缩记忆、OOXML 文档分析与缓存 |
+| `src/media` / `src/ipc` | WebRTC/GStreamer、帧处理、共享内存 IPC 与 VLM coordination |
+| `src/server` | Gateway 与 gRPC 进程入口、日志、状态映射和运行时统计 |
 
-```powershell
-build\x64-Release\Release\multimodal_inference_server.exe --config config\server.example.json
-```
+## 测试
 
-服务监听：`127.0.0.1:50051`（gRPC）
+当前 CMake 注册 **420 个 CTest**，覆盖 core、TLS/HTTP、LLM、配置、SQLite、向量检索、语义缓存、文档、记忆、Media/IPC、Persona/Gateway 和 gRPC 边界，并包含跨进程 E2E 与独立 benchmark target。
 
-**Emotion Inference Server**
-
-仅 BERT 情绪推理的轻量级服务（CPU-only）：
-
-```powershell
-build\x64-Release\Release\emotion_inference_server.exe --config config\emotion.json
-```
-
-服务监听：`127.0.0.1:50052`（gRPC）
-
-### 运行测试
+截至 2026-07-11，Windows VS2026/v145 Release 全量构建与 **420 项 CTest 均已通过**，并经过多轮重复验证，未观察到代码回归。
 
 ```powershell
-# 构建测试
 & "C:\Program Files\CMake\bin\cmake.exe" -B build/x64-Release-Tests-v145 `
   -G "Visual Studio 18 2026" -A x64 `
   -DBERT_BUILD_TESTS=ON `
   -DBERT_VCPKG_TRIPLET=x64-windows `
-  -DLLAMA_CPP_ROOT="<path-to-llama.cpp>"
+  -DBERT_USE_ONNXRUNTIME_GPU=OFF `
+  -DLLAMA_CPP_ROOT="<path-to-llama.cpp>" `
+  -DLLAMA_CPP_BUILD="<path-to-llama.cpp-build>"
 
-& "C:\Program Files\CMake\bin\cmake.exe" --build build/x64-Release-Tests-v145 `
-  --config Release --parallel
+& "C:\Program Files\CMake\bin\cmake.exe" --build `
+  build/x64-Release-Tests-v145 --config Release --parallel
 
-# 运行所有测试
-ctest --test-dir build/x64-Release-Tests-v145 -C Release --output-on-failure
+ctest --test-dir build/x64-Release-Tests-v145 `
+  -C Release --output-on-failure
 ```
 
----
+## 扩展边界
 
-## 🏗️ 架构概览
+| 层 | 推荐归属 | 内容 |
+| --- | --- | --- |
+| 领域业务 | 下游项目 | Persona、Prompt、领域评估、数据集与产品编排 |
+| Runtime 热路径 | AgentLoom 库 | Session、缓存、向量检索、记忆、Media 与 IPC |
+| 服务入口 | AgentLoom 基础 Server | HTTP/WebSocket/WebRTC、gRPC、认证、配置与生命周期 |
+| 模型后端 | 独立进程/外部服务 | BERT、VLM、vLLM 或 OpenAI-compatible backend |
 
-### 模块分层
+业务扩展优先通过 `I...` 接口注入。AgentLoom 提供基础训练/会话报告和 `IReportEvaluator` 扩展点，不包含特定学校、组织或商业项目的指标、权重与实现。
 
-```text
-┌─────────────────────────────────────────────────────────────┐
-│                      Application Layer                       │
-│  Gateway · Persona Runtime · Classroom Scheduler · Session  │
-└───────────────────────────────┬─────────────────────────────┘
-┌───────────────────────────────┴─────────────────────────────┐
-│                       Service Layer                          │
-│  Inference · Document Analysis · Memory · Semantic Cache    │
-└───────────────────────────────┬─────────────────────────────┘
-┌───────────────────────────────┴─────────────────────────────┐
-│                    Infrastructure Layer                      │
-│  core · net · config · cache · vector · models · storage    │
-└─────────────────────────────────────────────────────────────┘
-```
+## 文档
 
-### 核心模块
-
-| 模块 | 职责 |
-|------|------|
-| **core** | Result/Status、异常、内存池、线程池、对象池、RAII、队列 |
-| **net** | HTTP/WebSocket runtime、连接池、背压控制、请求接口 |
-| **config** | 配置加载、CLI fallback、section registry、分布式校验 |
-| **cache** | VLM 结果缓存、Redis 连接池、多级缓存策略 |
-| **vector** | 向量索引（Exact/Faiss）、Embedding pipeline、HF Tokenizer FFI |
-| **models** | ONNX Runtime 封装、llama.cpp/mtmd 封装、模型生命周期管理 |
-| **service** | Persona Runtime、Session、Classroom、Gateway service、文档/记忆编排 |
-| **server** | 独立 gRPC inference server、Gateway HTTP/WS、runtime logger、进程入口 |
-| **storage** | SQLite 持久化、文档元数据、会话状态 |
-| **semantic_cache** | L0 记忆适配器、Redis 语义缓存、上下文风险检测、缓存策略 |
-| **memory** | L3 长期记忆压缩器、向量化记忆存储 |
-| **llm** | 本地/云端 LLM 客户端、gRPC 推理适配、重试与降级 |
-| **document** | 文档解析、分块、元数据存储、LLM chunk 缓存 |
-
-### 情感层处理模式
-
-主链路情感层以 BERT 情绪分类为 primary analyzer，并在 `FusedEmotionAnalyzer` 中融合多来源证据：
-
-```text
-用户/AI 文本
-  -> gRPC BERT emotion analyzer
-  -> keyword / vector / LLM evidence
-  -> per-label fusion logits
-  -> softmax emotion distribution
-  -> confidence / margin gate
-  -> V-A emotion state tracker
-  -> prompt hint + generation params + memory metadata
-```
-
-融合头不再把异构证据直接归一化，而是先构建每个 label 的 logit：
-
-```text
-logit[label] =
-    head_bias
-  + bert_signal_weight * bert_weight * bert_prob[label] * label_reliability[label]
-  + evidence_signal_weight * evidence_score[label]
-  + margin_signal_weight * primary_margin_bonus
-```
-
-随后对 logits 做 softmax，得到主情绪分布。这样既保留 BERT 概率、Macro-F1 风格标签可靠性、关键词/向量/LLM 来源权重的可解释性，也保留多类情绪竞争关系。
-
-门控策略基于融合后的 top confidence 和 top margin：
-
-```text
-top < accept_confidence || top1 - top2 < ambiguity_margin
-```
-
-低置信或类别接近时可触发 LLM fallback；fallback 结果作为 `llm` evidence 重新进入融合头，而不是直接覆盖 BERT。最终用户情绪和 AI 回复情绪共同更新 V-A 状态机，并序列化到会话状态与 L0 记忆元数据中。
-
-### 主要构建目标
-
-**服务器可执行文件**
-
-| Target | 说明 |
-|--------|------|
-| `agent_gateway_server` | 生产级网关服务器：Persona Gateway + HTTP/WS + 静态文件托管 + 文档分析 |
-| `multimodal_inference_server` | 多模态推理服务器：gRPC + BERT + VLM/llama.cpp（可选） |
-| `emotion_inference_server` | BERT 情绪推理服务器：仅 CPU，gRPC |
-| `persona_gateway_e2e_server` | E2E 测试网关服务器（手动测试用） |
-
-推理服务在项目间迁移时按 gRPC 进程边界处理：复制/发布编译产物、运行时依赖、配置样例和 protobuf/gRPC 头文件即可。业务侧可复用逻辑集中在 Persona/Session/Classroom/Gateway route targets，不要求消费方链接推理 server 内部实现库。
-
-**核心库**
-
-| Library | 职责 |
-|---------|------|
-| `agent_core` | Result/Status、内存池、线程池、对象池、队列、RAII |
-| `agent_net` | HTTP/WebSocket runtime、连接池、背压控制 |
-| `agent_tls` | TLS context、SSL/TLS 封装 |
-| `agent_http_client` | 出站 HTTP/HTTPS 客户端、重试策略 |
-| `agent_llm` | LLM 客户端（OpenAI + 本地 gRPC） |
-| `agent_models` | ONNX Runtime + llama.cpp 模型封装 |
-| `agent_cache` | VLM 结果缓存 |
-| `agent_vector` | 向量索引（Exact/Faiss）+ Embedding pipeline + HF Tokenizer FFI |
-| `agent_semantic_cache` | 语义缓存管线 + Redis 连接池 + L0 记忆适配器 |
-| `agent_storage` | SQLite 异步执行器 + 连接池 + 事务 |
-| `agent_vector_storage` | 向量元数据存储 + 分区注册表 |
-| `agent_memory` | L3 长期记忆压缩器 |
-| `agent_document` | 文档分析 + OOXML 解析 + 分块 + LLM chunk 缓存 |
-| `agent_service` | Persona 运行时 + 会话管理 + 课堂调度 + 网关服务聚合 |
-| `agent_config` | 配置系统 + section registry + CLI fallback |
-| `server_runtime` | Logger + server common utilities |
-
-**测试与工具**
-
-| Target | 说明 |
-|--------|------|
-| `core_tests` / `net_tests` / `config_tests` | 核心模块单元测试 |
-| `storage_tests` / `vector_storage_tests` | 存储层单元测试 |
-| `semantic_cache_tests` / `document_tests` | 缓存与文档单元测试 |
-| `memory_tests` / `vector_tests` / `service_tests` | 业务层单元测试 |
-| `llm_tests` / `llm_integration_tests` | LLM 客户端测试 |
-| `http_client_tests` / `tls_tests` | HTTP/TLS 客户端测试 |
-| `l3_compression_e2e_test` | L3 记忆压缩 E2E 测试 |
-| `document_analysis_e2e_test` | 文档分析 E2E 测试 |
-| `bert_inference_client` / `bert_benchmark_client` | BERT 协议客户端工具 |
-
----
-
-## 📚 文档索引
-
-完整目录见 [docs/README.md](docs/README.md)。
-
-常用入口：
+完整文档目录见 [docs/README.md](docs/README.md)。建议从以下内容开始：
 
 - [当前 Runtime 路线图](docs/CURRENT_RUNTIME_ROADMAP_2026_06.md)
 - [配置系统](docs/CONFIG_SYSTEM.md)
 - [部署指南](docs/DEPLOYMENT.md)
-- [Frontend/Backend API](docs/FRONTEND_BACKEND_API_PROTOCOL.md)
+- [Frontend/Backend API 协议](docs/FRONTEND_BACKEND_API_PROTOCOL.md)
 - [扩展 AgentLoom](docs/EXTENDING_AGENTLOOM.md)
+- [安全工程规范](docs/SECURITY_ENGINEERING_STANDARD.md)
 
----
+## 贡献与许可
 
-## 🧪 测试覆盖
+提交更改前请运行相关测试、同步受影响文档，并遵循 [AGENTS.md](AGENTS.md) 的工程约定。安全问题请参阅 [SECURITY.md](SECURITY.md)，不要在公开 Issue 中披露凭据或未修复漏洞。
 
-当前测试规模：**70+ CTest 用例**，覆盖率持续提升中。
-
-### 测试覆盖领域
-
-✅ **core** - 内存池、对象池、线程池、共享内存块、队列、UniqueHandle  
-✅ **net** - HTTP/WebSocket runtime、连接池、背压、静态文件、请求接口  
-✅ **http_client** - 出站 HTTP/HTTPS 客户端、URL 解析、重试策略  
-✅ **tls** - TLS context、SSL 证书加载  
-✅ **config** - 配置加载、CLI fallback、section 校验  
-✅ **storage** - SQLite 异步执行器、连接池、事务、RAII  
-✅ **vector_storage** - 向量元数据存储、分区注册表、指纹计算  
-✅ **vector** - Tokenizer、Embedding、向量索引、Top-K 检索、索引管理器  
-✅ **semantic_cache** - 缓存管线、L0 适配器、批量加载  
-✅ **document** - OOXML 提取器、文档解析  
-✅ **memory** - L3 长期记忆压缩器、向量化存储  
-✅ **llm** - OpenAI 客户端、本地 gRPC 客户端、重试与降级  
-✅ **service** - Persona 算法、会话管理、Persona 运行时、网关服务  
-
-### 运行测试
-
-```powershell
-# 运行所有测试
-ctest --test-dir build/tests -C Release --output-on-failure
-
-# 运行特定测试
-build\tests\Release\core_tests.exe
-build\tests\Release\net_tests.exe
-build\tests\Release\vector_tests.exe
-build\tests\Release\semantic_cache_tests.exe
-build\tests\Release\service_tests.exe
-
-# 增量构建单个测试
-cmake --build build/tests --target core_tests --config Release
-cmake --build build/tests --target semantic_cache_tests --config Release
-```
-
-### E2E 测试工具
-
-```powershell
-# L3 记忆压缩 E2E
-build\tests\Release\l3_compression_e2e_test.exe config\l3_test.json
-
-# 文档分析 E2E
-build\tests\Release\document_analysis_e2e_test.exe config\doc_test.json
-
-# Persona Gateway E2E（手动测试）
-build\tests\Release\persona_gateway_e2e_server.exe config\gateway_e2e.json
-```
-
----
-
-## ⚙️ 配置说明
-
-服务通过 JSON 配置文件 + CLI 参数启动，支持多 section 分布式校验。
-
-### 配置样例
-
-```json
-{
-  "models": {
-    "llm": "D:/models/qwen2-vl.gguf",
-    "mmproj": "D:/models/mmproj.gguf",
-    "bert": "D:/models/joint_model.onnx",
-    "n_gpu_layers": -1
-  },
-  "grpc": {
-    "host": "127.0.0.1",
-    "port": "50051",
-    "max_receive_message_mb": 100
-  },
-  "http": {
-    "host": "0.0.0.0",
-    "port": "8080",
-    "num_threads": 4,
-    "dist_root": "dist"
-  },
-  "auth": {
-    "metadata_key": "x-agent-auth",
-    "token_env": "AGENT_BACKEND_AUTH_TOKEN"
-  },
-  "vlm_cache": {
-    "enabled": true,
-    "max_entries": 512,
-    "max_mb": 1024,
-    "ttl_seconds": 3600
-  },
-  "semantic_cache": {
-    "enabled": true,
-    "redis_url": "tcp://127.0.0.1:6379",
-    "sim_threshold": 0.93,
-    "max_entries": 10000
-  }
-}
-```
-
-### CLI 覆盖参数
-
-```powershell
-multimodal_inference_server.exe `
-  --config config/server.json `
-  --llm "D:/models/custom.gguf" `
-  --host 0.0.0.0 `
-  --port 50051
-```
-
-完整配置说明见 [配置系统文档](docs/CONFIG_SYSTEM.md)。
-
----
-
-## 🔗 依赖管理
-
-### vcpkg 管理依赖
-
-- **gRPC** + Protobuf - RPC 框架
-- **OpenSSL** - TLS/SSL 加密
-- **spdlog** - 高性能日志
-- **GTest** - 单元测试框架
-- **hiredis** + redis++ - Redis 客户端
-- **libzip** - ZIP 文件解析（DOCX/PPTX）
-- **pugixml** - XML 解析（OOXML）
-
-### 预编译依赖
-
-- **ONNX Runtime** 1.17.1 (CPU) / 1.20.1 (GPU) - BERT 推理
-- **llama.cpp** with mtmd support - VLM 多模态推理
-- **OpenCV** 4.10 - 图像处理
-- **Boost** 1.85 (header-only) - Asio/Beast/Redis
-- **Faiss** 1.14.1 CPU - 向量索引
-- **SQLite** 3.53.1 - 本地持久化
-- **Eigen** 5.0.1 - 线性代数（向量运算）
-- **MKL** 2023.1 - BLAS 加速（Faiss 依赖）
-- **HuggingFace Tokenizers** (Rust FFI) - 分词器
-
-依赖按 `deps/` 和 `vcpkg_installed/` 两种方式集成。Linux 构建脚本自动下载和配置所有依赖。
-
-下游源码工程可通过 `add_subdirectory()` 使用稳定别名，例如
-`AgentLoom::core`、`AgentLoom::service`、`AgentLoom::gateway`、
-`AgentLoom::media` 和 `AgentLoom::ipc`。安装式 `find_package(AgentLoom)`
-导出将在后续稳定公共头文件边界后提供。
-
----
-
-## 🎯 复用与扩展边界
-
-AgentLoom 同时提供可复用核心库和基础 Server。推理模块以独立 gRPC 进程和 protobuf/gRPC 协议为主要交付边界；Persona Runtime、Session、Gateway、Memory、Media 和 IPC 等能力可以作为源码 target 被上层项目组合。
-
-领域功能通过接口注入。例如基础报告始终提供 session metrics，项目特有的质量评估通过 `IReportEvaluator` 接入；AgentLoom 不包含特定组织的指标、权重、数据集或评估实现。
-
-### 推荐职责划分
-
-| 层 | 推荐边界 | 内容 |
-|----|----------|------|
-| 领域业务 | 下游项目 | Persona、Prompt、领域评估、产品编排 |
-| Runtime 热路径 | AgentLoom 库 | Session、缓存、向量检索、记忆、媒体和 IPC |
-| 服务入口 | AgentLoom 基础 Server | HTTP/WebSocket/WebRTC、gRPC、配置和生命周期 |
-| 模型服务 | 独立进程 | BERT、VLM、vLLM 或 OpenAI-compatible backend |
-
----
-
-## 🚧 路线图
-
-### 当前阶段（v0.1）
-
-- ✅ 基础设施分层架构
-- ✅ HTTP/WebSocket runtime
-- ✅ 向量化 Embedding pipeline
-- ✅ 语义缓存与 Redis 集成
-- ✅ 文档分析与元数据管理
-- ✅ 网关层与课堂调度器
-- 🔄 L3 长期记忆压缩（进行中）
-
-### 下一阶段
-
-- 🎯 语义缓存完整链路（预填充 + 在线更新）
-- 🎯 RAG 知识库集成（教材、课标、经典题）
-- 🎯 vLLM 推理引擎路由与降级
-- 🎯 流式推理与 WebSocket 双工
-- 🎯 性能优化（SIMD 向量运算、零拷贝传输）
-- 🎯 多机部署与负载均衡
-
-详见 [当前 Runtime 路线图](docs/CURRENT_RUNTIME_ROADMAP_2026_06.md)。历史演进记录见 [旧 Runtime 路线图](docs/NEXT_RUNTIME_ROADMAP.md)。
-
----
-
-## 🛠️ 开发指南
-
-### 代码约定
-
-1. C API 对象（HANDLE、SQL 连接、io_context）封装为 RAII
-2. 错误码/异常统一包装为 `core::Status` 和 `core::Result<T>`
-3. 业务代码错误需在 `core::Status` 基础上输出日志
-4. 避免 `void*` 裸指针，优先使用 `std::optional<T>`
-5. 内存分配使用 `core` 中的内存池/对象池
-6. 所有模块需要单元测试和 E2E 测试
-7. 每个业务模块提供扩展接口（`I` 前缀抽象类）
-8. 避免平台单一 API（如 WIN32 API），使用条件编译分支
-9. 所有文件读写、路径处理默认 UTF-8，不使用系统本地编码
-10. 接口和源码文件能合并即合并，不超过 800 行上限
-
-### 风格约定
-
-- **注释**：少量准确的英文注释
-- **命名**：遵循 C++ 标准库风格（snake_case for functions/variables，PascalCase for types）
-- **模块边界**：core 层不依赖 gRPC/OpenCV/Faiss/Redis
-- **测试覆盖**：失败路径、并发路径、资源释放路径
-
----
-
-## 🤝 贡献
-
-欢迎提交 Issue 和 Pull Request！
-
-在贡献代码前，请确保：
-
-1. 运行 `ctest` 确保所有测试通过
-2. 新功能需要添加单元测试
-3. 遵循项目代码约定和风格
-4. 更新相关文档
-
----
-
-## 📝 License
-
-[MIT License](LICENSE)
-
----
-
-## 📧 联系方式
-
-- **项目维护**：Orange20000922
-- **相关项目**：[Filerestore_CLI](https://github.com/Orange20000922/Filerestore_CLI)
-
----
-
-<p align="center">
-  <i>Built with ❤️ by Orange20000922</i>
-</p>
+AgentLoom 使用 [MIT License](LICENSE)。

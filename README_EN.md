@@ -17,15 +17,26 @@ The project originated from an educational agent backend, but the open-source bo
 
 The current version is `0.1.0` and remains under active development. It is suitable for downstream development, system integration, and production-oriented engineering validation, but absolute ABI stability is not guaranteed.
 
+## Core Features
+
+- **Composable architecture**: Core capabilities exposed as CMake targets—integrate as libraries or deploy as standalone servers.
+- **Complete hot path**: End-to-end C++ implementation from WebSocket connection through session management, memory recall, emotion sensing, to LLM generation—avoiding cross-language boundary overhead.
+- **Real-time multimodal sensing**: Complete pipeline from browser camera WebRTC input, GStreamer decoding, OpenCV dynamic frame sampling, to VLM inference.
+- **Inference cost optimization**: Semantic cache, prompt KV cache, and VLM result cache coordinate to reduce redundant inference overhead; VRAM guard supports low-memory scenarios and OOM degradation.
+- **Clear process boundaries**: BERT and VLM inference as independent gRPC processes supporting containerization and independent scaling; gateway connects via gRPC or shared-memory IPC.
+- **Production-grade engineering**: 420+ unit and cross-process E2E tests covering concurrency paths, error recovery, and resource cleanup; unified error model via `core::Status`/`Result`.
+
 ## Implemented Capabilities
 
-- HTTP/WebSocket gateway with JWT/cookie authentication, static files, request filtering, backpressure, and maintenance tasks.
-- Persona, session, skill-session, multi-persona scheduling, proactive speech state, tracing, and persisted emotion state.
-- ONNX Runtime BERT emotion inference and llama.cpp/mtmd streaming or synchronous VLM inference.
-- Redis/SQLite L0 memory, compressed L3 memory, Exact/Faiss retrieval, VLM result cache, and prompt KV cache.
-- DOCX/PPTX OOXML extraction, managed document storage, chunk analysis, metadata, and LLM/semantic caches.
-- WebRTC signaling, GStreamer media pipelines, OpenCV sampling, shared-memory frame IPC, backlog, and VLM coordination.
-- Shared `core::Status`/`Result`, RAII wrappers, memory/thread/object pools, concurrent queues, TLS, and HTTP clients.
+- **Gateway runtime**: Unified HTTP/WebSocket entry, JWT/cookie authentication, static file hosting, request filtering, backpressure, and runtime maintenance tasks.
+- **Agent runtime**: Persona, session, skill session, multi-persona scheduling, proactive speech state machine, trace and emotion state persistence.
+- **Model services**: ONNX Runtime BERT emotion inference, and llama.cpp/mtmd-based streaming and synchronous VLM inference.
+- **Emotion fusion**: BERT backbone combined with keyword evidence, updating V-A state through configurable fusion head, confidence, and margin gate.
+- **Memory and cache**: Redis/SQLite L0 memory, L3 compressed memory, Exact/Faiss vector retrieval, VLM result cache, and image-prefix prompt KV cache based on llama.cpp sequence state (memory/Redis dual backend).
+- **Document pipeline**: DOCX/PPTX OOXML extraction, managed file storage, chunk analysis, metadata, and LLM/semantic caches.
+- **Real-time multimodal input**: WebRTC signaling (offer/answer/ICE/resume), GStreamer `webrtcbin` media pipeline, OpenCV dynamic frame sampling (MOG2/histogram/edge/EMA/cooldown), key frame JPEG/PNG encoding (NVIDIA/VAAPI/D3D11/QSV hardware acceleration with software fallback).
+- **Frame inference pipeline**: Shared-memory frame IPC (MPMC sequence ring, RAII claim, epoch recovery) + gRPC IPC control plane (grant/revoke/probe, lease coordination, cross-process fault recovery) form a data-plane/control-plane-separated transport layer; upper layers compose ordered admission, mmap disk spool overflow replay, private backlog, VLM coordinator, and execution-level sealed aggregation (running → sealing → replay → aggregate) into a controlled key-frame inference lifecycle.
+- **Infrastructure**: `core::Status`/`Result`, RAII handle wrappers, memory pools, thread pools, object pools, thread-safe queues, keyed serial executor (per-key serialization, session affinity ordering), task group (structured concurrency), TLS context, and concurrent HTTP client.
 
 ## Runtime Boundaries
 
@@ -42,18 +53,21 @@ Browser / Downstream Application
               +---- gRPC ----> emotion_inference_server
               |
               +---- gRPC ----> multimodal_inference_server
+              |                   (VLM inference · frame coordinator)
               |
-              +---- shared memory IPC ----> local frame/VLM data plane
+              +== shared memory (data plane) + gRPC (control plane) ==> frame inference pipeline
 ```
 
-Inference is primarily reused through standalone processes and protobuf/gRPC contracts. Gateway, persona, session, memory, media, and IPC components can also be linked directly into downstream source builds.
+Model inference defaults to independent processes with protobuf/gRPC contracts as the reuse boundary. Key frame transmission adopts separated shared-memory data plane + gRPC control plane: large frames use shared memory zero-copy, while grant/revoke/epoch lifecycle and fault recovery use gRPC control signaling. Gateway, persona, session, memory, media, and IPC can also be directly composed into downstream source builds via CMake targets.
 
-| Server target | Current responsibility |
+### Basic Servers
+
+| Target | Current responsibility |
 | --- | --- |
-| `agent_gateway_server` | HTTP/WebSocket gateway combining persona, auth, memory, documents, skills, and static frontend hosting |
-| `emotion_inference_server` | ONNX BERT emotion inference over gRPC |
-| `multimodal_inference_server` | BERT plus llama.cpp/mtmd VLM inference over gRPC |
-| `persona_gateway_e2e_server` | Manual gateway integration server |
+| `agent_gateway_server` | HTTP/WebSocket gateway, combining persona, auth, memory, documents, skills, and static frontend |
+| `emotion_inference_server` | ONNX BERT emotion inference gRPC server |
+| `multimodal_inference_server` | BERT + llama.cpp/mtmd VLM gRPC server |
+| `persona_gateway_e2e_server` | Gateway E2E server for manual integration verification |
 
 ## Reusable CMake Targets
 
@@ -152,7 +166,7 @@ Public examples contain placeholder model paths. The gateway example expects `AG
 
 | Path | Responsibility |
 | --- | --- |
-| `src/core` | `Status`/`Result`, RAII, memory/object/thread pools, and concurrent queues |
+| `src/core` | `Status`/`Result`, RAII, memory/object/thread pools, concurrent queues, keyed serial executor, and task group |
 | `src/net` | HTTP/WebSocket server, TLS, HTTP client, connection management, and backpressure |
 | `src/config` | JSON/CLI section registry, parsing, and cross-section validation |
 | `src/models` | ONNX Runtime, llama.cpp/mtmd, runner pools, and model lifecycle |
@@ -160,8 +174,8 @@ Public examples contain placeholder model paths. The gateway example expects `AG
 | `src/semantic_cache` | Redis pools, L0 adapters, policies, and context risk detection |
 | `src/storage` / `src/vector` | SQLite, vector metadata, embeddings, and Exact/Faiss indexes |
 | `src/memory` / `src/document` | L3 compression, OOXML analysis, and document caches |
-| `src/media` / `src/ipc` | WebRTC/GStreamer, frame processing, shared-memory IPC, and VLM coordination |
-| `src/server` | Gateway/gRPC process entries, logging, status mapping, and runtime statistics |
+| `src/media` / `src/ipc` | WebRTC/GStreamer, frame encoding/sampling, shared-memory data plane and gRPC control plane, ordered admission, disk spool replay, and VLM coordination |
+| `src/server` | Gateway and gRPC process entries, logging, status mapping, and runtime statistics |
 
 ## Tests
 

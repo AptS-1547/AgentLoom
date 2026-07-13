@@ -224,6 +224,6 @@ ctest --test-dir build/x64-Release-Tests-v145 `
 
 ## 贡献与许可
 
-提交更改前请运行相关测试、同步受影响文档，并遵循 [AGENTS.md](AGENTS.md) 的工程约定。安全问题请参阅 [SECURITY.md](SECURITY.md)，不要在公开 Issue 中披露凭据或未修复漏洞。
+提交更改前请运行相关测试、同步受影响文档，可以参考 [AGENTS.md](AGENTS.md) 的工程约定。安全问题请参阅 [SECURITY.md](SECURITY.md)，不要在公开 Issue 中披露凭据或未修复漏洞。
 
 AgentLoom 使用 [MIT License](LICENSE)。

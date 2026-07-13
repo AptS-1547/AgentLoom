@@ -5,7 +5,6 @@
 #include "server_common.h"
 #include "server_options.h"
 #include "inference_frame_ipc_control.h"
-
 #include "multimodal_inference.grpc.pb.h"
 
 namespace server::grpc_service {

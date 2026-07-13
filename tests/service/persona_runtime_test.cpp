@@ -678,7 +678,17 @@ TEST(SkillSessionManagerTest, RunsStartReadyObservationAndStopLifecycle) {
     stop.reason = "用户关闭视觉观察";
     auto stopped = manager.Stop(stop);
     ASSERT_TRUE(stopped.ok()) << stopped.status().message();
-    EXPECT_EQ(stopped.value().state, SkillSessionState::Closed);
+    EXPECT_EQ(stopped.value().state, SkillSessionState::Closing);
+    ASSERT_TRUE(manager.CompleteClosing(
+        start.session_id,
+        start.skill_id,
+        started.value().execution_id,
+        "closed after async drain",
+        "trace-stop").ok());
+    current = manager.Get(start.session_id, start.skill_id);
+    ASSERT_TRUE(current.ok());
+    ASSERT_TRUE(current.value().has_value());
+    EXPECT_EQ(current.value()->state, SkillSessionState::Closed);
     EXPECT_EQ(stopped.value().close_reason, "用户关闭视觉观察");
 }
 
@@ -709,6 +719,27 @@ TEST(SkillSessionManagerTest, ExpiresStartingSessionThroughMaintenanceTask) {
     ASSERT_TRUE(current.value().has_value());
     EXPECT_EQ(current.value()->state, SkillSessionState::Expired);
     EXPECT_EQ(current.value()->last_error, "startup_timeout");
+}
+
+TEST(SkillSessionManagerTest, ExpiresClosingSessionThatMissesAtomicDrainDeadline) {
+    SkillSessionOptions options;
+    options.closing_timeout = std::chrono::milliseconds(5);
+    SkillSessionManager manager(options);
+    SkillSessionStartRequest start;
+    start.execution_id = "closing-timeout-execution";
+    start.skill_id = "vision.observe";
+    start.session_id = "closing-timeout-session";
+    auto started = manager.Start(start);
+    ASSERT_TRUE(started.ok());
+    ASSERT_TRUE(manager.MarkReady(start.session_id, start.skill_id, "ready", "trace").ok());
+    ASSERT_TRUE(manager.BeginClosing(
+        start.session_id, start.skill_id, start.execution_id, "draining", "trace").ok());
+    std::this_thread::sleep_for(std::chrono::milliseconds(8));
+    EXPECT_EQ(manager.CleanupExpired({}), 1u);
+    auto current = manager.Get(start.session_id, start.skill_id);
+    ASSERT_TRUE(current.ok());
+    ASSERT_TRUE(current.value().has_value());
+    EXPECT_EQ(current.value()->state, SkillSessionState::Expired);
 }
 
 TEST(SkillVisionEventSinkTest, RecordsVisionEventAsSkillObservation) {

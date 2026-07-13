@@ -1,5 +1,6 @@
 #include "emotion_grpc_service.h"
 #include "multimodal_grpc_service.h"
+#include "inference_frame_ipc_grpc_signal.h"
 
 #include "exception.h"
 
@@ -14,6 +15,9 @@
 #include <spdlog/spdlog.h>
 
 #include <atomic>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <map>
 #include <memory>
@@ -22,8 +26,34 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace {
+
+using namespace std::chrono_literals;
+
+std::string UniqueIpcChannelName() {
+    static std::atomic<std::uint64_t> sequence{0};
+    return "agent_grpc_ipc_control_" +
+           std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + "_" +
+           std::to_string(sequence.fetch_add(1, std::memory_order_relaxed));
+}
+
+class IpcChannelCleanup {
+public:
+    explicit IpcChannelCleanup(std::string name) : name_(std::move(name)) {
+        ipc::media::SharedMemoryInferenceFrameChannel::Remove(name_);
+    }
+
+    ~IpcChannelCleanup() {
+        ipc::media::SharedMemoryInferenceFrameChannel::Remove(name_);
+    }
+
+    const std::string& name() const noexcept { return name_; }
+
+private:
+    std::string name_;
+};
 
 class GrpcServerHarness {
 public:
@@ -401,6 +431,107 @@ TEST_F(InferenceGrpcTest, MultimodalExceptionLogsOnlySafeRequestIdentifiers) {
     EXPECT_NE(logs.find("session_id=session-7"), std::string::npos);
     EXPECT_NE(logs.find("task_type=scene-description"), std::string::npos);
     EXPECT_EQ(logs.find("sensitive prompt must not be logged"), std::string::npos);
+}
+
+TEST_F(InferenceGrpcTest, GrpcPeerLossFencesGatewaySharedMemoryLease) {
+    IpcChannelCleanup cleanup(UniqueIpcChannelName());
+    auto created_sink = ipc::media::RecoverableInferenceFrameIpcSink::Create({
+        .name = cleanup.name(),
+        .slot_count = 2,
+        .payload_capacity = 64,
+    });
+    ASSERT_TRUE(created_sink.ok()) << created_sink.status().message();
+    std::shared_ptr<ipc::media::IRecoverableInferenceFrameIpcSink> sink(
+        std::move(created_sink).value());
+    auto receiver = std::make_shared<ipc::media::InferenceFrameIpcGrantReceiver>();
+    std::shared_ptr<ipc::media::GrpcInferenceFrameIpcSignal> signal;
+    std::unique_ptr<ipc::media::InferenceFrameIpcLeaseCoordinator> coordinator;
+
+    MultimodalServerOptions options;
+    options.grpc.slow_request_ms = 0;
+    server_common::RuntimeStats stats;
+    FakeMultimodalService backend;
+    server::grpc_service::MultimodalGrpcService grpc_service(
+        options,
+        stats,
+        backend,
+        receiver.get());
+    {
+        GrpcServerHarness server(grpc_service);
+        signal = std::make_shared<ipc::media::GrpcInferenceFrameIpcSignal>(
+            server.channel(),
+            ipc::media::GrpcInferenceFrameIpcSignalOptions{.deadline = 200ms});
+        coordinator = std::make_unique<ipc::media::InferenceFrameIpcLeaseCoordinator>(
+            sink,
+            signal);
+        ASSERT_TRUE(coordinator->Start().ok());
+        ASSERT_TRUE(coordinator->CheckPeer().ok());
+        EXPECT_EQ(receiver->ControlSnapshot().state, ipc::media::InferenceFrameIpcControlState::Granted);
+    }
+
+    const auto probe = coordinator->CheckPeer();
+    ASSERT_FALSE(probe.ok());
+    EXPECT_TRUE(
+        probe.code() == core::ErrorCode::Unavailable ||
+        probe.code() == core::ErrorCode::Timeout);
+    EXPECT_EQ(coordinator->Snapshot().state, ipc::media::InferenceFrameIpcControlState::Fenced);
+    EXPECT_TRUE(sink->Snapshot().fenced);
+
+    std::vector<std::byte> payload(8, std::byte{0x45});
+    const ipc::media::SharedFramePublishRequest request{
+        .execution_id = "execution-grpc-crash",
+        .session_id = "session-grpc-crash",
+        .trace_id = "trace-grpc-crash",
+        .selected_sequence = 1,
+        .transport_sequence = 1,
+        .frame_id = 1,
+        .payload = payload,
+    };
+    EXPECT_EQ(sink->Publish(request).code(), core::ErrorCode::Cancelled);
+}
+
+TEST_F(InferenceGrpcTest, GrpcControlRevokeAndRecoverRotateInferenceEpoch) {
+    IpcChannelCleanup cleanup(UniqueIpcChannelName());
+    auto created_sink = ipc::media::RecoverableInferenceFrameIpcSink::Create({
+        .name = cleanup.name(),
+        .slot_count = 4,
+        .payload_capacity = 64,
+    });
+    ASSERT_TRUE(created_sink.ok()) << created_sink.status().message();
+    std::shared_ptr<ipc::media::IRecoverableInferenceFrameIpcSink> sink(
+        std::move(created_sink).value());
+    auto receiver = std::make_shared<ipc::media::InferenceFrameIpcGrantReceiver>();
+
+    MultimodalServerOptions options;
+    options.grpc.slow_request_ms = 0;
+    server_common::RuntimeStats stats;
+    FakeMultimodalService backend;
+    server::grpc_service::MultimodalGrpcService grpc_service(
+        options,
+        stats,
+        backend,
+        receiver.get());
+    GrpcServerHarness server(grpc_service);
+    auto signal = std::make_shared<ipc::media::GrpcInferenceFrameIpcSignal>(
+        server.channel(),
+        ipc::media::GrpcInferenceFrameIpcSignalOptions{.deadline = 500ms});
+    ipc::media::InferenceFrameIpcLeaseCoordinator coordinator(sink, signal);
+
+    ASSERT_TRUE(coordinator.Start().ok());
+    const auto old_epoch = coordinator.Snapshot().grant.epoch;
+    ASSERT_TRUE(coordinator.Revoke("planned inference restart").ok());
+    EXPECT_EQ(receiver->ControlSnapshot().state, ipc::media::InferenceFrameIpcControlState::Fenced);
+    EXPECT_EQ(receiver->TryClaim().status().code(), core::ErrorCode::Cancelled);
+
+    ASSERT_TRUE(coordinator.Recover().ok());
+    const auto recovered = coordinator.Snapshot();
+    EXPECT_NE(recovered.grant.epoch, old_epoch);
+    EXPECT_EQ(receiver->ControlSnapshot().grant.epoch, recovered.grant.epoch);
+    EXPECT_TRUE(coordinator.CheckPeer().ok());
+    const auto stale_revoke = signal->Revoke(old_epoch, "delayed stale revoke");
+    EXPECT_EQ(stale_revoke.code(), core::ErrorCode::FailedPrecondition);
+    EXPECT_EQ(receiver->ControlSnapshot().state, ipc::media::InferenceFrameIpcControlState::Granted);
+    EXPECT_EQ(receiver->ControlSnapshot().grant.epoch, recovered.grant.epoch);
 }
 
 } // namespace

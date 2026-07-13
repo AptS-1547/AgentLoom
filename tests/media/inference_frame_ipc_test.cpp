@@ -1,4 +1,5 @@
 #include "inference_frame_ipc_receiver.h"
+#include "inference_frame_ipc_control.h"
 #include "inference_frame_ipc_lifecycle.h"
 #include "inference_frame_shared_memory.h"
 
@@ -11,7 +12,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
+#include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -49,14 +53,37 @@ private:
     std::string name_;
 };
 
+class SpoolDirectoryCleanup {
+public:
+    explicit SpoolDirectoryCleanup(std::string_view suffix)
+        : path_(std::filesystem::current_path() / "build" / "test-receiver-spool" /
+                (std::string(suffix) + "-" + UniqueChannelName("directory"))) {
+        std::filesystem::create_directories(path_);
+    }
+
+    ~SpoolDirectoryCleanup() {
+        std::error_code ec;
+        std::filesystem::remove_all(path_, ec);
+    }
+
+    const std::filesystem::path& path() const noexcept {
+        return path_;
+    }
+
+private:
+    std::filesystem::path path_;
+};
+
 ipc::media::SharedFramePublishRequest MakeRequest(
     std::string_view session_id,
     std::uint64_t frame_id,
     std::span<const std::byte> payload,
     media::inference::InferenceFrameFormat format = media::inference::InferenceFrameFormat::Jpeg) {
     return {
+        .execution_id = "execution-ipc",
         .session_id = session_id,
         .trace_id = "trace-ipc",
+        .selected_sequence = frame_id,
         .frame_id = frame_id,
         .timestamp_us = static_cast<std::int64_t>(frame_id * 1'000),
         .width = 320,
@@ -66,6 +93,41 @@ ipc::media::SharedFramePublishRequest MakeRequest(
         .payload = payload,
     };
 }
+
+class CapturingAdmissionSink final : public media::inference::IInferenceFrameAdmissionSink {
+public:
+    core::Status AdmitFrame(media::inference::OwnedInferenceFrame frame) override {
+        std::lock_guard lock(mutex_);
+        frame_.emplace(std::move(frame));
+        return core::Status::Ok();
+    }
+
+    std::optional<media::inference::OwnedInferenceFrame> Take() {
+        std::lock_guard lock(mutex_);
+        auto frame = std::move(frame_);
+        frame_.reset();
+        return frame;
+    }
+
+private:
+    std::mutex mutex_;
+    std::optional<media::inference::OwnedInferenceFrame> frame_;
+};
+
+class RejectingControlSignal final : public ipc::media::IInferenceFrameIpcControlSignal {
+public:
+    core::Status ApplyGrant(const ipc::media::InferenceFrameIpcGrant&) override {
+        return core::Status::Error(core::ErrorCode::Unavailable, "fake control signal unavailable");
+    }
+
+    core::Status Revoke(std::uint64_t, std::string_view) override {
+        return core::Status::Error(core::ErrorCode::Unavailable, "fake control signal unavailable");
+    }
+
+    core::Status Probe(std::uint64_t) override {
+        return core::Status::Error(core::ErrorCode::Unavailable, "fake control signal unavailable");
+    }
+};
 
 TEST(InferenceFrameSharedMemoryTest, PublishesClaimsAndReusesAcknowledgedSlot) {
     ChannelCleanup cleanup(UniqueChannelName("reuse"));
@@ -87,7 +149,9 @@ TEST(InferenceFrameSharedMemoryTest, PublishesClaimsAndReusesAcknowledgedSlot) {
 
     auto claimed = consumer.value()->TryClaim();
     ASSERT_TRUE(claimed.ok()) << claimed.status().message();
+    EXPECT_EQ(claimed.value().metadata().execution_id, "execution-ipc");
     EXPECT_EQ(claimed.value().metadata().session_id, "session-a");
+    EXPECT_EQ(claimed.value().metadata().selected_sequence, 1u);
     EXPECT_EQ(claimed.value().metadata().frame_id, 1u);
     ASSERT_EQ(claimed.value().payload().size(), payload.size());
     EXPECT_EQ(claimed.value().payload().front(), std::byte{0x2A});
@@ -121,6 +185,63 @@ TEST(InferenceFrameSharedMemoryTest, ClaimDestructorAcknowledgesSlot) {
     }
     EXPECT_EQ(producer.value()->Snapshot().acknowledged_frames, 1u);
     EXPECT_TRUE(producer.value()->Publish(MakeRequest("session-raii", 3, payload)).ok());
+}
+
+TEST(InferenceFrameSharedMemoryTest, FenceInvalidatesOldReaderAndOutstandingClaim) {
+    ChannelCleanup cleanup(UniqueChannelName("fence"));
+    auto producer = ipc::media::SharedMemoryInferenceFrameChannel::Create({
+        .name = cleanup.name(),
+        .slot_count = 2,
+        .payload_capacity = 64,
+    });
+    ASSERT_TRUE(producer.ok()) << producer.status().message();
+    const auto epoch = producer.value()->Snapshot().epoch;
+    auto consumer = ipc::media::SharedMemoryInferenceFrameChannel::Open({
+        .name = cleanup.name(),
+        .expected_epoch = epoch,
+    });
+    ASSERT_TRUE(consumer.ok()) << consumer.status().message();
+    std::vector<std::byte> payload(16, std::byte{0x31});
+
+    ASSERT_TRUE(producer.value()->Publish(MakeRequest("session-fence", 1, payload)).ok());
+    auto claimed = consumer.value()->TryClaim();
+    ASSERT_TRUE(claimed.ok()) << claimed.status().message();
+    ASSERT_TRUE(claimed.value().valid());
+
+    ASSERT_TRUE(producer.value()->Fence().ok());
+    EXPECT_TRUE(producer.value()->Snapshot().fenced);
+    EXPECT_FALSE(claimed.value().valid());
+    EXPECT_TRUE(claimed.value().payload().empty());
+    EXPECT_TRUE(claimed.value().metadata().session_id.empty());
+    EXPECT_EQ(consumer.value()->TryClaim().status().code(), core::ErrorCode::Cancelled);
+    EXPECT_EQ(
+        producer.value()->Publish(MakeRequest("session-fence", 2, payload)).code(),
+        core::ErrorCode::Cancelled);
+    EXPECT_TRUE(claimed.value().Acknowledge().ok());
+}
+
+TEST(InferenceFrameSharedMemoryTest, OpenRejectsEpochNotGrantedByControlPlane) {
+    ChannelCleanup cleanup(UniqueChannelName("epoch-grant"));
+    auto producer = ipc::media::SharedMemoryInferenceFrameChannel::Create({
+        .name = cleanup.name(),
+        .slot_count = 2,
+        .payload_capacity = 64,
+    });
+    ASSERT_TRUE(producer.ok()) << producer.status().message();
+    const auto epoch = producer.value()->Snapshot().epoch;
+
+    auto rejected = ipc::media::SharedMemoryInferenceFrameChannel::Open({
+        .name = cleanup.name(),
+        .expected_epoch = epoch + 1,
+    });
+    ASSERT_FALSE(rejected.ok());
+    EXPECT_EQ(rejected.status().code(), core::ErrorCode::FailedPrecondition);
+
+    auto accepted = ipc::media::SharedMemoryInferenceFrameChannel::Open({
+        .name = cleanup.name(),
+        .expected_epoch = epoch,
+    });
+    EXPECT_TRUE(accepted.ok()) << accepted.status().message();
 }
 
 TEST(InferenceFrameSharedMemoryTest, RejectsSingleSlotSequenceLayout) {
@@ -261,6 +382,125 @@ TEST(InferenceFrameIpcLifecycleTest, ConsumerReconnectsAfterProducerRecreatesEpo
     EXPECT_EQ(after.value().metadata().frame_id, 2u);
 }
 
+TEST(InferenceFrameIpcLifecycleTest, ConsumerAppliesOnlyCurrentProducerGrant) {
+    ChannelCleanup cleanup(UniqueChannelName("apply-grant"));
+    auto producer = ipc::media::RecoverableInferenceFrameIpcSink::Create({
+        .name = cleanup.name(),
+        .slot_count = 4,
+        .payload_capacity = 64,
+    });
+    ASSERT_TRUE(producer.ok()) << producer.status().message();
+    const auto old_grant = producer.value()->CurrentGrant();
+    auto consumer = ipc::media::ReconnectableInferenceFrameIpcSource::Open({
+        .name = old_grant.channel_name,
+        .expected_epoch = old_grant.epoch,
+    });
+    ASSERT_TRUE(consumer.ok()) << consumer.status().message();
+
+    ASSERT_TRUE(producer.value()->Recreate().ok());
+    const auto new_grant = producer.value()->CurrentGrant();
+    EXPECT_NE(new_grant.epoch, old_grant.epoch);
+    EXPECT_EQ(consumer.value()->TryClaim().status().code(), core::ErrorCode::Cancelled);
+    EXPECT_EQ(
+        consumer.value()->ApplyGrant(old_grant).code(),
+        core::ErrorCode::FailedPrecondition);
+    auto invalid_layout_grant = new_grant;
+    ++invalid_layout_grant.slot_count;
+    EXPECT_EQ(
+        consumer.value()->ApplyGrant(invalid_layout_grant).code(),
+        core::ErrorCode::FailedPrecondition);
+    ASSERT_TRUE(consumer.value()->ApplyGrant(new_grant).ok());
+
+    std::vector<std::byte> payload(16, std::byte{0x52});
+    ASSERT_TRUE(producer.value()->Publish(MakeRequest("session-grant", 2, payload)).ok());
+    auto claimed = consumer.value()->TryClaim();
+    ASSERT_TRUE(claimed.ok()) << claimed.status().message();
+    EXPECT_EQ(claimed.value().metadata().frame_id, 2u);
+}
+
+TEST(InferenceFrameIpcControlTest, RevokeAndRecoverRotateGrantWithoutStaleAccess) {
+    ChannelCleanup cleanup(UniqueChannelName("control-recover"));
+    auto created_sink = ipc::media::RecoverableInferenceFrameIpcSink::Create({
+        .name = cleanup.name(),
+        .slot_count = 4,
+        .payload_capacity = 64,
+    });
+    ASSERT_TRUE(created_sink.ok()) << created_sink.status().message();
+    std::shared_ptr<ipc::media::IRecoverableInferenceFrameIpcSink> sink(
+        std::move(created_sink).value());
+    auto receiver = std::make_shared<ipc::media::InferenceFrameIpcGrantReceiver>();
+    ipc::media::InferenceFrameIpcLeaseCoordinator coordinator(sink, receiver);
+    std::vector<std::byte> payload(16, std::byte{0x63});
+
+    ASSERT_TRUE(coordinator.Start().ok());
+    const auto old_epoch = coordinator.Snapshot().grant.epoch;
+    ASSERT_TRUE(sink->Publish(MakeRequest("session-control", 1, payload)).ok());
+    auto old_claim = receiver->TryClaim();
+    ASSERT_TRUE(old_claim.ok()) << old_claim.status().message();
+    ASSERT_TRUE(old_claim.value().valid());
+
+    ASSERT_TRUE(coordinator.Revoke("inference peer lost").ok());
+    EXPECT_FALSE(old_claim.value().valid());
+    EXPECT_TRUE(old_claim.value().payload().empty());
+    EXPECT_EQ(receiver->TryClaim().status().code(), core::ErrorCode::Cancelled);
+    EXPECT_EQ(sink->Publish(MakeRequest("session-control", 2, payload)).code(), core::ErrorCode::Cancelled);
+
+    ASSERT_TRUE(coordinator.Recover().ok());
+    const auto recovered = coordinator.Snapshot();
+    EXPECT_EQ(recovered.state, ipc::media::InferenceFrameIpcControlState::Granted);
+    EXPECT_NE(recovered.grant.epoch, old_epoch);
+    EXPECT_EQ(recovered.recoveries, 1u);
+    ASSERT_TRUE(sink->Publish(MakeRequest("session-control", 3, payload)).ok());
+    auto new_claim = receiver->TryClaim();
+    ASSERT_TRUE(new_claim.ok()) << new_claim.status().message();
+    EXPECT_EQ(new_claim.value().metadata().frame_id, 3u);
+}
+
+TEST(InferenceFrameIpcControlTest, SignalFailureFencesProducer) {
+    ChannelCleanup cleanup(UniqueChannelName("control-failure"));
+    auto created_sink = ipc::media::RecoverableInferenceFrameIpcSink::Create({
+        .name = cleanup.name(),
+        .slot_count = 2,
+        .payload_capacity = 64,
+    });
+    ASSERT_TRUE(created_sink.ok()) << created_sink.status().message();
+    std::shared_ptr<ipc::media::IRecoverableInferenceFrameIpcSink> sink(
+        std::move(created_sink).value());
+    auto signal = std::make_shared<RejectingControlSignal>();
+    ipc::media::InferenceFrameIpcLeaseCoordinator coordinator(sink, signal);
+
+    const auto status = coordinator.Start();
+    ASSERT_FALSE(status.ok());
+    EXPECT_EQ(status.code(), core::ErrorCode::Unavailable);
+    EXPECT_TRUE(sink->Snapshot().fenced);
+    std::vector<std::byte> payload(16, std::byte{0x64});
+    EXPECT_EQ(
+        sink->Publish(MakeRequest("session-control-failure", 1, payload)).code(),
+        core::ErrorCode::Cancelled);
+}
+
+TEST(InferenceFrameIpcControlTest, FailedPeerProbeFencesActiveProducer) {
+    ChannelCleanup cleanup(UniqueChannelName("control-probe"));
+    auto created_sink = ipc::media::RecoverableInferenceFrameIpcSink::Create({
+        .name = cleanup.name(),
+        .slot_count = 2,
+        .payload_capacity = 64,
+    });
+    ASSERT_TRUE(created_sink.ok()) << created_sink.status().message();
+    std::shared_ptr<ipc::media::IRecoverableInferenceFrameIpcSink> sink(
+        std::move(created_sink).value());
+    auto receiver = std::make_shared<ipc::media::InferenceFrameIpcGrantReceiver>();
+    ipc::media::InferenceFrameIpcLeaseCoordinator coordinator(sink, receiver);
+    ASSERT_TRUE(coordinator.Start().ok());
+    receiver->Shutdown();
+
+    const auto status = coordinator.CheckPeer();
+    ASSERT_FALSE(status.ok());
+    EXPECT_EQ(status.code(), core::ErrorCode::Unavailable);
+    EXPECT_EQ(coordinator.Snapshot().state, ipc::media::InferenceFrameIpcControlState::Fenced);
+    EXPECT_TRUE(sink->Snapshot().fenced);
+}
+
 TEST(InferenceFrameIpcReceiverTest, CopiesPrivatePayloadAndSubmitsBacklogFrame) {
     ChannelCleanup cleanup(UniqueChannelName("receiver"));
     auto producer = ipc::media::SharedMemoryInferenceFrameChannel::Create({
@@ -295,6 +535,36 @@ TEST(InferenceFrameIpcReceiverTest, CopiesPrivatePayloadAndSubmitsBacklogFrame) 
     EXPECT_EQ(snapshot.received_frames, 1u);
     EXPECT_EQ(snapshot.copied_frames, 1u);
     EXPECT_EQ(snapshot.submitted_frames, 1u);
+}
+
+TEST(InferenceFrameIpcReceiverTest, RoutesOwnedFrameThroughExecutionAdmissionSink) {
+    ChannelCleanup cleanup(UniqueChannelName("execution-sink"));
+    auto producer = ipc::media::SharedMemoryInferenceFrameChannel::Create({
+        .name = cleanup.name(),
+        .slot_count = 2,
+        .payload_capacity = 128,
+    });
+    ASSERT_TRUE(producer.ok());
+    auto source = ipc::media::SharedMemoryInferenceFrameChannel::Open({.name = cleanup.name()});
+    ASSERT_TRUE(source.ok());
+
+    core::BucketMemoryPool pool;
+    media::inference::SegmentedInferenceFrameBacklog unused_backlog;
+    auto sink = std::make_shared<CapturingAdmissionSink>();
+    media::inference::InferenceFrameIpcReceiver receiver(
+        *source.value(), pool, unused_backlog, {}, {}, {.admission_sink = sink});
+    std::vector<std::byte> payload(80, std::byte{0x6D});
+    ASSERT_TRUE(producer.value()->Publish(MakeRequest("session-execution-sink", 7, payload)).ok());
+    ASSERT_TRUE(receiver.PollOnce().ok());
+
+    auto admitted = sink->Take();
+    ASSERT_TRUE(admitted.has_value());
+    EXPECT_EQ(admitted->metadata().execution_id, "execution-ipc");
+    EXPECT_EQ(admitted->metadata().selected_sequence, 7u);
+    ASSERT_EQ(admitted->bytes().size(), payload.size());
+    EXPECT_EQ(admitted->bytes().front(), std::byte{0x6D});
+    EXPECT_EQ(unused_backlog.Snapshot().queued_frames, 0u);
+    EXPECT_EQ(receiver.Snapshot().submitted_frames, 1u);
 }
 
 TEST(InferenceFrameIpcReceiverTest, ObserverExceptionDoesNotRejectAdmittedFrame) {
@@ -380,6 +650,116 @@ TEST(InferenceFrameIpcReceiverTest, BacklogRejectionDoesNotRetainSharedSlot) {
     EXPECT_EQ(receiver.PollOnce().code(), core::ErrorCode::ResourceExhausted);
     EXPECT_EQ(producer.value()->Snapshot().acknowledged_frames, 2u);
     EXPECT_TRUE(producer.value()->Publish(MakeRequest("session-full", 3, payload)).ok());
+}
+
+TEST(InferenceFrameIpcReceiverTest, SpoolsOverflowFrameWithoutRejectingAdmission) {
+    ChannelCleanup cleanup(UniqueChannelName("overflow-spool"));
+    SpoolDirectoryCleanup spool_directory("overflow");
+    auto producer = ipc::media::SharedMemoryInferenceFrameChannel::Create({
+        .name = cleanup.name(),
+        .slot_count = 2,
+        .payload_capacity = 64,
+    });
+    ASSERT_TRUE(producer.ok());
+    auto source = ipc::media::SharedMemoryInferenceFrameChannel::Open({.name = cleanup.name()});
+    ASSERT_TRUE(source.ok());
+    auto spool = media::inference::MappedInferenceFrameSpool::Create({
+        .root_directory = spool_directory.path(),
+        .execution_id = "execution-ipc",
+        .segment_bytes = 1024,
+        .max_spool_bytes = 4096,
+        .flush_on_append = true,
+        .remove_on_destroy = true,
+    });
+    ASSERT_TRUE(spool.ok()) << spool.status().message();
+    std::shared_ptr<media::inference::IInferenceFrameSpool> shared_spool(
+        std::move(spool).value());
+    std::weak_ptr<media::inference::IInferenceFrameSpool> weak_spool = shared_spool;
+
+    core::BucketMemoryPool pool;
+    media::inference::SegmentedInferenceFrameBacklog backlog({
+        .max_sessions = 1,
+        .segments_per_session = 1,
+        .slots_per_segment = 1,
+    });
+    media::inference::InferenceFrameIpcReceiver receiver(
+        *source.value(),
+        pool,
+        backlog,
+        {},
+        {},
+        {.overflow_spool = shared_spool});
+    shared_spool.reset();
+    EXPECT_FALSE(weak_spool.expired());
+    std::vector<std::byte> payload(32, std::byte{0x66});
+
+    ASSERT_TRUE(producer.value()->Publish(MakeRequest("session-overflow", 1, payload)).ok());
+    ASSERT_TRUE(receiver.PollOnce().ok());
+    ASSERT_TRUE(producer.value()->Publish(MakeRequest("session-overflow", 2, payload)).ok());
+    ASSERT_TRUE(receiver.PollOnce().ok());
+
+    const auto receiver_snapshot = receiver.Snapshot();
+    EXPECT_EQ(receiver_snapshot.submitted_frames, 1u);
+    EXPECT_EQ(receiver_snapshot.spooled_frames, 1u);
+    EXPECT_EQ(receiver_snapshot.rejected_frames, 0u);
+    auto retained_spool = weak_spool.lock();
+    ASSERT_TRUE(retained_spool);
+    EXPECT_EQ(retained_spool->Snapshot().admitted_records, 1u);
+    ASSERT_TRUE(retained_spool->Seal().ok());
+    auto replayed = retained_spool->ReplayNext();
+    ASSERT_TRUE(replayed.ok()) << replayed.status().message();
+    ASSERT_TRUE(replayed.value().has_value());
+    EXPECT_EQ(replayed.value()->metadata().execution_id, "execution-ipc");
+    EXPECT_EQ(replayed.value()->metadata().selected_sequence, 2u);
+    EXPECT_EQ(replayed.value()->metadata().frame.frame_id, 2u);
+    EXPECT_EQ(replayed.value()->bytes().front(), std::byte{0x66});
+}
+
+TEST(InferenceFrameIpcReceiverTest, ReportsSpoolFailureAsRejectedAdmission) {
+    ChannelCleanup cleanup(UniqueChannelName("overflow-failure"));
+    SpoolDirectoryCleanup spool_directory("failure");
+    auto producer = ipc::media::SharedMemoryInferenceFrameChannel::Create({
+        .name = cleanup.name(),
+        .slot_count = 2,
+        .payload_capacity = 64,
+    });
+    ASSERT_TRUE(producer.ok());
+    auto source = ipc::media::SharedMemoryInferenceFrameChannel::Open({.name = cleanup.name()});
+    ASSERT_TRUE(source.ok());
+    auto spool = media::inference::MappedInferenceFrameSpool::Create({
+        .root_directory = spool_directory.path(),
+        .execution_id = "execution-ipc",
+        .segment_bytes = 1024,
+        .max_spool_bytes = 1024,
+        .flush_on_append = true,
+        .remove_on_destroy = true,
+    });
+    ASSERT_TRUE(spool.ok()) << spool.status().message();
+    std::shared_ptr<media::inference::IInferenceFrameSpool> shared_spool(
+        std::move(spool).value());
+    ASSERT_TRUE(shared_spool->Seal().ok());
+
+    core::BucketMemoryPool pool;
+    media::inference::SegmentedInferenceFrameBacklog backlog({
+        .max_sessions = 1,
+        .segments_per_session = 1,
+        .slots_per_segment = 1,
+    });
+    media::inference::InferenceFrameIpcReceiver receiver(
+        *source.value(),
+        pool,
+        backlog,
+        {},
+        {},
+        {.overflow_spool = shared_spool});
+    std::vector<std::byte> payload(32, std::byte{0x77});
+
+    ASSERT_TRUE(producer.value()->Publish(MakeRequest("session-failure", 1, payload)).ok());
+    ASSERT_TRUE(receiver.PollOnce().ok());
+    ASSERT_TRUE(producer.value()->Publish(MakeRequest("session-failure", 2, payload)).ok());
+    EXPECT_EQ(receiver.PollOnce().code(), core::ErrorCode::FailedPrecondition);
+    EXPECT_EQ(receiver.Snapshot().spooled_frames, 0u);
+    EXPECT_EQ(receiver.Snapshot().rejected_frames, 1u);
 }
 
 } // namespace

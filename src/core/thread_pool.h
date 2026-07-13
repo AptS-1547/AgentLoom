@@ -3,6 +3,7 @@
 #include "blocking_queue.h"
 #include "result.h"
 #include "shared_memory_block.h"
+#include "task_group.h"
 #include "trace_context.h"
 
 #include <atomic>
@@ -81,6 +82,13 @@ public:
         return std::move(payload_);
     }
 
+    Result<TaskGroupToken> AcquireChildTask() const {
+        if (!task_group_token_) {
+            return Status::Error(ErrorCode::FailedPrecondition, "current task is not tracked by a task group");
+        }
+        return task_group_token_->AcquireChild();
+    }
+
 private:
     friend class ThreadPool;
 
@@ -97,10 +105,15 @@ private:
         payload_.reset();
     }
 
+    void set_task_group_token(TaskGroupToken* token) noexcept {
+        task_group_token_ = token;
+    }
+
     std::size_t worker_index_ = 0;
     std::string pool_name_;
     std::stop_token stop_token_;
     SharedMemoryBlock payload_;
+    TaskGroupToken* task_group_token_ = nullptr;
 };
 
 class ThreadPool {
@@ -117,10 +130,42 @@ public:
     void Shutdown(bool drain = true);
 
     Status SubmitTask(TaskFunction task, SharedMemoryBlock payload = {}, std::string name = {});
+    Status SubmitTask(TaskGroup& group,
+                      TaskFunction task,
+                      SharedMemoryBlock payload = {},
+                      std::string name = {});
+    Status SubmitTask(TaskGroupToken token,
+                      TaskFunction task,
+                      SharedMemoryBlock payload = {},
+                      std::string name = {});
 
     template <typename Fn>
     Status Submit(Fn&& fn, SharedMemoryBlock payload = {}, std::string name = {}) {
-        TaskFunction task = [func = std::forward<Fn>(fn)](ThreadPoolContext& context) mutable -> Status {
+        return SubmitTask(MakeTask(std::forward<Fn>(fn)), std::move(payload), std::move(name));
+    }
+
+    template <typename Fn>
+    Status Submit(TaskGroup& group, Fn&& fn, SharedMemoryBlock payload = {}, std::string name = {}) {
+        return SubmitTask(group, MakeTask(std::forward<Fn>(fn)), std::move(payload), std::move(name));
+    }
+
+    template <typename Fn>
+    Status Submit(TaskGroupToken token, Fn&& fn, SharedMemoryBlock payload = {}, std::string name = {}) {
+        return SubmitTask(
+            std::move(token),
+            MakeTask(std::forward<Fn>(fn)),
+            std::move(payload),
+            std::move(name));
+    }
+
+    ThreadPoolStats Stats() const;
+    std::vector<WorkerStatus> WorkerStatuses() const;
+    bool running() const noexcept;
+
+private:
+    template <typename Fn>
+    static TaskFunction MakeTask(Fn&& fn) {
+        return [func = std::forward<Fn>(fn)](ThreadPoolContext& context) mutable -> Status {
             if constexpr (std::is_invocable_v<Fn&, ThreadPoolContext&>) {
                 using ReturnType = std::invoke_result_t<Fn&, ThreadPoolContext&>;
                 if constexpr (std::is_same_v<ReturnType, Status>) {
@@ -145,19 +190,13 @@ public:
                 static_assert(std::is_invocable_v<Fn&, ThreadPoolContext&>, "thread pool task is not invocable");
             }
         };
-        return SubmitTask(std::move(task), std::move(payload), std::move(name));
     }
-
-    ThreadPoolStats Stats() const;
-    std::vector<WorkerStatus> WorkerStatuses() const;
-    bool running() const noexcept;
-
-private:
     struct QueuedTask {
         TaskFunction task;
         SharedMemoryBlock payload;
         std::string name;
         std::string trace_id;
+        std::shared_ptr<TaskGroupToken> task_group_token;
     };
 
     struct WorkerRuntime {

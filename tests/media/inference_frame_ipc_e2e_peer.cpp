@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <fstream>
+#include <optional>
 #include <string>
 #include <thread>
 
@@ -15,10 +16,14 @@ namespace {
 using namespace std::chrono_literals;
 
 core::Result<std::unique_ptr<ipc::media::SharedMemoryInferenceFrameChannel>> OpenWithRetry(
-    const std::string& name) {
+    const std::string& name,
+    std::optional<std::uint64_t> expected_epoch = std::nullopt) {
     const auto deadline = std::chrono::steady_clock::now() + 5s;
     for (;;) {
-        auto channel = ipc::media::SharedMemoryInferenceFrameChannel::Open({.name = name});
+        auto channel = ipc::media::SharedMemoryInferenceFrameChannel::Open({
+            .name = name,
+            .expected_epoch = expected_epoch,
+        });
         if (channel.ok()) {
             return channel;
         }
@@ -106,6 +111,45 @@ int Consume(const std::string& name, std::size_t expected_count, const std::stri
     }
 }
 
+int WaitForFence(
+    const std::string& name,
+    std::uint64_t expected_epoch,
+    const std::string& report_path) {
+    auto channel = OpenWithRetry(name, expected_epoch);
+    if (!channel.ok()) {
+        return 30;
+    }
+    {
+        std::ofstream report(report_path, std::ios::binary | std::ios::trunc);
+        if (!report) {
+            return 31;
+        }
+        report << "ready\n";
+        if (!report.good()) {
+            return 32;
+        }
+    }
+
+    const auto deadline = std::chrono::steady_clock::now() + 10s;
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto claimed = channel.value()->TryClaim();
+        if (claimed.ok()) {
+            claimed.value().Acknowledge();
+            continue;
+        }
+        if (claimed.status().code() == core::ErrorCode::Cancelled) {
+            std::ofstream report(report_path, std::ios::binary | std::ios::trunc);
+            report << "fenced\n";
+            return report.good() ? 0 : 33;
+        }
+        if (claimed.status().code() != core::ErrorCode::NotFound) {
+            return 34;
+        }
+        std::this_thread::sleep_for(1ms);
+    }
+    return 35;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -119,6 +163,9 @@ int main(int argc, char** argv) {
     }
     if (mode == "claim-crash") {
         ClaimAndCrash(name);
+    }
+    if (mode == "wait-fence" && argc == 5) {
+        return WaitForFence(name, std::stoull(argv[3]), argv[4]);
     }
     return 3;
 }

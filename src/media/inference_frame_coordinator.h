@@ -6,14 +6,22 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <functional>
 #include <memory>
 
 namespace media::inference {
+
+struct InferenceFrameTerminalEvent {
+    InferenceFrameMetadata frame;
+    core::Status inference_status = core::Status::Ok();
+    core::Status publish_status = core::Status::Ok();
+};
 
 struct InferenceFrameCoordinatorOptions {
     std::size_t worker_count = 2;
     std::chrono::milliseconds wait_timeout{100};
     bool shutdown_backlog = true;
+    std::function<void(InferenceFrameTerminalEvent)> terminal_observer;
 };
 
 struct InferenceFrameCoordinatorSnapshot {

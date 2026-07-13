@@ -12,6 +12,7 @@
 #include <optional>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace media::inference {
@@ -102,6 +103,9 @@ public:
     struct SessionResults {
         mutable std::mutex mutex;
         std::map<InferenceFrameOrderKey, InferenceFrameResultRecord> ordered_results;
+        std::unordered_set<std::uint64_t> selected_sequences;
+        std::string session_id;
+        std::string execution_id;
         bool closed = false;
     };
 
@@ -124,13 +128,24 @@ public:
                 core::ErrorCode::InvalidArgument,
                 "successful inference result payload is missing"));
         }
+        if (!record.frame.execution_id.empty() && record.frame.selected_sequence == 0) {
+            return Reject(core::Status::Error(
+                core::ErrorCode::InvalidArgument,
+                "execution result selected_sequence is required"));
+        }
         if (shutdown_.load(std::memory_order_acquire)) {
             return Reject(core::Status::Error(
                 core::ErrorCode::Cancelled,
                 "inference result table is shut down"));
         }
 
-        auto session = GetOrCreateSession(record.frame.session_id);
+        const auto partition_key = record.frame.execution_id.empty()
+            ? "session\n" + record.frame.session_id
+            : "execution\n" + record.frame.execution_id;
+        auto session = GetOrCreateSession(
+            partition_key,
+            record.frame.session_id,
+            record.frame.execution_id);
         if (!session.ok()) {
             return Reject(session.status());
         }
@@ -146,8 +161,15 @@ public:
                 core::ErrorCode::ResourceExhausted,
                 "inference result session capacity reached"));
         }
+        if (record.frame.selected_sequence != 0 &&
+            session.value()->selected_sequences.contains(record.frame.selected_sequence)) {
+            return Reject(core::Status::Error(
+                core::ErrorCode::AlreadyExists,
+                "inference result selected_sequence already exists"));
+        }
 
         const InferenceFrameOrderKey key{
+            .selected_sequence = record.frame.selected_sequence,
             .timestamp_us = record.frame.timestamp_us,
             .frame_id = record.frame.frame_id,
         };
@@ -158,38 +180,67 @@ public:
                 core::ErrorCode::AlreadyExists,
                 "inference result key already exists"));
         }
+        if (it->second.frame.selected_sequence != 0) {
+            session.value()->selected_sequences.insert(it->second.frame.selected_sequence);
+        }
         published_results_.fetch_add(1, std::memory_order_relaxed);
         return core::Status::Ok();
     }
 
     core::Result<std::vector<InferenceFrameResultRecord>> FinalizeSession(
         std::string_view session_id) {
+        if (session_id.empty()) {
+            return core::Status::Error(core::ErrorCode::InvalidArgument, "session_id is required");
+        }
+        std::vector<std::shared_ptr<SessionResults>> matched;
+        {
+            std::lock_guard sessions_lock(sessions_mutex_);
+            for (auto it = sessions_.begin(); it != sessions_.end();) {
+                if (it->second->session_id != session_id) {
+                    ++it;
+                    continue;
+                }
+                std::lock_guard session_lock(it->second->mutex);
+                it->second->closed = true;
+                matched.push_back(it->second);
+                it = sessions_.erase(it);
+            }
+        }
+        if (matched.empty()) {
+            return core::Status::Error(core::ErrorCode::NotFound, "inference result session not found");
+        }
+        auto results = Extract(std::move(matched));
+        std::sort(results.begin(), results.end(), [](const auto& lhs, const auto& rhs) {
+            return InferenceFrameOrderKey{
+                       lhs.frame.selected_sequence,
+                       lhs.frame.timestamp_us,
+                       lhs.frame.frame_id} <
+                   InferenceFrameOrderKey{
+                       rhs.frame.selected_sequence,
+                       rhs.frame.timestamp_us,
+                       rhs.frame.frame_id};
+        });
+        return results;
+    }
+
+    core::Result<std::vector<InferenceFrameResultRecord>> FinalizeExecution(
+        std::string_view execution_id) {
+        if (execution_id.empty()) {
+            return core::Status::Error(core::ErrorCode::InvalidArgument, "execution_id is required");
+        }
         std::shared_ptr<SessionResults> session;
         {
             std::lock_guard sessions_lock(sessions_mutex_);
-            const auto it = sessions_.find(std::string(session_id));
+            const auto it = sessions_.find("execution\n" + std::string(execution_id));
             if (it == sessions_.end()) {
-                return core::Status::Error(
-                    core::ErrorCode::NotFound,
-                    "inference result session not found");
+                return core::Status::Error(core::ErrorCode::NotFound, "inference result execution not found");
             }
             session = it->second;
             std::lock_guard session_lock(session->mutex);
             session->closed = true;
             sessions_.erase(it);
         }
-
-        std::vector<InferenceFrameResultRecord> results;
-        {
-            std::lock_guard lock(session->mutex);
-            results.reserve(session->ordered_results.size());
-            for (auto& [key, record] : session->ordered_results) {
-                static_cast<void>(key);
-                results.push_back(std::move(record));
-            }
-            session->ordered_results.clear();
-        }
-        return results;
+        return Extract({std::move(session)});
     }
 
     void Shutdown() {
@@ -210,6 +261,7 @@ public:
             std::lock_guard lock(session->mutex);
             session->closed = true;
             session->ordered_results.clear();
+            session->selected_sequences.clear();
         }
     }
 
@@ -228,14 +280,38 @@ public:
     }
 
 private:
-    core::Result<std::shared_ptr<SessionResults>> GetOrCreateSession(std::string_view session_id) {
+    static std::vector<InferenceFrameResultRecord> Extract(
+        std::vector<std::shared_ptr<SessionResults>> sessions) {
+        std::vector<InferenceFrameResultRecord> results;
+        for (auto& session : sessions) {
+            std::lock_guard lock(session->mutex);
+            results.reserve(results.size() + session->ordered_results.size());
+            for (auto& [key, record] : session->ordered_results) {
+                static_cast<void>(key);
+                results.push_back(std::move(record));
+            }
+            session->ordered_results.clear();
+            session->selected_sequences.clear();
+        }
+        return results;
+    }
+
+    core::Result<std::shared_ptr<SessionResults>> GetOrCreateSession(
+        std::string_view partition_key,
+        std::string_view session_id,
+        std::string_view execution_id) {
         std::lock_guard lock(sessions_mutex_);
         if (shutdown_.load(std::memory_order_acquire)) {
             return core::Status::Error(
                 core::ErrorCode::Cancelled,
                 "inference result table is shut down");
         }
-        if (auto it = sessions_.find(std::string(session_id)); it != sessions_.end()) {
+        if (auto it = sessions_.find(std::string(partition_key)); it != sessions_.end()) {
+            if (it->second->session_id != session_id || it->second->execution_id != execution_id) {
+                return core::Status::Error(
+                    core::ErrorCode::FailedPrecondition,
+                    "inference result partition identity does not match its first publisher");
+            }
             return it->second;
         }
         if (sessions_.size() >= options_.max_sessions) {
@@ -244,7 +320,9 @@ private:
                 "inference result session limit reached");
         }
         auto session = std::make_shared<SessionResults>();
-        sessions_.emplace(std::string(session_id), session);
+        session->session_id = session_id;
+        session->execution_id = execution_id;
+        sessions_.emplace(std::string(partition_key), session);
         return session;
     }
 
@@ -339,27 +417,33 @@ public:
         Shutdown();
     }
 
-    core::Status Submit(OwnedInferenceFrame frame) {
+    InferenceFrameSubmitOutcome TrySubmit(OwnedInferenceFrame frame) {
+        auto reject = [&](core::Status status, bool expected_backpressure = false) -> InferenceFrameSubmitOutcome {
+            return {
+                .status = LogFailure(std::move(status), expected_backpressure),
+                .rejected_frame = std::optional<OwnedInferenceFrame>(std::move(frame)),
+            };
+        };
         if (!options_status_.ok()) {
-            return options_status_;
+            return reject(options_status_);
         }
         if (!frame.valid()) {
-            return LogFailure(core::Status::Error(
+            return reject(core::Status::Error(
                 core::ErrorCode::InvalidArgument,
                 "owned inference frame is invalid"));
         }
         if (shutdown_.load(std::memory_order_acquire)) {
-            return LogFailure(core::Status::Error(
+            return reject(core::Status::Error(
                 core::ErrorCode::Cancelled,
                 "inference frame backlog is shut down"));
         }
 
         auto session = GetOrCreateSession(frame.metadata().session_id);
         if (!session.ok()) {
-            return LogFailure(session.status());
+            return reject(session.status());
         }
         if (session.value()->closed.load(std::memory_order_acquire)) {
-            return LogFailure(core::Status::Error(
+            return reject(core::Status::Error(
                 core::ErrorCode::Cancelled,
                 "inference frame session is closed"));
         }
@@ -384,7 +468,7 @@ public:
                     continue;
                 }
                 if (state.closed.load(std::memory_order_acquire)) {
-                    return LogFailure(core::Status::Error(
+                    return reject(core::Status::Error(
                         core::ErrorCode::Cancelled,
                         "inference frame session is closed"));
                 }
@@ -411,14 +495,16 @@ public:
             }
             if (submitted) {
                 ScheduleSegment(session.value(), segment_index);
-                return core::Status::Ok();
+                return {};
             }
         }
 
         rejected_frames_.fetch_add(1, std::memory_order_relaxed);
-        return LogFailure(core::Status::Error(
-            core::ErrorCode::ResourceExhausted,
-            "inference frame session backlog is full"));
+        return reject(
+            core::Status::Error(
+                core::ErrorCode::ResourceExhausted,
+                "inference frame session backlog is full"),
+            true);
     }
 
     core::Result<OwnedInferenceFrame> TryTake() {
@@ -641,10 +727,16 @@ private:
         return discarded;
     }
 
-    core::Status LogFailure(core::Status status) const {
-        logger_.warn("[InferenceFrameBacklogRejected] code={} error={}",
-                     static_cast<int>(status.code()),
-                     status.message());
+    core::Status LogFailure(core::Status status, bool expected_backpressure) const {
+        if (expected_backpressure) {
+            logger_.debug("[InferenceFrameBacklogBackpressure] code={} error={}",
+                          static_cast<int>(status.code()),
+                          status.message());
+        } else {
+            logger_.warn("[InferenceFrameBacklogRejected] code={} error={}",
+                         static_cast<int>(status.code()),
+                         status.message());
+        }
         return status;
     }
 
@@ -709,6 +801,11 @@ SessionInferenceFrameResultTable::FinalizeSession(std::string_view session_id) {
     return impl_->FinalizeSession(session_id);
 }
 
+core::Result<std::vector<InferenceFrameResultRecord>>
+SessionInferenceFrameResultTable::FinalizeExecution(std::string_view execution_id) {
+    return impl_->FinalizeExecution(execution_id);
+}
+
 void SessionInferenceFrameResultTable::Shutdown() {
     impl_->Shutdown();
 }
@@ -724,8 +821,8 @@ SegmentedInferenceFrameBacklog::SegmentedInferenceFrameBacklog(
 
 SegmentedInferenceFrameBacklog::~SegmentedInferenceFrameBacklog() = default;
 
-core::Status SegmentedInferenceFrameBacklog::Submit(OwnedInferenceFrame frame) {
-    return impl_->Submit(std::move(frame));
+InferenceFrameSubmitOutcome SegmentedInferenceFrameBacklog::TrySubmit(OwnedInferenceFrame frame) {
+    return impl_->TrySubmit(std::move(frame));
 }
 
 core::Result<OwnedInferenceFrame> SegmentedInferenceFrameBacklog::TryTake() {

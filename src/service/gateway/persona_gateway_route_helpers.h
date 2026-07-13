@@ -385,6 +385,7 @@ static Json SkillObservationToJson(const persona::SkillObservation& observation)
         }
     }
     return Json{
+        {"executionId", observation.execution_id},
         {"skillId", observation.skill_id},
         {"sessionId", observation.session_id},
         {"traceId", observation.trace_id},
@@ -403,6 +404,7 @@ static Json SkillSessionSnapshotToJson(const persona::SkillSessionSnapshot& snap
         observations.push_back(SkillObservationToJson(observation));
     }
     return Json{
+        {"executionId", snapshot.execution_id},
         {"skillId", snapshot.skill_id},
         {"sessionId", snapshot.session_id},
         {"userUuid", snapshot.user_uuid},

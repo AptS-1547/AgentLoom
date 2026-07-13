@@ -24,6 +24,10 @@ namespace media {
 class WebRtcSessionRegistry;
 }
 
+namespace ipc::media {
+class IInferenceFrameIpcLeaseCoordinator;
+}
+
 namespace agent::service::gateway {
 
 class IRuntimeMaintenanceTask {
@@ -136,6 +140,23 @@ private:
     std::shared_ptr<persona::ISkillSessionManager> manager_;
     std::chrono::milliseconds interval_;
     core::LoggerAdapter logger_;
+};
+
+class InferenceFrameIpcPeerMaintenanceTask final : public IRuntimeMaintenanceTask {
+public:
+    InferenceFrameIpcPeerMaintenanceTask(
+        std::shared_ptr<ipc::media::IInferenceFrameIpcLeaseCoordinator> coordinator,
+        std::chrono::milliseconds interval,
+        bool auto_recover = true);
+
+    std::string_view Name() const noexcept override;
+    std::chrono::milliseconds Interval() const noexcept override;
+    core::Status Tick(std::stop_token stop_token) override;
+
+private:
+    std::shared_ptr<ipc::media::IInferenceFrameIpcLeaseCoordinator> coordinator_;
+    std::chrono::milliseconds interval_;
+    bool auto_recover_ = true;
 };
 
 struct L3MemoryFlushMaintenanceOptions {

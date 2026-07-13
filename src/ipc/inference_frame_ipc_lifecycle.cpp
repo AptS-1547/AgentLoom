@@ -38,6 +38,22 @@ core::Status RecoverableInferenceFrameIpcSink::Publish(const SharedFramePublishR
     return channel_->Publish(request);
 }
 
+core::Status RecoverableInferenceFrameIpcSink::Fence() {
+    std::unique_lock lock(mutex_);
+    if (shutdown_ || !channel_) {
+        return core::Status::Error(core::ErrorCode::Unavailable, "shared frame producer is disconnected");
+    }
+    const auto status = channel_->Fence();
+    if (!status.ok()) {
+        logger_.error(
+            "[frame-ipc-lifecycle] producer fence failed name={} code={} message={}",
+            options_.name,
+            static_cast<int>(status.code()),
+            status.message());
+    }
+    return status;
+}
+
 core::Status RecoverableInferenceFrameIpcSink::Recreate() {
     std::unique_lock lock(mutex_);
     if (shutdown_) {
@@ -45,6 +61,16 @@ core::Status RecoverableInferenceFrameIpcSink::Recreate() {
     }
 
     if (channel_) {
+        const auto fence_status = channel_->Fence();
+        if (!fence_status.ok()) {
+            ++recovery_failures_;
+            logger_.error(
+                "[frame-ipc-lifecycle] producer recreate fence failed name={} code={} message={}",
+                options_.name,
+                static_cast<int>(fence_status.code()),
+                fence_status.message());
+            return fence_status;
+        }
         channel_->Shutdown();
         channel_.reset();
     }
@@ -80,6 +106,20 @@ void RecoverableInferenceFrameIpcSink::Shutdown() {
 InferenceFrameSharedMemorySnapshot RecoverableInferenceFrameIpcSink::Snapshot() const {
     std::shared_lock lock(mutex_);
     return channel_ ? channel_->Snapshot() : InferenceFrameSharedMemorySnapshot{.shutdown = shutdown_};
+}
+
+InferenceFrameIpcGrant RecoverableInferenceFrameIpcSink::CurrentGrant() const {
+    std::shared_lock lock(mutex_);
+    if (!channel_) {
+        return {};
+    }
+    const auto snapshot = channel_->Snapshot();
+    return {
+        .channel_name = options_.name,
+        .epoch = snapshot.epoch,
+        .slot_count = snapshot.slot_count,
+        .payload_capacity = snapshot.payload_capacity,
+    };
 }
 
 InferenceFrameIpcLifecycleSnapshot RecoverableInferenceFrameIpcSink::LifecycleSnapshot() const {
@@ -150,6 +190,62 @@ core::Status ReconnectableInferenceFrameIpcSource::Reconnect() {
         "[frame-ipc-lifecycle] consumer reconnected name={} epoch={}",
         options_.name,
         channel_->Snapshot().epoch);
+    return core::Status::Ok();
+}
+
+core::Status ReconnectableInferenceFrameIpcSource::ApplyGrant(InferenceFrameIpcGrant grant) {
+    if (grant.channel_name.empty() || grant.epoch == 0 ||
+        grant.slot_count < 2 || grant.payload_capacity == 0) {
+        return core::Status::Error(core::ErrorCode::InvalidArgument, "shared frame IPC grant is invalid");
+    }
+
+    std::unique_lock lock(mutex_);
+    if (shutdown_) {
+        return core::Status::Error(core::ErrorCode::Cancelled, "shared frame consumer is shut down");
+    }
+
+    InferenceFrameSharedMemoryOptions replacement_options{
+        .name = std::move(grant.channel_name),
+        .slot_count = grant.slot_count,
+        .payload_capacity = grant.payload_capacity,
+        .expected_epoch = grant.epoch,
+    };
+    auto replacement = SharedMemoryInferenceFrameChannel::Open(replacement_options, logger_);
+    if (!replacement.ok()) {
+        ++recovery_failures_;
+        logger_.warn(
+            "[frame-ipc-lifecycle] consumer grant rejected name={} epoch={} code={} message={}",
+            replacement_options.name,
+            grant.epoch,
+            static_cast<int>(replacement.status().code()),
+            replacement.status().message());
+        return replacement.status();
+    }
+    const auto replacement_snapshot = replacement.value()->Snapshot();
+    if (replacement_snapshot.slot_count != grant.slot_count ||
+        replacement_snapshot.payload_capacity != grant.payload_capacity) {
+        ++recovery_failures_;
+        logger_.warn(
+            "[frame-ipc-lifecycle] consumer grant layout rejected name={} epoch={} slots={} payload_capacity={}",
+            replacement_options.name,
+            grant.epoch,
+            grant.slot_count,
+            grant.payload_capacity);
+        return core::Status::Error(
+            core::ErrorCode::FailedPrecondition,
+            "shared frame layout does not match control-plane grant");
+    }
+
+    if (channel_) {
+        channel_->Shutdown();
+    }
+    channel_ = std::move(replacement).value();
+    options_ = std::move(replacement_options);
+    ++recoveries_;
+    logger_.info(
+        "[frame-ipc-lifecycle] consumer applied grant name={} epoch={}",
+        options_.name,
+        grant.epoch);
     return core::Status::Ok();
 }
 

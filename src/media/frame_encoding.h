@@ -51,8 +51,11 @@ struct VideoFrameEncoderSelection {
 };
 
 struct EncodedVideoFrameMetadata {
+    std::string execution_id;
     std::string session_id;
     std::string trace_id;
+    std::uint64_t selected_sequence = 0;
+    std::uint64_t transport_sequence = 0;
     std::uint64_t frame_id = 0;
     std::int64_t timestamp_us = 0;
     std::uint32_t width = 0;
@@ -70,6 +73,7 @@ public:
         std::size_t payload_size) noexcept;
 
     const EncodedVideoFrameMetadata& metadata() const noexcept;
+    EncodedVideoFrameMetadata& metadata() noexcept;
     std::span<const std::byte> bytes() const noexcept;
     bool valid() const noexcept;
 
@@ -94,6 +98,9 @@ class IEncodedVideoFrameSink {
 public:
     virtual ~IEncodedVideoFrameSink() = default;
     virtual core::Status Publish(EncodedVideoFrame frame) = 0;
+    virtual core::Status PublishBorrowed(const EncodedVideoFrame& frame) {
+        return Publish(frame);
+    }
 };
 
 class GStreamerVideoFrameEncoder final : public IVideoFrameEncoder {

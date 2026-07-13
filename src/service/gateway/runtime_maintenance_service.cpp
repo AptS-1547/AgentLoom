@@ -1,6 +1,7 @@
 #include "runtime_maintenance_service.h"
 
 #include "webrtc_session_registry.h"
+#include "inference_frame_ipc_control.h"
 
 #include <algorithm>
 #include <ctime>
@@ -277,6 +278,45 @@ core::Status SkillSessionMaintenanceTask::Tick(std::stop_token stop_token) {
         logger_.info("[maintenance] skill session cleanup expired_count={}", expired);
     }
     return core::Status::Ok();
+}
+
+InferenceFrameIpcPeerMaintenanceTask::InferenceFrameIpcPeerMaintenanceTask(
+    std::shared_ptr<ipc::media::IInferenceFrameIpcLeaseCoordinator> coordinator,
+    std::chrono::milliseconds interval,
+    bool auto_recover)
+    : coordinator_(std::move(coordinator)),
+      interval_(interval),
+      auto_recover_(auto_recover) {}
+
+std::string_view InferenceFrameIpcPeerMaintenanceTask::Name() const noexcept {
+    return "inference_frame_ipc_peer";
+}
+
+std::chrono::milliseconds InferenceFrameIpcPeerMaintenanceTask::Interval() const noexcept {
+    return interval_;
+}
+
+core::Status InferenceFrameIpcPeerMaintenanceTask::Tick(std::stop_token stop_token) {
+    if (stop_token.stop_requested() || !coordinator_) {
+        return core::Status::Ok();
+    }
+    using State = ipc::media::InferenceFrameIpcControlState;
+    switch (coordinator_->Snapshot().state) {
+    case State::Idle:
+        return coordinator_->Start();
+    case State::Granted:
+        return coordinator_->CheckPeer();
+    case State::Fenced:
+    case State::Failed:
+        return auto_recover_
+            ? coordinator_->Recover()
+            : core::Status::Error(core::ErrorCode::Unavailable, "inference frame IPC peer is fenced");
+    case State::Recovering:
+        return core::Status::Error(core::ErrorCode::Unavailable, "inference frame IPC peer is recovering");
+    case State::Shutdown:
+        return core::Status::Ok();
+    }
+    return core::Status::Error(core::ErrorCode::InternalError, "unknown inference frame IPC control state");
 }
 
 L3MemoryFlushMaintenanceTask::L3MemoryFlushMaintenanceTask(

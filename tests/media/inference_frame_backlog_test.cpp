@@ -115,9 +115,12 @@ TEST(SegmentedInferenceFrameBacklogTest, RejectsWhenSessionRegionIsFull) {
     }
     auto overflow = MakeFrame(pool, "session-full", 3);
     ASSERT_TRUE(overflow.ok());
-    const auto status = backlog.Submit(std::move(overflow).value());
+    auto outcome = backlog.TrySubmit(std::move(overflow).value());
 
-    EXPECT_EQ(status.code(), core::ErrorCode::ResourceExhausted);
+    EXPECT_EQ(outcome.status.code(), core::ErrorCode::ResourceExhausted);
+    ASSERT_TRUE(outcome.rejected_frame.has_value());
+    EXPECT_EQ(outcome.rejected_frame->metadata().frame_id, 3u);
+    EXPECT_EQ(outcome.rejected_frame->bytes().size(), 64u);
     EXPECT_EQ(backlog.Snapshot().rejected_frames, 1u);
 }
 
@@ -407,6 +410,81 @@ TEST(InferenceFrameResultTableTest, ShutdownRejectsNewResults) {
     EXPECT_EQ(status.code(), core::ErrorCode::Cancelled);
     EXPECT_EQ(table.Snapshot().session_count, 0u);
     EXPECT_EQ(table.Snapshot().pending_results, 0u);
+}
+
+TEST(InferenceFrameResultTableTest, FinalizesExecutionsIndependentlyWithinOneSession) {
+    media::inference::SessionInferenceFrameResultTable table;
+    auto first = MakeResult("shared-session", 2, 200);
+    first.frame.execution_id = "execution-a";
+    first.frame.selected_sequence = 2;
+    auto second = MakeResult("shared-session", 1, 100);
+    second.frame.execution_id = "execution-b";
+    second.frame.selected_sequence = 1;
+    ASSERT_TRUE(table.Publish(std::move(first)).ok());
+    ASSERT_TRUE(table.Publish(std::move(second)).ok());
+
+    auto execution_a = table.FinalizeExecution("execution-a");
+    ASSERT_TRUE(execution_a.ok()) << execution_a.status().message();
+    ASSERT_EQ(execution_a.value().size(), 1u);
+    EXPECT_EQ(execution_a.value().front().frame.execution_id, "execution-a");
+
+    auto execution_b = table.FinalizeExecution("execution-b");
+    ASSERT_TRUE(execution_b.ok()) << execution_b.status().message();
+    ASSERT_EQ(execution_b.value().size(), 1u);
+    EXPECT_EQ(execution_b.value().front().frame.execution_id, "execution-b");
+}
+
+TEST(InferenceFrameResultTableTest, FinalizesExecutionBySelectedSequence) {
+    media::inference::SessionInferenceFrameResultTable table;
+    auto later_timestamp = MakeResult("ordered-session", 20, 20'000);
+    later_timestamp.frame.execution_id = "ordered-execution";
+    later_timestamp.frame.selected_sequence = 1;
+    auto earlier_timestamp = MakeResult("ordered-session", 10, 10'000);
+    earlier_timestamp.frame.execution_id = "ordered-execution";
+    earlier_timestamp.frame.selected_sequence = 2;
+
+    ASSERT_TRUE(table.Publish(std::move(earlier_timestamp)).ok());
+    ASSERT_TRUE(table.Publish(std::move(later_timestamp)).ok());
+    auto finalized = table.FinalizeExecution("ordered-execution");
+
+    ASSERT_TRUE(finalized.ok()) << finalized.status().message();
+    ASSERT_EQ(finalized.value().size(), 2u);
+    EXPECT_EQ(finalized.value()[0].frame.selected_sequence, 1u);
+    EXPECT_EQ(finalized.value()[1].frame.selected_sequence, 2u);
+}
+
+TEST(InferenceFrameResultTableTest, RejectsExecutionIdentitySharedAcrossSessions) {
+    media::inference::SessionInferenceFrameResultTable table;
+    auto first = MakeResult("session-a", 1, 1'000);
+    first.frame.execution_id = "unique-execution";
+    first.frame.selected_sequence = 1;
+    auto conflicting = MakeResult("session-b", 2, 2'000);
+    conflicting.frame.execution_id = "unique-execution";
+    conflicting.frame.selected_sequence = 2;
+
+    ASSERT_TRUE(table.Publish(std::move(first)).ok());
+    const auto status = table.Publish(std::move(conflicting));
+
+    EXPECT_EQ(status.code(), core::ErrorCode::FailedPrecondition);
+    auto finalized = table.FinalizeExecution("unique-execution");
+    ASSERT_TRUE(finalized.ok());
+    ASSERT_EQ(finalized.value().size(), 1u);
+    EXPECT_EQ(finalized.value().front().frame.session_id, "session-a");
+}
+
+TEST(InferenceFrameResultTableTest, RejectsDuplicateSelectedSequenceWithinExecution) {
+    media::inference::SessionInferenceFrameResultTable table;
+    auto first = MakeResult("sequence-session", 1, 1'000);
+    first.frame.execution_id = "sequence-execution";
+    first.frame.selected_sequence = 1;
+    auto duplicate = MakeResult("sequence-session", 2, 2'000);
+    duplicate.frame.execution_id = "sequence-execution";
+    duplicate.frame.selected_sequence = 1;
+
+    ASSERT_TRUE(table.Publish(std::move(first)).ok());
+    const auto status = table.Publish(std::move(duplicate));
+
+    EXPECT_EQ(status.code(), core::ErrorCode::AlreadyExists);
 }
 
 } // namespace

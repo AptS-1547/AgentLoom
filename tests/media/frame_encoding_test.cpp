@@ -204,12 +204,16 @@ TEST(InferenceFrameGatewayProducerTest, PublishesEncodedFrameIntoSharedChannel) 
     std::vector<std::byte> payload;
     auto encoded = encoder.value()->Encode(MakeRgbFrame(payload, 160, 90, 19), 0.91, "trace-ipc-encode");
     ASSERT_TRUE(encoded.ok()) << encoded.status().message();
+    encoded.value().metadata().execution_id = "execution-encode";
+    encoded.value().metadata().selected_sequence = 7;
 
     media::InferenceFrameGatewayProducer producer(*channel.value());
     ASSERT_TRUE(producer.Publish(std::move(encoded).value()).ok());
     auto claimed = consumer.value()->TryClaim();
     ASSERT_TRUE(claimed.ok()) << claimed.status().message();
+    EXPECT_EQ(claimed.value().metadata().execution_id, "execution-encode");
     EXPECT_EQ(claimed.value().metadata().session_id, "session-encode");
+    EXPECT_EQ(claimed.value().metadata().selected_sequence, 7u);
     EXPECT_EQ(claimed.value().metadata().trace_id, "trace-ipc-encode");
     EXPECT_EQ(claimed.value().metadata().frame_id, 19u);
     EXPECT_EQ(
@@ -219,6 +223,49 @@ TEST(InferenceFrameGatewayProducerTest, PublishesEncodedFrameIntoSharedChannel) 
     EXPECT_EQ(claimed.value().payload()[0], std::byte{0xFF});
     EXPECT_EQ(claimed.value().payload()[1], std::byte{0xD8});
     EXPECT_EQ(producer.Snapshot().published_frames, 1u);
+}
+
+TEST(InferenceFrameGatewayProducerTest, BorrowedPublishCanRetryAfterBackpressure) {
+    const auto channel_name = "frame-gateway-borrowed-retry-" +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+    ipc::media::SharedMemoryInferenceFrameChannel::Remove(channel_name);
+    auto channel = ipc::media::SharedMemoryInferenceFrameChannel::Create({
+        .name = channel_name,
+        .slot_count = 2,
+        .payload_capacity = 1024 * 1024,
+        .remove_existing = true,
+        .remove_on_destroy = true,
+    });
+    ASSERT_TRUE(channel.ok()) << channel.status().message();
+    core::BucketMemoryPool pool;
+    auto encoder = media::GStreamerVideoFrameEncoder::Create(pool, {
+        .format = media::EncodedVideoFrameFormat::Jpeg,
+        .preference = media::VideoImageEncoderPreference::Software,
+    });
+    ASSERT_TRUE(encoder.ok()) << encoder.status().message();
+    std::vector<std::byte> payload;
+    auto frame = MakeRgbFrame(payload, 16, 16, 33);
+    auto first = encoder.value()->Encode(frame, 0.8, "borrowed-retry");
+    auto second = encoder.value()->Encode(frame, 0.8, "borrowed-retry");
+    auto third = encoder.value()->Encode(frame, 0.8, "borrowed-retry");
+    ASSERT_TRUE(first.ok());
+    ASSERT_TRUE(second.ok());
+    ASSERT_TRUE(third.ok());
+    first.value().metadata().execution_id = "execution-retry";
+    first.value().metadata().selected_sequence = 1;
+    second.value().metadata().execution_id = "execution-retry";
+    second.value().metadata().selected_sequence = 2;
+    third.value().metadata().execution_id = "execution-retry";
+    third.value().metadata().selected_sequence = 3;
+    media::InferenceFrameGatewayProducer producer(*channel.value());
+    ASSERT_TRUE(producer.PublishBorrowed(first.value()).ok());
+    ASSERT_TRUE(producer.PublishBorrowed(second.value()).ok());
+    EXPECT_EQ(producer.PublishBorrowed(third.value()).code(), core::ErrorCode::ResourceExhausted);
+    auto claimed = channel.value()->TryClaim();
+    ASSERT_TRUE(claimed.ok());
+    ASSERT_TRUE(claimed.value().Acknowledge().ok());
+    EXPECT_TRUE(producer.PublishBorrowed(third.value()).ok());
+    EXPECT_TRUE(third.value().valid());
 }
 
 TEST(WebRtcMediaPipelineTest, RejectsIncompleteEncodingPair) {

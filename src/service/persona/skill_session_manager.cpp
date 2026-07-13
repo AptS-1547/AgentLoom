@@ -47,6 +47,9 @@ core::Result<SkillSessionSnapshot> SkillSessionManager::Start(const SkillSession
 
     session = SkillSessionSnapshot{};
     session.skill_id = request.skill_id;
+    session.execution_id = request.execution_id.empty()
+        ? request.session_id + ":" + request.skill_id + ":" + std::to_string(next_execution_id_++)
+        : request.execution_id;
     session.session_id = request.session_id;
     session.user_uuid = request.user_uuid;
     session.persona_id = request.persona_id;
@@ -83,7 +86,10 @@ core::Result<SkillSessionSnapshot> SkillSessionManager::Stop(const SkillSessionS
     session.status_text = request.reason.empty() ? "skill session closing" : request.reason;
     session.last_activity_at = now;
     session.closing_started_at = now;
-    session.state = SkillSessionState::Closed;
+    if (!request.execution_id.empty() && request.execution_id != session.execution_id) {
+        return core::Status::Error(core::ErrorCode::FailedPrecondition, "skill execution is stale");
+    }
+    session.state = SkillSessionState::Closing;
     logger_.info("[skill] stop skill={} session={} source={} trace_id={}",
                  session.skill_id,
                  session.session_id,
@@ -119,6 +125,9 @@ core::Status SkillSessionManager::MarkReady(std::string_view session_id,
     if (Terminal(session.state)) {
         return core::Status::Error(core::ErrorCode::FailedPrecondition, "skill session is terminal");
     }
+    if (session.state == SkillSessionState::Closing) {
+        return core::Status::Error(core::ErrorCode::FailedPrecondition, "skill session is closing");
+    }
     session.state = SkillSessionState::Ready;
     session.status_text = std::move(status_text);
     session.trace_id = trace_id.empty() ? session.trace_id : std::string(trace_id);
@@ -129,7 +138,8 @@ core::Status SkillSessionManager::MarkReady(std::string_view session_id,
 core::Status SkillSessionManager::MarkFailed(std::string_view session_id,
                                              std::string_view skill_id,
                                              std::string error,
-                                             std::string_view trace_id) {
+                                             std::string_view trace_id,
+                                             std::string_view execution_id) {
     const auto now = std::chrono::steady_clock::now();
     std::lock_guard lock(mutex_);
     auto it = sessions_.find(Key(session_id, skill_id));
@@ -137,6 +147,9 @@ core::Status SkillSessionManager::MarkFailed(std::string_view session_id,
         return core::Status::Error(core::ErrorCode::NotFound, "skill session not found");
     }
     auto& session = it->second;
+    if (!execution_id.empty() && execution_id != session.execution_id) {
+        return core::Status::Error(core::ErrorCode::FailedPrecondition, "skill execution is stale");
+    }
     session.state = SkillSessionState::Failed;
     session.last_error = std::move(error);
     session.status_text = session.last_error;
@@ -147,6 +160,63 @@ core::Status SkillSessionManager::MarkFailed(std::string_view session_id,
                  session.session_id,
                  session.trace_id,
                  session.last_error);
+    return core::Status::Ok();
+}
+
+core::Status SkillSessionManager::BeginClosing(std::string_view session_id,
+                                               std::string_view skill_id,
+                                               std::string_view execution_id,
+                                               std::string reason,
+                                               std::string_view trace_id) {
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard lock(mutex_);
+    auto it = sessions_.find(Key(session_id, skill_id));
+    if (it == sessions_.end()) {
+        return core::Status::Error(core::ErrorCode::NotFound, "skill session not found");
+    }
+    auto& session = it->second;
+    if (session.execution_id != execution_id) {
+        return core::Status::Error(core::ErrorCode::FailedPrecondition, "skill execution is stale");
+    }
+    if (Terminal(session.state)) {
+        return core::Status::Error(core::ErrorCode::FailedPrecondition, "skill session is terminal");
+    }
+    if (session.state != SkillSessionState::Closing) {
+        session.closing_started_at = now;
+    }
+    session.state = SkillSessionState::Closing;
+    session.close_reason = std::move(reason);
+    session.status_text = session.close_reason.empty() ? "skill session closing" : session.close_reason;
+    session.trace_id = trace_id.empty() ? session.trace_id : std::string(trace_id);
+    session.last_activity_at = now;
+    return core::Status::Ok();
+}
+
+core::Status SkillSessionManager::CompleteClosing(std::string_view session_id,
+                                                  std::string_view skill_id,
+                                                  std::string_view execution_id,
+                                                  std::string status_text,
+                                                  std::string_view trace_id) {
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard lock(mutex_);
+    auto it = sessions_.find(Key(session_id, skill_id));
+    if (it == sessions_.end()) {
+        return core::Status::Error(core::ErrorCode::NotFound, "skill session not found");
+    }
+    auto& session = it->second;
+    if (session.execution_id != execution_id) {
+        return core::Status::Error(core::ErrorCode::FailedPrecondition, "skill execution is stale");
+    }
+    if (session.state == SkillSessionState::Closed) {
+        return core::Status::Ok();
+    }
+    if (session.state != SkillSessionState::Closing) {
+        return core::Status::Error(core::ErrorCode::FailedPrecondition, "skill session is not closing");
+    }
+    session.state = SkillSessionState::Closed;
+    session.status_text = status_text.empty() ? "skill session closed" : std::move(status_text);
+    session.trace_id = trace_id.empty() ? session.trace_id : std::string(trace_id);
+    session.last_activity_at = now;
     return core::Status::Ok();
 }
 
@@ -161,10 +231,15 @@ core::Status SkillSessionManager::RecordObservation(const SkillObservation& obse
         return core::Status::Error(core::ErrorCode::NotFound, "skill session not found");
     }
     auto& session = it->second;
+    if (!observation.execution_id.empty() && observation.execution_id != session.execution_id) {
+        return core::Status::Error(core::ErrorCode::FailedPrecondition, "skill execution is stale");
+    }
     if (Terminal(session.state)) {
         return core::Status::Error(core::ErrorCode::FailedPrecondition, "skill session is terminal");
     }
-    session.state = SkillSessionState::Running;
+    if (session.state != SkillSessionState::Closing) {
+        session.state = SkillSessionState::Running;
+    }
     session.trace_id = observation.trace_id.empty() ? session.trace_id : observation.trace_id;
     session.last_activity_at = now;
     if (!observation.stale && observation.should_inject_prompt) {

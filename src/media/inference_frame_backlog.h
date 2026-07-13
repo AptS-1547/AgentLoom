@@ -14,6 +14,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace media::inference {
@@ -29,8 +30,11 @@ enum class InferenceFrameFormat {
 };
 
 struct InferenceFrameMetadata {
+    std::string execution_id;
     std::string session_id;
     std::string trace_id;
+    std::uint64_t selected_sequence = 0;
+    std::uint64_t transport_sequence = 0;
     std::uint64_t frame_id = 0;
     std::int64_t timestamp_us = 0;
     std::uint32_t width = 0;
@@ -72,6 +76,15 @@ private:
     std::size_t payload_size_ = 0;
 };
 
+struct InferenceFrameSubmitOutcome {
+    core::Status status = core::Status::Ok();
+    std::optional<OwnedInferenceFrame> rejected_frame;
+
+    bool accepted() const noexcept {
+        return status.ok();
+    }
+};
+
 core::Result<OwnedInferenceFrame> CopyInferenceFrame(
     core::RawMemoryPool& memory_pool,
     InferenceFrameMetadata metadata,
@@ -96,6 +109,7 @@ struct SegmentedFrameBacklogSnapshot {
 };
 
 struct InferenceFrameOrderKey {
+    std::uint64_t selected_sequence = 0;
     std::int64_t timestamp_us = 0;
     std::uint64_t frame_id = 0;
 
@@ -127,6 +141,12 @@ public:
     virtual core::Status Publish(InferenceFrameResultRecord record) = 0;
     virtual core::Result<std::vector<InferenceFrameResultRecord>> FinalizeSession(
         std::string_view session_id) = 0;
+    virtual core::Result<std::vector<InferenceFrameResultRecord>> FinalizeExecution(
+        std::string_view execution_id) {
+        return core::Status::Error(
+            core::ErrorCode::Unimplemented,
+            "inference result table does not support execution finalization");
+    }
     virtual void Shutdown() = 0;
     virtual InferenceFrameResultTableSnapshot Snapshot() const = 0;
 };
@@ -144,6 +164,8 @@ public:
     core::Status Publish(InferenceFrameResultRecord record) override;
     core::Result<std::vector<InferenceFrameResultRecord>> FinalizeSession(
         std::string_view session_id) override;
+    core::Result<std::vector<InferenceFrameResultRecord>> FinalizeExecution(
+        std::string_view execution_id) override;
     void Shutdown() override;
     InferenceFrameResultTableSnapshot Snapshot() const override;
 
@@ -156,13 +178,22 @@ class IInferenceFrameBacklog {
 public:
     virtual ~IInferenceFrameBacklog() = default;
 
-    virtual core::Status Submit(OwnedInferenceFrame frame) = 0;
+    virtual InferenceFrameSubmitOutcome TrySubmit(OwnedInferenceFrame frame) = 0;
+    virtual core::Status Submit(OwnedInferenceFrame frame) {
+        return TrySubmit(std::move(frame)).status;
+    }
     virtual core::Result<OwnedInferenceFrame> TryTake() = 0;
     virtual core::Result<OwnedInferenceFrame> WaitTake(
         std::chrono::milliseconds timeout) = 0;
     virtual core::Status CloseSession(std::string_view session_id) = 0;
     virtual void Shutdown() = 0;
     virtual SegmentedFrameBacklogSnapshot Snapshot() const = 0;
+};
+
+class IInferenceFrameAdmissionSink {
+public:
+    virtual ~IInferenceFrameAdmissionSink() = default;
+    virtual core::Status AdmitFrame(OwnedInferenceFrame frame) = 0;
 };
 
 class SegmentedInferenceFrameBacklog final : public IInferenceFrameBacklog {
@@ -175,7 +206,7 @@ public:
     SegmentedInferenceFrameBacklog(const SegmentedInferenceFrameBacklog&) = delete;
     SegmentedInferenceFrameBacklog& operator=(const SegmentedInferenceFrameBacklog&) = delete;
 
-    core::Status Submit(OwnedInferenceFrame frame) override;
+    InferenceFrameSubmitOutcome TrySubmit(OwnedInferenceFrame frame) override;
     core::Result<OwnedInferenceFrame> TryTake() override;
     core::Result<OwnedInferenceFrame> WaitTake(
         std::chrono::milliseconds timeout) override;

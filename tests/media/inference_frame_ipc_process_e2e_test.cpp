@@ -127,6 +127,22 @@ bool WaitForExit(bp::process& child, std::chrono::seconds timeout) {
     return true;
 }
 
+bool WaitForReport(
+    const std::filesystem::path& path,
+    std::string_view expected,
+    std::chrono::seconds timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        std::ifstream report(path, std::ios::binary);
+        std::string value;
+        if (report >> value && value == expected) {
+            return true;
+        }
+        std::this_thread::sleep_for(5ms);
+    }
+    return false;
+}
+
 TEST(InferenceFrameIpcProcessE2eTest, EncodesPublishesAndReceivesAcrossProcesses) {
     constexpr std::size_t frame_count = 12;
     ProcessE2eCleanup cleanup(UniqueName("flow"));
@@ -237,6 +253,49 @@ TEST(InferenceFrameIpcProcessE2eTest, RecreateRecoversSlotAbandonedByCrashedPeer
         });
     ASSERT_TRUE(WaitForExit(replacement_consumer, 10s));
     EXPECT_EQ(replacement_consumer.exit_code(), 0);
+}
+
+TEST(InferenceFrameIpcProcessE2eTest, ControlPlaneFenceStopsSurvivingStaleReader) {
+    ProcessE2eCleanup cleanup(UniqueName("fence"));
+    auto sink = ipc::media::RecoverableInferenceFrameIpcSink::Create({
+        .name = cleanup.name(),
+        .slot_count = 2,
+        .payload_capacity = 1024,
+    });
+    ASSERT_TRUE(sink.ok()) << sink.status().message();
+    const auto old_grant = sink.value()->CurrentGrant();
+
+    boost::asio::io_context stale_context;
+    bp::process stale_reader(
+        stale_context,
+        MEDIA_IPC_E2E_PEER_PATH,
+        std::vector<std::string>{
+            "wait-fence",
+            cleanup.name(),
+            std::to_string(old_grant.epoch),
+            cleanup.report_path().string(),
+        });
+    ASSERT_TRUE(WaitForReport(cleanup.report_path(), "ready", 10s));
+
+    ASSERT_TRUE(sink.value()->Fence().ok());
+    ASSERT_TRUE(WaitForExit(stale_reader, 10s));
+    ASSERT_EQ(stale_reader.exit_code(), 0);
+    ASSERT_TRUE(WaitForReport(cleanup.report_path(), "fenced", 1s));
+
+    ASSERT_TRUE(sink.value()->Recreate().ok());
+    const auto new_grant = sink.value()->CurrentGrant();
+    ASSERT_NE(new_grant.epoch, old_grant.epoch);
+    auto old_epoch_reader = ipc::media::SharedMemoryInferenceFrameChannel::Open({
+        .name = cleanup.name(),
+        .expected_epoch = old_grant.epoch,
+    });
+    ASSERT_FALSE(old_epoch_reader.ok());
+    EXPECT_EQ(old_epoch_reader.status().code(), core::ErrorCode::FailedPrecondition);
+    auto current_reader = ipc::media::SharedMemoryInferenceFrameChannel::Open({
+        .name = cleanup.name(),
+        .expected_epoch = new_grant.epoch,
+    });
+    EXPECT_TRUE(current_reader.ok()) << current_reader.status().message();
 }
 
 } // namespace

@@ -157,6 +157,24 @@ core::Result<std::shared_ptr<WebRtcMediaPipeline>> WebRtcMediaPipeline::Create(W
             core::ErrorCode::InvalidArgument,
             "frame_encoder and encoded_frame_sink must be configured together");
     }
+    if (!options.frame_executor && options.compute_pool) {
+        options.frame_executor = std::make_shared<core::KeyedSerialExecutor>(
+            options.compute_pool,
+            core::KeyedSerialExecutorOptions{
+                .max_keys = 1,
+                .queue_capacity_per_key = 1024,
+                .task_name_prefix = "vision-frame-stream",
+            });
+    }
+    if (options.encoded_frame_sink &&
+        !std::dynamic_pointer_cast<IOrderedEncodedFrameSink>(options.encoded_frame_sink)) {
+        options.encoded_frame_sink = std::make_shared<OrderedEncodedFrameSink>(
+            options.encoded_frame_sink,
+            OrderedEncodedFrameSinkOptions{
+                .max_executions = 1,
+                .window_capacity = 1024,
+            });
+    }
     auto init_status = GstInitializer::EnsureInitialized();
     if (!init_status.ok()) {
         return init_status;
@@ -182,20 +200,44 @@ WebRtcMediaPipeline::WebRtcMediaPipeline(WebRtcMediaPipelineOptions options) noe
     : options_(std::move(options)) {}
 
 WebRtcMediaPipeline::~WebRtcMediaPipeline() {
-    std::lock_guard lock(pipeline_mutex_);
-    if (bus_) {
-        if (bus_handler_id_ != 0) {
-            g_signal_handler_disconnect(bus_, bus_handler_id_);
-            bus_handler_id_ = 0;
+    {
+        std::lock_guard lock(pipeline_mutex_);
+        if (bus_) {
+            if (bus_handler_id_ != 0) {
+                g_signal_handler_disconnect(bus_, bus_handler_id_);
+                bus_handler_id_ = 0;
+            }
+            gst_bus_remove_signal_watch(bus_);
+            gst_object_unref(bus_);
+            bus_ = nullptr;
         }
-        gst_bus_remove_signal_watch(bus_);
-        gst_object_unref(bus_);
-        bus_ = nullptr;
+        if (pipeline_) {
+            gst_element_set_state(pipeline_, GST_STATE_NULL);
+            gst_object_unref(pipeline_);
+            pipeline_ = nullptr;
+        }
     }
-    if (pipeline_) {
-        gst_element_set_state(pipeline_, GST_STATE_NULL);
-        gst_object_unref(pipeline_);
-        pipeline_ = nullptr;
+    if (options_.frame_executor) {
+        const auto drain_status = options_.frame_executor->WaitIdle(FrameStreamKey(), std::chrono::seconds(30));
+        if (!drain_status.ok()) {
+            NotifyPipelineStatus(drain_status, false);
+        }
+    }
+    static_cast<void>(publish_tasks_->Seal());
+    auto published = publish_tasks_->WaitFor(std::chrono::seconds(30));
+    if (!published.ok()) {
+        NotifyPipelineStatus(published.status(), false);
+    } else if (!published.value().first_failure.ok()) {
+        NotifyPipelineStatus(published.value().first_failure, false);
+    }
+    if (auto ordered_sink = std::dynamic_pointer_cast<IOrderedEncodedFrameSink>(options_.encoded_frame_sink)) {
+        auto sealed = ordered_sink->SealExecution(
+            options_.session_id,
+            FrameStreamKey(),
+            selected_sequence_->load(std::memory_order_acquire));
+        if (!sealed.ok()) {
+            NotifyPipelineStatus(sealed.status(), false);
+        }
     }
 }
 
@@ -392,6 +434,9 @@ core::Status WebRtcMediaPipeline::HandleSample(GstSample* sample) {
     VideoFrameView frame;
     frame.session_id = options_.session_id;
     frame.frame_id = ++frame_id_;
+    if (GST_BUFFER_PTS_IS_VALID(buffer)) {
+        frame.timestamp_us = static_cast<std::int64_t>(GST_BUFFER_PTS(buffer) / GST_USECOND);
+    }
     frame.width = static_cast<std::uint32_t>(width > 0 ? width : 0);
     frame.height = static_cast<std::uint32_t>(height > 0 ? height : 0);
     GstVideoInfo video_info;
@@ -411,7 +456,7 @@ core::Status WebRtcMediaPipeline::HandleSample(GstSample* sample) {
 }
 
 void WebRtcMediaPipeline::SubmitFrame(VideoFrameView frame) {
-    if (!options_.frame_sampler || !options_.compute_pool) {
+    if (!options_.frame_sampler || !options_.frame_executor) {
         return;
     }
 
@@ -420,8 +465,21 @@ void WebRtcMediaPipeline::SubmitFrame(VideoFrameView frame) {
     auto encoder = options_.frame_encoder;
     auto encoded_sink = options_.encoded_frame_sink;
     auto io_pool = options_.io_pool;
-    auto status = options_.compute_pool->Submit(
-        [sampler, event_sink, encoder, encoded_sink, io_pool, frame = std::move(frame)]() mutable -> core::Status {
+    auto execution_id = FrameStreamKey();
+    auto selected_sequence = selected_sequence_;
+    auto publish_tasks = publish_tasks_;
+    const auto stream_key = FrameStreamKey();
+    auto status = options_.frame_executor->Submit(
+        stream_key,
+        [sampler,
+         event_sink,
+         encoder,
+         encoded_sink,
+         io_pool,
+         execution_id = std::move(execution_id),
+         selected_sequence = std::move(selected_sequence),
+         publish_tasks,
+         frame = std::move(frame)]() mutable -> core::Status {
             if (frame.buffer) {
                 frame.bytes = frame.buffer->bytes();
             }
@@ -447,25 +505,51 @@ void WebRtcMediaPipeline::SubmitFrame(VideoFrameView frame) {
                 }
             }
             if (decision.value().submit_to_vlm && encoder && encoded_sink) {
+                const auto sequence = selected_sequence->fetch_add(1, std::memory_order_relaxed) + 1;
                 auto encoded = encoder->Encode(frame, decision.value().saliency_score);
                 if (!encoded.ok()) {
+                    if (auto ordered_sink = std::dynamic_pointer_cast<IOrderedEncodedFrameSink>(encoded_sink)) {
+                        static_cast<void>(ordered_sink->MarkSkipped(
+                            frame.session_id,
+                            execution_id,
+                            sequence,
+                            encoded.status()));
+                    }
                     return encoded.status();
                 }
+                encoded.value().metadata().execution_id = execution_id;
+                encoded.value().metadata().selected_sequence = sequence;
                 if (!io_pool) {
                     return encoded_sink->Publish(std::move(encoded).value());
                 }
-                return io_pool->Submit(
+                auto submit_status = io_pool->Submit(
+                    *publish_tasks,
                     [encoded_sink, encoded_frame = std::move(encoded).value()]() mutable -> core::Status {
                         return encoded_sink->Publish(std::move(encoded_frame));
                     },
                     {},
                     "vision-frame-ipc-publish");
+                if (!submit_status.ok()) {
+                    if (auto ordered_sink = std::dynamic_pointer_cast<IOrderedEncodedFrameSink>(encoded_sink)) {
+                        static_cast<void>(ordered_sink->MarkSkipped(
+                            frame.session_id,
+                            execution_id,
+                            sequence,
+                            submit_status));
+                    }
+                }
+                return submit_status;
             }
             return core::Status::Ok();
         },
-        {},
         "vision-frame-sampler");
-    (void)status;
+    if (!status.ok()) {
+        NotifyPipelineStatus(status, false);
+    }
+}
+
+std::string WebRtcMediaPipeline::FrameStreamKey() const {
+    return options_.execution_id.empty() ? options_.session_id : options_.execution_id;
 }
 
 void WebRtcMediaPipeline::OnPadAdded(GstElement*, GstPad* pad, gpointer user_data) {

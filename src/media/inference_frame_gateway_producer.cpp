@@ -24,6 +24,10 @@ InferenceFrameGatewayProducer::InferenceFrameGatewayProducer(
       logger_(logger.valid() ? std::move(logger) : core::LoggerAdapter::ForModule("frame-ipc-producer")) {}
 
 core::Status InferenceFrameGatewayProducer::Publish(EncodedVideoFrame frame) {
+    return PublishBorrowed(frame);
+}
+
+core::Status InferenceFrameGatewayProducer::PublishBorrowed(const EncodedVideoFrame& frame) {
     if (!frame.valid()) {
         rejected_frames_.fetch_add(1, std::memory_order_relaxed);
         const auto status = core::Status::Error(core::ErrorCode::InvalidArgument, "encoded video frame is invalid");
@@ -37,8 +41,11 @@ core::Status InferenceFrameGatewayProducer::Publish(EncodedVideoFrame frame) {
     const auto& metadata = frame.metadata();
     const auto payload = frame.bytes();
     const auto status = sink_.Publish({
+        .execution_id = metadata.execution_id,
         .session_id = metadata.session_id,
         .trace_id = metadata.trace_id,
+        .selected_sequence = metadata.selected_sequence,
+        .transport_sequence = metadata.transport_sequence,
         .frame_id = metadata.frame_id,
         .timestamp_us = metadata.timestamp_us,
         .width = metadata.width,

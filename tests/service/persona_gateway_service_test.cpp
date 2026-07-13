@@ -421,11 +421,12 @@ void WriteMinimalDocx(const std::filesystem::path& path) {
     int error = 0;
     zip_t* archive = zip_open(path.string().c_str(), ZIP_CREATE | ZIP_TRUNCATE, &error);
     ASSERT_NE(archive, nullptr);
-    AddZipText(archive, "[Content_Types].xml", R"(<?xml version="1.0" encoding="UTF-8"?>
+    const std::string content_types_xml = R"(<?xml version="1.0" encoding="UTF-8"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
   <Default Extension="xml" ContentType="application/xml"/>
   <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
-</Types>)");
+</Types>)";
+    AddZipText(archive, "[Content_Types].xml", content_types_xml);
     const std::string document_xml = R"(<?xml version="1.0" encoding="UTF-8"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:body>
@@ -906,7 +907,8 @@ TEST(PersonaGatewayHttpAdapterTest, HandlesSkillSessionHttpControlRoutes) {
     ASSERT_EQ(stopped.result(), ::net::http::status::ok);
     auto stopped_body = Json::parse(stopped.body());
     ASSERT_TRUE(stopped_body["ok"].get<bool>());
-    EXPECT_EQ(stopped_body["data"]["state"], "closed");
+    EXPECT_EQ(stopped_body["data"]["state"], "closing");
+    EXPECT_TRUE(stopped_body["data"]["executionId"].is_string());
     EXPECT_EQ(stopped_body["data"]["closeReason"], "stop vision");
 
     server.Stop();
@@ -975,7 +977,8 @@ TEST(PersonaGatewayHttpAdapterTest, HandlesSkillSessionWebSocketControlRoutes) {
             }},
         });
     ASSERT_EQ(stopped["type"], "skill.session.stopped");
-    EXPECT_EQ(stopped["payload"]["data"]["state"], "closed");
+    EXPECT_EQ(stopped["payload"]["data"]["state"], "closing");
+    EXPECT_TRUE(stopped["payload"]["data"]["executionId"].is_string());
     EXPECT_EQ(stopped["payload"]["data"]["closeReason"], "ws stop");
 
     server.Stop();

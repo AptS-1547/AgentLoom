@@ -400,12 +400,17 @@ target_link_libraries(multimodal_proto PUBLIC protobuf::libprotobuf gRPC::grpc++
 add_library(agent_core STATIC
     src/core/blocking_queue.h
     src/core/exception.h
+    src/core/keyed_serial_executor.cpp
+    src/core/keyed_serial_executor.h
     src/core/logger_adapter.h
     src/core/memory_pool.cpp
     src/core/memory_pool.h
     src/core/object_pool.h
+    src/core/ordered_bitmap_window.h
     src/core/result.h
     src/core/shared_memory_block.h
+    src/core/task_group.cpp
+    src/core/task_group.h
     src/core/thread_pool.cpp
     src/core/thread_pool.h
     src/core/unique_handle.h
@@ -930,6 +935,8 @@ target_link_libraries(agent_vector_storage PUBLIC
 )
 
 add_library(agent_ipc STATIC
+    src/ipc/inference_frame_ipc_control.cpp
+    src/ipc/inference_frame_ipc_control.h
     src/ipc/inference_frame_ipc_lifecycle.cpp
     src/ipc/inference_frame_ipc_lifecycle.h
     src/ipc/inference_frame_shared_memory.cpp
@@ -947,6 +954,22 @@ target_link_libraries(agent_ipc PUBLIC
     spdlog::spdlog
 )
 
+add_library(agent_ipc_grpc STATIC
+    src/ipc/inference_frame_ipc_grpc_signal.cpp
+    src/ipc/inference_frame_ipc_grpc_signal.h
+)
+
+target_include_directories(agent_ipc_grpc PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/ipc
+    ${GENERATED_DIR}
+)
+
+target_link_libraries(agent_ipc_grpc PUBLIC
+    agent_ipc
+    multimodal_proto
+    gRPC::grpc++
+)
+
 add_library(agent_media_inference STATIC
     src/media/inference_frame_backlog.cpp
     src/media/inference_frame_backlog.h
@@ -954,6 +977,12 @@ add_library(agent_media_inference STATIC
     src/media/inference_frame_coordinator.h
     src/media/inference_frame_ipc_receiver.cpp
     src/media/inference_frame_ipc_receiver.h
+    src/media/ordered_inference_frame_admission.cpp
+    src/media/ordered_inference_frame_admission.h
+    src/media/inference_frame_spool.cpp
+    src/media/inference_frame_spool.h
+    src/media/inference_frame_spool_replayer.cpp
+    src/media/inference_frame_spool_replayer.h
     src/media/vision_inference_interfaces.h
 )
 
@@ -965,6 +994,7 @@ target_include_directories(agent_media_inference PUBLIC
 target_link_libraries(agent_media_inference PUBLIC
     agent_core
     agent_ipc
+    boost_interprocess_headers
     spdlog::spdlog
 )
 
@@ -976,6 +1006,8 @@ if(TARGET gstreamer_core)
         src/media/inference_frame_gateway_producer.h
         src/media/opencv_frame_sampler.cpp
         src/media/opencv_frame_sampler.h
+        src/media/ordered_encoded_frame_sink.cpp
+        src/media/ordered_encoded_frame_sink.h
         src/media/vision_runtime_interfaces.cpp
         src/media/vision_runtime_interfaces.h
         src/media/vision_inference_interfaces.h
@@ -1105,6 +1137,8 @@ if(BERT_BUILD_TESTS)
 
     add_executable(core_tests
         tests/core/core_infra_test.cpp
+        tests/core/keyed_serial_executor_test.cpp
+        tests/core/ordered_bitmap_window_test.cpp
     )
 
     target_link_libraries(core_tests PRIVATE
@@ -1118,6 +1152,9 @@ if(BERT_BUILD_TESTS)
         tests/media/inference_frame_backlog_test.cpp
         tests/media/inference_frame_coordinator_test.cpp
         tests/media/inference_frame_ipc_test.cpp
+        tests/media/inference_frame_spool_test.cpp
+        tests/media/inference_frame_spool_e2e_test.cpp
+        tests/media/ordered_inference_frame_admission_test.cpp
     )
 
     target_link_libraries(media_inference_tests PRIVATE
@@ -1143,6 +1180,14 @@ if(BERT_BUILD_TESTS)
         agent_media_inference
     )
 
+    add_executable(media_inference_spool_bench
+        tests/media/inference_frame_spool_bench.cpp
+    )
+
+    target_link_libraries(media_inference_spool_bench PRIVATE
+        agent_media_inference
+    )
+
     add_executable(net_tests
         tests/net/net_protocol_test.cpp
     )
@@ -1158,6 +1203,7 @@ if(BERT_BUILD_TESTS)
         add_executable(media_tests
             tests/media/frame_encoding_test.cpp
             tests/media/opencv_frame_sampler_test.cpp
+            tests/media/ordered_encoded_frame_sink_test.cpp
             tests/media/webrtc_media_pipeline_test.cpp
             tests/media/webrtc_signaling_handler_test.cpp
             tests/media/webrtc_bin_test.cpp
@@ -1199,6 +1245,22 @@ if(BERT_BUILD_TESTS)
 
         if(WIN32)
             set_target_properties(media_rtc_ipc_fake_vlm_stress PROPERTIES
+                VS_DEBUGGER_ENVIRONMENT "PATH=${GSTREAMER_ROOT}/bin;%PATH%;GST_PLUGIN_PATH=${GSTREAMER_ROOT}/lib/gstreamer-1.0"
+            )
+        endif()
+
+        add_executable(media_real_video_e2e_bench
+            tests/media/real_video_e2e_bench.cpp
+        )
+
+        target_link_libraries(media_real_video_e2e_bench PRIVATE
+            agent_skill_media
+        )
+
+        copy_runtime_files(media_real_video_e2e_bench ${BERT_OPENCV_RUNTIME_FILES})
+
+        if(WIN32)
+            set_target_properties(media_real_video_e2e_bench PROPERTIES
                 VS_DEBUGGER_ENVIRONMENT "PATH=${GSTREAMER_ROOT}/bin;%PATH%;GST_PLUGIN_PATH=${GSTREAMER_ROOT}/lib/gstreamer-1.0"
             )
         endif()
@@ -1670,6 +1732,8 @@ endforeach()
 
 if(TARGET agent_media)
     add_library(agent_skill_media STATIC
+        src/service/persona/media_inference_execution.cpp
+        src/service/persona/media_inference_execution.h
         src/service/persona/skill_vision_event_sink.cpp
         src/service/persona/skill_vision_event_sink.h
     )
@@ -1681,7 +1745,17 @@ if(TARGET agent_media)
     target_link_libraries(agent_skill_media PUBLIC
         agent_agent_runtime
         agent_media
+        agent_media_inference
     )
+
+    if(BERT_BUILD_TESTS)
+        add_executable(media_inference_execution_bench
+            tests/service/media_inference_execution_bench.cpp
+        )
+        target_link_libraries(media_inference_execution_bench PRIVATE
+            agent_skill_media
+        )
+    endif()
 endif()
 
 if(BERT_BUILD_TESTS)
@@ -1689,6 +1763,7 @@ if(BERT_BUILD_TESTS)
         tests/service/persona_algorithm_test.cpp
         tests/service/session_manager_test.cpp
         tests/service/persona_runtime_test.cpp
+        tests/service/media_inference_execution_test.cpp
         tests/service/emotion_fusion_analyzer_test.cpp
         tests/service/persona_gateway_service_test.cpp
     )
@@ -1769,6 +1844,7 @@ target_include_directories(agent_server PUBLIC
 target_link_libraries(agent_server PUBLIC
     multimodal_proto
     agent_core
+    agent_ipc
     agent_media_inference
     agent_service
     agent_models
@@ -1818,6 +1894,7 @@ if(BERT_BUILD_TESTS)
     target_link_libraries(inference_grpc_tests PRIVATE
         multimodal_proto
         agent_core
+        agent_ipc_grpc
         server_runtime
         agent_config
         gRPC::grpc++

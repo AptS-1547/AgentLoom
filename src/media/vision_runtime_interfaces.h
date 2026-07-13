@@ -60,6 +60,7 @@ struct VideoFrameView {
     std::string session_id;
     std::uint64_t frame_id = 0;
     std::chrono::steady_clock::time_point captured_at = std::chrono::steady_clock::now();
+    std::optional<std::int64_t> timestamp_us;
     std::uint32_t width = 0;
     std::uint32_t height = 0;
     std::size_t row_stride_bytes = 0;

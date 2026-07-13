@@ -87,6 +87,24 @@ const char* ErrorCodeName(core::ErrorCode code) noexcept {
 
 WebRtcSignalingHandler::WebRtcSignalingHandler(WebRtcSignalingOptions options)
     : options_(std::move(options)) {
+    if (!options_.frame_executor && options_.compute_pool) {
+        options_.frame_executor = std::make_shared<core::KeyedSerialExecutor>(
+            options_.compute_pool,
+            core::KeyedSerialExecutorOptions{
+                .max_keys = options_.max_sessions,
+                .queue_capacity_per_key = 1024,
+                .task_name_prefix = "vision-frame-stream",
+            });
+    }
+    if (options_.encoded_frame_sink &&
+        !std::dynamic_pointer_cast<IOrderedEncodedFrameSink>(options_.encoded_frame_sink)) {
+        options_.encoded_frame_sink = std::make_shared<OrderedEncodedFrameSink>(
+            options_.encoded_frame_sink,
+            OrderedEncodedFrameSinkOptions{
+                .max_executions = options_.max_sessions,
+                .window_capacity = 1024,
+            });
+    }
     auto registry_ref = std::make_shared<std::weak_ptr<WebRtcSessionRegistry>>();
     if (!options_.frame_observer) {
         options_.frame_observer = [registry_ref](const VideoFrameView& frame) {
@@ -104,6 +122,7 @@ WebRtcSignalingHandler::WebRtcSignalingHandler(WebRtcSignalingOptions options)
             .name = name,
             .decode = options.decode_options,
             .compute_pool = options.compute_pool,
+            .frame_executor = options.frame_executor,
             .io_pool = options.io_pool,
             .frame_sampler = options.frame_sampler,
             .vlm_client = options.vlm_client,

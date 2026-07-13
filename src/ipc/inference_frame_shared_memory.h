@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -14,6 +15,7 @@ namespace ipc::media {
 
 inline constexpr std::size_t kSharedFrameSessionIdCapacity = 128;
 inline constexpr std::size_t kSharedFrameTraceIdCapacity = 128;
+inline constexpr std::size_t kSharedFrameExecutionIdCapacity = 128;
 
 enum class SharedFrameFormat : std::uint32_t {
     Unknown = 0,
@@ -26,8 +28,11 @@ enum class SharedFrameFormat : std::uint32_t {
 };
 
 struct SharedFrameMetadata {
+    std::string execution_id;
     std::string session_id;
     std::string trace_id;
+    std::uint64_t selected_sequence = 0;
+    std::uint64_t transport_sequence = 0;
     std::uint64_t frame_id = 0;
     std::int64_t timestamp_us = 0;
     std::uint32_t width = 0;
@@ -37,8 +42,11 @@ struct SharedFrameMetadata {
 };
 
 struct SharedFramePublishRequest {
+    std::string_view execution_id;
     std::string_view session_id;
     std::string_view trace_id;
+    std::uint64_t selected_sequence = 0;
+    std::uint64_t transport_sequence = 0;
     std::uint64_t frame_id = 0;
     std::int64_t timestamp_us = 0;
     std::uint32_t width = 0;
@@ -53,6 +61,7 @@ struct InferenceFrameSharedMemoryOptions {
     std::string name;
     std::size_t slot_count = 64;
     std::size_t payload_capacity = 4 * 1024 * 1024;
+    std::optional<std::uint64_t> expected_epoch;
     bool remove_existing = false;
     bool remove_on_destroy = false;
 };
@@ -65,6 +74,7 @@ struct InferenceFrameSharedMemorySnapshot {
     std::uint64_t claimed_frames = 0;
     std::uint64_t acknowledged_frames = 0;
     std::uint64_t rejected_frames = 0;
+    bool fenced = false;
     bool shutdown = false;
 };
 
@@ -80,7 +90,7 @@ public:
 
     /// 返回 slot 元数据；仅在 claim 有效且未 Acknowledge 时可使用。
     const SharedFrameMetadata& metadata() const noexcept;
-    /// 返回共享 payload 视图；不得跨 Acknowledge、移动赋值或析构保存。
+    /// 返回共享 payload 视图；不得跨 Acknowledge、fence、移动赋值或析构保存。
     std::span<const std::byte> payload() const noexcept;
     /// 释放当前 slot；可重复调用，但实际确认至多执行一次。
     core::Status Acknowledge() noexcept;
@@ -144,6 +154,8 @@ public:
 
     core::Status Publish(const SharedFramePublishRequest& request) override;
     core::Result<ClaimedSharedFrame> TryClaim() override;
+    /// 原子撤销当前 epoch，使旧 reader 和尚未确认的 claim 立即失效。
+    core::Status Fence();
     void Shutdown() override;
     InferenceFrameSharedMemorySnapshot Snapshot() const override;
 

@@ -534,6 +534,102 @@ TEST(ThreadPoolTest, RecordsFailedTaskStatus) {
     EXPECT_EQ(stats.failed_tasks, 1u);
 }
 
+TEST(TaskGroupTest, TracksNestedTasksAcrossPoolsAfterSeal) {
+    core::ThreadPool compute({1, 8, "task-group-compute"});
+    core::ThreadPool io({1, 8, "task-group-io"});
+    ASSERT_TRUE(compute.Start().ok());
+    ASSERT_TRUE(io.Start().ok());
+
+    core::TaskGroup group;
+    std::promise<void> root_entered;
+    auto root_entered_future = root_entered.get_future();
+    std::promise<void> release_root;
+    auto release_root_future = release_root.get_future().share();
+    std::atomic<int> completed{0};
+
+    auto submit = compute.Submit(
+        group,
+        [&](core::ThreadPoolContext& context) -> core::Status {
+            root_entered.set_value();
+            release_root_future.wait();
+            auto child = context.AcquireChildTask();
+            if (!child.ok()) {
+                return child.status();
+            }
+            auto child_submit = io.Submit(
+                std::move(child).value(),
+                [&] {
+                    completed.fetch_add(1, std::memory_order_relaxed);
+                    return core::Status::Ok();
+                },
+                {},
+                "task-group-child");
+            if (!child_submit.ok()) {
+                return child_submit;
+            }
+            completed.fetch_add(1, std::memory_order_relaxed);
+            return core::Status::Ok();
+        },
+        {},
+        "task-group-root");
+    ASSERT_TRUE(submit.ok()) << submit.message();
+    ASSERT_EQ(root_entered_future.wait_for(2s), std::future_status::ready);
+
+    ASSERT_TRUE(group.Seal().ok());
+    EXPECT_EQ(compute.Submit(group, [] { return core::Status::Ok(); }).code(),
+              core::ErrorCode::FailedPrecondition);
+    release_root.set_value();
+
+    auto drained = group.WaitFor(2s);
+    ASSERT_TRUE(drained.ok()) << drained.status().message();
+    EXPECT_TRUE(drained.value().drained);
+    EXPECT_EQ(drained.value().outstanding_tasks, 0u);
+    EXPECT_EQ(drained.value().completed_tasks, 2u);
+    EXPECT_EQ(drained.value().failed_tasks, 0u);
+    EXPECT_EQ(completed.load(std::memory_order_relaxed), 2);
+
+    compute.Shutdown(true);
+    io.Shutdown(true);
+}
+
+TEST(TaskGroupTest, ReportsRejectedTrackedTaskAsFailure) {
+    core::ThreadPool pool({1, 1, "task-group-reject"});
+    core::TaskGroup group;
+
+    auto submit = pool.Submit(group, [] { return core::Status::Ok(); });
+    EXPECT_EQ(submit.code(), core::ErrorCode::Unavailable);
+    ASSERT_TRUE(group.Seal().ok());
+
+    auto drained = group.WaitFor(100ms);
+    ASSERT_TRUE(drained.ok()) << drained.status().message();
+    EXPECT_EQ(drained.value().completed_tasks, 0u);
+    EXPECT_EQ(drained.value().failed_tasks, 1u);
+    EXPECT_EQ(drained.value().first_failure.code(), core::ErrorCode::Unavailable);
+}
+
+TEST(TaskGroupTest, InvokesDrainedCallbackOnceAfterLastTask) {
+    core::ThreadPool pool({1, 4, "task-group-callback"});
+    ASSERT_TRUE(pool.Start().ok());
+    core::TaskGroup group;
+    std::atomic<int> callback_count{0};
+    std::promise<void> callback_called;
+    auto callback_future = callback_called.get_future();
+
+    ASSERT_TRUE(group.OnDrained([&] {
+        EXPECT_TRUE(group.Snapshot().drained);
+        callback_count.fetch_add(1, std::memory_order_relaxed);
+        callback_called.set_value();
+    }).ok());
+    ASSERT_TRUE(pool.Submit(group, [] { return core::Status::Ok(); }).ok());
+    ASSERT_TRUE(group.Seal().ok());
+    ASSERT_EQ(callback_future.wait_for(2s), std::future_status::ready);
+    EXPECT_EQ(callback_count.load(std::memory_order_relaxed), 1);
+
+    auto drained = group.WaitFor(2s);
+    ASSERT_TRUE(drained.ok()) << drained.status().message();
+    pool.Shutdown(true);
+}
+
 TEST(UniqueHandleTest, MoveReleaseAndResetFollowResourceTraits) {
     test_resources::fake_close_count.store(0, std::memory_order_relaxed);
     test_resources::fake_last_closed.store(0, std::memory_order_relaxed);

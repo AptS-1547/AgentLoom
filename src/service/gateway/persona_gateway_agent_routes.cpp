@@ -258,6 +258,7 @@ DECLARE_AUTHENTICATED_HTTP_ROUTE(SkillSessionStartRoute, ::net::http::verb::post
         return;
     }
     persona::SkillSessionStartRequest req;
+    req.execution_id = context.body.value("executionId", context.body.value("execution_id", std::string{}));
     req.trace_id = context.trace_id;
     req.skill_id = context.body.value("skillId", context.body.value("skill_id", std::string{}));
     req.session_id = context.body.value("sessionId", context.body.value("session_id", std::string{}));
@@ -287,6 +288,7 @@ DECLARE_AUTHENTICATED_HTTP_ROUTE(SkillSessionStopRoute, ::net::http::verb::post,
         return;
     }
     persona::SkillSessionStopRequest req;
+    req.execution_id = context.body.value("executionId", context.body.value("execution_id", std::string{}));
     req.trace_id = context.trace_id;
     req.skill_id = context.body.value("skillId", context.body.value("skill_id", std::string{}));
     req.session_id = context.body.value("sessionId", context.body.value("session_id", std::string{}));
@@ -403,6 +405,7 @@ DECLARE_AUTHENTICATED_WS_ROUTE(SkillSessionStartWsRoute, "skill.session.start") 
     }
     const auto payload = context.body.value("payload", Json::object());
     persona::SkillSessionStartRequest req;
+    req.execution_id = payload.value("executionId", payload.value("execution_id", std::string{}));
     req.trace_id = context.trace_id;
     req.skill_id = payload.value("skillId", payload.value("skill_id", std::string{}));
     req.session_id = payload.value("sessionId", payload.value("session_id", std::string{}));
@@ -436,6 +439,7 @@ DECLARE_AUTHENTICATED_WS_ROUTE(SkillSessionStopWsRoute, "skill.session.stop") {
     }
     const auto payload = context.body.value("payload", Json::object());
     persona::SkillSessionStopRequest req;
+    req.execution_id = payload.value("executionId", payload.value("execution_id", std::string{}));
     req.trace_id = context.trace_id;
     req.skill_id = payload.value("skillId", payload.value("skill_id", std::string{}));
     req.session_id = payload.value("sessionId", payload.value("session_id", std::string{}));

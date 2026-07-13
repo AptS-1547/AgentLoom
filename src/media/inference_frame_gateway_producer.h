@@ -18,6 +18,7 @@ struct InferenceFrameGatewayProducerSnapshot {
 class IInferenceFrameGatewayProducer : public IEncodedVideoFrameSink {
 public:
     ~IInferenceFrameGatewayProducer() override = default;
+    core::Status PublishBorrowed(const EncodedVideoFrame& frame) override = 0;
     virtual InferenceFrameGatewayProducerSnapshot Snapshot() const = 0;
 };
 
@@ -28,6 +29,7 @@ public:
         core::LoggerAdapter logger = {});
 
     core::Status Publish(EncodedVideoFrame frame) override;
+    core::Status PublishBorrowed(const EncodedVideoFrame& frame) override;
     InferenceFrameGatewayProducerSnapshot Snapshot() const override;
 
 private:

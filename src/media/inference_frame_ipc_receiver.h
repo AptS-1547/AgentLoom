@@ -1,6 +1,7 @@
 #pragma once
 
 #include "inference_frame_backlog.h"
+#include "inference_frame_spool.h"
 #include "inference_frame_shared_memory.h"
 
 #include <cstddef>
@@ -14,8 +15,14 @@ struct InferenceFrameIpcReceiverSnapshot {
     std::size_t received_frames = 0;
     std::size_t copied_frames = 0;
     std::size_t submitted_frames = 0;
+    std::size_t spooled_frames = 0;
     std::size_t rejected_frames = 0;
     bool shutdown = false;
+};
+
+struct InferenceFrameIpcReceiverOptions {
+    std::shared_ptr<IInferenceFrameSpool> overflow_spool;
+    std::shared_ptr<IInferenceFrameAdmissionSink> admission_sink;
 };
 
 using InferenceFrameIpcReceiverObserver = std::function<void(
@@ -39,7 +46,8 @@ public:
         core::RawMemoryPool& memory_pool,
         IInferenceFrameBacklog& backlog,
         core::LoggerAdapter logger = {},
-        InferenceFrameIpcReceiverObserver observer = {});
+        InferenceFrameIpcReceiverObserver observer = {},
+        InferenceFrameIpcReceiverOptions options = {});
     ~InferenceFrameIpcReceiver() override;
 
     InferenceFrameIpcReceiver(const InferenceFrameIpcReceiver&) = delete;

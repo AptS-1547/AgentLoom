@@ -82,6 +82,11 @@ private:
         cv::Mat precheck_ref_gray;
     };
 
+    struct SessionEntry {
+        std::mutex mutex;
+        SessionState state;
+    };
+
     core::Result<cv::Mat> BuildRgbMat(const VideoFrameView& frame) const;
     SessionState MakeSessionState() const;
     static int OddKernel(int value) noexcept;
@@ -94,8 +99,8 @@ private:
     double EffectiveFps(const SessionState& state, double now_seconds) const noexcept;
 
     OpenCvFrameSamplerConfig config_;
-    mutable std::mutex mutex_;
-    std::unordered_map<std::string, SessionState> sessions_;
+    mutable std::mutex sessions_mutex_;
+    std::unordered_map<std::string, std::shared_ptr<SessionEntry>> sessions_;
 };
 
 } // namespace media

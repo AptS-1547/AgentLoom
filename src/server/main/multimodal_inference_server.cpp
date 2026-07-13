@@ -11,6 +11,7 @@
 #include "logger.h"
 #include "multimodal_grpc_service.h"
 #include "multimodal_service.h"
+#include "inference_frame_ipc_control.h"
 #include "option_parser.h"
 #include "server_common.h"
 #include "../../../tools/crash_dump.h"
@@ -125,7 +126,13 @@ int main(int argc, char** argv) {
 
     server_common::RuntimeStats stats;
     service::MultimodalService multimodal_service(options);
-    server::grpc_service::MultimodalGrpcService grpc_service(options, stats, multimodal_service);
+    ipc::media::InferenceFrameIpcGrantReceiver ipc_control(
+        core::LoggerAdapter::ForModule("frame-ipc-control"));
+    server::grpc_service::MultimodalGrpcService grpc_service(
+        options,
+        stats,
+        multimodal_service,
+        &ipc_control);
 
     grpc::EnableDefaultHealthCheckService(true);
     grpc::ServerBuilder builder;

@@ -36,12 +36,14 @@ public:
         core::RawMemoryPool& memory_pool,
         IInferenceFrameBacklog& backlog,
         core::LoggerAdapter logger,
-        InferenceFrameIpcReceiverObserver observer)
+        InferenceFrameIpcReceiverObserver observer,
+        InferenceFrameIpcReceiverOptions options)
         : source_(source),
           memory_pool_(memory_pool),
           backlog_(backlog),
           logger_(logger.valid() ? std::move(logger) : core::LoggerAdapter::ForModule("media-inference")),
-          observer_(std::move(observer)) {}
+          observer_(std::move(observer)),
+          options_(std::move(options)) {}
 
     core::Status PollOnce() {
         if (shutdown_.load(std::memory_order_acquire)) {
@@ -62,8 +64,11 @@ public:
             }
 
             InferenceFrameMetadata metadata;
+            metadata.execution_id = claimed.value().metadata().execution_id;
             metadata.session_id = claimed.value().metadata().session_id;
             metadata.trace_id = claimed.value().metadata().trace_id;
+            metadata.selected_sequence = claimed.value().metadata().selected_sequence;
+            metadata.transport_sequence = claimed.value().metadata().transport_sequence;
             metadata.frame_id = claimed.value().metadata().frame_id;
             metadata.timestamp_us = claimed.value().metadata().timestamp_us;
             metadata.width = claimed.value().metadata().width;
@@ -84,9 +89,47 @@ public:
             }
             copied_frames_.fetch_add(1, std::memory_order_relaxed);
 
-            const auto submit_status = backlog_.Submit(std::move(copied).value());
-            if (!submit_status.ok()) {
-                return Reject(submit_status, claimed.value().metadata());
+            if (options_.admission_sink) {
+                const auto admission_status = options_.admission_sink->AdmitFrame(
+                    std::move(copied).value());
+                if (!admission_status.ok()) {
+                    return Reject(admission_status, claimed.value().metadata());
+                }
+                submitted_frames_.fetch_add(1, std::memory_order_relaxed);
+                Notify(claimed.value().metadata(), core::Status::Ok());
+                return core::Status::Ok();
+            }
+
+            auto submit = backlog_.TrySubmit(std::move(copied).value());
+            if (!submit.accepted()) {
+                if (submit.status.code() != core::ErrorCode::ResourceExhausted ||
+                    !options_.overflow_spool ||
+                    !submit.rejected_frame.has_value()) {
+                    return Reject(submit.status, claimed.value().metadata());
+                }
+                auto& overflow_frame = submit.rejected_frame.value();
+                const auto& overflow_metadata = overflow_frame.metadata();
+                if (overflow_metadata.execution_id.empty() ||
+                    overflow_metadata.selected_sequence == 0) {
+                    return Reject(
+                        core::Status::Error(
+                            core::ErrorCode::FailedPrecondition,
+                            "overflow frame execution identity is missing"),
+                        claimed.value().metadata());
+                }
+                SpoolFrameMetadata spool_metadata;
+                spool_metadata.execution_id = overflow_metadata.execution_id;
+                spool_metadata.selected_sequence = overflow_metadata.selected_sequence;
+                spool_metadata.frame = overflow_metadata;
+                const auto spool_status = options_.overflow_spool->Append(
+                    spool_metadata,
+                    overflow_frame.bytes());
+                if (!spool_status.ok()) {
+                    return Reject(spool_status.status(), claimed.value().metadata());
+                }
+                spooled_frames_.fetch_add(1, std::memory_order_relaxed);
+                Notify(claimed.value().metadata(), core::Status::Ok());
+                return core::Status::Ok();
             }
             submitted_frames_.fetch_add(1, std::memory_order_relaxed);
             Notify(claimed.value().metadata(), core::Status::Ok());
@@ -125,6 +168,7 @@ public:
             .received_frames = received_frames_.load(std::memory_order_relaxed),
             .copied_frames = copied_frames_.load(std::memory_order_relaxed),
             .submitted_frames = submitted_frames_.load(std::memory_order_relaxed),
+            .spooled_frames = spooled_frames_.load(std::memory_order_relaxed),
             .rejected_frames = rejected_frames_.load(std::memory_order_relaxed),
             .shutdown = shutdown_.load(std::memory_order_acquire),
         };
@@ -166,9 +210,11 @@ private:
     IInferenceFrameBacklog& backlog_;
     core::LoggerAdapter logger_;
     InferenceFrameIpcReceiverObserver observer_;
+    InferenceFrameIpcReceiverOptions options_;
     std::atomic<std::size_t> received_frames_{0};
     std::atomic<std::size_t> copied_frames_{0};
     std::atomic<std::size_t> submitted_frames_{0};
+    std::atomic<std::size_t> spooled_frames_{0};
     std::atomic<std::size_t> rejected_frames_{0};
     std::atomic<bool> shutdown_{false};
 };
@@ -178,13 +224,15 @@ InferenceFrameIpcReceiver::InferenceFrameIpcReceiver(
     core::RawMemoryPool& memory_pool,
     IInferenceFrameBacklog& backlog,
     core::LoggerAdapter logger,
-    InferenceFrameIpcReceiverObserver observer)
+    InferenceFrameIpcReceiverObserver observer,
+    InferenceFrameIpcReceiverOptions options)
     : impl_(std::make_unique<Impl>(
           source,
           memory_pool,
           backlog,
           std::move(logger),
-          std::move(observer))) {}
+          std::move(observer),
+          std::move(options))) {}
 
 InferenceFrameIpcReceiver::~InferenceFrameIpcReceiver() = default;
 

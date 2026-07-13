@@ -1,5 +1,6 @@
 #include "session_manager.h"
 #include "runtime_maintenance_service.h"
+#include "inference_frame_ipc_control.h"
 
 #include <gtest/gtest.h>
 
@@ -19,6 +20,7 @@ using agent::service::persona::PersonalityConfig;
 using agent::service::persona::SessionManager;
 using agent::service::persona::SessionOptions;
 using agent::service::gateway::IRuntimeMaintenanceTask;
+using agent::service::gateway::InferenceFrameIpcPeerMaintenanceTask;
 using agent::service::gateway::RuntimeMaintenanceService;
 using agent::service::gateway::SessionMaintenanceTask;
 
@@ -43,6 +45,50 @@ public:
 
 private:
     std::atomic<int>& ticks_;
+};
+
+class FakeIpcLeaseCoordinator final : public ipc::media::IInferenceFrameIpcLeaseCoordinator {
+public:
+    core::Status Start() override {
+        ++starts;
+        snapshot.state = ipc::media::InferenceFrameIpcControlState::Granted;
+        return core::Status::Ok();
+    }
+
+    core::Status Revoke(std::string) override {
+        snapshot.state = ipc::media::InferenceFrameIpcControlState::Fenced;
+        return core::Status::Ok();
+    }
+
+    core::Status CheckPeer() override {
+        ++probes;
+        if (!fail_probe) {
+            return core::Status::Ok();
+        }
+        snapshot.state = ipc::media::InferenceFrameIpcControlState::Fenced;
+        return core::Status::Error(core::ErrorCode::Unavailable, "fake inference peer lost");
+    }
+
+    core::Status Recover() override {
+        ++recoveries;
+        snapshot.state = ipc::media::InferenceFrameIpcControlState::Granted;
+        fail_probe = false;
+        return core::Status::Ok();
+    }
+
+    void Shutdown() override {
+        snapshot.state = ipc::media::InferenceFrameIpcControlState::Shutdown;
+    }
+
+    ipc::media::InferenceFrameIpcControlSnapshot Snapshot() const override {
+        return snapshot;
+    }
+
+    ipc::media::InferenceFrameIpcControlSnapshot snapshot;
+    bool fail_probe = false;
+    int starts = 0;
+    int probes = 0;
+    int recoveries = 0;
 };
 
 CreateSessionRequest MakeCreateRequest(std::string session_id = "session-a") {
@@ -222,6 +268,25 @@ TEST(RuntimeMaintenanceServiceTest, SessionCleanupTaskExpiresIdleSessions) {
     EXPECT_EQ(manager.SessionCount(), 0u);
     compute.Shutdown(true);
     io.Shutdown(true);
+}
+
+TEST(RuntimeMaintenanceServiceTest, IpcPeerTaskFencesThenRecoversLostInferencePeer) {
+    auto coordinator = std::make_shared<FakeIpcLeaseCoordinator>();
+    InferenceFrameIpcPeerMaintenanceTask task(coordinator, 10ms, true);
+    std::stop_source stop;
+
+    ASSERT_TRUE(task.Tick(stop.get_token()).ok());
+    EXPECT_EQ(coordinator->starts, 1);
+    EXPECT_EQ(coordinator->snapshot.state, ipc::media::InferenceFrameIpcControlState::Granted);
+
+    coordinator->fail_probe = true;
+    const auto lost = task.Tick(stop.get_token());
+    EXPECT_EQ(lost.code(), core::ErrorCode::Unavailable);
+    EXPECT_EQ(coordinator->snapshot.state, ipc::media::InferenceFrameIpcControlState::Fenced);
+
+    ASSERT_TRUE(task.Tick(stop.get_token()).ok());
+    EXPECT_EQ(coordinator->recoveries, 1);
+    EXPECT_EQ(coordinator->snapshot.state, ipc::media::InferenceFrameIpcControlState::Granted);
 }
 
 } // namespace

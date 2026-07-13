@@ -1,6 +1,6 @@
 # AgentLoom
 
-> 可组合的 C++20 Agent Runtime、Gateway 与多模态推理基础设施
+> 可组合的 Agent 服务端基础设施 —— HTTP/WebSocket Gateway、Persona Runtime、语义记忆、实时视觉输入与 BERT/VLM 推理，C++20 实现
 
 中文 | [English](README_EN.md)
 
@@ -17,16 +17,26 @@ AgentLoom 是一个面向服务端智能体的 C++20 Runtime。它把 HTTP/WebSo
 
 当前版本为 `0.1.0`。接口仍在活跃开发中，适合用于二次开发、系统集成和面向生产的工程验证，不保证ABI的绝对稳定。
 
+## 核心特性
+
+- **可组合架构**：核心能力以 CMake target 形式暴露，既可作为库集成到下游源码工程，也可以作为独立 Server 部署。
+- **完整的对话热路径**：从 WebSocket 连接、会话管理、记忆召回、情绪感知到 LLM 生成的端到端 C++ 实现，避免跨语言边界开销。
+- **实时多模态感知**：从浏览器摄像头 WebRTC 输入、GStreamer 解码、OpenCV 动态抽帧到 VLM 推理的完整链路。
+- **推理成本优化**：语义缓存、Prompt KV Cache 与 VLM 结果缓存协同，降低重复推理开销；VRAM guard 支持低显存与 OOM 降级。
+- **进程边界清晰**：BERT 与 VLM 推理作为独立 gRPC 进程，支持容器化与独立扩缩容；Gateway 通过 gRPC 或共享内存 IPC 对接。
+- **生产工程质量**：420+ 单元测试与跨进程 E2E 测试，覆盖并发路径、错误恢复与资源释放；`core::Status`/`Result` 统一错误模型。
+
 ## 已实现能力
 
 - **Gateway Runtime**：统一 HTTP/WebSocket 入口、JWT/cookie 认证、静态文件托管、请求过滤、背压和运行时维护任务。
 - **Agent Runtime**：Persona、Session、Skill Session、多人格调度、主动发言状态机、trace 和情绪状态持久化。
 - **模型服务**：ONNX Runtime BERT 情绪推理，以及基于 llama.cpp/mtmd 的流式与同步 VLM 推理。
 - **情感融合**：BERT 主干结合关键词等证据，通过可配置 fusion head、置信度和 margin gate 更新 V-A 状态。
-- **记忆与缓存**：Redis/SQLite L0 记忆、L3 压缩记忆、Exact/Faiss 检索、VLM 结果缓存和 Prompt KV Cache。
+- **记忆与缓存**：Redis/SQLite L0 记忆、L3 压缩记忆、Exact/Faiss 向量检索、VLM 结果缓存，以及基于 llama.cpp sequence state 的 image-prefix Prompt KV Cache（memory/Redis 双后端）。
 - **文档链路**：DOCX/PPTX OOXML 提取、受管文件存储、分块分析、元数据和 LLM/语义缓存。
-- **实时多模态**：WebRTC signaling、GStreamer media pipeline、OpenCV 抽帧、共享内存帧 IPC、backlog 和 VLM coordinator。
-- **基础设施**：`core::Status`/`Result`、RAII、内存池、线程池、对象池、线程安全队列、TLS 和并发 HTTP client。
+- **实时多模态输入**：WebRTC signaling（offer/answer/ICE/resume）、GStreamer `webrtcbin` media pipeline、OpenCV 动态抽帧（MOG2/直方图/边缘变化/EMA/cooldown）、关键帧 JPEG/PNG 编码（NVIDIA/VAAPI/D3D11/QSV 硬件加速与软件回退）。
+- **帧推理链路**：共享内存帧 IPC（MPMC sequence ring、RAII claim、epoch 重建）+ gRPC IPC 控制面（grant/revoke/probe、lease 协调、跨进程故障恢复）组成数据面/控制面分离的传输层；上层由有序准入、mmap 磁盘 spool 溢出回放、私有 backlog、VLM coordinator 和执行级封口聚合（running → sealing → replay → aggregate）构成受控的关键帧推理生命周期。
+- **基础设施**：`core::Status`/`Result`、RAII 句柄封装、内存池、线程池、对象池、线程安全队列、keyed serial executor（按 key 串行、会话亲和保序）、task group（结构化并发）、TLS context 和并发 HTTP client。
 
 ## 运行时边界
 
@@ -43,11 +53,12 @@ Browser / Downstream Application
               +---- gRPC ----> emotion_inference_server
               |
               +---- gRPC ----> multimodal_inference_server
+              |                   (VLM 推理 · 帧 coordinator)
               |
-              +---- shared memory IPC ----> local frame/VLM data plane
+              +== shared memory (数据面) + gRPC (控制面) ==> 帧推理链路
 ```
 
-模型推理默认以独立进程和 protobuf/gRPC 协议作为复用边界。Gateway、Persona、Session、Memory、Media 与 IPC 也可以通过 CMake target 直接组合到下游源码工程。
+模型推理默认以独立进程和 protobuf/gRPC 协议作为复用边界。关键帧传输采用共享内存数据面 + gRPC 控制面分离：大体积帧走共享内存零拷贝，grant/revoke/epoch 生命周期与故障恢复走 gRPC 控制信令。Gateway、Persona、Session、Memory、Media 与 IPC 也可以通过 CMake target 直接组合到下游源码工程。
 
 ### 基础 Server
 
@@ -156,7 +167,7 @@ build\x64-Release\Release\emotion_inference_server.exe `
 
 | 目录 | 职责 |
 | --- | --- |
-| `src/core` | `Status`/`Result`、RAII、内存/对象/线程池和并发队列 |
+| `src/core` | `Status`/`Result`、RAII、内存/对象/线程池、并发队列、keyed serial executor 与 task group |
 | `src/net` | HTTP/WebSocket Server、TLS、HTTP client、连接管理和背压 |
 | `src/config` | JSON/CLI section registry、配置解析与跨 section 校验 |
 | `src/models` | ONNX Runtime、llama.cpp/mtmd、runner pool 和模型生命周期 |
@@ -164,7 +175,7 @@ build\x64-Release\Release\emotion_inference_server.exe `
 | `src/semantic_cache` | Redis 连接池、L0 adapter、缓存策略和 context risk detector |
 | `src/storage` / `src/vector` | SQLite、向量元数据、embedding pipeline 与 Exact/Faiss index |
 | `src/memory` / `src/document` | L3 压缩记忆、OOXML 文档分析与缓存 |
-| `src/media` / `src/ipc` | WebRTC/GStreamer、帧处理、共享内存 IPC 与 VLM coordination |
+| `src/media` / `src/ipc` | WebRTC/GStreamer、帧编码抽样、共享内存数据面与 gRPC 控制面、有序准入、磁盘 spool 回放与 VLM coordination |
 | `src/server` | Gateway 与 gRPC 进程入口、日志、状态映射和运行时统计 |
 
 ## 测试

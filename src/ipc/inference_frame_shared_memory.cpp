@@ -19,9 +19,10 @@ namespace {
 namespace bip = boost::interprocess;
 
 constexpr std::uint64_t kRegionMagic = 0x3143504952464941ULL;
-constexpr std::uint32_t kRegionVersion = 1;
+constexpr std::uint32_t kRegionVersion = 3;
 constexpr std::uint32_t kRegionInitializing = 1;
 constexpr std::uint32_t kRegionReady = 2;
+constexpr std::uint32_t kRegionFenced = 3;
 constexpr std::size_t kCacheLineSize = 64;
 
 static_assert(std::atomic<std::uint64_t>::is_always_lock_free);
@@ -50,6 +51,8 @@ struct alignas(kCacheLineSize) RegionHeader {
 struct alignas(kCacheLineSize) SlotHeader {
     std::atomic<std::uint64_t> sequence{0};
     std::uint64_t epoch = 0;
+    std::uint64_t selected_sequence = 0;
+    std::uint64_t transport_sequence = 0;
     std::uint64_t frame_id = 0;
     std::int64_t timestamp_us = 0;
     std::uint32_t payload_size = 0;
@@ -58,10 +61,12 @@ struct alignas(kCacheLineSize) SlotHeader {
     std::uint32_t format = 0;
     std::uint16_t session_id_size = 0;
     std::uint16_t trace_id_size = 0;
-    std::uint32_t reserved = 0;
+    std::uint16_t execution_id_size = 0;
+    std::uint16_t reserved = 0;
     double saliency = 0.0;
     char session_id[kSharedFrameSessionIdCapacity]{};
     char trace_id[kSharedFrameTraceIdCapacity]{};
+    char execution_id[kSharedFrameExecutionIdCapacity]{};
 };
 
 struct RegionLayout {
@@ -114,6 +119,9 @@ core::Status ValidatePublishRequest(
     }
     if (request.trace_id.size() >= kSharedFrameTraceIdCapacity) {
         return core::Status::Error(core::ErrorCode::InvalidArgument, "shared frame trace_id is too long");
+    }
+    if (request.execution_id.size() >= kSharedFrameExecutionIdCapacity) {
+        return core::Status::Error(core::ErrorCode::InvalidArgument, "shared frame execution_id is too long");
     }
     if (request.payload.empty()) {
         return core::Status::Error(core::ErrorCode::InvalidArgument, "shared frame payload is empty");
@@ -168,6 +176,9 @@ public:
         if (shutdown_.load(std::memory_order_acquire)) {
             return Reject(core::Status::Error(core::ErrorCode::Cancelled, "shared frame channel is shut down"));
         }
+        if (!AccessAllowed()) {
+            return Reject(core::Status::Error(core::ErrorCode::Cancelled, "shared frame channel is fenced"));
+        }
         const auto validation = ValidatePublishRequest(request, header_->payload_capacity);
         if (!validation.ok()) {
             return Reject(validation);
@@ -204,6 +215,8 @@ public:
         std::memcpy(payload, request.payload.data(), request.payload.size());
 
         slot->epoch = header_->epoch.load(std::memory_order_acquire);
+        slot->selected_sequence = request.selected_sequence;
+        slot->transport_sequence = request.transport_sequence;
         slot->frame_id = request.frame_id;
         slot->timestamp_us = request.timestamp_us;
         slot->payload_size = static_cast<std::uint32_t>(request.payload.size());
@@ -213,12 +226,17 @@ public:
         slot->saliency = request.saliency;
         slot->session_id_size = static_cast<std::uint16_t>(request.session_id.size());
         slot->trace_id_size = static_cast<std::uint16_t>(request.trace_id.size());
+        slot->execution_id_size = static_cast<std::uint16_t>(request.execution_id.size());
         std::memcpy(slot->session_id, request.session_id.data(), request.session_id.size());
         slot->session_id[request.session_id.size()] = '\0';
         if (!request.trace_id.empty()) {
             std::memcpy(slot->trace_id, request.trace_id.data(), request.trace_id.size());
         }
         slot->trace_id[request.trace_id.size()] = '\0';
+        if (!request.execution_id.empty()) {
+            std::memcpy(slot->execution_id, request.execution_id.data(), request.execution_id.size());
+        }
+        slot->execution_id[request.execution_id.size()] = '\0';
 
         slot->sequence.store(position + 1, std::memory_order_release);
         header_->published_frames.fetch_add(1, std::memory_order_relaxed);
@@ -226,6 +244,30 @@ public:
     }
 
     core::Result<ClaimedSharedFrame> TryClaim();
+
+    core::Status Fence() noexcept {
+        auto expected = kRegionReady;
+        if (header_->state.compare_exchange_strong(
+                expected,
+                kRegionFenced,
+                std::memory_order_acq_rel,
+                std::memory_order_acquire) ||
+            expected == kRegionFenced) {
+            return core::Status::Ok();
+        }
+        return core::Status::Error(
+            core::ErrorCode::FailedPrecondition,
+            "shared frame region is not ready for fencing");
+    }
+
+    bool AccessAllowed(std::uint64_t expected_epoch) const noexcept {
+        return header_->state.load(std::memory_order_acquire) == kRegionReady &&
+               header_->epoch.load(std::memory_order_acquire) == expected_epoch;
+    }
+
+    bool AccessAllowed() const noexcept {
+        return header_->state.load(std::memory_order_acquire) == kRegionReady;
+    }
 
     void Shutdown() noexcept {
         shutdown_.store(true, std::memory_order_release);
@@ -240,6 +282,7 @@ public:
             .claimed_frames = header_->claimed_frames.load(std::memory_order_relaxed),
             .acknowledged_frames = header_->acknowledged_frames.load(std::memory_order_relaxed),
             .rejected_frames = header_->rejected_frames.load(std::memory_order_relaxed),
+            .fenced = header_->state.load(std::memory_order_acquire) == kRegionFenced,
             .shutdown = shutdown_.load(std::memory_order_acquire),
         };
     }
@@ -280,11 +323,13 @@ public:
         std::shared_ptr<SharedMemoryInferenceFrameChannel::Impl> channel,
         SlotHeader* slot,
         std::uint64_t position,
+        std::uint64_t claimed_epoch,
         SharedFrameMetadata metadata,
         std::span<const std::byte> payload)
         : channel_(std::move(channel)),
           slot_(slot),
           position_(position),
+          claimed_epoch_(claimed_epoch),
           metadata_(std::move(metadata)),
           payload_(payload) {}
 
@@ -304,9 +349,16 @@ public:
         return core::Status::Ok();
     }
 
+    bool AccessAllowed() const noexcept {
+        return !acknowledged_.load(std::memory_order_acquire) &&
+               !payload_.empty() &&
+               channel_->AccessAllowed(claimed_epoch_);
+    }
+
     std::shared_ptr<SharedMemoryInferenceFrameChannel::Impl> channel_;
     SlotHeader* slot_ = nullptr;
     std::uint64_t position_ = 0;
+    std::uint64_t claimed_epoch_ = 0;
     SharedFrameMetadata metadata_;
     std::span<const std::byte> payload_;
     std::atomic<bool> acknowledged_{false};
@@ -315,6 +367,9 @@ public:
 core::Result<ClaimedSharedFrame> SharedMemoryInferenceFrameChannel::Impl::TryClaim() {
     if (shutdown_.load(std::memory_order_acquire)) {
         return core::Status::Error(core::ErrorCode::Cancelled, "shared frame channel is shut down");
+    }
+    if (!AccessAllowed()) {
+        return core::Status::Error(core::ErrorCode::Cancelled, "shared frame channel is fenced");
     }
 
     std::uint64_t position = header_->dequeue_position.load(std::memory_order_relaxed);
@@ -329,8 +384,8 @@ core::Result<ClaimedSharedFrame> SharedMemoryInferenceFrameChannel::Impl::TryCla
                     position,
                     position + 1,
                     std::memory_order_relaxed)) {
-                slot = &candidate;
-                break;
+                    slot = &candidate;
+                    break;
             }
             continue;
         }
@@ -342,12 +397,18 @@ core::Result<ClaimedSharedFrame> SharedMemoryInferenceFrameChannel::Impl::TryCla
     }
 
     const auto epoch = header_->epoch.load(std::memory_order_acquire);
+    if (!AccessAllowed(epoch)) {
+        slot->sequence.store(position + header_->slot_count, std::memory_order_release);
+        header_->acknowledged_frames.fetch_add(1, std::memory_order_relaxed);
+        return core::Status::Error(core::ErrorCode::Cancelled, "shared frame channel was fenced while claiming");
+    }
     const auto valid = slot->epoch == epoch &&
                        slot->payload_size > 0 &&
                        slot->payload_size <= header_->payload_capacity &&
                        slot->session_id_size > 0 &&
                        slot->session_id_size < kSharedFrameSessionIdCapacity &&
-                       slot->trace_id_size < kSharedFrameTraceIdCapacity;
+                       slot->trace_id_size < kSharedFrameTraceIdCapacity &&
+                       slot->execution_id_size < kSharedFrameExecutionIdCapacity;
     if (!valid) {
         slot->sequence.store(position + header_->slot_count, std::memory_order_release);
         header_->acknowledged_frames.fetch_add(1, std::memory_order_relaxed);
@@ -357,8 +418,11 @@ core::Result<ClaimedSharedFrame> SharedMemoryInferenceFrameChannel::Impl::TryCla
     }
 
     SharedFrameMetadata metadata;
+    metadata.execution_id.assign(slot->execution_id, slot->execution_id_size);
     metadata.session_id.assign(slot->session_id, slot->session_id_size);
     metadata.trace_id.assign(slot->trace_id, slot->trace_id_size);
+    metadata.selected_sequence = slot->selected_sequence;
+    metadata.transport_sequence = slot->transport_sequence;
     metadata.frame_id = slot->frame_id;
     metadata.timestamp_us = slot->timestamp_us;
     metadata.width = slot->width;
@@ -371,8 +435,15 @@ core::Result<ClaimedSharedFrame> SharedMemoryInferenceFrameChannel::Impl::TryCla
         shared_from_this(),
         slot,
         position,
+        epoch,
         std::move(metadata),
         std::span<const std::byte>(Payload(slot_index), slot->payload_size)));
+    if (!claim.valid()) {
+        claim.Acknowledge();
+        return core::Status::Error(
+            core::ErrorCode::Cancelled,
+            "shared frame channel was fenced before claim delivery");
+    }
     header_->claimed_frames.fetch_add(1, std::memory_order_relaxed);
     return claim;
 }
@@ -386,11 +457,11 @@ ClaimedSharedFrame& ClaimedSharedFrame::operator=(ClaimedSharedFrame&&) noexcept
 
 const SharedFrameMetadata& ClaimedSharedFrame::metadata() const noexcept {
     static const SharedFrameMetadata empty;
-    return impl_ ? impl_->metadata_ : empty;
+    return impl_ && impl_->AccessAllowed() ? impl_->metadata_ : empty;
 }
 
 std::span<const std::byte> ClaimedSharedFrame::payload() const noexcept {
-    return impl_ ? impl_->payload_ : std::span<const std::byte>{};
+    return impl_ && impl_->AccessAllowed() ? impl_->payload_ : std::span<const std::byte>{};
 }
 
 core::Status ClaimedSharedFrame::Acknowledge() noexcept {
@@ -398,7 +469,7 @@ core::Status ClaimedSharedFrame::Acknowledge() noexcept {
 }
 
 bool ClaimedSharedFrame::valid() const noexcept {
-    return impl_ && !impl_->acknowledged_.load(std::memory_order_acquire) && !impl_->payload_.empty();
+    return impl_ && impl_->AccessAllowed();
 }
 
 core::Result<std::unique_ptr<SharedMemoryInferenceFrameChannel>>
@@ -475,6 +546,12 @@ SharedMemoryInferenceFrameChannel::Open(
             header->header_size != sizeof(RegionHeader)) {
             return core::Status::Error(core::ErrorCode::FailedPrecondition, "shared frame region header is incompatible");
         }
+        if (options.expected_epoch &&
+            header->epoch.load(std::memory_order_acquire) != *options.expected_epoch) {
+            return core::Status::Error(
+                core::ErrorCode::FailedPrecondition,
+                "shared frame epoch does not match control-plane grant");
+        }
         auto layout = CalculateLayout(header->slot_count, header->payload_capacity);
         if (!layout.ok() ||
             header->region_size != layout.value().region_size ||
@@ -521,6 +598,10 @@ core::Status SharedMemoryInferenceFrameChannel::Publish(const SharedFramePublish
 
 core::Result<ClaimedSharedFrame> SharedMemoryInferenceFrameChannel::TryClaim() {
     return impl_->TryClaim();
+}
+
+core::Status SharedMemoryInferenceFrameChannel::Fence() {
+    return impl_->Fence();
 }
 
 void SharedMemoryInferenceFrameChannel::Shutdown() {

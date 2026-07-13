@@ -1,6 +1,8 @@
 #pragma once
 
 #include "frame_encoding.h"
+#include "keyed_serial_executor.h"
+#include "ordered_encoded_frame_sink.h"
 #include "request_interfaces.h"
 #include "result.h"
 #include "thread_pool.h"
@@ -25,6 +27,7 @@ struct WebRtcSignalingOptions {
     std::size_t max_sessions = 256;
     WebRtcDecodeOptions decode_options;
     std::shared_ptr<core::ThreadPool> compute_pool;
+    std::shared_ptr<core::IKeyedSerialExecutor> frame_executor;
     std::shared_ptr<core::ThreadPool> io_pool;
     std::shared_ptr<IFrameSampler> frame_sampler;
     std::shared_ptr<IVlmVisionClient> vlm_client;

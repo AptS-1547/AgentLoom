@@ -27,14 +27,21 @@ core::Result<FrameSamplingDecision> OpenCvFrameSampler::Evaluate(const VideoFram
         return rgb.status();
     }
 
-    std::lock_guard lock(mutex_);
-    auto [it, inserted] = sessions_.try_emplace(frame.session_id);
-    if (inserted) {
-        it->second = MakeSessionState();
+    std::shared_ptr<SessionEntry> entry;
+    {
+        std::lock_guard lock(sessions_mutex_);
+        auto [it, inserted] = sessions_.try_emplace(frame.session_id);
+        if (inserted) {
+            it->second = std::make_shared<SessionEntry>();
+            it->second->state = MakeSessionState();
+        }
+        entry = it->second;
     }
-    auto& state = it->second;
-    const auto now = frame.captured_at.time_since_epoch();
-    const double now_seconds = std::chrono::duration<double>(now).count();
+    std::lock_guard entry_lock(entry->mutex);
+    auto& state = entry->state;
+    const double now_seconds = frame.timestamp_us.has_value()
+        ? static_cast<double>(*frame.timestamp_us) / 1'000'000.0
+        : std::chrono::duration<double>(frame.captured_at.time_since_epoch()).count();
 
     if (config_.adaptive_enabled && !ShouldRunHeavyAnalysis(state, rgb.value(), now_seconds)) {
         return FrameSamplingDecision{

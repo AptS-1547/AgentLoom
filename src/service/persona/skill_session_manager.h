@@ -4,6 +4,7 @@
 #include "result.h"
 
 #include <chrono>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -35,6 +36,7 @@ struct SkillSessionOptions {
 };
 
 struct SkillSessionStartRequest {
+    std::string execution_id;
     std::string skill_id;
     std::string session_id;
     std::string user_uuid;
@@ -47,6 +49,7 @@ struct SkillSessionStartRequest {
 };
 
 struct SkillSessionStopRequest {
+    std::string execution_id;
     std::string skill_id;
     std::string session_id;
     std::string authenticated_user_uuid;
@@ -58,6 +61,7 @@ struct SkillSessionStopRequest {
 };
 
 struct SkillObservation {
+    std::string execution_id;
     std::string skill_id;
     std::string session_id;
     std::string trace_id;
@@ -70,6 +74,7 @@ struct SkillObservation {
 };
 
 struct SkillSessionSnapshot {
+    std::string execution_id;
     std::string skill_id;
     std::string session_id;
     std::string user_uuid;
@@ -109,7 +114,18 @@ public:
     virtual core::Status MarkFailed(std::string_view session_id,
                                     std::string_view skill_id,
                                     std::string error,
-                                    std::string_view trace_id) = 0;
+                                    std::string_view trace_id,
+                                    std::string_view execution_id = {}) = 0;
+    virtual core::Status BeginClosing(std::string_view session_id,
+                                      std::string_view skill_id,
+                                      std::string_view execution_id,
+                                      std::string reason,
+                                      std::string_view trace_id) = 0;
+    virtual core::Status CompleteClosing(std::string_view session_id,
+                                         std::string_view skill_id,
+                                         std::string_view execution_id,
+                                         std::string status_text,
+                                         std::string_view trace_id) = 0;
     /// 记录一次 observation；实现负责 recent_observations 容量限制。
     virtual core::Status RecordObservation(const SkillObservation& observation) = 0;
     /// 清理超时会话。
@@ -151,7 +167,18 @@ public:
     core::Status MarkFailed(std::string_view session_id,
                             std::string_view skill_id,
                             std::string error,
-                            std::string_view trace_id) override;
+                            std::string_view trace_id,
+                            std::string_view execution_id = {}) override;
+    core::Status BeginClosing(std::string_view session_id,
+                              std::string_view skill_id,
+                              std::string_view execution_id,
+                              std::string reason,
+                              std::string_view trace_id) override;
+    core::Status CompleteClosing(std::string_view session_id,
+                                 std::string_view skill_id,
+                                 std::string_view execution_id,
+                                 std::string status_text,
+                                 std::string_view trace_id) override;
     core::Status RecordObservation(const SkillObservation& observation) override;
     std::size_t CleanupExpired(std::stop_token stop_token) override;
 
@@ -167,6 +194,7 @@ private:
     core::LoggerAdapter logger_;
     mutable std::mutex mutex_;
     std::unordered_map<std::string, SkillSessionSnapshot> sessions_;
+    std::uint64_t next_execution_id_ = 1;
 };
 
 } // namespace agent::service::persona

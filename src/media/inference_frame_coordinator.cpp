@@ -172,13 +172,27 @@ private:
                 failed_frames_.fetch_add(1, std::memory_order_relaxed);
             }
 
+            InferenceFrameTerminalEvent terminal_event{
+                .frame = record.frame,
+                .inference_status = record.status,
+            };
             const auto publish_status = result_table_.Publish(std::move(record));
+            terminal_event.publish_status = publish_status;
             if (!publish_status.ok()) {
                 result_publish_failures_.fetch_add(1, std::memory_order_relaxed);
                 logger_.warn(
                     "[frame-coordinator] result publish failed code={} message={}",
                     static_cast<int>(publish_status.code()),
                     publish_status.message());
+            }
+            if (options_.terminal_observer) {
+                try {
+                    options_.terminal_observer(std::move(terminal_event));
+                } catch (const std::exception&) {
+                    logger_.warn("[frame-coordinator] terminal observer failed unexpectedly");
+                } catch (...) {
+                    logger_.warn("[frame-coordinator] terminal observer failed unexpectedly");
+                }
             }
         }
         return core::Status::Ok();

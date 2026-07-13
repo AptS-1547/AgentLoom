@@ -182,6 +182,10 @@ const EncodedVideoFrameMetadata& EncodedVideoFrame::metadata() const noexcept {
     return metadata_;
 }
 
+EncodedVideoFrameMetadata& EncodedVideoFrame::metadata() noexcept {
+    return metadata_;
+}
+
 std::span<const std::byte> EncodedVideoFrame::bytes() const noexcept {
     return {payload_.data(), std::min(payload_.size(), payload_size_)};
 }
@@ -316,8 +320,9 @@ public:
             }
         }
         gst_buffer_unmap(input.get(), &input_map);
+        const auto timestamp_us = frame.timestamp_us.value_or(TimestampMicros(frame.captured_at));
         GST_BUFFER_PTS(input.get()) = static_cast<GstClockTime>(
-            std::max<std::int64_t>(0, TimestampMicros(frame.captured_at))) * GST_USECOND;
+            std::max<std::int64_t>(0, timestamp_us)) * GST_USECOND;
         GST_BUFFER_DURATION(input.get()) = GST_CLOCK_TIME_NONE;
 
         const auto flow = gst_app_src_push_buffer(GST_APP_SRC(appsrc_), input.release());
@@ -368,7 +373,7 @@ public:
         metadata.session_id = frame.session_id;
         metadata.trace_id = std::move(trace_id);
         metadata.frame_id = frame.frame_id;
-        metadata.timestamp_us = TimestampMicros(frame.captured_at);
+        metadata.timestamp_us = timestamp_us;
         metadata.width = frame.width;
         metadata.height = frame.height;
         metadata.format = options_.format;

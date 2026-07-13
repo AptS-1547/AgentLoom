@@ -95,9 +95,65 @@ Status ThreadPool::SubmitTask(TaskFunction task, SharedMemoryBlock payload, std:
     }
 
     auto status = queue_.TryPush(QueuedTask{
-        std::move(task), std::move(payload), std::move(name), std::move(trace_id)});
+        std::move(task), std::move(payload), std::move(name), std::move(trace_id), {}});
     if (!status.ok()) {
         rejected_tasks_.fetch_add(1, std::memory_order_relaxed);
+        return status;
+    }
+
+    submitted_tasks_.fetch_add(1, std::memory_order_relaxed);
+    return Status::Ok();
+}
+
+Status ThreadPool::SubmitTask(TaskGroup& group,
+                              TaskFunction task,
+                              SharedMemoryBlock payload,
+                              std::string name) {
+    auto token = group.AcquireRoot();
+    if (!token.ok()) {
+        rejected_tasks_.fetch_add(1, std::memory_order_relaxed);
+        return token.status();
+    }
+    return SubmitTask(std::move(token).value(), std::move(task), std::move(payload), std::move(name));
+}
+
+Status ThreadPool::SubmitTask(TaskGroupToken token,
+                              TaskFunction task,
+                              SharedMemoryBlock payload,
+                              std::string name) {
+    if (!token.valid()) {
+        rejected_tasks_.fetch_add(1, std::memory_order_relaxed);
+        return Status::Error(ErrorCode::InvalidArgument, "task group token is inactive");
+    }
+    if (!task) {
+        rejected_tasks_.fetch_add(1, std::memory_order_relaxed);
+        const auto status = Status::Error(ErrorCode::InvalidArgument, "task is empty");
+        token.Complete(status);
+        return status;
+    }
+    if (!running_.load(std::memory_order_acquire)) {
+        rejected_tasks_.fetch_add(1, std::memory_order_relaxed);
+        const auto status = Status::Error(ErrorCode::Unavailable, "thread pool is not running");
+        token.Complete(status);
+        return status;
+    }
+
+    std::string trace_id;
+    if (current_trace && !current_trace->trace_id.empty()) {
+        trace_id = current_trace->trace_id;
+    }
+
+    auto tracking_token = std::make_shared<TaskGroupToken>(std::move(token));
+    auto status = queue_.TryPush(QueuedTask{
+        std::move(task),
+        std::move(payload),
+        std::move(name),
+        std::move(trace_id),
+        tracking_token,
+    });
+    if (!status.ok()) {
+        rejected_tasks_.fetch_add(1, std::memory_order_relaxed);
+        tracking_token->Complete(status);
         return status;
     }
 
@@ -148,6 +204,7 @@ void ThreadPool::WorkerLoop(std::stop_token stop_token, std::size_t worker_index
         active_workers_.fetch_add(1, std::memory_order_relaxed);
         SetWorkerState(worker_index, WorkerState::Running, std::move(queued.name));
         context.set_payload(std::move(queued.payload));
+        context.set_task_group_token(queued.task_group_token.get());
 
         TraceContext trace_ctx;
         trace_ctx.trace_id = std::move(queued.trace_id);
@@ -165,8 +222,12 @@ void ThreadPool::WorkerLoop(std::stop_token stop_token, std::size_t worker_index
         }
 
         context.clear_payload();
+        context.set_task_group_token(nullptr);
         active_workers_.fetch_sub(1, std::memory_order_relaxed);
         const auto task_ok = status.ok();
+        if (queued.task_group_token) {
+            queued.task_group_token->Complete(status);
+        }
         FinishWorkerTask(worker_index, std::move(status));
 
         if (task_ok) {

@@ -8,6 +8,7 @@ require_command ctest
 
 run_all=false
 include_redis=false
+verify_package=true
 
 for arg in "$@"; do
     case "$arg" in
@@ -16,6 +17,9 @@ for arg in "$@"; do
             ;;
         --redis)
             include_redis=true
+            ;;
+        --skip-package)
+            verify_package=false
             ;;
         *)
             fail "unknown test option: $arg"
@@ -36,3 +40,7 @@ if [[ "$run_all" != true ]]; then
 fi
 
 ctest "${ctest_args[@]}"
+
+if [[ "$verify_package" == true ]]; then
+    bash "$SCRIPT_DIR/verify_package.sh"
+fi

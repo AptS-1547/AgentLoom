@@ -7,6 +7,8 @@ REPO_ROOT="$(cd -- "$LINUX_DIR/.." && pwd)"
 
 BUILD_DIR="${BUILD_DIR:-$REPO_ROOT/build/linux-local-tests}"
 LINUX_SOURCE_DIR="${LINUX_SOURCE_DIR:-$REPO_ROOT/build/linux-source}"
+LINUX_INSTALL_DIR="${LINUX_INSTALL_DIR:-$REPO_ROOT/build/linux-agentloom-install}"
+PACKAGE_CONSUMER_BUILD_DIR="${PACKAGE_CONSUMER_BUILD_DIR:-$REPO_ROOT/build/linux-package-consumer}"
 LINUX_VENV_DIR="${LINUX_VENV_DIR:-$REPO_ROOT/build/linux-python-venv}"
 PYTHON_BIN="${PYTHON_BIN:-$LINUX_VENV_DIR/bin/python}"
 DEPS_DIR="${DEPS_DIR:-$REPO_ROOT/deps}"

@@ -7,7 +7,7 @@
 #include "request_interfaces.h"
 #include "skill_session_manager.h"
 
-#include "third_party/nlohmann/json.hpp"
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <cstdint>

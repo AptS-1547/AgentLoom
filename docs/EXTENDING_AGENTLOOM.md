@@ -2,9 +2,9 @@
 
 本文档说明下游项目如何复用 AgentLoom 核心库、基础 Server 和扩展接口，同时保持领域代码与开源 Runtime 解耦。
 
-## 1. 源码依赖
+## 1. CMake 依赖
 
-当前稳定支持通过 `add_subdirectory()` 使用构建树 target：
+源码集成可以通过 `add_subdirectory()` 使用构建树 target：
 
 ```cmake
 add_subdirectory(path/to/AgentLoom)
@@ -41,7 +41,50 @@ AgentLoom::gateway
 AgentLoom::service
 ```
 
-这些 alias 不改变内部 `agent_*` target，方便现有工程逐步迁移。安装式 `find_package(AgentLoom)` 尚未作为稳定接口承诺；在公共 header install/export 边界完成前，下游应锁定具体 commit 或 release tag。
+这些 alias 不改变内部 `agent_*` target，方便现有工程逐步迁移。
+
+安装式复用会导出相同的 `AgentLoom::...` target，并安装静态库、公共头文件、生成的 protobuf/gRPC 头及版本文件：
+
+```powershell
+& "C:\Program Files\CMake\bin\cmake.exe" --install build/x64-Release `
+  --config Release --prefix build/agentloom-package
+```
+
+消费端项目：
+
+```cmake
+cmake_minimum_required(VERSION 3.20)
+project(MyAgent LANGUAGES CXX)
+
+find_package(AgentLoom CONFIG REQUIRED)
+
+add_executable(my_agent main.cpp)
+target_compile_features(my_agent PRIVATE cxx_std_20)
+target_link_libraries(my_agent PRIVATE
+    AgentLoom::core
+    AgentLoom::runtime
+    AgentLoom::gateway
+)
+```
+
+配置消费端时，需要将 AgentLoom 安装前缀和 vcpkg package root 加入 `CMAKE_PREFIX_PATH`。公共头文件以安装前缀为根，例如：
+
+```cpp
+#include <AgentLoom/core/result.h>
+#include <AgentLoom/service/persona/persona_runtime.h>
+```
+
+`AgentLoomConfig.cmake` 会查找 Protobuf、gRPC、spdlog、OpenSSL、Redis client、libzip、pugixml、Faiss、OpenCV 和 nlohmann-json。构建 AgentLoom 时使用的本地预编译依赖路径会作为消费端默认值写入 config；迁移安装包或使用另一套依赖时，可以在 `find_package()` 前覆盖：
+
+```cmake
+set(AgentLoom_ONNXRUNTIME_ROOT "<onnxruntime-package>")
+set(AgentLoom_LLAMA_CPP_INCLUDE_DIRS "<llama-includes>")
+set(AgentLoom_LLAMA_CPP_LIBRARIES "<llama-libraries>")
+set(AgentLoom_GSTREAMER_ROOT "<gstreamer-sdk>")
+set(AgentLoom_BOOST_ROOT "<boost-root>")
+```
+
+SQLite 和 HuggingFace tokenizer C API 还可以通过 `AgentLoom_SQLITE_*` 与 `AgentLoom_HF_TOKENIZERS_*` 变量覆盖。静态库不会隔离 STL、CRT 或第三方库 ABI；Windows 下 AgentLoom、消费端和 vcpkg 依赖必须保持 generator、MSVC 工具集和 triplet 一致。
 
 ## 2. 推理服务边界
 

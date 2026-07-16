@@ -1,0 +1,124 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+
+find_dependency(Protobuf CONFIG)
+find_dependency(gRPC CONFIG)
+find_dependency(spdlog CONFIG)
+find_dependency(OpenSSL)
+find_dependency(nlohmann_json CONFIG)
+find_dependency(hiredis CONFIG)
+find_dependency(redis++ CONFIG)
+find_dependency(libzip CONFIG)
+find_dependency(pugixml CONFIG)
+find_dependency(Threads)
+
+set(AgentLoom_FAISS_ROOT "@BERT_FAISS_ROOT@" CACHE PATH
+    "Faiss package used by AgentLoom")
+if(WIN32)
+    if(NOT faiss_DIR OR faiss_DIR MATCHES "-NOTFOUND$")
+        set(faiss_DIR "@faiss_DIR@")
+    endif()
+    find_dependency(faiss CONFIG)
+elseif(NOT TARGET faiss)
+    find_library(AgentLoom_OPENBLAS_LIBRARY NAMES openblas libopenblas.so.0 REQUIRED)
+    add_library(faiss SHARED IMPORTED)
+    set_target_properties(faiss PROPERTIES
+        IMPORTED_LOCATION "${AgentLoom_FAISS_ROOT}/lib/libfaiss.so"
+        INTERFACE_INCLUDE_DIRECTORIES "${AgentLoom_FAISS_ROOT}/include"
+        INTERFACE_LINK_LIBRARIES "${AgentLoom_OPENBLAS_LIBRARY}")
+endif()
+
+if(@AGENTLOOM_PACKAGE_HAS_MEDIA@)
+    if(NOT OpenCV_DIR OR OpenCV_DIR MATCHES "-NOTFOUND$")
+        set(OpenCV_DIR "@OpenCV_DIR@")
+    endif()
+    find_dependency(OpenCV CONFIG COMPONENTS core imgproc videoio)
+endif()
+
+set(AgentLoom_ONNXRUNTIME_ROOT "@ONNXRUNTIME_ROOT@" CACHE PATH
+    "ONNX Runtime package used by AgentLoom")
+set(AgentLoom_SQLITE_INCLUDE_DIR "@BERT_SQLITE_INCLUDE_DIR@" CACHE PATH
+    "SQLite include directory used by AgentLoom")
+set(AgentLoom_SQLITE_LIBRARY "@BERT_SQLITE_IMPLIB@" CACHE FILEPATH
+    "SQLite import or shared library used by AgentLoom")
+set(AgentLoom_SQLITE_RUNTIME "@BERT_SQLITE_DLL@" CACHE FILEPATH
+    "SQLite runtime library used by AgentLoom")
+set(AgentLoom_HF_TOKENIZERS_INCLUDE_DIR "@HF_TOKENIZERS_INCLUDE_DIR@" CACHE PATH
+    "HuggingFace tokenizer C API include directory")
+set(AgentLoom_HF_TOKENIZERS_LIBRARY "@HF_TOKENIZERS_STATICLIB_PATH@" CACHE FILEPATH
+    "HuggingFace tokenizer C API static library")
+set(AgentLoom_LLAMA_CPP_INCLUDE_DIRS "@LLAMA_CPP_INCLUDE_DIRS@" CACHE STRING
+    "llama.cpp and mtmd include directories")
+set(AgentLoom_LLAMA_CPP_LIBRARIES "@LLAMA_CPP_LIBS@" CACHE STRING
+    "llama.cpp and mtmd libraries")
+set(AgentLoom_GSTREAMER_ROOT "@GSTREAMER_ROOT@" CACHE PATH
+    "GStreamer SDK root used by AgentLoom media targets")
+set(AgentLoom_BOOST_ROOT "@BERT_BOOST_ROOT@" CACHE PATH
+    "Boost header package used by AgentLoom")
+
+if(NOT TARGET Boost::headers)
+    add_library(Boost::headers INTERFACE IMPORTED)
+    set_target_properties(Boost::headers PROPERTIES
+        INTERFACE_INCLUDE_DIRECTORIES "${AgentLoom_BOOST_ROOT}")
+endif()
+
+if(NOT TARGET onnxruntime)
+    add_library(onnxruntime SHARED IMPORTED)
+    if(WIN32)
+        set_target_properties(onnxruntime PROPERTIES
+            IMPORTED_LOCATION "${AgentLoom_ONNXRUNTIME_ROOT}/lib/onnxruntime.dll"
+            IMPORTED_IMPLIB "${AgentLoom_ONNXRUNTIME_ROOT}/lib/onnxruntime.lib"
+            INTERFACE_INCLUDE_DIRECTORIES "${AgentLoom_ONNXRUNTIME_ROOT}/include")
+    else()
+        set_target_properties(onnxruntime PROPERTIES
+            IMPORTED_LOCATION "${AgentLoom_ONNXRUNTIME_ROOT}/lib/libonnxruntime.so"
+            INTERFACE_INCLUDE_DIRECTORIES "${AgentLoom_ONNXRUNTIME_ROOT}/include")
+    endif()
+endif()
+
+if(WIN32 AND NOT TARGET sqlite3)
+    add_library(sqlite3 SHARED IMPORTED)
+    set_target_properties(sqlite3 PROPERTIES
+        IMPORTED_LOCATION "${AgentLoom_SQLITE_RUNTIME}"
+        INTERFACE_INCLUDE_DIRECTORIES "${AgentLoom_SQLITE_INCLUDE_DIR}")
+    if(WIN32)
+        set_property(TARGET sqlite3 PROPERTY IMPORTED_IMPLIB "${AgentLoom_SQLITE_LIBRARY}")
+    endif()
+endif()
+
+if(NOT TARGET hf_tokenizers_capi)
+    add_library(hf_tokenizers_capi STATIC IMPORTED)
+    set_target_properties(hf_tokenizers_capi PROPERTIES
+        IMPORTED_LOCATION "${AgentLoom_HF_TOKENIZERS_LIBRARY}"
+        INTERFACE_INCLUDE_DIRECTORIES "${AgentLoom_HF_TOKENIZERS_INCLUDE_DIR}")
+    if(WIN32)
+        set_property(TARGET hf_tokenizers_capi APPEND PROPERTY INTERFACE_LINK_LIBRARIES
+            ws2_32 userenv advapi32 bcrypt ntdll kernel32 ole32 oleaut32 uuid synchronization)
+    elseif(APPLE)
+        set_property(TARGET hf_tokenizers_capi APPEND PROPERTY INTERFACE_LINK_LIBRARIES
+            "-framework Security" "-framework CoreFoundation")
+    else()
+        set_property(TARGET hf_tokenizers_capi APPEND PROPERTY INTERFACE_LINK_LIBRARIES pthread dl m)
+    endif()
+endif()
+
+if(@BERT_BUILD_MULTIMODAL_INFERENCE_SERVER@ AND NOT TARGET AgentLoom::llama_cpp_external)
+    add_library(AgentLoom::llama_cpp_external INTERFACE IMPORTED)
+    set_target_properties(AgentLoom::llama_cpp_external PROPERTIES
+        INTERFACE_INCLUDE_DIRECTORIES "${AgentLoom_LLAMA_CPP_INCLUDE_DIRS}"
+        INTERFACE_LINK_LIBRARIES "${AgentLoom_LLAMA_CPP_LIBRARIES}")
+endif()
+
+if(WIN32 AND NOT TARGET AgentLoom::gstreamer_external)
+    add_library(AgentLoom::gstreamer_external INTERFACE IMPORTED)
+    set_target_properties(AgentLoom::gstreamer_external PROPERTIES
+        INTERFACE_INCLUDE_DIRECTORIES
+            "${AgentLoom_GSTREAMER_ROOT}/include/gstreamer-1.0;${AgentLoom_GSTREAMER_ROOT}/include/glib-2.0;${AgentLoom_GSTREAMER_ROOT}/lib/glib-2.0/include"
+        INTERFACE_LINK_LIBRARIES
+            "${AgentLoom_GSTREAMER_ROOT}/lib/gstreamer-1.0.lib;${AgentLoom_GSTREAMER_ROOT}/lib/gobject-2.0.lib;${AgentLoom_GSTREAMER_ROOT}/lib/glib-2.0.lib;${AgentLoom_GSTREAMER_ROOT}/lib/gstapp-1.0.lib;${AgentLoom_GSTREAMER_ROOT}/lib/gstvideo-1.0.lib;${AgentLoom_GSTREAMER_ROOT}/lib/gstsdp-1.0.lib;${AgentLoom_GSTREAMER_ROOT}/lib/gstwebrtc-1.0.lib")
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/AgentLoomTargets.cmake")
+
+check_required_components(AgentLoom)

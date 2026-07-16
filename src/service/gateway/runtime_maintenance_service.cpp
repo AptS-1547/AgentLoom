@@ -1,7 +1,10 @@
 #include "runtime_maintenance_service.h"
 
-#include "webrtc_session_registry.h"
 #include "inference_frame_ipc_control.h"
+
+#if defined(AGENTLOOM_HAS_MEDIA)
+#include "webrtc_session_registry.h"
+#endif
 
 #include <algorithm>
 #include <ctime>
@@ -246,11 +249,17 @@ core::Status WebRtcSessionMaintenanceTask::Tick(std::stop_token stop_token) {
     if (stop_token.stop_requested() || !registry_) {
         return core::Status::Ok();
     }
+#if defined(AGENTLOOM_HAS_MEDIA)
     const auto expired = registry_->CleanupExpired(stop_token);
     if (expired > 0) {
         logger_.info("[maintenance] rtc session cleanup expired_count={}", expired);
     }
     return core::Status::Ok();
+#else
+    return core::Status::Error(
+        core::ErrorCode::Unimplemented,
+        "WebRTC media support is not available in this build");
+#endif
 }
 
 SkillSessionMaintenanceTask::SkillSessionMaintenanceTask(

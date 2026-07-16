@@ -35,10 +35,31 @@ add_custom_target(linux_check
     USES_TERMINAL
 )
 
+add_custom_target(linux_test
+    COMMAND "${BASH_EXECUTABLE}" "${LINUX_ROOT}/scripts/test.sh" --skip-package
+    WORKING_DIRECTORY "${LINUX_ROOT}/.."
+    USES_TERMINAL
+)
+
+add_custom_target(linux_verify_package
+    COMMAND "${BASH_EXECUTABLE}" "${LINUX_ROOT}/scripts/verify_package.sh"
+    WORKING_DIRECTORY "${LINUX_ROOT}/.."
+    USES_TERMINAL
+)
+
+add_custom_target(linux_package
+    COMMAND "${BASH_EXECUTABLE}" "${LINUX_ROOT}/scripts/package.sh"
+    WORKING_DIRECTORY "${LINUX_ROOT}/.."
+    USES_TERMINAL
+)
+
 add_custom_target(linux_all
-    DEPENDS linux_check
+    DEPENDS linux_check linux_test linux_package
 )
 
 add_dependencies(linux_configure linux_prepare)
 add_dependencies(linux_build linux_configure)
 add_dependencies(linux_check linux_build)
+add_dependencies(linux_test linux_build)
+add_dependencies(linux_verify_package linux_build)
+add_dependencies(linux_package linux_verify_package)

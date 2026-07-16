@@ -3,6 +3,7 @@ set -euo pipefail
 source "$(dirname "$0")/common.sh"
 
 require_linux
+require_command cmake
 require_command file
 require_command ldd
 
@@ -51,6 +52,8 @@ fi
 
 rm -rf "$PACKAGE_DIR"
 mkdir -p "$PACKAGE_DIR/bin" "$PACKAGE_DIR/config" "$PACKAGE_DIR/tools" "$PACKAGE_DIR/dist"
+
+cmake --install "$BUILD_DIR" --prefix "$PACKAGE_DIR/sdk"
 
 declare -a copied_elfs=()
 for artifact in "${artifacts[@]}"; do
@@ -155,6 +158,10 @@ Useful binaries:
 
 Configuration templates are under config/.
 Frontend static files, if present at package time, are under dist/.
+The reusable CMake SDK is under sdk/ and can be consumed with:
+
+  find_package(AgentLoom CONFIG REQUIRED)
+  target_link_libraries(my_agent PRIVATE AgentLoom::core AgentLoom::runtime AgentLoom::gateway)
 EOF
 
 {
@@ -167,6 +174,10 @@ EOF
     echo
     echo "[runtime_libraries]"
     find "$PACKAGE_DIR/bin" -maxdepth 1 -type f -name '*.so*' -printf '%f\n' | sort
+    echo
+    echo "[sdk]"
+    echo "prefix=sdk"
+    echo "config=sdk/lib/cmake/AgentLoom/AgentLoomConfig.cmake"
 } > "$PACKAGE_DIR/manifest.txt"
 
 log "Linux package created at $PACKAGE_DIR"

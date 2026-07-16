@@ -84,7 +84,26 @@ target_link_libraries(my_agent PRIVATE
 )
 ```
 
-当前公开别名包括 `core`、`net`、`tls`、`http_client`、`config`、`storage`、`vector_storage`、`vector`、`semantic_cache`、`memory`、`document`、`llm`、`models`、`cache`、`ipc`、`media_inference`、`media`、`runtime`、`gateway` 和 `service`。安装式 `find_package(AgentLoom)` 导出尚未提供。
+当前公开别名包括 `core`、`net`、`tls`、`http_client`、`config`、`storage`、`vector_storage`、`vector`、`semantic_cache`、`memory`、`document`、`llm`、`models`、`cache`、`ipc`、`media_inference`、`media`、`runtime`、`gateway` 和 `service`。
+
+也可以安装静态库、头文件和 CMake package 后通过 `find_package()` 复用：
+
+```powershell
+& "C:\Program Files\CMake\bin\cmake.exe" --install build/x64-Release `
+  --config Release --prefix build/agentloom-package
+```
+
+```cmake
+find_package(AgentLoom CONFIG REQUIRED)
+
+target_link_libraries(my_agent PRIVATE
+    AgentLoom::core
+    AgentLoom::runtime
+    AgentLoom::gateway
+)
+```
+
+消费端将安装前缀加入 `CMAKE_PREFIX_PATH`，公共头文件使用 `#include <AgentLoom/core/result.h>` 形式。静态库仍要求消费端使用兼容的编译器、C++ Runtime 和第三方依赖 ABI；完整依赖定位与覆盖变量见 [扩展 AgentLoom](docs/EXTENDING_AGENTLOOM.md)。
 
 ## 构建
 

@@ -26,8 +26,11 @@ else()
     set(HF_TOKENIZERS_CARGO_FLAG "")
 endif()
 
+set(HF_TOKENIZERS_CARGO_TARGET_ROOT
+    "${HF_TOKENIZERS_CRATE_DIR}/target"
+    CACHE PATH "Cargo target root for hf_tokenizers_capi")
 set(HF_TOKENIZERS_TARGET_DIR
-    "${HF_TOKENIZERS_CRATE_DIR}/target/${HF_TOKENIZERS_TARGET_SUBDIR}")
+    "${HF_TOKENIZERS_CARGO_TARGET_ROOT}/${HF_TOKENIZERS_TARGET_SUBDIR}")
 
 if(WIN32)
     set(HF_TOKENIZERS_STATICLIB_NAME "hf_tokenizers_capi.lib")
@@ -54,7 +57,9 @@ list(APPEND HF_TOKENIZERS_RUST_SOURCES "${HF_TOKENIZERS_CRATE_DIR}/Cargo.toml")
 
 add_custom_command(
     OUTPUT "${HF_TOKENIZERS_STATICLIB_PATH}"
-    COMMAND ${_hf_cargo_cmd}
+    COMMAND ${CMAKE_COMMAND} -E env
+        "CARGO_TARGET_DIR=${HF_TOKENIZERS_CARGO_TARGET_ROOT}"
+        ${_hf_cargo_cmd}
     WORKING_DIRECTORY "${HF_TOKENIZERS_CRATE_DIR}"
     DEPENDS ${HF_TOKENIZERS_RUST_SOURCES}
     COMMENT "Building hf_tokenizers_capi (${HF_TOKENIZERS_CARGO_PROFILE}) via cargo"

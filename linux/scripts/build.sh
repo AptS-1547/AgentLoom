@@ -7,6 +7,7 @@ require_command cmake
 [[ -f "$BUILD_DIR/CMakeCache.txt" ]] || fail "build is not configured; run linux/scripts/configure.sh first"
 
 targets=(
+    agentloom_sdk
     core_tests
     net_tests
     http_client_tests
@@ -26,6 +27,8 @@ targets=(
     persona_gateway_e2e_server
     agent_gateway_server
     emotion_inference_server
+    bert_inference_client
+    bert_benchmark_client
 )
 
 if [[ "${1:-}" == "--inference" ]]; then

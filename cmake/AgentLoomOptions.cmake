@@ -1,6 +1,8 @@
 option(BERT_BUILD_TESTS "Build C++ unit tests" OFF)
 option(BERT_BUILD_MULTIMODAL_INFERENCE_SERVER "Build full multimodal inference server with VLM/llama.cpp support" ON)
 option(BERT_BUILD_EMOTION_INFERENCE_SERVER "Build CPU-only BERT emotion inference server" ON)
+option(AGENT_LLAMA_STRICT_TOOLSET_ABI
+    "Treat a prebuilt llama.cpp MSVC toolset mismatch as a configuration error" OFF)
 
 if(MSVC)
     add_compile_options(/utf-8)

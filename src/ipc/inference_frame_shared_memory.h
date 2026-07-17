@@ -35,6 +35,7 @@ struct SharedFrameMetadata {
     std::uint64_t transport_sequence = 0;
     std::uint64_t frame_id = 0;
     std::int64_t timestamp_us = 0;
+    std::int64_t published_at_unix_us = 0;
     std::uint32_t width = 0;
     std::uint32_t height = 0;
     std::uint32_t format = 0;
@@ -49,6 +50,7 @@ struct SharedFramePublishRequest {
     std::uint64_t transport_sequence = 0;
     std::uint64_t frame_id = 0;
     std::int64_t timestamp_us = 0;
+    std::int64_t published_at_unix_us = 0;
     std::uint32_t width = 0;
     std::uint32_t height = 0;
     std::uint32_t format = 0;

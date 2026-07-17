@@ -1,5 +1,8 @@
 #include "http_server.h"
 
+#include "boost/beast/http/dynamic_body.hpp"
+#include "boost/beast/http/message.hpp"
+#include "boost/beast/http/parser.hpp"
 #include "exception.h"
 #include "trace_context.h"
 #include "websocket_session.h"
@@ -120,12 +123,15 @@ private:
 
 void HttpServer::HttpSession::DoRead() {
     request_ = {};
+    request_parser_.emplace();
+    request_parser_->body_limit(server_.options_.request_body_limit);
     buffer_.consume(buffer_.size());
     stream_.expires_after(server_.options_.request_timeout);
+
     http::async_read(
         stream_,
         buffer_,
-        request_,
+        *request_parser_,
         beast::bind_front_handler(&HttpSession::OnRead, shared_from_this()));
 }
 
@@ -138,14 +144,31 @@ void HttpServer::HttpSession::OnRead(beast::error_code ec, std::size_t) {
         Close(ConnectionCloseInfo::Timeout("http request timeout"));
         return;
     }
+    if (ec == http::error::body_limit) {
+        if (request_parser_) {
+            const auto& parsed = request_parser_->get();
+            auto response = MakeStatusResponse(
+                parsed.version(), false, http::status::payload_too_large, "payload too large");
+            request_parser_.reset();
+            Send(std::move(response));
+        } else {
+            Close({ConnectionCloseReason::ProtocolError,
+                   core::Status::Error(core::ErrorCode::ResourceExhausted,
+                                       "HTTP request body exceeds configured limit"),
+                   "HTTP request body exceeds configured limit"});
+        }
+        return;
+    }
     if (ec) {
         Close({ConnectionCloseReason::ProtocolError,
                core::Status::Error(core::ErrorCode::InvalidArgument, ec.message()),
                ec.message()});
         return;
     }
-    stream_.expires_never();
 
+    request_ = request_parser_->release();
+    request_parser_.reset();
+    stream_.expires_never();
     std::string trace_id;
     auto trace_header = request_.find("X-Trace-Id");
     if (trace_header != request_.end()) {

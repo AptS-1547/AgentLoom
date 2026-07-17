@@ -26,6 +26,7 @@ struct VectorOptions {
 struct VectorEntry {
     std::string cache_key;
     std::string model_fingerprint;
+    std::string session_id;
     std::vector<float> embedding;
     int64_t created_at_ms = 0;
 };
@@ -34,6 +35,13 @@ struct VectorHit {
     std::string cache_key;
     float similarity = 0.0f;
     bool tentative = false;
+    bool same_session = false;
+};
+
+enum class VectorSessionScope {
+    PreferSameSession,
+    SameSessionOnly,
+    CrossSessionOnly,
 };
 
 class VectorIndex {
@@ -46,7 +54,9 @@ public:
         std::string_view bucket_key,
         std::string_view model_fingerprint,
         const std::vector<float>& embedding,
-        float saliency_hint);
+        float saliency_hint,
+        std::string_view preferred_session_id = {},
+        VectorSessionScope session_scope = VectorSessionScope::PreferSameSession);
 
     void Evict(std::string_view bucket_key, const std::string& cache_key);
 

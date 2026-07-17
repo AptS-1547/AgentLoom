@@ -19,7 +19,7 @@ namespace {
 namespace bip = boost::interprocess;
 
 constexpr std::uint64_t kRegionMagic = 0x3143504952464941ULL;
-constexpr std::uint32_t kRegionVersion = 3;
+constexpr std::uint32_t kRegionVersion = 4;
 constexpr std::uint32_t kRegionInitializing = 1;
 constexpr std::uint32_t kRegionReady = 2;
 constexpr std::uint32_t kRegionFenced = 3;
@@ -55,6 +55,7 @@ struct alignas(kCacheLineSize) SlotHeader {
     std::uint64_t transport_sequence = 0;
     std::uint64_t frame_id = 0;
     std::int64_t timestamp_us = 0;
+    std::int64_t published_at_unix_us = 0;
     std::uint32_t payload_size = 0;
     std::uint32_t width = 0;
     std::uint32_t height = 0;
@@ -219,6 +220,7 @@ public:
         slot->transport_sequence = request.transport_sequence;
         slot->frame_id = request.frame_id;
         slot->timestamp_us = request.timestamp_us;
+        slot->published_at_unix_us = request.published_at_unix_us;
         slot->payload_size = static_cast<std::uint32_t>(request.payload.size());
         slot->width = request.width;
         slot->height = request.height;
@@ -425,6 +427,7 @@ core::Result<ClaimedSharedFrame> SharedMemoryInferenceFrameChannel::Impl::TryCla
     metadata.transport_sequence = slot->transport_sequence;
     metadata.frame_id = slot->frame_id;
     metadata.timestamp_us = slot->timestamp_us;
+    metadata.published_at_unix_us = slot->published_at_unix_us;
     metadata.width = slot->width;
     metadata.height = slot->height;
     metadata.format = slot->format;

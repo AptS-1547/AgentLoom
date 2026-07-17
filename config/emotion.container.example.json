@@ -52,6 +52,7 @@
   },
   "vlm_cache": {
     "enabled": false,
+    "reuse_policy": "result_vector",
     "persist": false,
     "dir": "/app/cache/vlm",
     "max_entries": 512,
@@ -69,6 +70,22 @@
       "max_entries_per_bucket": 256,
       "ttl_seconds": 3600,
       "dir": "/app/cache/vlm/vectors"
+    },
+    "prompt_kv": {
+      "enabled": false,
+      "backend": "memory",
+      "key_prefix": "agent:vlm:prompt_kv",
+      "ttl_seconds": 3600,
+      "max_mb": 512,
+      "near_embedding_enabled": false,
+      "near_same_session_min_cosine": 0.99,
+      "near_cross_session_min_cosine": 0.995,
+      "near_same_session_min_mean_token_cosine": 0.99,
+      "near_cross_session_min_mean_token_cosine": 0.995,
+      "near_same_session_min_p05_token_cosine": 0.95,
+      "near_cross_session_min_p05_token_cosine": 0.98,
+      "near_same_session_max_relative_l2": 0.15,
+      "near_cross_session_max_relative_l2": 0.10
     }
   }
 }

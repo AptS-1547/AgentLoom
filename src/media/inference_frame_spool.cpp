@@ -23,7 +23,7 @@ namespace bip = boost::interprocess;
 
 constexpr std::uint64_t kSegmentMagic = 0x414C53504F4F4C31ULL;
 constexpr std::uint32_t kRecordMagic = 0x46525031U;
-constexpr std::uint32_t kSchemaVersion = 1;
+constexpr std::uint32_t kSchemaVersion = 2;
 constexpr std::size_t kRecordAlignment = 8;
 constexpr std::size_t kMaxIdentityBytes = 4096;
 
@@ -44,8 +44,16 @@ struct RecordHeader {
     std::uint32_t header_size = sizeof(RecordHeader);
     std::uint64_t total_size = 0;
     std::uint64_t selected_sequence = 0;
+    std::uint64_t transport_sequence = 0;
     std::uint64_t frame_id = 0;
     std::int64_t timestamp_us = 0;
+    std::int64_t published_at_unix_us = 0;
+    std::int64_t received_at_unix_us = 0;
+    std::int64_t admitted_at_unix_us = 0;
+    std::int64_t spooled_at_unix_us = 0;
+    std::int64_t replayed_at_unix_us = 0;
+    std::int64_t inference_started_at_unix_us = 0;
+    std::int64_t terminal_at_unix_us = 0;
     std::uint32_t width = 0;
     std::uint32_t height = 0;
     std::uint32_t format = 0;
@@ -350,8 +358,16 @@ public:
         RecordHeader record;
         record.total_size = record_bytes;
         record.selected_sequence = metadata.selected_sequence;
+        record.transport_sequence = metadata.frame.transport_sequence;
         record.frame_id = metadata.frame.frame_id;
         record.timestamp_us = metadata.frame.timestamp_us;
+        record.published_at_unix_us = metadata.frame.timing.published_at_unix_us;
+        record.received_at_unix_us = metadata.frame.timing.received_at_unix_us;
+        record.admitted_at_unix_us = metadata.frame.timing.admitted_at_unix_us;
+        record.spooled_at_unix_us = metadata.frame.timing.spooled_at_unix_us;
+        record.replayed_at_unix_us = metadata.frame.timing.replayed_at_unix_us;
+        record.inference_started_at_unix_us = metadata.frame.timing.inference_started_at_unix_us;
+        record.terminal_at_unix_us = metadata.frame.timing.terminal_at_unix_us;
         record.width = metadata.frame.width;
         record.height = metadata.frame.height;
         record.format = static_cast<std::uint32_t>(metadata.frame.format);
@@ -459,6 +475,7 @@ public:
             metadata.selected_sequence = record.selected_sequence;
             metadata.frame.execution_id = options_.execution_id;
             metadata.frame.selected_sequence = record.selected_sequence;
+            metadata.frame.transport_sequence = record.transport_sequence;
             metadata.frame.session_id.assign(
                 reinterpret_cast<const char*>(cursor),
                 record.session_id_size);
@@ -469,6 +486,13 @@ public:
             cursor += record.trace_id_size;
             metadata.frame.frame_id = record.frame_id;
             metadata.frame.timestamp_us = record.timestamp_us;
+            metadata.frame.timing.published_at_unix_us = record.published_at_unix_us;
+            metadata.frame.timing.received_at_unix_us = record.received_at_unix_us;
+            metadata.frame.timing.admitted_at_unix_us = record.admitted_at_unix_us;
+            metadata.frame.timing.spooled_at_unix_us = record.spooled_at_unix_us;
+            metadata.frame.timing.replayed_at_unix_us = record.replayed_at_unix_us;
+            metadata.frame.timing.inference_started_at_unix_us = record.inference_started_at_unix_us;
+            metadata.frame.timing.terminal_at_unix_us = record.terminal_at_unix_us;
             metadata.frame.width = record.width;
             metadata.frame.height = record.height;
             metadata.frame.format = static_cast<InferenceFrameFormat>(record.format);

@@ -47,6 +47,10 @@ target_link_libraries(agent_models PUBLIC
     agentloom_llama_cpp_dependency
 )
 
+if(TARGET agentloom_llama_abi_guard)
+    add_dependencies(agent_models agentloom_llama_abi_guard)
+endif()
+
 add_library(agent_cache STATIC
     src/cache/vlm_cache.cpp
     src/cache/vlm_cache.h
@@ -107,6 +111,7 @@ if(BERT_BUILD_TESTS)
         tests/vector/hf_tokenizer_test.cpp
         tests/vector/tokenizer_pool_test.cpp
         tests/vector/text_embedding_test.cpp
+        tests/vector/vlm_vector_cache_test.cpp
         tests/vector/vector_index_test.cpp
         tests/vector/vector_index_manager_test.cpp
     )

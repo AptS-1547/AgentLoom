@@ -25,6 +25,15 @@ namespace llm {
 
 static core::LoggerAdapter logger = core::LoggerAdapter::ForModule("models");
 
+std::string ExtractVlmImagePromptPrefix(std::string_view prompt) {
+    const std::string_view marker = mtmd_default_marker();
+    const auto marker_pos = prompt.find(marker);
+    if (marker_pos == std::string_view::npos) {
+        return {};
+    }
+    return std::string(prompt.substr(0, marker_pos));
+}
+
 void EnsureLlamaRuntimeInitialized() {
     static std::once_flag init_flag;
     std::call_once(init_flag, [] {
@@ -363,7 +372,8 @@ void LlamaRunner::SetPromptKvCache(std::shared_ptr<IPromptKvCache> cache) {
 VLMResult LlamaRunner::Generate(const std::vector<uint8_t>& image_data,
                                 const std::string& prompt,
                                 const GenerateParams& params,
-                                std::function<void(const std::string&)> token_callback) {
+                                std::function<void(const std::string&)> token_callback,
+                                std::shared_ptr<PreparedImageEmbedding> prepared_image) {
     std::lock_guard lock(mutex_);
 
     VLMResult result;
@@ -470,7 +480,9 @@ VLMResult LlamaRunner::Generate(const std::vector<uint8_t>& image_data,
         }
 
         auto t_img_end = std::chrono::high_resolution_clock::now();
-        result.image_encode_ms = std::chrono::duration<float, std::milli>(t_img_end - t_img_start).count();
+        result.image_encode_ms =
+            std::chrono::duration<float, std::milli>(t_img_end - t_img_start).count() +
+            (prepared_image ? prepared_image->image_encode_ms : 0.0f);
     }
 
     // 2. 分词（文本 + 图片 marker）
@@ -529,6 +541,7 @@ VLMResult LlamaRunner::Generate(const std::vector<uint8_t>& image_data,
 
     bool skipped_cached_prefix = !prompt_kv_cache_hit;
     bool stored_prompt_prefix = prompt_kv_cache_hit;
+    bool prepared_image_consumed = false;
     for (size_t i = 0; i < n_chunks; ++i) {
         const mtmd_input_chunk* chunk = mtmd_input_chunks_get(chunks.get(), i);
         const auto chunk_type = mtmd_input_chunk_get_type(chunk);
@@ -557,32 +570,56 @@ VLMResult LlamaRunner::Generate(const std::vector<uint8_t>& image_data,
             spdlog::info("mtmd_helper_eval_chunk_single done: chunk={} n_past={}", i, n_past);
         } else {
             const int32_t n_embd = llama_model_n_embd_inp(model);
-            auto media_batch = MakeMtmdBatch(mtmd_ctx);
-            if (!media_batch) {
-                return fail("Failed to create mtmd media batch");
-            }
-
-            spdlog::info("mtmd_batch_add_chunk started: chunk={}", i);
-            if (mtmd_batch_add_chunk(media_batch.get(), chunk) != 0) {
-                return fail("Failed to add media chunk to mtmd batch");
-            }
-            spdlog::info("mtmd_batch_add_chunk done: chunk={}", i);
-
-            spdlog::info("mtmd_batch_encode started: chunk={}", i);
-            if (mtmd_batch_encode(media_batch.get()) != 0) {
-                return fail("Failed to encode media batch");
-            }
-            spdlog::info("mtmd_batch_encode done: chunk={}", i);
-            float* embd = mtmd_batch_get_output_embd(media_batch.get(), chunk);
-            if (!embd) {
-                return fail("Failed to get media embedding from mtmd batch");
-            }
             const int32_t n_tokens = static_cast<int32_t>(mtmd_input_chunk_get_n_tokens(chunk));
+            MtmdBatchHandle media_batch;
+            float* embd = nullptr;
+
+            if (chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE &&
+                prepared_image && !prepared_image_consumed) {
+                const auto expected_values =
+                    static_cast<std::size_t>(n_tokens) * static_cast<std::size_t>(n_embd);
+                if (prepared_image->image_embedding_dim != n_embd ||
+                    prepared_image->image_embedding_tokens != n_tokens ||
+                    prepared_image->image_token_embeddings.size() != expected_values) {
+                    return fail("Prepared image embedding shape does not match tokenized image chunk");
+                }
+                embd = prepared_image->image_token_embeddings.data();
+                prepared_image_consumed = true;
+                spdlog::info(
+                    "VLM reused prepared image embedding: chunk={} tokens={} dim={}",
+                    i,
+                    n_tokens,
+                    n_embd);
+            } else {
+                media_batch = MakeMtmdBatch(mtmd_ctx);
+                if (!media_batch) {
+                    return fail("Failed to create mtmd media batch");
+                }
+
+                spdlog::info("mtmd_batch_add_chunk started: chunk={}", i);
+                if (mtmd_batch_add_chunk(media_batch.get(), chunk) != 0) {
+                    return fail("Failed to add media chunk to mtmd batch");
+                }
+                spdlog::info("mtmd_batch_add_chunk done: chunk={}", i);
+
+                spdlog::info("mtmd_batch_encode started: chunk={}", i);
+                if (mtmd_batch_encode(media_batch.get()) != 0) {
+                    return fail("Failed to encode media batch");
+                }
+                spdlog::info("mtmd_batch_encode done: chunk={}", i);
+                embd = mtmd_batch_get_output_embd(media_batch.get(), chunk);
+                if (!embd) {
+                    return fail("Failed to get media embedding from mtmd batch");
+                }
+            }
 
             if (chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE
-                && params.capture_image_embedding
+                && (params.capture_image_embedding || prompt_kv_enabled)
                 && result.image_embedding.empty()) {
                 result.image_embedding.assign(n_embd, 0.0f);
+                result.image_token_embeddings.assign(
+                    embd,
+                    embd + static_cast<std::size_t>(n_tokens) * n_embd);
                 for (int32_t t = 0; t < n_tokens; ++t) {
                     for (int32_t d = 0; d < n_embd; ++d) {
                         result.image_embedding[d] += embd[t * n_embd + d];
@@ -617,11 +654,20 @@ VLMResult LlamaRunner::Generate(const std::vector<uint8_t>& image_data,
                         LLAMA_STATE_SEQ_FLAGS_NONE);
                     if (written == entry.state.size()) {
                         entry.prefix_tokens = n_past;
+                        entry.session_id = params.prompt_kv_session_id;
+                        entry.prefix_fingerprint = params.prompt_kv_prefix_fingerprint;
+                        entry.image_embedding = result.image_embedding;
+                        entry.image_token_embeddings = result.image_token_embeddings;
+                        entry.image_embedding_dim = result.image_embedding_dim;
+                        entry.image_embedding_tokens = result.image_embedding_tokens;
                         impl_->kv_prefix_key = prompt_kv_key;
                         impl_->kv_prefix_tokens = n_past;
                         impl_->kv_prefix_valid = true;
                         if (impl_->prompt_kv_cache) {
                             impl_->prompt_kv_cache->Store(prompt_kv_key, entry);
+                            for (const auto& alias : params.prompt_kv_cache_alias_keys) {
+                                impl_->prompt_kv_cache->StoreAlias(alias, prompt_kv_key);
+                            }
                         }
                         stored_prompt_prefix = true;
                         spdlog::info("VLM prompt KV cache stored: key={} bytes={} prefix_tokens={}",
@@ -786,6 +832,9 @@ VLMResult LlamaRunner::EncodeImageOnly(const std::vector<uint8_t>& image_data) {
         const int32_t n_tokens = static_cast<int32_t>(mtmd_input_chunk_get_n_tokens(chunk));
 
         result.image_embedding.assign(n_embd, 0.0f);
+        result.image_token_embeddings.assign(
+            embd,
+            embd + static_cast<std::size_t>(n_tokens) * n_embd);
         for (int32_t t = 0; t < n_tokens; ++t) {
             for (int32_t d = 0; d < n_embd; ++d) {
                 result.image_embedding[d] += embd[t * n_embd + d];

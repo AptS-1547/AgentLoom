@@ -84,8 +84,10 @@ ipc::media::SharedFramePublishRequest MakeRequest(
         .session_id = session_id,
         .trace_id = "trace-ipc",
         .selected_sequence = frame_id,
+        .transport_sequence = frame_id + 100,
         .frame_id = frame_id,
         .timestamp_us = static_cast<std::int64_t>(frame_id * 1'000),
+        .published_at_unix_us = 1'700'000'000'000'000LL + static_cast<std::int64_t>(frame_id),
         .width = 320,
         .height = 180,
         .format = static_cast<std::uint32_t>(format),
@@ -152,7 +154,9 @@ TEST(InferenceFrameSharedMemoryTest, PublishesClaimsAndReusesAcknowledgedSlot) {
     EXPECT_EQ(claimed.value().metadata().execution_id, "execution-ipc");
     EXPECT_EQ(claimed.value().metadata().session_id, "session-a");
     EXPECT_EQ(claimed.value().metadata().selected_sequence, 1u);
+    EXPECT_EQ(claimed.value().metadata().transport_sequence, 101u);
     EXPECT_EQ(claimed.value().metadata().frame_id, 1u);
+    EXPECT_EQ(claimed.value().metadata().published_at_unix_us, 1'700'000'000'000'001LL);
     ASSERT_EQ(claimed.value().payload().size(), payload.size());
     EXPECT_EQ(claimed.value().payload().front(), std::byte{0x2A});
     ASSERT_TRUE(claimed.value().Acknowledge().ok());
@@ -529,6 +533,13 @@ TEST(InferenceFrameIpcReceiverTest, CopiesPrivatePayloadAndSubmitsBacklogFrame) 
     ASSERT_TRUE(frame.ok()) << frame.status().message();
     EXPECT_EQ(frame.value().metadata().session_id, "session-rx");
     EXPECT_EQ(frame.value().metadata().frame_id, 9u);
+    EXPECT_EQ(frame.value().metadata().timing.published_at_unix_us, 1'700'000'000'000'009LL);
+    EXPECT_GE(
+        frame.value().metadata().timing.received_at_unix_us,
+        frame.value().metadata().timing.published_at_unix_us);
+    EXPECT_GE(
+        frame.value().metadata().timing.admitted_at_unix_us,
+        frame.value().metadata().timing.received_at_unix_us);
     ASSERT_EQ(frame.value().bytes().size(), payload.size());
     EXPECT_EQ(frame.value().bytes().front(), std::byte{0x4C});
     const auto snapshot = receiver.Snapshot();
@@ -561,6 +572,10 @@ TEST(InferenceFrameIpcReceiverTest, RoutesOwnedFrameThroughExecutionAdmissionSin
     ASSERT_TRUE(admitted.has_value());
     EXPECT_EQ(admitted->metadata().execution_id, "execution-ipc");
     EXPECT_EQ(admitted->metadata().selected_sequence, 7u);
+    EXPECT_EQ(admitted->metadata().timing.published_at_unix_us, 1'700'000'000'000'007LL);
+    EXPECT_GE(
+        admitted->metadata().timing.received_at_unix_us,
+        admitted->metadata().timing.published_at_unix_us);
     ASSERT_EQ(admitted->bytes().size(), payload.size());
     EXPECT_EQ(admitted->bytes().front(), std::byte{0x6D});
     EXPECT_EQ(unused_backlog.Snapshot().queued_frames, 0u);
@@ -712,6 +727,8 @@ TEST(InferenceFrameIpcReceiverTest, SpoolsOverflowFrameWithoutRejectingAdmission
     EXPECT_EQ(replayed.value()->metadata().execution_id, "execution-ipc");
     EXPECT_EQ(replayed.value()->metadata().selected_sequence, 2u);
     EXPECT_EQ(replayed.value()->metadata().frame.frame_id, 2u);
+    EXPECT_EQ(replayed.value()->metadata().frame.transport_sequence, 102u);
+    EXPECT_GT(replayed.value()->metadata().frame.timing.spooled_at_unix_us, 0);
     EXPECT_EQ(replayed.value()->bytes().front(), std::byte{0x66});
 }
 

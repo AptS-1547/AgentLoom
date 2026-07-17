@@ -173,6 +173,18 @@ core::Result<std::string> RedisConnectionPool::Get(const std::string& key) {
     }
 }
 
+core::Result<bool> RedisConnectionPool::Exists(const std::string& key) {
+    auto status = EnsureConnected();
+    if (!status.ok()) return status;
+
+    try {
+        return redis_->exists(key) > 0;
+    } catch (const sw::redis::Error& e) {
+        return core::Status::Error(core::ErrorCode::InternalError,
+            std::string("EXISTS failed: ") + e.what());
+    }
+}
+
 core::Result<std::vector<std::string>> RedisConnectionPool::MGet(const std::vector<std::string>& keys) {
     auto status = EnsureConnected();
     if (!status.ok()) return status;

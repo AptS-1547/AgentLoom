@@ -1,5 +1,6 @@
 #include "inference_frame_gateway_producer.h"
 
+#include <chrono>
 #include <utility>
 
 namespace media {
@@ -40,6 +41,8 @@ core::Status InferenceFrameGatewayProducer::PublishBorrowed(const EncodedVideoFr
 
     const auto& metadata = frame.metadata();
     const auto payload = frame.bytes();
+    const auto published_at_unix_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
     const auto status = sink_.Publish({
         .execution_id = metadata.execution_id,
         .session_id = metadata.session_id,
@@ -48,6 +51,7 @@ core::Status InferenceFrameGatewayProducer::PublishBorrowed(const EncodedVideoFr
         .transport_sequence = metadata.transport_sequence,
         .frame_id = metadata.frame_id,
         .timestamp_us = metadata.timestamp_us,
+        .published_at_unix_us = published_at_unix_us,
         .width = metadata.width,
         .height = metadata.height,
         .format = static_cast<std::uint32_t>(ToSharedFormat(metadata.format)),

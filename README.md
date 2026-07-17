@@ -113,7 +113,7 @@ target_link_libraries(my_agent PRIVATE
 - CMake 3.20+
 - vcpkg manifest 依赖：gRPC、Protobuf、OpenSSL、spdlog、Redis clients、libzip、pugixml、nlohmann/json；测试另需 GTest
 - 预编译/外部依赖：ONNX Runtime、llama.cpp（含 mtmd）、OpenCV、Boost、SQLite、Faiss、Eigen、MKL 和 HuggingFace Tokenizers C API
-- **工具链说明**：截至 2026-07-11，使用最新 VS2026/v145 工具链构建启用 CUDA 的 llama.cpp 会在 CUDA 编译阶段因兼容性问题直接失败，表明当前 CUDA Toolkit 对 VS2026/v145 的支持仍不充分。因此，本仓库测试基线使用的 llama.cpp 依赖由 VS2022/v143 构建。理论上这可能引入 ABI 兼容风险，但现有单元测试、压力测试和集成测试均未复现相关问题。在官方支持完善前，建议对启用 CUDA 的依赖统一使用 VS2022/v143 构建。
+- **工具链说明**：截至 2026-07-16，使用 VS2026/v145 构建启用 CUDA 的 llama.cpp 仍受 CUDA Toolkit 兼容性限制，因此当前 CUDA 基线由 VS2022/v143 构建。真实 Qwen2.5-VL E2E 已确认，VS2026/v145 Release 宿主加载 VS2022/v143 Debug llama.cpp 会在 token generation 的 `llama_decode()` 中触发 ABI 崩溃；将 llama.cpp 改为 Release 后，同一共享内存 E2E 完整通过。Debug/Release CRT 配置必须一致，工具集版本也应尽量一致。
 
 仓库的 `deps/` 与 `vcpkg_installed/` 是本地依赖目录，不随源码分发。Linux 脚本可以准备对应依赖；Windows 需要按本机路径准备依赖，并确保 CMake generator、MSVC 工具集和 vcpkg ABI 一致。
 
@@ -132,6 +132,20 @@ VS2026/v145 必须使用支持 `Visual Studio 18 2026` generator 的 CMake，例
 
 & "C:\Program Files\CMake\bin\cmake.exe" --build build/x64-Release `
   --config Release --parallel
+```
+
+AgentLoom 会从 `LLAMA_CPP_BUILD/CMakeCache.txt` 推断预编译 llama.cpp 的配置。多配置 VS 工程在构建 `agent_models` 前执行 ABI guard：Release、RelWithDebInfo 和 MinSizeRel 归为 Release CRT，Debug 归为 Debug CRT；两侧类别不同会直接终止构建，而不是继续链接可能崩溃的 runtime。
+
+若外部 llama.cpp 构建目录没有 `CMakeCache.txt`，可显式指定：
+
+```powershell
+-DLLAMA_CPP_PREBUILT_CONFIG=Release
+```
+
+MSVC 工具集目录版本不一致默认给出 CMake warning。需要在 CI 或正式发布构建中强制一致时启用：
+
+```powershell
+-DAGENT_LLAMA_STRICT_TOOLSET_ABI=ON
 ```
 
 ### Linux / WSL2
@@ -179,6 +193,47 @@ build\x64-Release\Release\multimodal_inference_server.exe `
 build\x64-Release\Release\emotion_inference_server.exe `
   --config config\emotion.container.example.json
 ```
+
+VLM 缓存支持三种复用顺序：
+
+- `result_vector`：Exact Result Cache → Vector Cache → Prompt KV/Fresh，兼容原有最低延迟策略。
+- `prompt_kv_vector`：Prompt KV → Vector Cache → Fresh。该模式禁止 Exact Result Cache 的直接命中与 stale fallback；VLMCache 仅作为 Vector Index 的结果载荷仓库。
+- `tiered`：Exact KV（encoded hash/完整视觉 token embedding，可跨 session）→ 同 session Near KV → Exact Result Cache → 同 session Vector Cache → 跨 session Near KV → 跨 session Vector Cache → Fresh。所有近似缓存均优先同流，跨流 Near KV 必须使用不低于同流的相似度阈值。
+
+连续视觉上下文希望保留重新生成能力时，可使用：
+
+```powershell
+build\x64-Release\Release\multimodal_inference_server.exe `
+  --config config\e2e_test.json `
+  --vlm-cache-reuse-policy prompt_kv_vector `
+  --vlm-vector-cache-enabled `
+  --vlm-prompt-kv-cache-enabled `
+  --vlm-prompt-kv-backend memory `
+  --vlm-prompt-kv-max-mb 512
+```
+
+`prompt_kv_vector` 要求 VLM cache、Vector Cache 和 Prompt KV Cache 同时启用；配置不完整时服务会在启动阶段直接报错，避免静默退化到 Exact Result Cache。
+
+完整分级模式还需启用 Near KV：
+
+```powershell
+build\x64-Release\Release\multimodal_inference_server.exe `
+  --config config\e2e_test.json `
+  --vlm-cache-reuse-policy tiered `
+  --vlm-vector-cache-enabled `
+  --vlm-prompt-kv-cache-enabled `
+  --vlm-prompt-kv-near-enabled `
+  --vlm-prompt-kv-near-same-session-min-cosine 0.99 `
+  --vlm-prompt-kv-near-same-session-min-token-mean 0.99 `
+  --vlm-prompt-kv-near-same-session-min-token-p05 0.95 `
+  --vlm-prompt-kv-near-same-session-max-relative-l2 0.15 `
+  --vlm-prompt-kv-near-cross-session-min-cosine 0.995 `
+  --vlm-prompt-kv-near-cross-session-min-token-mean 0.995 `
+  --vlm-prompt-kv-near-cross-session-min-token-p05 0.98 `
+  --vlm-prompt-kv-near-cross-session-max-relative-l2 0.10
+```
+
+`tiered` 保留 Exact Result Cache，用于确定性结果复用和降低重复生成导致的幻觉波动。Exact KV key 不包含 `session_id`；Near KV 与 Vector Cache 保存来源 session，并优先选择同 session 候选。Near KV 使用完整视觉 token embedding 的组合 gate：全局 cosine、per-token cosine 均值、per-token cosine P05 和 relative L2 必须同时满足阈值；`token min` 与 `max abs error` 仅作为诊断指标，避免少数边缘 patch 阻断轻微编解码失真下的安全复用。跨 session 的四项 gate 必须不宽松于同 session。
 
 公开样例包含占位模型路径，运行前必须改为本机文件。Gateway 样例默认要求 `AGENT_LLM_API_KEY`；认证、Redis、embedding、emotion analyzer、L0/L3 memory 和 document cache 都可以按部署环境配置。
 
@@ -234,7 +289,8 @@ ctest --test-dir build/x64-Release-Tests-v145 `
 
 完整文档目录见 [docs/README.md](docs/README.md)。建议从以下内容开始：
 
-- [当前 Runtime 路线图](docs/CURRENT_RUNTIME_ROADMAP_2026_06.md)
+- [架构总览](docs/ARCHITECTURE_VISUAL.md)
+- [对话缓存与推理策略](docs/CONVERSATION_CACHE_AND_INFERENCE_STRATEGY.md)
 - [配置系统](docs/CONFIG_SYSTEM.md)
 - [部署指南](docs/DEPLOYMENT.md)
 - [Frontend/Backend API 协议](docs/FRONTEND_BACKEND_API_PROTOCOL.md)

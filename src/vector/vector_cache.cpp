@@ -76,7 +76,9 @@ std::optional<VectorHit> VectorIndex::Query(
     std::string_view bucket_key,
     std::string_view model_fingerprint,
     const std::vector<float>& embedding,
-    float saliency_hint) {
+    float saliency_hint,
+    std::string_view preferred_session_id,
+    VectorSessionScope session_scope) {
     if (!options_.enabled || embedding.empty()) return std::nullopt;
 
     std::vector<float> query = embedding;
@@ -87,8 +89,10 @@ std::optional<VectorHit> VectorIndex::Query(
     if (it == buckets_.end() || it->second.empty()) return std::nullopt;
 
     const int64_t now = NowMs();
-    float best_sim = 0.0f;
-    const VectorEntry* best_entry = nullptr;
+    float best_same_session_sim = 0.0f;
+    float best_cross_session_sim = 0.0f;
+    const VectorEntry* best_same_session = nullptr;
+    const VectorEntry* best_cross_session = nullptr;
 
     for (const auto& entry : it->second) {
         if (!model_fingerprint.empty() && entry.model_fingerprint != model_fingerprint) {
@@ -100,29 +104,53 @@ std::optional<VectorHit> VectorIndex::Query(
             }
         }
         const float sim = CosineSim(query, entry.embedding);
-        if (sim > best_sim) {
-            best_sim = sim;
-            best_entry = &entry;
+        const bool same_session =
+            !preferred_session_id.empty() && entry.session_id == preferred_session_id;
+        if ((session_scope == VectorSessionScope::SameSessionOnly && !same_session) ||
+            (session_scope == VectorSessionScope::CrossSessionOnly && same_session)) {
+            continue;
+        }
+        if (same_session) {
+            if (sim > best_same_session_sim) {
+                best_same_session_sim = sim;
+                best_same_session = &entry;
+            }
+        } else if (sim > best_cross_session_sim) {
+            best_cross_session_sim = sim;
+            best_cross_session = &entry;
         }
     }
 
-    if (!best_entry) return std::nullopt;
-
-    if (best_sim >= options_.sim_threshold_high) {
-        logger.debug("[VectorIndex] high-confidence hit: sim={:.4f} key={}", best_sim, best_entry->cache_key);
-        return VectorHit{best_entry->cache_key, best_sim, false};
-    }
-
-    if (best_sim >= options_.sim_threshold_mid) {
-        const bool saliency_ok = (saliency_hint <= 0.0f) ||
-                                  (saliency_hint < options_.max_saliency_for_mid);
-        if (saliency_ok) {
-            logger.debug("[VectorIndex] tentative hit: sim={:.4f} saliency={:.3f} key={}",
-                      best_sim, saliency_hint, best_entry->cache_key);
-            return VectorHit{best_entry->cache_key, best_sim, true};
+    const auto make_hit = [&](const VectorEntry* entry, float similarity, bool same_session)
+        -> std::optional<VectorHit> {
+        if (!entry) {
+            return std::nullopt;
         }
-        logger.debug("[VectorIndex] mid-band rejected by saliency: sim={:.4f} saliency={:.3f}",
-                  best_sim, saliency_hint);
+        if (similarity >= options_.sim_threshold_high) {
+            logger.debug("[VectorIndex] high-confidence hit: sim={:.4f} key={}", similarity, entry->cache_key);
+            return VectorHit{entry->cache_key, similarity, false, same_session};
+        }
+        if (similarity >= options_.sim_threshold_mid) {
+            const bool saliency_ok = (saliency_hint <= 0.0f) ||
+                                      (saliency_hint < options_.max_saliency_for_mid);
+            if (saliency_ok) {
+                logger.debug("[VectorIndex] tentative hit: sim={:.4f} saliency={:.3f} key={}",
+                             similarity, saliency_hint, entry->cache_key);
+                return VectorHit{entry->cache_key, similarity, true, same_session};
+            }
+            logger.debug("[VectorIndex] mid-band rejected by saliency: sim={:.4f} saliency={:.3f}",
+                         similarity, saliency_hint);
+        }
+        return std::nullopt;
+    };
+
+    if (session_scope != VectorSessionScope::CrossSessionOnly) {
+        if (auto hit = make_hit(best_same_session, best_same_session_sim, true)) {
+            return hit;
+        }
+    }
+    if (session_scope != VectorSessionScope::SameSessionOnly) {
+        return make_hit(best_cross_session, best_cross_session_sim, false);
     }
 
     return std::nullopt;

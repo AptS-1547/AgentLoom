@@ -128,6 +128,7 @@ private:
             }
 
             auto owned_frame = std::move(frame).value();
+            owned_frame.metadata().timing.inference_started_at_unix_us = InferenceFrameNowUnixUs();
             const auto started = std::chrono::steady_clock::now();
             InferenceFrameResultRecord record;
             record.frame = owned_frame.metadata();
@@ -171,6 +172,7 @@ private:
             } else {
                 failed_frames_.fetch_add(1, std::memory_order_relaxed);
             }
+            record.frame.timing.terminal_at_unix_us = InferenceFrameNowUnixUs();
 
             InferenceFrameTerminalEvent terminal_event{
                 .frame = record.frame,

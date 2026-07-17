@@ -48,6 +48,7 @@ struct BertRuntimeConfigOptions {
 
 struct VlmCacheConfigOptions {
     bool enabled = false;
+    std::string reuse_policy = "result_vector";
     bool persist = false;
     std::filesystem::path cache_dir = "cache/vlm";
     std::size_t max_entries = 512;
@@ -81,6 +82,15 @@ struct VlmPromptKvCacheOptions {
     std::string key_prefix = "agent:vlm:prompt_kv";
     std::int64_t ttl_seconds = 3600;
     std::size_t max_bytes = 512ULL * 1024ULL * 1024ULL;
+    bool near_embedding_enabled = false;
+    float near_same_session_min_cosine = 0.99f;
+    float near_cross_session_min_cosine = 0.995f;
+    float near_same_session_min_mean_token_cosine = 0.99f;
+    float near_cross_session_min_mean_token_cosine = 0.995f;
+    float near_same_session_min_p05_token_cosine = 0.95f;
+    float near_cross_session_min_p05_token_cosine = 0.98f;
+    float near_same_session_max_relative_l2 = 0.15f;
+    float near_cross_session_max_relative_l2 = 0.10f;
 };
 
 struct LlmOptions {

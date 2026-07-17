@@ -214,7 +214,8 @@ Business extensions should use `I...` interfaces. AgentLoom provides base sessio
 
 See [docs/README.md](docs/README.md) for the complete categorized index. Recommended entry points:
 
-- [Current runtime roadmap](docs/CURRENT_RUNTIME_ROADMAP_2026_06.md)
+- [Architecture overview](docs/ARCHITECTURE_VISUAL.md)
+- [Conversation cache and inference strategy](docs/CONVERSATION_CACHE_AND_INFERENCE_STRATEGY.md)
 - [Configuration system](docs/CONFIG_SYSTEM.md)
 - [Deployment guide](docs/DEPLOYMENT.md)
 - [Frontend/backend API protocol](docs/FRONTEND_BACKEND_API_PROTOCOL.md)

@@ -49,14 +49,23 @@ media::inference::SpoolFrameMetadata MakeMetadata(
     media::inference::SpoolFrameMetadata metadata;
     metadata.execution_id = std::move(execution_id);
     metadata.selected_sequence = sequence;
+    metadata.frame.execution_id = metadata.execution_id;
     metadata.frame.session_id = "session-spool";
     metadata.frame.trace_id = "trace-" + std::to_string(frame_id);
+    metadata.frame.selected_sequence = sequence;
+    metadata.frame.transport_sequence = sequence + 1000;
     metadata.frame.frame_id = frame_id;
     metadata.frame.timestamp_us = static_cast<std::int64_t>(frame_id * 1'000);
     metadata.frame.width = 320;
     metadata.frame.height = 180;
     metadata.frame.format = media::inference::InferenceFrameFormat::Jpeg;
     metadata.frame.saliency = 0.75;
+    metadata.frame.timing = {
+        .published_at_unix_us = 1'700'000'000'000'000LL + static_cast<std::int64_t>(sequence),
+        .received_at_unix_us = 1'700'000'000'000'100LL + static_cast<std::int64_t>(sequence),
+        .admitted_at_unix_us = 1'700'000'000'000'200LL + static_cast<std::int64_t>(sequence),
+        .spooled_at_unix_us = 1'700'000'000'000'300LL + static_cast<std::int64_t>(sequence),
+    };
     return metadata;
 }
 
@@ -104,6 +113,15 @@ TEST(MappedInferenceFrameSpoolTest, AppendsSealsAndReplaysAcrossSegments) {
         ASSERT_TRUE(lease.valid());
         EXPECT_EQ(lease.metadata().execution_id, execution_id);
         EXPECT_EQ(lease.metadata().selected_sequence, expected_sequences[index]);
+        EXPECT_EQ(
+            lease.metadata().frame.transport_sequence,
+            expected_sequences[index] + 1000);
+        EXPECT_EQ(
+            lease.metadata().frame.timing.published_at_unix_us,
+            1'700'000'000'000'000LL + static_cast<std::int64_t>(expected_sequences[index]));
+        EXPECT_EQ(
+            lease.metadata().frame.timing.spooled_at_unix_us,
+            1'700'000'000'000'300LL + static_cast<std::int64_t>(expected_sequences[index]));
         ASSERT_FALSE(lease.bytes().empty());
         EXPECT_EQ(static_cast<std::uint8_t>(lease.bytes().front()), expected_values[index]);
     }
@@ -279,6 +297,10 @@ TEST(InferenceFrameSpoolReplayerTest, RetainsPendingFrameAcrossBackpressure) {
     auto first = backlog.WaitTake(std::chrono::milliseconds(100));
     ASSERT_TRUE(first.ok()) << first.status().message();
     EXPECT_EQ(first.value().metadata().selected_sequence, 1u);
+    EXPECT_GT(first.value().metadata().timing.replayed_at_unix_us, 0);
+    EXPECT_GT(
+        first.value().metadata().timing.replayed_at_unix_us,
+        first.value().metadata().timing.spooled_at_unix_us);
 
     auto second_pump = replayer.Pump();
     ASSERT_TRUE(second_pump.ok()) << second_pump.status().message();

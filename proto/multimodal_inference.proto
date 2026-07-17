@@ -27,6 +27,15 @@ service MultimodalInference {
 
   // 查询推理端当前 IPC 租约状态。
   rpc GetInferenceFrameIpcStatus(InferenceFrameIpcStatusRequest) returns (InferenceFrameIpcControlResponse);
+
+  // 创建一个通过共享内存接收帧的有限媒体执行。
+  rpc OpenSkillMediaExecution(OpenSkillMediaExecutionRequest) returns (SkillMediaExecutionResponse);
+
+  // 声明某个媒体执行不再产生新帧，并异步完成 spool drain 与聚合。
+  rpc SealSkillMediaInput(SealSkillMediaInputRequest) returns (SkillMediaExecutionResponse);
+
+  // 查询媒体执行进度；完成后可返回有序逐帧结果。
+  rpc GetSkillMediaExecutionStatus(GetSkillMediaExecutionStatusRequest) returns (SkillMediaExecutionResponse);
 }
 
 message InferenceFrameIpcGrantRequest {
@@ -54,6 +63,91 @@ message InferenceFrameIpcControlResponse {
   uint64 recoveries = 8;
   uint64 failures = 9;
   string error = 10;
+}
+
+message OpenSkillMediaExecutionRequest {
+  string execution_id = 1;
+  string session_id = 2;
+  string skill_id = 3;
+  string trace_id = 4;
+}
+
+message SealSkillMediaInputRequest {
+  string execution_id = 1;
+  string session_id = 2;
+  uint64 expected_selected_frames = 3;
+  uint64 final_transport_sequence = 4;
+  string reason = 5;
+}
+
+message GetSkillMediaExecutionStatusRequest {
+  string execution_id = 1;
+  string session_id = 2;
+  bool include_results = 3;
+}
+
+message SkillMediaFrameResult {
+  uint64 selected_sequence = 1;
+  uint64 transport_sequence = 2;
+  uint64 frame_id = 3;
+  int64 timestamp_us = 4;
+  int32 status_code = 5;
+  string error = 6;
+  string scene_hint = 7;
+  string action_hint = 8;
+  string object_hint = 9;
+  string agent_hint = 10;
+  string memory_candidate = 11;
+  repeated string facts = 12;
+  repeated string weak_interpretations = 13;
+  string raw_text = 14;
+  double confidence = 15;
+  double image_encode_ms = 16;
+  double prompt_eval_ms = 17;
+  double eval_ms = 18;
+  int32 prompt_tokens = 19;
+  int32 generated_tokens = 20;
+  bool cache_hit = 21;
+  bool cache_stale = 22;
+  string result_source = 23;
+  uint64 publish_to_receive_us = 24;
+  uint64 receive_to_admit_us = 25;
+  uint64 queue_wait_us = 26;
+  uint64 spool_wait_us = 27;
+  uint64 inference_us = 28;
+  uint64 publish_to_terminal_us = 29;
+  bool spooled = 30;
+  uint64 stream_wait_us = 31;
+  uint64 replay_wait_us = 32;
+  uint64 publish_to_terminal_excluding_stream_us = 33;
+  bool prompt_kv_cache_hit = 34;
+  bool prompt_kv_near_candidate = 35;
+  bool prompt_kv_near_accepted = 36;
+  bool prompt_kv_near_same_session = 37;
+  float prompt_kv_global_cosine = 38;
+  float prompt_kv_mean_token_cosine = 39;
+  float prompt_kv_p05_token_cosine = 40;
+  float prompt_kv_min_token_cosine = 41;
+  float prompt_kv_relative_l2 = 42;
+  float prompt_kv_max_abs_error = 43;
+}
+
+message SkillMediaExecutionResponse {
+  string execution_id = 1;
+  string session_id = 2;
+  string state = 3;
+  uint64 expected_selected_frames = 4;
+  uint64 selected_frames = 5;
+  uint64 committed_frames = 6;
+  uint64 hot_frames = 7;
+  uint64 spooled_frames = 8;
+  uint64 terminal_frames = 9;
+  uint64 failed_inference_frames = 10;
+  bool seal_requested = 11;
+  bool replay_complete = 12;
+  bool complete = 13;
+  string error = 14;
+  repeated SkillMediaFrameResult results = 15;
 }
 
 // ===== BERT 情绪分类（接收已编码张量，tokenizer 在 Python 端完成） =====
@@ -134,6 +228,7 @@ message VLMToken {
   bool cache_hit = 5;
   bool cache_stale = 6;
   string result_source = 7;
+  bool prompt_kv_cache_hit = 8;
 }
 
 message VLMResponse {
@@ -153,4 +248,14 @@ message VLMResponse {
   string image_sha256 = 11;
   string prompt_sha256 = 12;
   string result_source = 13;
+  bool prompt_kv_cache_hit = 14;
+  bool prompt_kv_near_candidate = 15;
+  bool prompt_kv_near_accepted = 16;
+  bool prompt_kv_near_same_session = 17;
+  float prompt_kv_global_cosine = 18;
+  float prompt_kv_mean_token_cosine = 19;
+  float prompt_kv_p05_token_cosine = 20;
+  float prompt_kv_min_token_cosine = 21;
+  float prompt_kv_relative_l2 = 22;
+  float prompt_kv_max_abs_error = 23;
 }

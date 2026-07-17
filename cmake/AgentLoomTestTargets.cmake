@@ -73,6 +73,20 @@ if(BERT_BUILD_TESTS)
     find_package(GTest CONFIG REQUIRED)
     include(GoogleTest)
 
+    add_test(NAME llama_abi_guard_release_match
+        COMMAND "${CMAKE_COMMAND}"
+            -DAGENT_CONFIG=Release
+            -DLLAMA_CONFIG=RelWithDebInfo
+            -DLLAMA_BUILD=test-llama-build
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/AgentLoomLlamaAbiGuard.cmake")
+    add_test(NAME llama_abi_guard_debug_mismatch
+        COMMAND "${CMAKE_COMMAND}"
+            -DAGENT_CONFIG=Debug
+            -DLLAMA_CONFIG=Release
+            -DLLAMA_BUILD=test-llama-build
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/AgentLoomLlamaAbiGuard.cmake")
+    set_tests_properties(llama_abi_guard_debug_mismatch PROPERTIES WILL_FAIL TRUE)
+
     add_executable(core_tests
         tests/core/core_infra_test.cpp
         tests/core/keyed_serial_executor_test.cpp
@@ -87,6 +101,7 @@ if(BERT_BUILD_TESTS)
     gtest_discover_tests(core_tests DISCOVERY_MODE PRE_TEST)
 
     add_executable(media_inference_tests
+        tests/media/grpc_vlm_vision_client_test.cpp
         tests/media/inference_frame_backlog_test.cpp
         tests/media/inference_frame_coordinator_test.cpp
         tests/media/inference_frame_ipc_test.cpp
@@ -97,8 +112,15 @@ if(BERT_BUILD_TESTS)
 
     target_link_libraries(media_inference_tests PRIVATE
         agent_media_inference
+        agent_media_vlm_grpc
         GTest::gtest_main
     )
+
+    target_include_directories(media_inference_tests PRIVATE
+        ${GENERATED_DIR}
+    )
+
+    copy_runtime_files(media_inference_tests ${VCPKG_RUNTIME_DLLS})
 
     gtest_discover_tests(media_inference_tests DISCOVERY_MODE PRE_TEST)
 
@@ -199,6 +221,24 @@ if(BERT_BUILD_TESTS)
 
         if(WIN32)
             set_target_properties(media_real_video_e2e_bench PROPERTIES
+                VS_DEBUGGER_ENVIRONMENT "PATH=${GSTREAMER_ROOT}/bin;%PATH%;GST_PLUGIN_PATH=${GSTREAMER_ROOT}/lib/gstreamer-1.0"
+            )
+        endif()
+
+        add_executable(media_real_video_shared_vlm_e2e
+            tools/real_video_shared_vlm_e2e.cpp
+        )
+
+        target_link_libraries(media_real_video_shared_vlm_e2e PRIVATE
+            agent_media
+            agent_ipc_grpc
+        )
+
+        copy_runtime_files(media_real_video_shared_vlm_e2e ${BERT_OPENCV_RUNTIME_FILES})
+        copy_runtime_files(media_real_video_shared_vlm_e2e ${VCPKG_RUNTIME_DLLS})
+
+        if(WIN32)
+            set_target_properties(media_real_video_shared_vlm_e2e PROPERTIES
                 VS_DEBUGGER_ENVIRONMENT "PATH=${GSTREAMER_ROOT}/bin;%PATH%;GST_PLUGIN_PATH=${GSTREAMER_ROOT}/lib/gstreamer-1.0"
             )
         endif()

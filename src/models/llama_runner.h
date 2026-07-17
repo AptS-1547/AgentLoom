@@ -5,6 +5,8 @@
 
 #pragma once
 
+#include "result.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -12,7 +14,9 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 struct llama_model;
@@ -21,6 +25,8 @@ struct mtmd_context;
 namespace llm {
 
 class LlamaSharedRuntime;
+
+std::string ExtractVlmImagePromptPrefix(std::string_view prompt);
 
 /**
  * VLM 推理结果
@@ -36,11 +42,20 @@ struct VLMResult {
     bool prompt_kv_cache_hit = false;
 
     std::vector<float> image_embedding;
+    std::vector<float> image_token_embeddings;
     int32_t image_embedding_dim = 0;
     int32_t image_embedding_tokens = 0;
 
     bool success = false;
     std::string error_message;
+};
+
+struct PreparedImageEmbedding {
+    float image_encode_ms = 0.0f;
+    std::vector<float> image_embedding;
+    std::vector<float> image_token_embeddings;
+    int32_t image_embedding_dim = 0;
+    int32_t image_embedding_tokens = 0;
 };
 
 /**
@@ -55,6 +70,9 @@ struct GenerateParams {
     bool capture_image_embedding = false;
     bool enable_prompt_kv_cache = false;
     std::string prompt_kv_cache_key;
+    std::vector<std::string> prompt_kv_cache_alias_keys;
+    std::string prompt_kv_session_id;
+    std::string prompt_kv_prefix_fingerprint;
 };
 
 struct DeviceMemoryInfo {
@@ -74,13 +92,55 @@ struct MemorySnapshot {
 struct PromptKvCacheEntry {
     std::vector<uint8_t> state;
     int32_t prefix_tokens = 0;
+    std::string session_id;
+    std::string prefix_fingerprint;
+    std::vector<float> image_embedding;
+    std::vector<float> image_token_embeddings;
+    int32_t image_embedding_dim = 0;
+    int32_t image_embedding_tokens = 0;
+};
+
+struct PromptKvNearQuery {
+    std::string session_id;
+    std::string prefix_fingerprint;
+    std::span<const float> image_embedding;
+    std::span<const float> image_token_embeddings;
+    int32_t image_embedding_dim = 0;
+    int32_t image_embedding_tokens = 0;
+    float same_session_min_cosine = 0.99f;
+    float cross_session_min_cosine = 0.995f;
+    float same_session_min_mean_token_cosine = 0.99f;
+    float cross_session_min_mean_token_cosine = 0.995f;
+    float same_session_min_p05_token_cosine = 0.95f;
+    float cross_session_min_p05_token_cosine = 0.98f;
+    float same_session_max_relative_l2 = 0.15f;
+    float cross_session_max_relative_l2 = 0.10f;
+    bool allow_same_session = true;
+    bool allow_cross_session = true;
+};
+
+struct PromptKvNearMatch {
+    std::string key;
+    std::string source_session_id;
+    float cosine_similarity = 0.0f;
+    float mean_token_cosine = 0.0f;
+    float p05_token_cosine = 0.0f;
+    float min_token_cosine = 0.0f;
+    float relative_l2 = 0.0f;
+    float max_abs_error = 0.0f;
+    bool same_session = false;
+    bool accepted = false;
 };
 
 class IPromptKvCache {
 public:
     virtual ~IPromptKvCache() = default;
+    virtual core::Result<bool> Probe(const std::string& key) = 0;
     virtual std::optional<PromptKvCacheEntry> Load(const std::string& key) = 0;
     virtual void Store(const std::string& key, const PromptKvCacheEntry& entry) = 0;
+    virtual void StoreAlias(const std::string& alias, const std::string& key) = 0;
+    virtual core::Result<std::optional<PromptKvNearMatch>> FindNear(
+        const PromptKvNearQuery& query) = 0;
 };
 
 /**
@@ -124,7 +184,8 @@ public:
     VLMResult Generate(const std::vector<uint8_t>& image_data,
                        const std::string& prompt,
                        const GenerateParams& params = {},
-                       std::function<void(const std::string&)> token_callback = nullptr);
+                       std::function<void(const std::string&)> token_callback = nullptr,
+                       std::shared_ptr<PreparedImageEmbedding> prepared_image = nullptr);
 
     VLMResult EncodeImageOnly(const std::vector<uint8_t>& image_data);
 

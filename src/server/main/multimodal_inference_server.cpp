@@ -14,6 +14,7 @@
 #include "inference_frame_ipc_control.h"
 #include "option_parser.h"
 #include "server_common.h"
+#include "shared_memory_media_runtime.h"
 #include "../../../tools/crash_dump.h"
 
 #include <grpc/grpc.h>
@@ -22,6 +23,7 @@
 #include <grpcpp/server.h>
 #include <grpcpp/server_builder.h>
 
+#include <algorithm>
 #include <exception>
 #include <filesystem>
 #include <iostream>
@@ -87,8 +89,9 @@ int main(int argc, char** argv) {
              options.vram.min_free_before_load_bytes / (1024 * 1024),
              options.vram.reload_after_unload,
              options.vram.unload_on_oom_error);
-    LOG_INFO("[Server] VLM cache: enabled={} persist={} dir={} max_entries={} max_mb={} ttl_seconds={} stale_on_failure={} default_allow_cache={}",
+    LOG_INFO("[Server] VLM cache: enabled={} reuse_policy={} persist={} dir={} max_entries={} max_mb={} ttl_seconds={} stale_on_failure={} default_allow_cache={}",
              options.vlm_cache.enabled,
+             options.vlm_cache.reuse_policy,
              options.vlm_cache.persist,
              options.vlm_cache.cache_dir.string(),
              options.vlm_cache.max_entries,
@@ -96,8 +99,9 @@ int main(int argc, char** argv) {
              options.vlm_cache.ttl_seconds,
              options.vlm_cache.allow_stale_on_failure,
              options.vlm_cache.default_allow_cache);
-    LOG_INFO("[Server] VLM prompt KV cache: enabled={} redis={}:{} prefix={} ttl_seconds={} max_mb={}",
+    LOG_INFO("[Server] VLM prompt KV cache: enabled={} backend={} redis={}:{} prefix={} ttl_seconds={} max_mb={}",
              options.vlm_prompt_kv_cache.enabled,
+             options.vlm_prompt_kv_cache.backend,
              options.vlm_prompt_kv_cache.redis_host,
              options.vlm_prompt_kv_cache.redis_port,
              options.vlm_prompt_kv_cache.key_prefix,
@@ -128,11 +132,32 @@ int main(int argc, char** argv) {
     service::MultimodalService multimodal_service(options);
     ipc::media::InferenceFrameIpcGrantReceiver ipc_control(
         core::LoggerAdapter::ForModule("frame-ipc-control"));
+    auto media_runtime_result = service::SharedMemoryMediaRuntime::Create(
+        multimodal_service,
+        ipc_control,
+        {
+            .spool_root = std::filesystem::path(options.grpc.log_dir) / "media-spool",
+            .receiver_workers = 2,
+            .vlm_workers = options.runner_pool_size,
+            .max_tokens = std::min(options.limits.max_vlm_tokens, 128),
+            .context_size = std::min(options.limits.max_context_size, 4096),
+            .allow_cache = options.vlm_cache.enabled,
+        },
+        core::LoggerAdapter::ForModule("shared-media-runtime"));
+    if (!media_runtime_result.ok()) {
+        LOG_ERROR(
+            "[Server] Failed to start shared memory media runtime: {}",
+            media_runtime_result.status().message());
+        logging::Shutdown();
+        return 1;
+    }
+    auto media_runtime = std::move(media_runtime_result).value();
     server::grpc_service::MultimodalGrpcService grpc_service(
         options,
         stats,
         multimodal_service,
-        &ipc_control);
+        &ipc_control,
+        media_runtime.get());
 
     grpc::EnableDefaultHealthCheckService(true);
     grpc::ServerBuilder builder;
@@ -166,6 +191,7 @@ int main(int argc, char** argv) {
         });
 
     server->Wait();
+    media_runtime->Shutdown();
     LOG_INFO("[Server] Shutdown complete");
     logging::Shutdown();
 

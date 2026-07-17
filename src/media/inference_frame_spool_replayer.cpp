@@ -60,6 +60,7 @@ public:
                         copied.status().message());
                     return copied.status();
                 }
+                copied.value().metadata().timing.replayed_at_unix_us = InferenceFrameNowUnixUs();
                 pending_frame_.emplace(std::move(copied).value());
             }
 

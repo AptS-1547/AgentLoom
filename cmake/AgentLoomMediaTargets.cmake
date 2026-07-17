@@ -62,6 +62,30 @@ target_link_libraries(agent_media_inference PUBLIC
     spdlog::spdlog
 )
 
+add_library(agent_media_vlm_grpc STATIC
+    src/media/grpc_vlm_vision_client.cpp
+    src/media/grpc_vlm_vision_client.h
+)
+
+target_include_directories(agent_media_vlm_grpc PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/media
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/core
+)
+
+target_include_directories(agent_media_vlm_grpc PRIVATE
+    ${GENERATED_DIR}
+)
+
+target_link_libraries(agent_media_vlm_grpc PUBLIC
+    agent_media_inference
+)
+
+target_link_libraries(agent_media_vlm_grpc PRIVATE
+    multimodal_proto
+    gRPC::grpc++
+    nlohmann_json::nlohmann_json
+)
+
 if(TARGET gstreamer_core)
     add_library(agent_media STATIC
         src/media/frame_encoding.cpp

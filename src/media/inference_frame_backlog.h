@@ -19,6 +19,30 @@
 
 namespace media::inference {
 
+struct InferenceFrameTiming {
+    std::int64_t published_at_unix_us = 0;
+    std::int64_t received_at_unix_us = 0;
+    std::int64_t admitted_at_unix_us = 0;
+    std::int64_t spooled_at_unix_us = 0;
+    std::int64_t replayed_at_unix_us = 0;
+    std::int64_t inference_started_at_unix_us = 0;
+    std::int64_t terminal_at_unix_us = 0;
+};
+
+inline std::int64_t InferenceFrameNowUnixUs() noexcept {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+inline std::uint64_t InferenceFrameDurationUs(
+    std::int64_t started_at_unix_us,
+    std::int64_t ended_at_unix_us) noexcept {
+    if (started_at_unix_us <= 0 || ended_at_unix_us < started_at_unix_us) {
+        return 0;
+    }
+    return static_cast<std::uint64_t>(ended_at_unix_us - started_at_unix_us);
+}
+
 enum class InferenceFrameFormat {
     Unknown,
     Jpeg,
@@ -41,6 +65,7 @@ struct InferenceFrameMetadata {
     std::uint32_t height = 0;
     InferenceFrameFormat format = InferenceFrameFormat::Unknown;
     double saliency = 0.0;
+    InferenceFrameTiming timing;
 };
 
 class OwnedInferenceFrame {

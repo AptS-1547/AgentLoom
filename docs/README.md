@@ -16,7 +16,7 @@
 建议按以下顺序了解项目：
 
 1. [项目 README](../README.md)：定位、构建目标、模块概览和快速开始。
-2. [当前 Runtime 路线图](CURRENT_RUNTIME_ROADMAP_2026_06.md)：当前完成度、优先级和生产缺口。
+2. [架构总览](ARCHITECTURE_VISUAL.md)：当前模块、进程边界和主要数据流。
 3. [配置系统](CONFIG_SYSTEM.md)：Server 配置和 CLI 覆盖方式。
 4. [部署指南](DEPLOYMENT.md)：推理 Server 的构建、启动和运行时依赖。
 5. [Frontend/Backend API](FRONTEND_BACKEND_API_PROTOCOL.md)：Gateway HTTP/WebSocket 协议。
@@ -28,7 +28,6 @@
 
 | 文档 | 状态 | 内容 |
 |------|------|------|
-| [CURRENT_RUNTIME_ROADMAP_2026_06.md](CURRENT_RUNTIME_ROADMAP_2026_06.md) | 当前规范 | Runtime 当前阶段、优先级、VLM/IPC/Prompt Cache 状态 |
 | [CONFIG_SYSTEM.md](CONFIG_SYSTEM.md) | 当前规范 | JSON section、CLI override 和配置扩展方式 |
 | [FRONTEND_BACKEND_API_PROTOCOL.md](FRONTEND_BACKEND_API_PROTOCOL.md) | 当前规范 | HTTP、WebSocket、认证、文档和 Skill API |
 | [GATEWAY_FRONTEND_SESSION_ALIGNMENT.md](GATEWAY_FRONTEND_SESSION_ALIGNMENT.md) | 当前设计 | Gateway、前端和 session 生命周期对齐 |

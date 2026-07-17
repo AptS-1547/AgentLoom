@@ -127,11 +127,13 @@ core::Status MediaInferenceExecution::AdmitFrame(media::inference::OwnedInferenc
 
 core::Status MediaInferenceExecution::ProcessAdmission(media::inference::OwnedInferenceFrame frame) {
     const auto sequence = frame.metadata().selected_sequence;
+    frame.metadata().timing.admitted_at_unix_us = media::inference::InferenceFrameNowUnixUs();
     auto admission = dependencies_.backlog->TrySubmit(std::move(frame));
     bool spooled = false;
     if (!admission.accepted() && admission.status.code() == core::ErrorCode::ResourceExhausted &&
         admission.rejected_frame.has_value()) {
         auto rejected = std::move(admission.rejected_frame).value();
+        rejected.metadata().timing.spooled_at_unix_us = media::inference::InferenceFrameNowUnixUs();
         media::inference::SpoolFrameMetadata metadata{
             .execution_id = options_.execution_id,
             .selected_sequence = sequence,
@@ -261,6 +263,15 @@ core::Status MediaInferenceExecution::ReplayUntilComplete() {
         }
         if (replay.value().complete) break;
         if (options_.replay_retry_delay.count() > 0) std::this_thread::sleep_for(options_.replay_retry_delay);
+    }
+    // Replay 已将所有映射 payload 复制到 backlog，此时释放临时 spool 文件。
+    const auto cleanup = dependencies_.spool->Cleanup();
+    if (!cleanup.ok()) {
+        logger_.warn(
+            "[media-execution] spool cleanup deferred execution={} code={} message={}",
+            options_.execution_id,
+            static_cast<int>(cleanup.code()),
+            cleanup.message());
     }
     {
         std::lock_guard lock(mutex_);

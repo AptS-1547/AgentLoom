@@ -66,15 +66,105 @@ void FillIpcControlResponse(
     }
 }
 
+void FillSkillMediaExecutionResponse(
+    const service::SharedMediaExecutionSnapshot& snapshot,
+    multimodal_inference::SkillMediaExecutionResponse& response) {
+    response.set_execution_id(snapshot.execution_id);
+    response.set_session_id(snapshot.session_id);
+    response.set_state(snapshot.state);
+    response.set_expected_selected_frames(snapshot.expected_selected_frames);
+    response.set_selected_frames(snapshot.selected_frames);
+    response.set_committed_frames(snapshot.committed_frames);
+    response.set_hot_frames(snapshot.hot_frames);
+    response.set_spooled_frames(snapshot.spooled_frames);
+    response.set_terminal_frames(snapshot.terminal_frames);
+    response.set_failed_inference_frames(snapshot.failed_inference_frames);
+    response.set_seal_requested(snapshot.seal_requested);
+    response.set_replay_complete(snapshot.replay_complete);
+    response.set_complete(snapshot.complete);
+    if (!snapshot.status.ok()) response.set_error(snapshot.status.message());
+    for (const auto& record : snapshot.results) {
+        auto* result = response.add_results();
+        result->set_selected_sequence(record.frame.selected_sequence);
+        result->set_transport_sequence(record.frame.transport_sequence);
+        result->set_frame_id(record.frame.frame_id);
+        result->set_timestamp_us(record.frame.timestamp_us);
+        result->set_status_code(static_cast<int>(record.status.code()));
+        if (!record.status.ok()) result->set_error(record.status.message());
+        const auto& timing = record.frame.timing;
+        result->set_publish_to_receive_us(media::inference::InferenceFrameDurationUs(
+            timing.published_at_unix_us, timing.received_at_unix_us));
+        result->set_receive_to_admit_us(media::inference::InferenceFrameDurationUs(
+            timing.received_at_unix_us, timing.admitted_at_unix_us));
+        const auto queue_started_at = timing.replayed_at_unix_us > 0
+            ? timing.replayed_at_unix_us
+            : timing.admitted_at_unix_us;
+        result->set_queue_wait_us(media::inference::InferenceFrameDurationUs(
+            queue_started_at, timing.inference_started_at_unix_us));
+        result->set_spool_wait_us(media::inference::InferenceFrameDurationUs(
+            timing.spooled_at_unix_us, timing.replayed_at_unix_us));
+        const auto stream_wait_us = timing.spooled_at_unix_us > 0
+            ? media::inference::InferenceFrameDurationUs(
+                  timing.spooled_at_unix_us, snapshot.input_sealed_at_unix_us)
+            : 0;
+        const auto replay_wait_us = timing.spooled_at_unix_us > 0
+            ? media::inference::InferenceFrameDurationUs(
+                  snapshot.input_sealed_at_unix_us, timing.replayed_at_unix_us)
+            : 0;
+        result->set_stream_wait_us(stream_wait_us);
+        result->set_replay_wait_us(replay_wait_us);
+        result->set_inference_us(media::inference::InferenceFrameDurationUs(
+            timing.inference_started_at_unix_us, timing.terminal_at_unix_us));
+        result->set_publish_to_terminal_us(media::inference::InferenceFrameDurationUs(
+            timing.published_at_unix_us, timing.terminal_at_unix_us));
+        const auto total_us = media::inference::InferenceFrameDurationUs(
+            timing.published_at_unix_us, timing.terminal_at_unix_us);
+        result->set_publish_to_terminal_excluding_stream_us(
+            total_us >= stream_wait_us ? total_us - stream_wait_us : 0);
+        result->set_spooled(timing.spooled_at_unix_us > 0);
+        if (!record.result.has_value()) continue;
+        const auto& value = record.result.value();
+        result->set_scene_hint(value.scene_hint);
+        result->set_action_hint(value.action_hint);
+        result->set_object_hint(value.object_hint);
+        result->set_agent_hint(value.agent_hint);
+        result->set_memory_candidate(value.memory_candidate);
+        for (const auto& fact : value.facts) result->add_facts(fact);
+        for (const auto& item : value.weak_interpretations) result->add_weak_interpretations(item);
+        result->set_raw_text(value.raw_text);
+        result->set_confidence(value.confidence);
+        result->set_image_encode_ms(value.image_encode_ms);
+        result->set_prompt_eval_ms(value.prompt_eval_ms);
+        result->set_eval_ms(value.eval_ms);
+        result->set_prompt_tokens(value.prompt_tokens);
+        result->set_generated_tokens(value.generated_tokens);
+        result->set_cache_hit(value.cache_hit);
+        result->set_cache_stale(value.cache_stale);
+        result->set_prompt_kv_cache_hit(value.prompt_kv_cache_hit);
+        result->set_result_source(value.result_source);
+        result->set_prompt_kv_near_candidate(value.prompt_kv_near_candidate);
+        result->set_prompt_kv_near_accepted(value.prompt_kv_near_accepted);
+        result->set_prompt_kv_near_same_session(value.prompt_kv_near_same_session);
+        result->set_prompt_kv_global_cosine(value.prompt_kv_global_cosine);
+        result->set_prompt_kv_mean_token_cosine(value.prompt_kv_mean_token_cosine);
+        result->set_prompt_kv_p05_token_cosine(value.prompt_kv_p05_token_cosine);
+        result->set_prompt_kv_min_token_cosine(value.prompt_kv_min_token_cosine);
+        result->set_prompt_kv_relative_l2(value.prompt_kv_relative_l2);
+        result->set_prompt_kv_max_abs_error(value.prompt_kv_max_abs_error);
+    }
+}
+
 } // namespace
 
 MultimodalGrpcService::MultimodalGrpcService(const MultimodalServerOptions& options,
                                              server_common::RuntimeStats& stats,
                                              service::IMultimodalService& service,
-                                             ipc::media::IInferenceFrameIpcGrantReceiver* ipc_control)
+                                             ipc::media::IInferenceFrameIpcGrantReceiver* ipc_control,
+                                             service::ISharedMemoryMediaRuntime* media_runtime)
     : stats_(stats),
       service_(service),
       ipc_control_(ipc_control),
+      media_runtime_(media_runtime),
       slow_request_ms_(options.grpc.slow_request_ms),
       auth_options_(options.auth),
       request_limits_(options.limits) {}
@@ -353,6 +443,99 @@ grpc::Status MultimodalGrpcService::GetInferenceFrameIpcStatus(
                 "inference frame IPC control is not configured"));
         }
         FillIpcControlResponse(ipc_control_->ControlSnapshot(), *response);
+        return rpc.Success();
+    });
+}
+
+grpc::Status MultimodalGrpcService::OpenSkillMediaExecution(
+    grpc::ServerContext* context,
+    const multimodal_inference::OpenSkillMediaExecutionRequest* request,
+    multimodal_inference::SkillMediaExecutionResponse* response) {
+    grpc_error::RpcCall rpc(*context, stats_, "OpenSkillMediaExecution", 1, false, slow_request_ms_);
+    return rpc.Run([&] {
+        if (!request || !response) return rpc.Failure(InvalidRpcArguments());
+        if (auto status = CheckAuth(*context); !status.ok()) {
+            return rpc.Failure(status, grpc::StatusCode::UNAUTHENTICATED);
+        }
+        if (!media_runtime_) {
+            return rpc.Failure(core::Status::Error(
+                core::ErrorCode::FailedPrecondition,
+                "shared memory media runtime is not configured"));
+        }
+        if (request->execution_id().empty() || request->session_id().empty() ||
+            request->execution_id().size() >= ipc::media::kSharedFrameExecutionIdCapacity ||
+            request->session_id().size() >= ipc::media::kSharedFrameSessionIdCapacity ||
+            request->trace_id().size() >= ipc::media::kSharedFrameTraceIdCapacity) {
+            return rpc.Failure(core::Status::Error(
+                core::ErrorCode::InvalidArgument,
+                "shared media execution identity is invalid"));
+        }
+        auto opened = media_runtime_->Open({
+            .execution_id = request->execution_id(),
+            .session_id = request->session_id(),
+            .skill_id = request->skill_id().empty() ? "vision.observe" : request->skill_id(),
+            .trace_id = request->trace_id(),
+        });
+        if (!opened.ok()) return rpc.Failure(opened.status());
+        FillSkillMediaExecutionResponse(opened.value(), *response);
+        return rpc.Success();
+    });
+}
+
+grpc::Status MultimodalGrpcService::SealSkillMediaInput(
+    grpc::ServerContext* context,
+    const multimodal_inference::SealSkillMediaInputRequest* request,
+    multimodal_inference::SkillMediaExecutionResponse* response) {
+    grpc_error::RpcCall rpc(*context, stats_, "SealSkillMediaInput", 1, false, slow_request_ms_);
+    return rpc.Run([&] {
+        if (!request || !response) return rpc.Failure(InvalidRpcArguments());
+        if (auto status = CheckAuth(*context); !status.ok()) {
+            return rpc.Failure(status, grpc::StatusCode::UNAUTHENTICATED);
+        }
+        if (!media_runtime_) {
+            return rpc.Failure(core::Status::Error(
+                core::ErrorCode::FailedPrecondition,
+                "shared memory media runtime is not configured"));
+        }
+        if (request->expected_selected_frames() > std::numeric_limits<std::size_t>::max()) {
+            return rpc.Failure(core::Status::Error(
+                core::ErrorCode::InvalidArgument,
+                "shared media expected frame count exceeds platform limits"));
+        }
+        auto sealed = media_runtime_->Seal({
+            .execution_id = request->execution_id(),
+            .session_id = request->session_id(),
+            .expected_selected_frames = static_cast<std::size_t>(request->expected_selected_frames()),
+            .final_transport_sequence = request->final_transport_sequence(),
+            .reason = request->reason(),
+        });
+        if (!sealed.ok()) return rpc.Failure(sealed.status());
+        FillSkillMediaExecutionResponse(sealed.value(), *response);
+        return rpc.Success();
+    });
+}
+
+grpc::Status MultimodalGrpcService::GetSkillMediaExecutionStatus(
+    grpc::ServerContext* context,
+    const multimodal_inference::GetSkillMediaExecutionStatusRequest* request,
+    multimodal_inference::SkillMediaExecutionResponse* response) {
+    grpc_error::RpcCall rpc(*context, stats_, "GetSkillMediaExecutionStatus", 1, false, slow_request_ms_);
+    return rpc.Run([&] {
+        if (!request || !response) return rpc.Failure(InvalidRpcArguments());
+        if (auto status = CheckAuth(*context); !status.ok()) {
+            return rpc.Failure(status, grpc::StatusCode::UNAUTHENTICATED);
+        }
+        if (!media_runtime_) {
+            return rpc.Failure(core::Status::Error(
+                core::ErrorCode::FailedPrecondition,
+                "shared memory media runtime is not configured"));
+        }
+        auto snapshot = media_runtime_->Get(
+            request->session_id(),
+            request->execution_id(),
+            request->include_results());
+        if (!snapshot.ok()) return rpc.Failure(snapshot.status());
+        FillSkillMediaExecutionResponse(snapshot.value(), *response);
         return rpc.Success();
     });
 }

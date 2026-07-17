@@ -35,6 +35,10 @@ core::Result<media::inference::OwnedInferenceFrame> MakeEncodedFrame(
     metadata.height = 8;
     metadata.format = format;
     metadata.saliency = 0.8;
+    const auto now = media::inference::InferenceFrameNowUnixUs();
+    metadata.timing.published_at_unix_us = now - 3000;
+    metadata.timing.received_at_unix_us = now - 2000;
+    metadata.timing.admitted_at_unix_us = now - 1000;
     return media::inference::CopyInferenceFrame(pool, std::move(metadata), payload);
 }
 
@@ -175,6 +179,11 @@ TEST(InferenceFrameCoordinatorTest, PublishesSuccessfulJpegResultAndKeepsPayload
     EXPECT_EQ(finalized.value().front().result->scene_hint, "scene-7");
     EXPECT_EQ(vlm.mime_types(), std::vector<std::string>{"image/jpeg"});
     EXPECT_EQ(vlm.observed_bytes(), std::vector<std::byte>{std::byte{0x07}});
+    const auto& timing = finalized.value().front().frame.timing;
+    EXPECT_GE(timing.inference_started_at_unix_us, timing.admitted_at_unix_us);
+    EXPECT_GE(timing.terminal_at_unix_us, timing.inference_started_at_unix_us);
+    EXPECT_GT(media::inference::InferenceFrameDurationUs(
+        timing.published_at_unix_us, timing.terminal_at_unix_us), 0u);
     EXPECT_EQ(coordinator.Snapshot().successful_frames, 1u);
 }
 

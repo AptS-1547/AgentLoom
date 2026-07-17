@@ -4,6 +4,7 @@
 #include "request_validation.h"
 #include "server_common.h"
 #include "server_options.h"
+#include "shared_memory_media_runtime.h"
 #include "inference_frame_ipc_control.h"
 #include "multimodal_inference.grpc.pb.h"
 
@@ -14,7 +15,8 @@ public:
     MultimodalGrpcService(const MultimodalServerOptions& options,
                           server_common::RuntimeStats& stats,
                           service::IMultimodalService& service,
-                          ipc::media::IInferenceFrameIpcGrantReceiver* ipc_control = nullptr);
+                          ipc::media::IInferenceFrameIpcGrantReceiver* ipc_control = nullptr,
+                          service::ISharedMemoryMediaRuntime* media_runtime = nullptr);
 
     grpc::Status PredictEmotion(grpc::ServerContext* context,
                                 const multimodal_inference::EmotionRequest* request,
@@ -51,12 +53,28 @@ public:
         const multimodal_inference::InferenceFrameIpcStatusRequest* request,
         multimodal_inference::InferenceFrameIpcControlResponse* response) override;
 
+    grpc::Status OpenSkillMediaExecution(
+        grpc::ServerContext* context,
+        const multimodal_inference::OpenSkillMediaExecutionRequest* request,
+        multimodal_inference::SkillMediaExecutionResponse* response) override;
+
+    grpc::Status SealSkillMediaInput(
+        grpc::ServerContext* context,
+        const multimodal_inference::SealSkillMediaInputRequest* request,
+        multimodal_inference::SkillMediaExecutionResponse* response) override;
+
+    grpc::Status GetSkillMediaExecutionStatus(
+        grpc::ServerContext* context,
+        const multimodal_inference::GetSkillMediaExecutionStatusRequest* request,
+        multimodal_inference::SkillMediaExecutionResponse* response) override;
+
 private:
     core::Status CheckAuth(const grpc::ServerContext& context) const;
 
     server_common::RuntimeStats& stats_;
     service::IMultimodalService& service_;
     ipc::media::IInferenceFrameIpcGrantReceiver* ipc_control_ = nullptr;
+    service::ISharedMemoryMediaRuntime* media_runtime_ = nullptr;
     int slow_request_ms_ = 250;
     request_validation::AuthOptions auth_options_;
     request_validation::RequestLimits request_limits_;

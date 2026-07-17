@@ -1,6 +1,6 @@
 # Next Runtime Roadmap
 
-> Document status: historical roadmap. Use `CURRENT_RUNTIME_ROADMAP_2026_06.md` for current priorities and implementation status.
+> Document status: historical roadmap. Use `README.md`, `docs/README.md`, and the current module design documents for public implementation status.
 
 > Working roadmap for the next AgentLoom runtime phase.
 > Status: active planning note  
@@ -8,9 +8,8 @@
 
 > 2026-06-20 update: this document is retained as the historical roadmap for
 > tokenizer, embedding, vector storage, semantic cache, and document pipeline
-> work. The current execution roadmap after the formal Server/E2E baseline and
-> emotion fusion experiments is now tracked in
-> `docs/CURRENT_RUNTIME_ROADMAP_2026_06.md`.
+> work. Current public implementation status is maintained in the project
+> README, documentation index, and module-specific design documents.
 
 ## 1. Current Baseline
 

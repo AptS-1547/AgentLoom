@@ -289,6 +289,45 @@ TEST(HttpServerRuntimeTest, DispatchesTypedHttpRequestInterface) {
     EXPECT_EQ(server.ConnectionStats().active_connections, 0u);
 }
 
+TEST(HttpServerRuntimeTest, RejectsOversizedBodyDuringParsing) {
+    net::HttpServerOptions options;
+    options.address = "127.0.0.1";
+    options.port = 0;
+    options.io_threads = 1;
+    options.request_body_limit = 8;
+    net::HttpServer server(options);
+
+    std::atomic<bool> handler_called = false;
+    server.SetHttpHandler([&](net::HttpRequest, net::HttpGeneratorCallback) {
+        handler_called.store(true, std::memory_order_release);
+    });
+
+    auto start_status = server.Start();
+    ASSERT_TRUE(start_status.ok()) << start_status.message();
+
+    asio::io_context io;
+    tcp::resolver resolver(io);
+    beast::tcp_stream stream(io);
+    stream.connect(resolver.resolve("127.0.0.1", std::to_string(server.port())));
+
+    net::BeastHttpRequest request{net::http::verb::post, "/oversized", 11};
+    request.set(net::http::field::host, "127.0.0.1");
+    request.body() = "123456789";
+    request.prepare_payload();
+    net::http::write(stream, request);
+
+    beast::flat_buffer buffer;
+    net::BeastHttpResponse response;
+    net::http::read(stream, buffer, response);
+
+    EXPECT_EQ(response.result(), net::http::status::payload_too_large);
+    EXPECT_EQ(response.body(), "payload too large");
+    EXPECT_FALSE(response.keep_alive());
+    EXPECT_FALSE(handler_called.load(std::memory_order_acquire));
+
+    server.Stop();
+}
+
 TEST(HttpServerRuntimeTest, AllowsTypedHandlerToRespondAfterReadTimeoutWindow) {
     net::HttpServerOptions options;
     options.address = "127.0.0.1";

@@ -85,6 +85,7 @@ int ParsePositiveOption(std::string_view flag, const std::string& value);
 int ParseNonNegativeOption(std::string_view flag, const std::string& value);
 std::size_t ParseMegabytesOption(std::string_view flag, const std::string& value);
 std::size_t ParseOptionalMegabytesOption(std::string_view flag, const std::string& value);
+float ParseFloatOption(std::string_view flag, const std::string& value, float minimum, float maximum);
 
 const Json* FindSection(const Json& root, std::string_view name);
 const Json* FindField(const Json& section, std::string_view section_name, std::string_view field_name);

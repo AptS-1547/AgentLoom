@@ -31,6 +31,7 @@
   },
   "vlm_cache": {
     "enabled": true,
+    "reuse_policy": "result_vector",
     "persist": false,
     "dir": "cache/vlm",
     "max_entries": 512,
@@ -47,6 +48,22 @@
       "max_saliency_for_mid": 0.15,
       "max_entries_per_bucket": 256,
       "ttl_seconds": 3600
+    },
+    "prompt_kv": {
+      "enabled": false,
+      "backend": "memory",
+      "key_prefix": "agent:vlm:prompt_kv",
+      "ttl_seconds": 3600,
+      "max_mb": 512,
+      "near_embedding_enabled": false,
+      "near_same_session_min_cosine": 0.99,
+      "near_cross_session_min_cosine": 0.995,
+      "near_same_session_min_mean_token_cosine": 0.99,
+      "near_cross_session_min_mean_token_cosine": 0.995,
+      "near_same_session_min_p05_token_cosine": 0.95,
+      "near_cross_session_min_p05_token_cosine": 0.98,
+      "near_same_session_max_relative_l2": 0.15,
+      "near_cross_session_max_relative_l2": 0.10
     }
   }
 }

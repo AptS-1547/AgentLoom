@@ -45,6 +45,8 @@ add_library(agent_server STATIC
     src/service/inference/multimodal_service.h
     src/service/inference/request_validation.cpp
     src/service/inference/request_validation.h
+    src/service/inference/shared_memory_media_runtime.cpp
+    src/service/inference/shared_memory_media_runtime.h
 )
 
 target_include_directories(agent_server PUBLIC
@@ -57,6 +59,7 @@ target_link_libraries(agent_server PUBLIC
     agent_core
     agent_ipc
     agent_media_inference
+    agent_skill_media
     agent_service
     agent_models
     agent_cache
@@ -65,6 +68,7 @@ target_link_libraries(agent_server PUBLIC
     server_runtime
     agent_config
     gRPC::grpc++
+    nlohmann_json::nlohmann_json
     spdlog::spdlog
 )
 
@@ -108,6 +112,7 @@ if(BERT_BUILD_TESTS)
         multimodal_proto
         agent_core
         agent_ipc_grpc
+        agent_media_inference
         server_runtime
         agent_config
         gRPC::grpc++
@@ -117,6 +122,29 @@ if(BERT_BUILD_TESTS)
 
     copy_runtime_files(inference_grpc_tests ${VCPKG_RUNTIME_DLLS})
     gtest_discover_tests(inference_grpc_tests DISCOVERY_MODE PRE_TEST)
+
+    add_executable(shared_media_runtime_tests
+        tests/server/shared_memory_media_runtime_test.cpp
+        src/service/inference/shared_memory_media_runtime.cpp
+    )
+
+    target_include_directories(shared_media_runtime_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/service/inference
+    )
+
+    target_link_libraries(shared_media_runtime_tests PRIVATE
+        multimodal_proto
+        agent_core
+        agent_ipc
+        agent_media_inference
+        agent_skill_media
+        agent_config
+        nlohmann_json::nlohmann_json
+        GTest::gtest_main
+    )
+
+    copy_runtime_files(shared_media_runtime_tests ${VCPKG_RUNTIME_DLLS})
+    gtest_discover_tests(shared_media_runtime_tests DISCOVERY_MODE PRE_TEST)
 endif()
 
 # ==================== 客户端工具（BERT 协议，用于向后兼容测试） ====================

@@ -100,6 +100,26 @@ std::size_t ParseOptionalMegabytesOption(std::string_view flag, const std::strin
     return static_cast<std::size_t>(ParseNonNegativeOption(flag, value)) * 1024 * 1024;
 }
 
+float ParseFloatOption(
+    std::string_view flag,
+    const std::string& value,
+    float minimum,
+    float maximum) {
+    try {
+        std::size_t consumed = 0;
+        const float parsed = std::stof(value, &consumed);
+        if (consumed != value.size() || !std::isfinite(parsed) ||
+            parsed < minimum || parsed > maximum) {
+            throw std::runtime_error("out of range");
+        }
+        return parsed;
+    } catch (const std::exception&) {
+        throw std::runtime_error(
+            std::string(flag) + " must be a finite number in [" +
+            std::to_string(minimum) + ", " + std::to_string(maximum) + "]");
+    }
+}
+
 const Json* FindSection(const Json& root, std::string_view name) {
     auto it = root.find(std::string(name));
     if (it == root.end()) {

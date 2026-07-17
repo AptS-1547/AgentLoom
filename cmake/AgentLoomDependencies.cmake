@@ -91,6 +91,34 @@ endif()
 if(NOT DEFINED LLAMA_CPP_BUILD)
     set(LLAMA_CPP_BUILD "${LLAMA_CPP_ROOT}/build" CACHE PATH "Path to llama.cpp build directory")
 endif()
+set(LLAMA_CPP_PREBUILT_CONFIG "" CACHE STRING
+    "Configuration used to build prebuilt llama.cpp binaries; inferred from its CMakeCache.txt when empty")
+
+function(agentloom_read_cmake_cache_entry cache_file entry_name output_variable)
+    if(NOT EXISTS "${cache_file}")
+        set(${output_variable} "" PARENT_SCOPE)
+        return()
+    endif()
+
+    file(STRINGS "${cache_file}" cache_entry
+        REGEX "^${entry_name}(:[^=]*)?=" LIMIT_COUNT 1)
+    if(cache_entry)
+        string(REGEX REPLACE "^[^=]*=" "" cache_value "${cache_entry}")
+        set(${output_variable} "${cache_value}" PARENT_SCOPE)
+    else()
+        set(${output_variable} "" PARENT_SCOPE)
+    endif()
+endfunction()
+
+set(LLAMA_CPP_CACHE_FILE "${LLAMA_CPP_BUILD}/CMakeCache.txt")
+agentloom_read_cmake_cache_entry(
+    "${LLAMA_CPP_CACHE_FILE}" CMAKE_BUILD_TYPE LLAMA_CPP_CACHED_BUILD_TYPE)
+agentloom_read_cmake_cache_entry(
+    "${LLAMA_CPP_CACHE_FILE}" CMAKE_CXX_COMPILER LLAMA_CPP_CACHED_CXX_COMPILER)
+
+if(NOT LLAMA_CPP_PREBUILT_CONFIG)
+    set(LLAMA_CPP_PREBUILT_CONFIG "${LLAMA_CPP_CACHED_BUILD_TYPE}")
+endif()
 
 set(LLAMA_CPP_INCLUDE_DIRS
     "${LLAMA_CPP_ROOT}/include"
@@ -106,6 +134,9 @@ if(WIN32)
         set(LLAMA_CPP_MTMD_LIB_DIR "${LLAMA_CPP_BUILD}/tools/mtmd/Release")
         set(LLAMA_CPP_GGML_LIB_DIR "${LLAMA_CPP_BUILD}/ggml/src/Release")
         set(LLAMA_CPP_BIN_DIR "${LLAMA_CPP_BUILD}/bin/Release")
+        if(NOT LLAMA_CPP_PREBUILT_CONFIG)
+            set(LLAMA_CPP_PREBUILT_CONFIG "Release")
+        endif()
     else()
         set(LLAMA_CPP_LIB_DIR "${LLAMA_CPP_BUILD}/src")
         set(LLAMA_CPP_COMMON_LIB_DIR "${LLAMA_CPP_BUILD}/common")
@@ -150,6 +181,55 @@ elseif(UNIX AND NOT APPLE)
         "${LLAMA_CPP_MTMD_LIB_DIR}/libmtmd.so*"
         "${LLAMA_CPP_GGML_LIB_DIR}/libggml*.so*"
     )
+endif()
+
+if(WIN32 AND BERT_BUILD_MULTIMODAL_INFERENCE_SERVER)
+    if(NOT LLAMA_CPP_PREBUILT_CONFIG)
+        message(FATAL_ERROR
+            "Cannot determine the ABI configuration of prebuilt llama.cpp at ${LLAMA_CPP_BUILD}. "
+            "Set LLAMA_CPP_PREBUILT_CONFIG to Debug, Release, RelWithDebInfo, or MinSizeRel.")
+    endif()
+
+    add_custom_target(agentloom_llama_abi_guard
+        COMMAND "${CMAKE_COMMAND}"
+            "-DAGENT_CONFIG=$<CONFIG>"
+            "-DLLAMA_CONFIG=${LLAMA_CPP_PREBUILT_CONFIG}"
+            "-DLLAMA_BUILD=${LLAMA_CPP_BUILD}"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/AgentLoomLlamaAbiGuard.cmake"
+        VERBATIM
+        COMMENT "Checking AgentLoom/llama.cpp ABI configuration")
+
+    if(MSVC AND LLAMA_CPP_CACHED_CXX_COMPILER)
+        string(REGEX MATCH
+            "MSVC[/\\\\]([0-9]+\\.[0-9]+)"
+            LLAMA_CPP_TOOLSET_MATCH "${LLAMA_CPP_CACHED_CXX_COMPILER}")
+        set(LLAMA_CPP_TOOLSET_DIRECTORY_VERSION "${CMAKE_MATCH_1}")
+        string(REGEX MATCH
+            "MSVC[/\\\\]([0-9]+\\.[0-9]+)"
+            AGENT_TOOLSET_MATCH "${CMAKE_CXX_COMPILER}")
+        set(AGENT_TOOLSET_DIRECTORY_VERSION "${CMAKE_MATCH_1}")
+
+        if(LLAMA_CPP_TOOLSET_DIRECTORY_VERSION
+                AND AGENT_TOOLSET_DIRECTORY_VERSION
+                AND NOT LLAMA_CPP_TOOLSET_DIRECTORY_VERSION
+                    STREQUAL AGENT_TOOLSET_DIRECTORY_VERSION)
+            string(CONCAT LLAMA_CPP_TOOLSET_MESSAGE
+                "MSVC toolset mismatch: AgentLoom uses ${AGENT_TOOLSET_DIRECTORY_VERSION} "
+                "(${CMAKE_CXX_COMPILER}), while llama.cpp uses "
+                "${LLAMA_CPP_TOOLSET_DIRECTORY_VERSION} (${LLAMA_CPP_CACHED_CXX_COMPILER}).")
+            if(AGENT_LLAMA_STRICT_TOOLSET_ABI)
+                message(FATAL_ERROR "${LLAMA_CPP_TOOLSET_MESSAGE}")
+            else()
+                message(WARNING
+                    "${LLAMA_CPP_TOOLSET_MESSAGE} Matching toolsets are recommended; "
+                    "set AGENT_LLAMA_STRICT_TOOLSET_ABI=ON to reject this configuration.")
+            endif()
+        endif()
+    endif()
+
+    message(STATUS
+        "llama.cpp prebuilt ABI: config=${LLAMA_CPP_PREBUILT_CONFIG}, "
+        "build=${LLAMA_CPP_BUILD}")
 endif()
 
 if(BERT_BUILD_MULTIMODAL_INFERENCE_SERVER)

@@ -66,6 +66,9 @@ public:
     /// GET key. Returns value or NotFound if key doesn't exist.
     core::Result<std::string> Get(const std::string& key);
 
+    /// EXISTS key. Returns whether the key exists without loading its value.
+    core::Result<bool> Exists(const std::string& key);
+
     /// MGET key1 key2 ... Returns values in same order (empty string for missing keys).
     core::Result<std::vector<std::string>> MGet(const std::vector<std::string>& keys);
 

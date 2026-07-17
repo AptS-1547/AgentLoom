@@ -10,6 +10,7 @@
 
 #include <boost/asio.hpp>
 #include <boost/beast.hpp>
+#include <boost/beast/http/parser.hpp>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -145,6 +146,7 @@ private:
     HttpServer& server_;
     beast::tcp_stream stream_;
     beast::flat_buffer buffer_;
+    std::optional<http::request_parser<http::string_body>> request_parser_;
     BeastHttpRequest request_;
     ConnectionLease lease_;
 };

@@ -121,8 +121,12 @@ TEST(ConfigOptionParserTest, ParsesCliFallbackOptionsThroughSections) {
         "--max-image-mb", "8",
         "--max-context-size", "2048",
         "--vlm-cache-enabled",
+        "--vlm-cache-reuse-policy", "prompt_kv_vector",
         "--vlm-cache-persist",
         "--vlm-cache-dir", "cache/test",
+        "--vlm-vector-cache-enabled",
+        "--vlm-prompt-kv-cache-enabled",
+        "--vlm-prompt-kv-backend", "memory",
         "--vram-warning-free-mb", "256",
         "--vram-unload-free-mb", "128"
     });
@@ -149,7 +153,9 @@ TEST(ConfigOptionParserTest, ParsesCliFallbackOptionsThroughSections) {
     EXPECT_EQ(options.limits.max_image_bytes, 8u * 1024u * 1024u);
     EXPECT_EQ(options.limits.max_context_size, 2048);
     EXPECT_TRUE(options.vlm_cache.enabled);
+    EXPECT_EQ(options.vlm_cache.reuse_policy, "prompt_kv_vector");
     EXPECT_TRUE(options.vlm_cache.persist);
+    EXPECT_TRUE(options.vlm_cache_vector.enabled);
     EXPECT_EQ(options.vlm_cache.cache_dir, std::filesystem::path("cache/test"));
     EXPECT_EQ(options.vram.warning_free_bytes, 256u * 1024u * 1024u);
     EXPECT_EQ(options.vram.unload_free_bytes, 128u * 1024u * 1024u);
@@ -182,12 +188,18 @@ TEST(ConfigOptionParserTest, LoadsConfigFileBeforeCliOverrides) {
             },
             "vlm_cache": {
                 "enabled": true,
+                "reuse_policy": "prompt_kv_vector",
                 "persist": false,
                 "dir": "cache/from-config",
                 "vector": {
                     "enabled": true,
                     "sim_threshold_high": 0.95,
                     "dir": "cache/from-config/vectors"
+                },
+                "prompt_kv": {
+                    "enabled": true,
+                    "backend": "memory",
+                    "max_mb": 256
                 }
             },
             "vram_guard": {
@@ -219,13 +231,117 @@ TEST(ConfigOptionParserTest, LoadsConfigFileBeforeCliOverrides) {
     EXPECT_EQ(options.limits.max_context_size, 2048);
     EXPECT_EQ(options.limits.max_image_bytes, 2u * 1024u * 1024u);
     EXPECT_TRUE(options.vlm_cache.enabled);
+    EXPECT_EQ(options.vlm_cache.reuse_policy, "prompt_kv_vector");
     EXPECT_FALSE(options.vlm_cache.persist);
     EXPECT_EQ(options.vlm_cache.cache_dir, std::filesystem::path("cache/from-config"));
     EXPECT_TRUE(options.vlm_cache_vector.enabled);
     EXPECT_FLOAT_EQ(options.vlm_cache_vector.sim_threshold_high, 0.95f);
     EXPECT_EQ(options.vlm_cache_vector.vector_dir, std::filesystem::path("cache/from-config/vectors"));
+    EXPECT_TRUE(options.vlm_prompt_kv_cache.enabled);
+    EXPECT_EQ(options.vlm_prompt_kv_cache.backend, "memory");
+    EXPECT_EQ(options.vlm_prompt_kv_cache.max_bytes, 256u * 1024u * 1024u);
     EXPECT_EQ(options.vram.warning_free_bytes, 512u * 1024u * 1024u);
     EXPECT_EQ(options.vram.unload_free_bytes, 256u * 1024u * 1024u);
+}
+
+TEST(ConfigOptionParserTest, RejectsPromptKvVectorPolicyWithoutRequiredCaches) {
+    EXPECT_THROW(
+        Parse({
+            "server",
+            "--llm", "llm.gguf",
+            "--vlm-cache-reuse-policy", "prompt_kv_vector"
+        }),
+        std::runtime_error);
+}
+
+TEST(ConfigOptionParserTest, ParsesTieredVlmCachePolicyAndNearThresholds) {
+    auto options = Parse({
+        "server",
+        "--llm", "llm.gguf",
+        "--vlm-cache-enabled",
+        "--vlm-vector-cache-enabled",
+        "--vlm-prompt-kv-cache-enabled",
+        "--vlm-prompt-kv-backend", "memory",
+        "--vlm-prompt-kv-near-enabled",
+        "--vlm-prompt-kv-near-same-session-min-cosine", "0.998",
+        "--vlm-prompt-kv-near-cross-session-min-cosine", "0.9995",
+        "--vlm-prompt-kv-near-same-session-min-token-mean", "0.991",
+        "--vlm-prompt-kv-near-cross-session-min-token-mean", "0.996",
+        "--vlm-prompt-kv-near-same-session-min-token-p05", "0.96",
+        "--vlm-prompt-kv-near-cross-session-min-token-p05", "0.985",
+        "--vlm-prompt-kv-near-same-session-max-relative-l2", "0.14",
+        "--vlm-prompt-kv-near-cross-session-max-relative-l2", "0.08",
+        "--vlm-cache-reuse-policy", "tiered"
+    });
+
+    EXPECT_EQ(options.vlm_cache.reuse_policy, "tiered");
+    EXPECT_TRUE(options.vlm_prompt_kv_cache.near_embedding_enabled);
+    EXPECT_FLOAT_EQ(options.vlm_prompt_kv_cache.near_same_session_min_cosine, 0.998f);
+    EXPECT_FLOAT_EQ(options.vlm_prompt_kv_cache.near_cross_session_min_cosine, 0.9995f);
+    EXPECT_FLOAT_EQ(options.vlm_prompt_kv_cache.near_same_session_min_mean_token_cosine, 0.991f);
+    EXPECT_FLOAT_EQ(options.vlm_prompt_kv_cache.near_cross_session_min_mean_token_cosine, 0.996f);
+    EXPECT_FLOAT_EQ(options.vlm_prompt_kv_cache.near_same_session_min_p05_token_cosine, 0.96f);
+    EXPECT_FLOAT_EQ(options.vlm_prompt_kv_cache.near_cross_session_min_p05_token_cosine, 0.985f);
+    EXPECT_FLOAT_EQ(options.vlm_prompt_kv_cache.near_same_session_max_relative_l2, 0.14f);
+    EXPECT_FLOAT_EQ(options.vlm_prompt_kv_cache.near_cross_session_max_relative_l2, 0.08f);
+}
+
+TEST(ConfigOptionParserTest, RejectsTieredPolicyWithoutNearPromptKv) {
+    EXPECT_THROW(
+        Parse({
+            "server",
+            "--llm", "llm.gguf",
+            "--vlm-cache-enabled",
+            "--vlm-vector-cache-enabled",
+            "--vlm-prompt-kv-cache-enabled",
+            "--vlm-prompt-kv-backend", "memory",
+            "--vlm-cache-reuse-policy", "tiered"
+        }),
+        std::runtime_error);
+}
+
+TEST(ConfigOptionParserTest, RejectsNearPromptKvWhenCrossSessionThresholdIsLooser) {
+    EXPECT_THROW(
+        Parse({
+            "server",
+            "--llm", "llm.gguf",
+            "--vlm-cache-enabled",
+            "--vlm-vector-cache-enabled",
+            "--vlm-prompt-kv-cache-enabled",
+            "--vlm-prompt-kv-backend", "memory",
+            "--vlm-prompt-kv-near-enabled",
+            "--vlm-prompt-kv-near-same-session-min-cosine", "0.999",
+            "--vlm-prompt-kv-near-cross-session-min-cosine", "0.998",
+            "--vlm-cache-reuse-policy", "tiered"
+        }),
+        std::runtime_error);
+}
+
+TEST(ConfigOptionParserTest, RejectsNearPromptKvWhenCrossSessionTokenGateIsLooser) {
+    EXPECT_THROW(
+        Parse({
+            "server",
+            "--llm", "llm.gguf",
+            "--vlm-cache-enabled",
+            "--vlm-vector-cache-enabled",
+            "--vlm-prompt-kv-cache-enabled",
+            "--vlm-prompt-kv-backend", "memory",
+            "--vlm-prompt-kv-near-enabled",
+            "--vlm-prompt-kv-near-same-session-min-token-p05", "0.98",
+            "--vlm-prompt-kv-near-cross-session-min-token-p05", "0.95",
+            "--vlm-cache-reuse-policy", "tiered"
+        }),
+        std::runtime_error);
+}
+
+TEST(ConfigOptionParserTest, RejectsUnknownVlmCacheReusePolicy) {
+    EXPECT_THROW(
+        Parse({
+            "server",
+            "--llm", "llm.gguf",
+            "--vlm-cache-reuse-policy", "unknown"
+        }),
+        std::runtime_error);
 }
 
 TEST(ConfigOptionParserTest, ResolvesAuthTokenFromFile) {

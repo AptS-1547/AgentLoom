@@ -71,6 +71,8 @@ public:
             metadata.transport_sequence = claimed.value().metadata().transport_sequence;
             metadata.frame_id = claimed.value().metadata().frame_id;
             metadata.timestamp_us = claimed.value().metadata().timestamp_us;
+            metadata.timing.published_at_unix_us = claimed.value().metadata().published_at_unix_us;
+            metadata.timing.received_at_unix_us = InferenceFrameNowUnixUs();
             metadata.width = claimed.value().metadata().width;
             metadata.height = claimed.value().metadata().height;
             metadata.format = format.value();
@@ -100,6 +102,7 @@ public:
                 return core::Status::Ok();
             }
 
+            copied.value().metadata().timing.admitted_at_unix_us = InferenceFrameNowUnixUs();
             auto submit = backlog_.TrySubmit(std::move(copied).value());
             if (!submit.accepted()) {
                 if (submit.status.code() != core::ErrorCode::ResourceExhausted ||
@@ -118,6 +121,7 @@ public:
                         claimed.value().metadata());
                 }
                 SpoolFrameMetadata spool_metadata;
+                overflow_frame.metadata().timing.spooled_at_unix_us = InferenceFrameNowUnixUs();
                 spool_metadata.execution_id = overflow_metadata.execution_id;
                 spool_metadata.selected_sequence = overflow_metadata.selected_sequence;
                 spool_metadata.frame = overflow_metadata;

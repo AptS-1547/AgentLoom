@@ -152,6 +152,13 @@ PersonaGatewayServer::PersonaGatewayServer(PersonaGatewayServerOptions options,
         sessions_,
         std::chrono::seconds(30),
         core::LoggerAdapter::ForModule("gateway"))));
+    if (auth_session_store_) {
+        static_cast<void>(maintenance_.RegisterTask(std::make_shared<AuthSessionMaintenanceTask>(
+            auth_session_store_,
+            std::chrono::seconds(60),
+            256,
+            core::LoggerAdapter::ForModule("gateway"))));
+    }
     for (const auto& task : dependencies_.maintenance_tasks) {
         static_cast<void>(maintenance_.RegisterTask(task));
     }

@@ -72,16 +72,15 @@ int main(int argc, char** argv) {
 
     std::cout << "[smoke] base_url: " << options.llm.base_url << "\n";
     std::cout << "[smoke] model:    " << options.llm.model << "\n";
-    std::cout << "[smoke] api_key:  " << options.llm.api_key.substr(0, 8) << "...\n";
+    std::cout << "[smoke] api_key:  resolved (redacted)\n";
     std::cout << "[smoke] prompts:  " << options.llm.prompts.size() << " loaded\n";
 
     // TLS verification:
     //   Linux / macOS: default TlsClientOptions triggers
     //                  set_default_verify_paths() → system trust store works
     //                  out of the box, no config needed.
-    //   Windows: vcpkg OpenSSL has no default trust store.  Use the
-    //            configured CA bundle if present, otherwise disable
-    //            verification (smoke tool only).
+    //   Windows: vcpkg OpenSSL has no default trust store.  A configured
+    //            Mozilla-compatible CA bundle is therefore required.
     agent::net::TlsClientOptions tls_opts;
 #ifdef _WIN32
     if (!options.llm.ca_bundle_path.empty()) {
@@ -92,8 +91,9 @@ int main(int argc, char** argv) {
         tls_opts.ca_bundle_path = bundle.string();
         std::cout << "[smoke] CA bundle: " << tls_opts.ca_bundle_path << "\n";
     } else {
-        tls_opts.verify_mode = agent::net::TlsVerifyMode::None;
-        std::cout << "[smoke] TLS verify: disabled (no ca_bundle_path on Windows)\n";
+        return Fail(
+            "llm.ca_bundle_path is required on Windows; run "
+            "tools\\update_mozilla_ca_bundle.ps1 first");
     }
 #else
     std::cout << "[smoke] TLS verify: system trust store\n";

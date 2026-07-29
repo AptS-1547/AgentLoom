@@ -428,6 +428,7 @@ TEST(ConfigLlmSectionTest, DisabledWhenBaseUrlEmpty) {
     auto opts = Parse({"server", "--llm", "llm.gguf"});
     EXPECT_TRUE(opts.llm.base_url.empty());
     EXPECT_TRUE(opts.llm.api_key.empty());
+    EXPECT_FALSE(opts.llm.disable_tls_verify_on_windows);
 }
 
 TEST(ConfigLlmSectionTest, ApiKeyResolvedFromEnv) {
@@ -529,6 +530,8 @@ TEST(ConfigLlmSectionTest, JsonConfigLoadsLlmSection) {
             "model": "deepseek-chat",
             "timeout_ms": 45000,
             "max_retries": 5,
+            "disable_tls_verify_on_windows": false,
+            "ca_bundle_path": "certs/mozilla-ca-bundle.pem",
             "prompts": {
                 "memory_extraction": "prompts/memory.txt",
                 "fact_distillation": "prompts/fact.txt"
@@ -547,6 +550,8 @@ TEST(ConfigLlmSectionTest, JsonConfigLoadsLlmSection) {
     EXPECT_EQ(opts.llm.timeout_ms, 45000);
     EXPECT_EQ(opts.llm.max_retries, 5);
     EXPECT_EQ(opts.llm.api_key, "sk-json-test");
+    EXPECT_FALSE(opts.llm.disable_tls_verify_on_windows);
+    EXPECT_EQ(opts.llm.ca_bundle_path, "certs/mozilla-ca-bundle.pem");
     EXPECT_EQ(opts.llm.prompts.size(), 2u);
     EXPECT_EQ(opts.llm.prompts["memory_extraction"].string(), "prompts/memory.txt");
 
@@ -744,6 +749,7 @@ TEST(ConfigPersonaGatewaySectionTest, JsonLoadsE2EGatewayOptionsAndResolvesStati
             },
             "session_idle_timeout_minutes": 30,
             "session_max_recent_turns": 24,
+            "session_max_active_sessions": 37,
             "runtime_recent_raw_turns": 10,
             "runtime_default_model": "e2e-model",
             "personas": {
@@ -804,6 +810,7 @@ TEST(ConfigPersonaGatewaySectionTest, JsonLoadsE2EGatewayOptionsAndResolvesStati
     EXPECT_EQ(opts.persona_gateway.io_pool.queue_capacity, 128u);
     EXPECT_EQ(opts.persona_gateway.session_idle_timeout_minutes, 30);
     EXPECT_EQ(opts.persona_gateway.session_max_recent_turns, 24u);
+    EXPECT_EQ(opts.persona_gateway.session_max_active_sessions, 37u);
     EXPECT_EQ(opts.persona_gateway.runtime_recent_raw_turns, 10u);
     EXPECT_EQ(opts.persona_gateway.runtime_default_model, "e2e-model");
     ASSERT_EQ(opts.persona_gateway.personas.size(), 2u);
@@ -847,6 +854,7 @@ TEST(ConfigPersonaGatewaySectionTest, CliOverridesGatewayJson) {
         "--gateway-io-queue", "200",
         "--gateway-session-idle-minutes", "45",
         "--gateway-session-max-recent-turns", "32",
+        "--gateway-session-max-active", "41",
         "--gateway-runtime-recent-raw-turns", "12",
         "--gateway-runtime-model", "cli-model",
         "--gateway-filter-disabled"
@@ -868,6 +876,7 @@ TEST(ConfigPersonaGatewaySectionTest, CliOverridesGatewayJson) {
     EXPECT_EQ(opts.persona_gateway.io_pool.queue_capacity, 200u);
     EXPECT_EQ(opts.persona_gateway.session_idle_timeout_minutes, 45);
     EXPECT_EQ(opts.persona_gateway.session_max_recent_turns, 32u);
+    EXPECT_EQ(opts.persona_gateway.session_max_active_sessions, 41u);
     EXPECT_EQ(opts.persona_gateway.runtime_recent_raw_turns, 12u);
     EXPECT_EQ(opts.persona_gateway.runtime_default_model, "cli-model");
     EXPECT_FALSE(opts.persona_gateway.request_filter_enabled);
@@ -887,6 +896,16 @@ TEST(ConfigPersonaGatewaySectionTest, RejectsInvalidWebSocketPath) {
             "server",
             "--llm", "llm.gguf",
             "--config", config_file.string(),
+        }),
+        std::runtime_error);
+}
+
+TEST(ConfigPersonaGatewaySectionTest, RejectsZeroActiveSessionLimit) {
+    EXPECT_THROW(
+        Parse({
+            "server",
+            "--llm", "llm.gguf",
+            "--gateway-session-max-active", "0",
         }),
         std::runtime_error);
 }

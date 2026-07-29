@@ -5,8 +5,11 @@
 
 include_guard(GLOBAL)
 
+get_filename_component(HF_TOKENIZERS_DEFAULT_CRATE_DIR
+    "${CMAKE_CURRENT_LIST_DIR}/../third_party/HuggingFace_Tokenzier/HuggingFace_Tokenzier_FFI"
+    ABSOLUTE)
 set(HF_TOKENIZERS_CRATE_DIR
-    "${CMAKE_SOURCE_DIR}/third_party/HuggingFace_Tokenzier/HuggingFace_Tokenzier_FFI"
+    "${HF_TOKENIZERS_DEFAULT_CRATE_DIR}"
     CACHE PATH "Path to the hf_tokenizers_capi Rust crate")
 
 set(HF_TOKENIZERS_INCLUDE_DIR

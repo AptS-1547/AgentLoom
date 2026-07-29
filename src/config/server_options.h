@@ -105,9 +105,11 @@ struct LlmOptions {
     int max_retries = 2;
     bool require_api_key = true;
     bool allow_placeholder = false;
-    bool disable_tls_verify_on_windows = true;
-    /// Optional CA bundle (PEM) for HTTPS verification.  Relative to config
-    /// file directory.  Leave empty on Linux to use the system trust store.
+    /// Emergency/test-only escape hatch. Production HTTPS must keep this false.
+    bool disable_tls_verify_on_windows = false;
+    /// CA bundle (PEM) for HTTPS verification, relative to the config file.
+    /// Required by the Windows OpenSSL client; optional on Linux, where an
+    /// empty path selects the system trust store.
     std::string ca_bundle_path;
     std::unordered_map<std::string, std::filesystem::path> prompts;
 };
@@ -330,6 +332,7 @@ struct PersonaGatewayConfigOptions {
     GatewayThreadPoolConfigOptions io_pool;
     int session_idle_timeout_minutes = 15;
     std::size_t session_max_recent_turns = 20;
+    std::size_t session_max_active_sessions = 1024;
     std::size_t runtime_recent_raw_turns = 10;
     std::string runtime_default_model;
     bool request_filter_enabled = true;
@@ -431,6 +434,7 @@ PersonaGatewayServerOptionsT ToPersonaGatewayServerOptions(const MultimodalServe
     options.io_pool.queue_capacity = config.persona_gateway.io_pool.queue_capacity;
     options.session.idle_timeout = std::chrono::minutes(config.persona_gateway.session_idle_timeout_minutes);
     options.session.max_recent_turns = config.persona_gateway.session_max_recent_turns;
+    options.session.max_active_sessions = config.persona_gateway.session_max_active_sessions;
     options.runtime.recent_raw_turns = config.persona_gateway.runtime_recent_raw_turns;
     options.runtime.default_model = config.persona_gateway.runtime_default_model.empty()
         ? config.llm.model

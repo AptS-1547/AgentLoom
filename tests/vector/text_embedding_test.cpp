@@ -9,6 +9,8 @@
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
+#include <future>
+#include <memory>
 #include <numeric>
 #include <string>
 #include <string_view>
@@ -272,4 +274,59 @@ TEST(EmbeddingPipelineE2ETest, EncodeReturnsNormalizedVector) {
         std::inner_product(vec.value().begin(), vec.value().end(),
                            vec.value().begin(), 0.0f));
     EXPECT_NEAR(norm, 1.0f, 1e-5f);
+}
+
+TEST(EmbeddingPipelineE2ETest, SharedModelSupportsConcurrentPipelines) {
+    REQUIRE_TOKENIZER();
+    REQUIRE_ONNX();
+
+    auto first_tokenizer = LoadTokenizer();
+    auto second_tokenizer = LoadTokenizer();
+    ASSERT_TRUE(first_tokenizer.valid());
+    ASSERT_TRUE(second_tokenizer.valid());
+
+    EmbeddingModelOptions opts;
+    opts.model_path = OnnxFixturePath();
+    opts.execution_provider = "cpu";
+    opts.allow_cpu_fallback = false;
+    opts.pooling = PoolingStrategy::Mean;
+    opts.normalize = true;
+
+    auto loaded = OnnxTextEmbeddingModel::Load(std::move(opts));
+    ASSERT_TRUE(loaded.ok()) << loaded.status().message();
+    std::shared_ptr<vector::IEmbeddingModel> shared_model(std::move(loaded).value());
+
+    EmbeddingPipeline first(
+        std::make_shared<HfTokenizer>(std::move(first_tokenizer)),
+        shared_model);
+    EmbeddingPipeline second(
+        std::make_shared<HfTokenizer>(std::move(second_tokenizer)),
+        shared_model);
+    EXPECT_GE(shared_model.use_count(), 3);
+
+    std::array<std::string_view, 3> first_texts{
+        "shared model first pipeline",
+        "parallel embedding request",
+        "第一组并发文本",
+    };
+    std::array<std::string_view, 2> second_texts{
+        "shared model second pipeline",
+        "第二组并发文本",
+    };
+
+    auto first_result = std::async(std::launch::async, [&] {
+        return first.EncodeBatch(first_texts);
+    });
+    auto second_result = std::async(std::launch::async, [&] {
+        return second.EncodeBatch(second_texts);
+    });
+
+    auto first_batch = first_result.get();
+    auto second_batch = second_result.get();
+    ASSERT_TRUE(first_batch.ok()) << first_batch.status().message();
+    ASSERT_TRUE(second_batch.ok()) << second_batch.status().message();
+    EXPECT_EQ(first_batch.value().batch_size, first_texts.size());
+    EXPECT_EQ(second_batch.value().batch_size, second_texts.size());
+    EXPECT_EQ(first_batch.value().dimension, second_batch.value().dimension);
+    EXPECT_EQ(shared_model->Dimension(), first_batch.value().dimension);
 }

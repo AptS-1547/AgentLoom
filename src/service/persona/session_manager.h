@@ -53,6 +53,23 @@ struct ConversationTurn {
 struct SessionOptions {
     std::chrono::minutes idle_timeout{15};
     std::size_t max_recent_turns = 20;
+    std::size_t max_active_sessions = 1024;
+};
+
+struct SessionAdmissionRequest {
+    std::string tenant_id = "default";
+    std::string user_uuid;
+    std::size_t requested_sessions = 1;
+    std::string reason;
+};
+
+/// 账户、租户或权限级 session 配额的扩展点。
+/// 全局 active session 硬上限由 SessionManager 固有保证，本策略暂不参与默认创建流程。
+class ISessionAdmissionPolicy {
+public:
+    virtual ~ISessionAdmissionPolicy() = default;
+
+    virtual core::Status Check(const SessionAdmissionRequest& request) const = 0;
 };
 
 struct CreateSessionRequest {

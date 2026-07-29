@@ -5,7 +5,7 @@ set(AGENTLOOM_CMAKE_INSTALL_DIR "${CMAKE_INSTALL_LIBDIR}/cmake/AgentLoom")
 set(_agentloom_public_targets
     bert_proto multimodal_proto agent_core agent_net agent_tls agent_http_client
     agent_llm agent_semantic_cache agent_document agent_memory agent_storage
-    agent_vector_storage agent_ipc agent_ipc_grpc agent_media_inference agent_media_vlm_grpc agent_media
+    agent_vector_storage agent_conversation agent_ipc agent_ipc_grpc agent_media_inference agent_media_vlm_grpc agent_media
     server_runtime agent_bert_models agent_models agent_cache agent_vector agent_config
     agent_service_core agent_agent_runtime agent_gateway_auth agent_agent_gateway
     agent_classroom_gateway agent_training_report_gateway agent_document_gateway
@@ -14,7 +14,7 @@ set(_agentloom_public_targets
 
 set(_agentloom_public_target_names
     bert_proto multimodal_proto core net tls http_client llm semantic_cache document
-    memory storage vector_storage ipc ipc_grpc media_inference vlm_client media runtime bert_models
+    memory storage vector_storage conversation ipc ipc_grpc media_inference vlm_client media runtime bert_models
     models cache vector config service_core agent_runtime gateway_auth agent_gateway
     classroom_gateway training_report_gateway document_gateway gateway service skill_media
     emotion_server server
@@ -79,6 +79,7 @@ set(_agentloom_install_include_dirs
     "${CMAKE_INSTALL_INCLUDEDIR}/AgentLoom/config"
     "${CMAKE_INSTALL_INCLUDEDIR}/AgentLoom/document"
     "${CMAKE_INSTALL_INCLUDEDIR}/AgentLoom/document/ooxml"
+    "${CMAKE_INSTALL_INCLUDEDIR}/AgentLoom/conversation"
     "${CMAKE_INSTALL_INCLUDEDIR}/AgentLoom/memory"
     "${CMAKE_INSTALL_INCLUDEDIR}/AgentLoom/storage"
     "${CMAKE_INSTALL_INCLUDEDIR}/AgentLoom/storage/sqlite"

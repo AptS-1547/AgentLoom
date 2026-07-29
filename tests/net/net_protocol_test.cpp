@@ -734,6 +734,39 @@ TEST(HttpServerRuntimeTest, DispatchesTypedWebSocketStreamRequestAndTracksConnec
     server.Stop();
 }
 
+TEST(HttpServerRuntimeTest, ClosesIdleWebSocketAfterConfiguredTimeout) {
+    net::HttpServerOptions options;
+    options.address = "127.0.0.1";
+    options.port = 0;
+    options.io_threads = 1;
+    options.websocket_idle_timeout = 1s;
+
+    net::HttpServer server(options);
+    std::promise<net::ConnectionCloseReason> close_seen;
+    auto close_seen_future = close_seen.get_future();
+    std::atomic_bool close_recorded{false};
+    server.SetWebSocketHandler("/ws", [](net::WebSocketSessionHandle&, net::WebSocketMessage) {});
+    server.SetWebSocketCloseHandler([&](const net::ConnectionCloseInfo& close_info) {
+        if (!close_recorded.exchange(true)) {
+            close_seen.set_value(close_info.reason);
+        }
+    });
+    ASSERT_TRUE(server.Start().ok());
+
+    asio::io_context io;
+    tcp::resolver resolver(io);
+    beast::websocket::stream<tcp::socket> ws(io);
+    asio::connect(ws.next_layer(), resolver.resolve("127.0.0.1", std::to_string(server.port())));
+    ws.handshake("127.0.0.1", "/ws");
+
+    ASSERT_EQ(close_seen_future.wait_for(4s), std::future_status::ready);
+    EXPECT_EQ(close_seen_future.get(), net::ConnectionCloseReason::IdleTimeout);
+
+    beast::error_code ec;
+    ws.next_layer().close(ec);
+    server.Stop();
+}
+
 TEST(HttpServerRuntimeTest, StreamsLargeWebSocketMessageAsFragments) {
     net::HttpServerOptions options;
     options.address = "127.0.0.1";

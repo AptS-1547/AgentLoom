@@ -1,6 +1,7 @@
 #pragma once
 
 #include "document_analysis_service.h"
+#include "gateway_auth.h"
 #include "logger_adapter.h"
 #include "long_term_memory_compressor.h"
 #include "result.h"
@@ -139,6 +140,24 @@ public:
 private:
     std::shared_ptr<persona::ISkillSessionManager> manager_;
     std::chrono::milliseconds interval_;
+    core::LoggerAdapter logger_;
+};
+
+class AuthSessionMaintenanceTask final : public IRuntimeMaintenanceTask {
+public:
+    AuthSessionMaintenanceTask(std::shared_ptr<IAuthSessionStore> store,
+                               std::chrono::milliseconds interval,
+                               std::size_t batch_size = 256,
+                               core::LoggerAdapter logger = core::LoggerAdapter::ForModule("gateway"));
+
+    std::string_view Name() const noexcept override;
+    std::chrono::milliseconds Interval() const noexcept override;
+    core::Status Tick(std::stop_token stop_token) override;
+
+private:
+    std::shared_ptr<IAuthSessionStore> store_;
+    std::chrono::milliseconds interval_;
+    std::size_t batch_size_;
     core::LoggerAdapter logger_;
 };
 

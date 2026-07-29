@@ -16,6 +16,7 @@
     "websocket_path": "/ws/session",
     "session_idle_timeout_minutes": 15,
     "session_max_recent_turns": 20,
+    "session_max_active_sessions": 1024,
     "runtime_recent_raw_turns": 10,
     "runtime_default_model": "deepseek-chat",
     "compute_pool": {

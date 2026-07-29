@@ -226,9 +226,21 @@ core::Result<std::shared_ptr<agent::llm::ILlmClient>> CreateLlmClient(const Tool
 
     if (config.llm.enabled && !config.llm.base_url.empty()) {
         agent::net::TlsClientOptions tls_opts;
+        if (!config.llm.ca_bundle_path.empty()) {
+            fs::path bundle_path = config.llm.ca_bundle_path;
+            if (bundle_path.is_relative() && !config.config_file_path.empty()) {
+                bundle_path = config.config_file_path.parent_path() / bundle_path;
+            }
+            tls_opts.ca_bundle_path = bundle_path.string();
+        }
 #ifdef _WIN32
         if (config.llm.disable_tls_verify_on_windows) {
+            LOG_WARN("[agent-gateway] TLS peer verification is disabled by configuration");
             tls_opts.verify_mode = agent::net::TlsVerifyMode::None;
+        } else if (tls_opts.ca_bundle_path.empty()) {
+            return core::Status::Error(
+                core::ErrorCode::FailedPrecondition,
+                "llm.ca_bundle_path is required for verified HTTPS on Windows OpenSSL");
         }
 #endif
         auto tls = agent::net::TlsContext::CreateClient(tls_opts);
@@ -339,7 +351,43 @@ core::Result<std::shared_ptr<agent::service::persona::IEmotionAnalyzer>> CreateE
             std::move(providers)));
 }
 
-core::Result<L0MemoryCacheBundle> CreateL0MemoryCache(const ToolConfig& config) {
+core::Result<std::shared_ptr<vector::OnnxTextEmbeddingModel>> CreateEmbeddingModel(
+    const ToolConfig& config) {
+    if (!fs::exists(config.embedding.onnx_model_path)) {
+        return core::Status::Error(
+            core::ErrorCode::NotFound,
+            "embedding model not found: " + config.embedding.onnx_model_path);
+    }
+
+    vector::EmbeddingModelOptions model_options;
+    model_options.model_path = config.embedding.onnx_model_path;
+    model_options.execution_provider = config.embedding.execution_provider;
+    model_options.allow_cpu_fallback = config.embedding.allow_cpu_fallback;
+    model_options.cuda_device_id = config.embedding.cuda_device_id;
+    model_options.intra_op_num_threads = config.embedding.intra_op_num_threads;
+    model_options.inter_op_num_threads = config.embedding.inter_op_num_threads;
+    model_options.expected_dimension = static_cast<std::size_t>(config.embedding.expected_dimension);
+    if (config.embedding.pooling_strategy == "mean") {
+        model_options.pooling = vector::PoolingStrategy::Mean;
+    } else if (config.embedding.pooling_strategy == "cls") {
+        model_options.pooling = vector::PoolingStrategy::Cls;
+    } else {
+        return core::Status::Error(
+            core::ErrorCode::InvalidArgument,
+            "unsupported embedding pooling_strategy: " + config.embedding.pooling_strategy);
+    }
+    model_options.normalize = config.embedding.normalize;
+    model_options.require_token_type_ids = config.embedding.require_token_type_ids;
+    auto model = vector::OnnxTextEmbeddingModel::Load(std::move(model_options));
+    if (!model.ok()) {
+        return model.status();
+    }
+    return std::shared_ptr<vector::OnnxTextEmbeddingModel>(std::move(model).value());
+}
+
+core::Result<L0MemoryCacheBundle> CreateL0MemoryCache(
+    const ToolConfig& config,
+    std::shared_ptr<vector::OnnxTextEmbeddingModel> embedding_model) {
     if (!config.l0_memory.enabled) {
         L0MemoryCacheBundle bundle;
         bundle.cache = std::make_shared<NoopSemanticCache>();
@@ -348,8 +396,10 @@ core::Result<L0MemoryCacheBundle> CreateL0MemoryCache(const ToolConfig& config) 
     if (!fs::exists(config.embedding.tokenizer_path)) {
         return core::Status::Error(core::ErrorCode::NotFound, "tokenizer not found: " + config.embedding.tokenizer_path);
     }
-    if (!fs::exists(config.embedding.onnx_model_path)) {
-        return core::Status::Error(core::ErrorCode::NotFound, "embedding model not found: " + config.embedding.onnx_model_path);
+    if (!embedding_model) {
+        return core::Status::Error(
+            core::ErrorCode::FailedPrecondition,
+            "shared embedding model is required");
     }
 
     auto tokenizer = vector::HfTokenizer::LoadFromFile(config.embedding.tokenizer_path);
@@ -358,19 +408,9 @@ core::Result<L0MemoryCacheBundle> CreateL0MemoryCache(const ToolConfig& config) 
     }
     auto tokenizer_ptr = std::make_shared<vector::HfTokenizer>(std::move(tokenizer).value());
 
-    vector::EmbeddingModelOptions model_options;
-    model_options.model_path = config.embedding.onnx_model_path;
-    model_options.execution_provider = config.embedding.execution_provider;
-    model_options.allow_cpu_fallback = true;
-    model_options.expected_dimension = static_cast<std::size_t>(config.embedding.expected_dimension);
-    model_options.pooling = vector::PoolingStrategy::Mean;
-    model_options.normalize = true;
-    auto model = vector::OnnxTextEmbeddingModel::Load(model_options);
-    if (!model.ok()) {
-        return model.status();
-    }
-    std::shared_ptr<vector::IEmbeddingModel> model_ptr(std::move(model).value());
-    auto embedding = std::make_shared<vector::EmbeddingPipeline>(std::move(tokenizer_ptr), std::move(model_ptr));
+    auto embedding = std::make_shared<vector::EmbeddingPipeline>(
+        std::move(tokenizer_ptr),
+        std::move(embedding_model));
 
     agent::semantic_cache::RedisPoolOptions redis_options;
     redis_options.host = config.l0_memory.redis_host;
@@ -404,12 +444,16 @@ core::Result<L0MemoryCacheBundle> CreateL0MemoryCache(const ToolConfig& config) 
     return bundle;
 }
 
-core::Result<std::shared_ptr<vector::EmbeddingPipeline>> CreateEmbeddingPipeline(const ToolConfig& config) {
+core::Result<std::shared_ptr<vector::EmbeddingPipeline>> CreateEmbeddingPipeline(
+    const ToolConfig& config,
+    std::shared_ptr<vector::OnnxTextEmbeddingModel> embedding_model) {
     if (!fs::exists(config.embedding.tokenizer_path)) {
         return core::Status::Error(core::ErrorCode::NotFound, "tokenizer not found: " + config.embedding.tokenizer_path);
     }
-    if (!fs::exists(config.embedding.onnx_model_path)) {
-        return core::Status::Error(core::ErrorCode::NotFound, "embedding model not found: " + config.embedding.onnx_model_path);
+    if (!embedding_model) {
+        return core::Status::Error(
+            core::ErrorCode::FailedPrecondition,
+            "shared embedding model is required");
     }
 
     auto tokenizer = vector::HfTokenizer::LoadFromFile(config.embedding.tokenizer_path);
@@ -418,24 +462,15 @@ core::Result<std::shared_ptr<vector::EmbeddingPipeline>> CreateEmbeddingPipeline
     }
     auto tokenizer_ptr = std::make_shared<vector::HfTokenizer>(std::move(tokenizer).value());
 
-    vector::EmbeddingModelOptions model_options;
-    model_options.model_path = config.embedding.onnx_model_path;
-    model_options.execution_provider = config.embedding.execution_provider;
-    model_options.allow_cpu_fallback = true;
-    model_options.expected_dimension = static_cast<std::size_t>(config.embedding.expected_dimension);
-    model_options.pooling = vector::PoolingStrategy::Mean;
-    model_options.normalize = true;
-    auto model = vector::OnnxTextEmbeddingModel::Load(model_options);
-    if (!model.ok()) {
-        return model.status();
-    }
-    std::shared_ptr<vector::IEmbeddingModel> model_ptr(std::move(model).value());
-    return std::make_shared<vector::EmbeddingPipeline>(std::move(tokenizer_ptr), std::move(model_ptr));
+    return std::make_shared<vector::EmbeddingPipeline>(
+        std::move(tokenizer_ptr),
+        std::move(embedding_model));
 }
 
 core::Result<std::shared_ptr<agent::document::IDocumentEmbeddingProvider>> CreateDocumentEmbeddingProvider(
-    const ToolConfig& config) {
-    auto pipeline = CreateEmbeddingPipeline(config);
+    const ToolConfig& config,
+    std::shared_ptr<vector::OnnxTextEmbeddingModel> embedding_model) {
+    auto pipeline = CreateEmbeddingPipeline(config, std::move(embedding_model));
     if (!pipeline.ok()) {
         return pipeline.status();
     }
@@ -467,15 +502,18 @@ core::Result<std::shared_ptr<agent::document::IDocumentLlmChunkCache>> CreateDoc
 }
 
 core::Result<std::shared_ptr<agent::semantic_cache::ISemanticCache>> CreateDocumentSemanticCache(
-    const ToolConfig& config) {
+    const ToolConfig& config,
+    std::shared_ptr<vector::OnnxTextEmbeddingModel> embedding_model) {
     if (!config.document_semantic_cache.enabled) {
         return std::shared_ptr<agent::semantic_cache::ISemanticCache>{};
     }
     if (!fs::exists(config.embedding.tokenizer_path)) {
         return core::Status::Error(core::ErrorCode::NotFound, "tokenizer not found: " + config.embedding.tokenizer_path);
     }
-    if (!fs::exists(config.embedding.onnx_model_path)) {
-        return core::Status::Error(core::ErrorCode::NotFound, "embedding model not found: " + config.embedding.onnx_model_path);
+    if (!embedding_model) {
+        return core::Status::Error(
+            core::ErrorCode::FailedPrecondition,
+            "shared embedding model is required");
     }
 
     auto tokenizer = vector::HfTokenizer::LoadFromFile(config.embedding.tokenizer_path);
@@ -483,19 +521,6 @@ core::Result<std::shared_ptr<agent::semantic_cache::ISemanticCache>> CreateDocum
         return tokenizer.status();
     }
     auto tokenizer_ptr = std::make_shared<vector::HfTokenizer>(std::move(tokenizer).value());
-
-    vector::EmbeddingModelOptions model_options;
-    model_options.model_path = config.embedding.onnx_model_path;
-    model_options.execution_provider = config.embedding.execution_provider;
-    model_options.allow_cpu_fallback = true;
-    model_options.expected_dimension = static_cast<std::size_t>(config.embedding.expected_dimension);
-    model_options.pooling = vector::PoolingStrategy::Mean;
-    model_options.normalize = true;
-    auto model = vector::OnnxTextEmbeddingModel::Load(model_options);
-    if (!model.ok()) {
-        return model.status();
-    }
-    std::shared_ptr<vector::OnnxTextEmbeddingModel> model_ptr(std::move(model).value());
 
     agent::semantic_cache::RedisPoolOptions redis_options;
     redis_options.host = config.document_semantic_cache.redis_host;
@@ -522,7 +547,7 @@ core::Result<std::shared_ptr<agent::semantic_cache::ISemanticCache>> CreateDocum
 
     agent::semantic_cache::SemanticCachePipelineDeps deps;
     deps.tokenizer = std::move(tokenizer_ptr);
-    deps.embedding_model = std::move(model_ptr);
+    deps.embedding_model = std::move(embedding_model);
     deps.index_manager = std::move(index);
 
     agent::semantic_cache::SemanticCachePipelineOptions options;
@@ -540,7 +565,8 @@ core::Result<std::shared_ptr<agent::semantic_cache::ISemanticCache>> CreateDocum
 
 core::Result<std::shared_ptr<agent::memory::LongTermMemoryCompressor>> CreateL3MemoryCompressor(
     const ToolConfig& config,
-    std::shared_ptr<agent::llm::ILlmClient> llm_client) {
+    std::shared_ptr<agent::llm::ILlmClient> llm_client,
+    std::shared_ptr<vector::OnnxTextEmbeddingModel> embedding_model) {
     if (!config.l3_memory.enabled) {
         return std::shared_ptr<agent::memory::LongTermMemoryCompressor>{};
     }
@@ -580,8 +606,8 @@ core::Result<std::shared_ptr<agent::memory::LongTermMemoryCompressor>> CreateL3M
     collection.name = config.l3_memory.collection_name;
     collection.embedding_model_fingerprint = config.l3_memory.embedding_fingerprint;
     collection.tokenizer_fingerprint = config.l3_memory.tokenizer_fingerprint;
-    collection.pooling_strategy = "mean";
-    collection.normalization = "l2";
+    collection.pooling_strategy = config.embedding.pooling_strategy;
+    collection.normalization = config.embedding.normalize ? "l2" : "none";
     collection.dimension = static_cast<std::size_t>(config.embedding.expected_dimension);
     collection.corpus_version = config.l3_memory.corpus_version;
     collection.policy_version = config.l3_memory.policy_version;
@@ -618,7 +644,7 @@ core::Result<std::shared_ptr<agent::memory::LongTermMemoryCompressor>> CreateL3M
         static_cast<std::size_t>(config.embedding.expected_dimension),
         index_options);
 
-    auto embedding_pipeline = CreateEmbeddingPipeline(config);
+    auto embedding_pipeline = CreateEmbeddingPipeline(config, std::move(embedding_model));
     if (!embedding_pipeline.ok()) {
         sqlite_pool->Close();
         redis->Shutdown();
@@ -718,7 +744,17 @@ int main(int argc, char** argv) {
         }
         auto llm_client = std::move(llm).value();
 
-        auto l0 = CreateL0MemoryCache(config);
+        auto loaded_embedding_model = CreateEmbeddingModel(config);
+        if (!loaded_embedding_model.ok()) {
+            logging::Shutdown();
+            return Fail("embedding model: " + loaded_embedding_model.status().message());
+        }
+        auto embedding_model = std::move(loaded_embedding_model).value();
+        LOG_INFO("[agent-gateway] embedding model loaded once provider={} model={}",
+                 embedding_model->GetActiveExecutionProvider(),
+                 config.embedding.onnx_model_path);
+
+        auto l0 = CreateL0MemoryCache(config, embedding_model);
         if (!l0.ok()) {
             logging::Shutdown();
             return Fail("L0 memory: " + l0.status().message());
@@ -731,7 +767,7 @@ int main(int argc, char** argv) {
                  config.embedding.tokenizer_path,
                  config.embedding.onnx_model_path);
 
-        auto l3 = CreateL3MemoryCompressor(config, llm_client);
+        auto l3 = CreateL3MemoryCompressor(config, llm_client, embedding_model);
         if (!l3.ok()) {
             logging::Shutdown();
             return Fail("L3 memory: " + l3.status().message());
@@ -743,7 +779,7 @@ int main(int argc, char** argv) {
                      config.l3_memory.user_uuids.size());
         }
 
-        auto document_embedding = CreateDocumentEmbeddingProvider(config);
+        auto document_embedding = CreateDocumentEmbeddingProvider(config, embedding_model);
         if (!document_embedding.ok()) {
             logging::Shutdown();
             return Fail("document embedding: " + document_embedding.status().message());
@@ -753,7 +789,7 @@ int main(int argc, char** argv) {
             logging::Shutdown();
             return Fail("document LLM chunk cache: " + document_llm_chunk_cache.status().message());
         }
-        auto document_semantic_cache = CreateDocumentSemanticCache(config);
+        auto document_semantic_cache = CreateDocumentSemanticCache(config, embedding_model);
         if (!document_semantic_cache.ok()) {
             logging::Shutdown();
             return Fail("document semantic cache: " + document_semantic_cache.status().message());

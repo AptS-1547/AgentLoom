@@ -1924,6 +1924,59 @@ TEST(GatewayAuthSessionStoreTest, PersistsResolvesAndRevokesSessions) {
     std::filesystem::remove(path.string() + "-shm", ec);
 }
 
+TEST(GatewayAuthSessionStoreTest, CleansExpiredSessionsInLruOrder) {
+    const auto path = std::filesystem::temp_directory_path() / "agent_gateway_auth_sessions_cleanup_test.db";
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    std::filesystem::remove(path.string() + "-wal", ec);
+    std::filesystem::remove(path.string() + "-shm", ec);
+
+    SqliteAuthSessionStore store(path.string());
+    ASSERT_TRUE(store.EnsureSchema().ok());
+
+    const auto now = std::chrono::system_clock::now();
+    AuthSessionRecord oldest;
+    oldest.token_id = "token-expired-oldest";
+    oldest.user_uuid = "uuid-oldest";
+    oldest.issued_at = now - std::chrono::hours(3);
+    oldest.expires_at = now - std::chrono::hours(2);
+    oldest.updated_at = now - std::chrono::hours(3);
+    ASSERT_TRUE(store.UpsertSession(oldest).ok());
+
+    AuthSessionRecord newer;
+    newer.token_id = "token-expired-newer";
+    newer.user_uuid = "uuid-newer";
+    newer.issued_at = now - std::chrono::hours(2);
+    newer.expires_at = now - std::chrono::hours(1);
+    newer.updated_at = now - std::chrono::hours(1);
+    ASSERT_TRUE(store.UpsertSession(newer).ok());
+
+    AuthSessionRecord active;
+    active.token_id = "token-active";
+    active.user_uuid = "uuid-active";
+    active.issued_at = now;
+    active.expires_at = now + std::chrono::hours(1);
+    active.updated_at = now;
+    ASSERT_TRUE(store.UpsertSession(active).ok());
+
+    auto first = store.CleanupExpired(now, 1);
+    ASSERT_TRUE(first.ok()) << first.status().message();
+    EXPECT_EQ(first.value(), 1u);
+    EXPECT_EQ(store.ResolveSession("token-expired-oldest").status().code(), core::ErrorCode::NotFound);
+    EXPECT_TRUE(store.ResolveSession("token-expired-newer").ok());
+    EXPECT_TRUE(store.ResolveSession("token-active").ok());
+
+    auto second = store.CleanupExpired(now, 8);
+    ASSERT_TRUE(second.ok()) << second.status().message();
+    EXPECT_EQ(second.value(), 1u);
+    EXPECT_EQ(store.ResolveSession("token-expired-newer").status().code(), core::ErrorCode::NotFound);
+    EXPECT_TRUE(store.ResolveSession("token-active").ok());
+
+    std::filesystem::remove(path, ec);
+    std::filesystem::remove(path.string() + "-wal", ec);
+    std::filesystem::remove(path.string() + "-shm", ec);
+}
+
 TEST(PersonaMetadataStoreTest, SqlitePersistsPersonaMetadataAcrossInstances) {
     const auto path = std::filesystem::temp_directory_path() / "agent_gateway_persona_metadata_test.db";
     std::error_code ec;

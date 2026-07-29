@@ -34,6 +34,8 @@ AgentLoom 是一个面向服务端智能体的 C++20 Runtime。它把 HTTP/WebSo
 - **情感融合**：BERT 主干结合关键词等证据，通过可配置 fusion head、置信度和 margin gate 更新 V-A 状态。
 - **记忆与缓存**：Redis/SQLite L0 记忆、L3 压缩记忆、Exact/Faiss 向量检索、VLM 结果缓存，以及基于 llama.cpp sequence state 的 image-prefix Prompt KV Cache（memory/Redis 双后端）。
 - **文档链路**：DOCX/PPTX OOXML 提取、受管文件存储、分块分析、元数据和 LLM/语义缓存。
+- **连续对话分块**：复用批量 embedding 与 SIMD 内积，以滚动块向量、时间代价和有界动态规划生成互不重叠的 DialogueBlock；上下文化 embedding 模式显式版本化。
+- **云任务并行执行**：可分解任务通过有界 worker pool 并发调用 OpenAI-compatible/本地 LLM，使用 ordered bitmap window 对乱序完成和失败终态进行保序归并。
 - **实时多模态输入**：WebRTC signaling（offer/answer/ICE/resume）、GStreamer `webrtcbin` media pipeline、OpenCV 动态抽帧（MOG2/直方图/边缘变化/EMA/cooldown）、关键帧 JPEG/PNG 编码（NVIDIA/VAAPI/D3D11/QSV 硬件加速与软件回退）。
 - **帧推理链路**：共享内存帧 IPC（MPMC sequence ring、RAII claim、epoch 重建）+ gRPC IPC 控制面（grant/revoke/probe、lease 协调、跨进程故障恢复）组成数据面/控制面分离的传输层；上层由有序准入、mmap 磁盘 spool 溢出回放、私有 backlog、VLM coordinator 和执行级封口聚合（running → sealing → replay → aggregate）构成受控的关键帧推理生命周期。
 - **基础设施**：`core::Status`/`Result`、RAII 句柄封装、内存池、线程池、对象池、线程安全队列、keyed serial executor（按 key 串行、会话亲和保序）、task group（结构化并发）、TLS context 和并发 HTTP client。
@@ -84,7 +86,7 @@ target_link_libraries(my_agent PRIVATE
 )
 ```
 
-当前公开别名包括 `core`、`net`、`tls`、`http_client`、`config`、`storage`、`vector_storage`、`vector`、`semantic_cache`、`memory`、`document`、`llm`、`models`、`cache`、`ipc`、`media_inference`、`media`、`runtime`、`gateway` 和 `service`。
+当前公开别名包括 `core`、`net`、`tls`、`http_client`、`config`、`storage`、`vector_storage`、`vector`、`semantic_cache`、`memory`、`document`、`conversation`、`llm`、`models`、`cache`、`ipc`、`media_inference`、`media`、`runtime`、`gateway` 和 `service`。
 
 也可以安装静态库、头文件和 CMake package 后通过 `find_package()` 复用：
 
@@ -147,6 +149,29 @@ MSVC 工具集目录版本不一致默认给出 CMake warning。需要在 CI 或
 ```powershell
 -DAGENT_LLAMA_STRICT_TOOLSET_ABI=ON
 ```
+
+#### Windows HTTPS CA bundle
+
+AgentLoom 的 HTTPS 客户端使用 OpenSSL。Windows 上的 vcpkg OpenSSL 不保证自动读取 Windows Certificate Store，因此访问公网云 API 时应显式携带 Mozilla CA bundle；这是一组公开的服务端信任根，不是客户端证书，也不包含私钥。
+
+仓库提供下载和 SHA-256 校验脚本。脚本通过 Windows 自身的 HTTPS 信任链下载 curl 官方发布的 Mozilla CA Extract：
+
+```powershell
+.\tools\update_mozilla_ca_bundle.ps1
+```
+
+默认输出到 `config/certs/mozilla-ca-bundle.pem`。Gateway 配置如下，路径相对于配置文件目录：
+
+```json
+{
+  "llm": {
+    "ca_bundle_path": "certs/mozilla-ca-bundle.pem",
+    "disable_tls_verify_on_windows": false
+  }
+}
+```
+
+Windows 上启用云 LLM 且保持证书校验时，`ca_bundle_path` 是必需项；缺失或不可读会在客户端初始化阶段失败，不再自动退化为 `verify_none`。部署包应携带该 PEM，并按固定发布周期或安全公告更新。Linux 未配置该字段时仍使用系统 CA trust store。
 
 ### Linux / WSL2
 
@@ -249,6 +274,7 @@ build\x64-Release\Release\multimodal_inference_server.exe `
 | `src/semantic_cache` | Redis 连接池、L0 adapter、缓存策略和 context risk detector |
 | `src/storage` / `src/vector` | SQLite、向量元数据、embedding pipeline 与 Exact/Faiss index |
 | `src/memory` / `src/document` | L3 压缩记忆、OOXML 文档分析与缓存 |
+| `src/conversation` | 连续话轮数据模型、上下文化 embedding 输入与有界动态规划分块 |
 | `src/media` / `src/ipc` | WebRTC/GStreamer、帧编码抽样、共享内存数据面与 gRPC 控制面、有序准入、磁盘 spool 回放与 VLM coordination |
 | `src/server` | Gateway 与 gRPC 进程入口、日志、状态映射和运行时统计 |
 

@@ -63,6 +63,7 @@ private:
     void DispatchReadError(core::Status status, std::size_t bytes_transferred, bool final_fragment);
 
     websocket::stream<beast::tcp_stream> stream_;
+    asio::steady_timer response_timer_;
     BeastHttpRequest request_;
     ConnectionLease lease_;
     WebSocketSessionOptions options_;

@@ -353,6 +353,7 @@ Json AuthSessionRecordToJson(const AuthSessionRecord& record) {
         {"subject", record.subject},
         {"issued_at", ToUnixSeconds(record.issued_at)},
         {"expires_at", ToUnixSeconds(record.expires_at)},
+        {"updated_at", ToUnixSeconds(record.updated_at)},
         {"revoked", record.revoked},
     };
 }
@@ -372,6 +373,7 @@ core::Result<AuthSessionRecord> AuthSessionRecordFromJson(std::string_view paylo
     record.subject = json.value("subject", std::string{});
     record.issued_at = FromUnixSeconds(json.value("issued_at", std::int64_t{0}));
     record.expires_at = FromUnixSeconds(json.value("expires_at", std::int64_t{0}));
+    record.updated_at = FromUnixSeconds(json.value("updated_at", ToUnixSeconds(record.issued_at)));
     record.revoked = json.value("revoked", false);
     if (record.token_id.empty() || record.user_uuid.empty()) {
         return core::Status::Error(core::ErrorCode::InvalidArgument, "invalid auth session record");
@@ -874,6 +876,10 @@ core::Status SqliteAuthSessionStore::EnsureSchema() {
         "updated_at INTEGER NOT NULL"
         ")");
     if (!create.ok()) return create;
+    auto cleanup_index = connection.Execute(
+        "CREATE INDEX IF NOT EXISTS idx_gateway_auth_sessions_cleanup "
+        "ON gateway_auth_sessions(revoked, expires_at, updated_at)");
+    if (!cleanup_index.ok()) return cleanup_index;
     auto create_users = connection.Execute(
         "CREATE TABLE IF NOT EXISTS gateway_auth_users ("
         "user_uuid TEXT PRIMARY KEY,"
@@ -899,7 +905,7 @@ core::Result<AuthSessionRecord> SqliteAuthSessionStore::ResolveSession(std::stri
     }
     auto connection = std::move(connection_result).value();
     auto statement_result = connection.Prepare(
-        "SELECT token_id,user_uuid,tenant_id,subject,issued_at,expires_at,revoked "
+        "SELECT token_id,user_uuid,tenant_id,subject,issued_at,expires_at,revoked,updated_at "
         "FROM gateway_auth_sessions WHERE token_id=?1");
     if (!statement_result.ok()) {
         return statement_result.status();
@@ -924,6 +930,7 @@ core::Result<AuthSessionRecord> SqliteAuthSessionStore::ResolveSession(std::stri
     record.issued_at = FromUnixSeconds(statement.ColumnInt64(4));
     record.expires_at = FromUnixSeconds(statement.ColumnInt64(5));
     record.revoked = statement.ColumnInt(6) != 0;
+    record.updated_at = FromUnixSeconds(statement.ColumnInt64(7));
     return record;
 }
 
@@ -1041,7 +1048,7 @@ core::Status SqliteAuthSessionStore::UpsertSession(const AuthSessionRecord& reco
     if (auto status = statement.BindText(4, record.subject); !status.ok()) return status;
     if (auto status = statement.BindInt64(5, ToUnixSeconds(record.issued_at)); !status.ok()) return status;
     if (auto status = statement.BindInt64(6, ToUnixSeconds(record.expires_at)); !status.ok()) return status;
-    if (auto status = statement.BindInt64(7, now); !status.ok()) return status;
+    if (auto status = statement.BindInt64(7, ToUnixSeconds(record.updated_at) == 0 ? now : ToUnixSeconds(record.updated_at)); !status.ok()) return status;
     auto step = statement.Step();
     if (!step.ok()) {
         return step.status();
@@ -1071,6 +1078,38 @@ core::Status SqliteAuthSessionStore::RevokeSession(std::string_view token_id, st
     return connection.Changes() == 0
         ? core::Status::Error(core::ErrorCode::NotFound, "auth session not found")
         : core::Status::Ok();
+}
+
+core::Result<std::size_t> SqliteAuthSessionStore::CleanupExpired(
+    std::chrono::system_clock::time_point now,
+    std::size_t max_records) {
+    if (max_records == 0) {
+        return core::Status::Error(core::ErrorCode::InvalidArgument,
+                                   "auth session cleanup batch size must be positive");
+    }
+    auto connection_result = SqliteConnection::Open(database_path_);
+    if (!connection_result.ok()) {
+        return connection_result.status();
+    }
+    auto connection = std::move(connection_result).value();
+    auto statement_result = connection.Prepare(
+        "DELETE FROM gateway_auth_sessions "
+        "WHERE token_id IN ("
+        "SELECT token_id FROM gateway_auth_sessions "
+        "WHERE revoked != 0 OR expires_at <= ?1 "
+        "ORDER BY updated_at ASC LIMIT ?2"
+        ")");
+    if (!statement_result.ok()) {
+        return statement_result.status();
+    }
+    auto statement = std::move(statement_result).value();
+    if (auto status = statement.BindInt64(1, ToUnixSeconds(now)); !status.ok()) return status;
+    if (auto status = statement.BindInt64(2, static_cast<std::int64_t>(max_records)); !status.ok()) return status;
+    auto step = statement.Step();
+    if (!step.ok()) {
+        return step.status();
+    }
+    return static_cast<std::size_t>(connection.Changes());
 }
 
 RedisAuthSessionStore::RedisAuthSessionStore(std::shared_ptr<semantic_cache::RedisConnectionPool> redis,
@@ -1142,9 +1181,14 @@ core::Status RedisAuthSessionStore::UpsertSession(const AuthSessionRecord& recor
     if (record.token_id.empty() || record.user_uuid.empty()) {
         return core::Status::Error(core::ErrorCode::InvalidArgument, "token_id and user_uuid are required");
     }
-    auto ttl = RemainingTtl(record.expires_at);
+    auto stored = record;
+    const auto now = std::chrono::system_clock::now();
+    if (stored.updated_at.time_since_epoch().count() == 0) {
+        stored.updated_at = now;
+    }
+    auto ttl = RemainingTtl(stored.expires_at);
     auto set_session = redis_->Set(SessionKey(record.token_id),
-                                  AuthSessionRecordToJson(record).dump(),
+                                  AuthSessionRecordToJson(stored).dump(),
                                   ttl);
     if (!set_session.ok()) {
         return set_session;
@@ -1159,9 +1203,76 @@ core::Status RedisAuthSessionStore::RevokeSession(std::string_view token_id, std
     }
     auto record = resolved.value();
     record.revoked = true;
+    record.updated_at = std::chrono::system_clock::now();
     return redis_->Set(SessionKey(token_id),
                        AuthSessionRecordToJson(record).dump(),
                        RemainingTtl(record.expires_at));
+}
+
+core::Result<std::size_t> RedisAuthSessionStore::CleanupExpired(
+    std::chrono::system_clock::time_point now,
+    std::size_t max_records) {
+    if (!redis_ || !redis_->running()) {
+        return core::Status::Error(core::ErrorCode::FailedPrecondition,
+                                   "redis auth session store is not running");
+    }
+    if (max_records == 0) {
+        return core::Status::Error(core::ErrorCode::InvalidArgument,
+                                   "auth session cleanup batch size must be positive");
+    }
+    auto keys_result = redis_->Scan(key_prefix_ + ":session:*");
+    if (!keys_result.ok()) {
+        return keys_result.status();
+    }
+    if (keys_result.value().empty()) {
+        return std::size_t{0};
+    }
+    auto payloads_result = redis_->MGet(keys_result.value());
+    if (!payloads_result.ok()) {
+        return payloads_result.status();
+    }
+
+    struct Candidate {
+        std::string key;
+        std::chrono::system_clock::time_point updated_at{};
+    };
+    std::vector<Candidate> candidates;
+    candidates.reserve(payloads_result.value().size());
+    for (std::size_t i = 0; i < payloads_result.value().size(); ++i) {
+        if (payloads_result.value()[i].empty()) {
+            continue;
+        }
+        auto record = AuthSessionRecordFromJson(payloads_result.value()[i]);
+        if (!record.ok()) {
+            return record.status();
+        }
+        if (record.value().revoked || record.value().expires_at <= now) {
+            candidates.push_back(Candidate{
+                keys_result.value()[i],
+                record.value().updated_at.time_since_epoch().count() == 0
+                    ? record.value().issued_at
+                    : record.value().updated_at});
+        }
+    }
+    std::sort(candidates.begin(), candidates.end(), [](const Candidate& lhs, const Candidate& rhs) {
+        return lhs.updated_at < rhs.updated_at;
+    });
+    if (candidates.size() > max_records) {
+        candidates.resize(max_records);
+    }
+    if (candidates.empty()) {
+        return std::size_t{0};
+    }
+    std::vector<std::string> keys;
+    keys.reserve(candidates.size());
+    for (const auto& candidate : candidates) {
+        keys.push_back(candidate.key);
+    }
+    auto deleted = redis_->Del(keys);
+    if (!deleted.ok()) {
+        return deleted.status();
+    }
+    return static_cast<std::size_t>(std::max<long long>(0, deleted.value()));
 }
 
 std::string RedisAuthSessionStore::SessionKey(std::string_view token_id) const {

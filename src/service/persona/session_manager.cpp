@@ -82,6 +82,14 @@ core::Result<SessionSnapshot> SessionManager::CreateSession(CreateSessionRequest
         if (sessions_.find(id) != sessions_.end()) {
             return core::Status::Error(core::ErrorCode::AlreadyExists, "session already exists");
         }
+        if (sessions_.size() >= options_.max_active_sessions) {
+            logger_.warn("[trace={}] [session] active session limit reached active={} limit={}",
+                         core::CurrentTraceId(),
+                         sessions_.size(),
+                         options_.max_active_sessions);
+            return core::Status::Error(core::ErrorCode::ResourceExhausted,
+                                       "active session limit reached");
+        }
         {
             std::lock_guard slot_lock(slot->mutex);
             snapshot = SnapshotLocked(slot->state);

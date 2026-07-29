@@ -12,6 +12,7 @@ namespace net {
 
 enum class ConnectionCloseReason {
     RemoteClosed,
+    IdleTimeout,
     ResponseTimeout,
     AccessDenied,
     BackpressureLimit,
@@ -33,6 +34,12 @@ struct ConnectionCloseInfo {
 
     static ConnectionCloseInfo Timeout(std::string detail = {}) {
         return {ConnectionCloseReason::ResponseTimeout,
+                core::Status::Error(core::ErrorCode::Timeout, detail),
+                std::move(detail)};
+    }
+
+    static ConnectionCloseInfo IdleTimeout(std::string detail = {}) {
+        return {ConnectionCloseReason::IdleTimeout,
                 core::Status::Error(core::ErrorCode::Timeout, detail),
                 std::move(detail)};
     }

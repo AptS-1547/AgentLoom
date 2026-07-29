@@ -7,6 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include <future>
+#include <filesystem>
 #include <string_view>
 #include <thread>
 
@@ -23,6 +24,9 @@ using agent::service::gateway::IRuntimeMaintenanceTask;
 using agent::service::gateway::InferenceFrameIpcPeerMaintenanceTask;
 using agent::service::gateway::RuntimeMaintenanceService;
 using agent::service::gateway::SessionMaintenanceTask;
+using agent::service::gateway::AuthSessionMaintenanceTask;
+using agent::service::gateway::AuthSessionRecord;
+using agent::service::gateway::SqliteAuthSessionStore;
 
 class CountingMaintenanceTask final : public IRuntimeMaintenanceTask {
 public:
@@ -138,6 +142,34 @@ TEST(SessionManagerTest, CreatesTouchesAddsTurnsAndClosesSession) {
 
     EXPECT_TRUE(manager.CloseSession("session-a", "trace-close").ok());
     EXPECT_EQ(manager.SessionCount(), 0u);
+
+    compute.Shutdown(true);
+    io.Shutdown(true);
+}
+
+TEST(SessionManagerTest, RejectsNewSessionsWhenActiveLimitIsReached) {
+    core::ThreadPool compute({1, 8, "test-compute"});
+    core::ThreadPool io({1, 8, "test-io"});
+    ASSERT_TRUE(compute.Start().ok());
+    ASSERT_TRUE(io.Start().ok());
+
+    SessionOptions options;
+    options.max_active_sessions = 2;
+    SessionManager manager(compute, io, options);
+
+    ASSERT_TRUE(manager.CreateSession(MakeCreateRequest("session-limit-a")).ok());
+    ASSERT_TRUE(manager.CreateSession(MakeCreateRequest("session-limit-b")).ok());
+    EXPECT_EQ(manager.SessionCount(), 2u);
+
+    auto rejected = manager.CreateSession(MakeCreateRequest("session-limit-c"));
+    ASSERT_FALSE(rejected.ok());
+    EXPECT_EQ(rejected.status().code(), core::ErrorCode::ResourceExhausted);
+    EXPECT_EQ(rejected.status().message(), "active session limit reached");
+
+    ASSERT_TRUE(manager.CloseSession("session-limit-a").ok());
+    auto admitted = manager.CreateSession(MakeCreateRequest("session-limit-c"));
+    ASSERT_TRUE(admitted.ok()) << admitted.status().message();
+    EXPECT_EQ(manager.SessionCount(), 2u);
 
     compute.Shutdown(true);
     io.Shutdown(true);
@@ -268,6 +300,34 @@ TEST(RuntimeMaintenanceServiceTest, SessionCleanupTaskExpiresIdleSessions) {
     EXPECT_EQ(manager.SessionCount(), 0u);
     compute.Shutdown(true);
     io.Shutdown(true);
+}
+
+TEST(RuntimeMaintenanceServiceTest, AuthSessionCleanupTaskRemovesExpiredSessions) {
+    const auto path = std::filesystem::temp_directory_path() / "agent_gateway_auth_maintenance_test.db";
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    std::filesystem::remove(path.string() + "-wal", ec);
+    std::filesystem::remove(path.string() + "-shm", ec);
+
+    auto store = std::make_shared<SqliteAuthSessionStore>(path.string());
+    ASSERT_TRUE(store->EnsureSchema().ok());
+    AuthSessionRecord record;
+    record.token_id = "maintenance-expired";
+    record.user_uuid = "maintenance-user";
+    record.issued_at = std::chrono::system_clock::now() - 2h;
+    record.expires_at = std::chrono::system_clock::now() - 1h;
+    ASSERT_TRUE(store->UpsertSession(record).ok());
+
+    AuthSessionMaintenanceTask task(store, 10ms, 8);
+    std::stop_source stop;
+    ASSERT_TRUE(task.Tick(stop.get_token()).ok());
+    auto resolved = store->ResolveSession(record.token_id);
+    EXPECT_FALSE(resolved.ok());
+    EXPECT_EQ(resolved.status().code(), core::ErrorCode::NotFound);
+
+    std::filesystem::remove(path, ec);
+    std::filesystem::remove(path.string() + "-wal", ec);
+    std::filesystem::remove(path.string() + "-shm", ec);
 }
 
 TEST(RuntimeMaintenanceServiceTest, IpcPeerTaskFencesThenRecoversLostInferencePeer) {

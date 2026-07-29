@@ -90,6 +90,7 @@ if(BERT_BUILD_TESTS)
     add_executable(core_tests
         tests/core/core_infra_test.cpp
         tests/core/keyed_serial_executor_test.cpp
+        tests/core/optimizer_test.cpp
         tests/core/ordered_bitmap_window_test.cpp
     )
 

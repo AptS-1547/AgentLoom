@@ -13,6 +13,81 @@ add_library(agent_semantic_cache STATIC
     src/semantic_cache/l0_memory_cache_adapter.cpp
 )
 
+# Generic continuous-dialogue segmentation. Domain-specific behavior rules stay downstream.
+add_library(agent_conversation STATIC
+    src/conversation/dialogue_segmenter.h
+    src/conversation/dialogue_segmenter.cpp
+)
+
+target_include_directories(agent_conversation PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/conversation
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/core
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/vector
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/semantic_cache
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/storage
+)
+
+target_link_libraries(agent_conversation PUBLIC
+    agent_core
+    agent_semantic_cache
+    eigen_headers
+)
+
+if(BERT_BUILD_TESTS)
+    add_executable(conversation_tests
+        tests/conversation/dialogue_segmenter_test.cpp
+    )
+    target_link_libraries(conversation_tests PRIVATE
+        agent_conversation
+        GTest::gtest_main
+    )
+    gtest_discover_tests(conversation_tests DISCOVERY_MODE PRE_TEST)
+
+    add_executable(conversation_pipeline_e2e_tests
+        tests/conversation/dialogue_cloud_pipeline_e2e_test.cpp
+    )
+    target_link_libraries(conversation_pipeline_e2e_tests PRIVATE
+        agent_conversation
+        agent_llm
+        GTest::gtest_main
+    )
+    gtest_discover_tests(conversation_pipeline_e2e_tests DISCOVERY_MODE PRE_TEST)
+endif()
+
+add_executable(conversation_pipeline_bench
+    tests/conversation/dialogue_cloud_pipeline_bench.cpp
+)
+target_link_libraries(conversation_pipeline_bench PRIVATE
+    agent_conversation
+    agent_llm
+)
+
+add_executable(dialogue_segmentation_dataset_bench
+    tests/conversation/dialogue_segmentation_dataset_bench.cpp
+)
+target_link_libraries(dialogue_segmentation_dataset_bench PRIVATE
+    agent_conversation
+    agent_vector
+    nlohmann_json::nlohmann_json
+)
+file(GLOB DIALOGUE_BENCH_ONNXRUNTIME_LIBS
+    "${ONNXRUNTIME_ROOT}/${BERT_ONNXRUNTIME_RUNTIME_GLOB}")
+copy_runtime_files(dialogue_segmentation_dataset_bench
+    ${DIALOGUE_BENCH_ONNXRUNTIME_LIBS})
+if(ONNXRUNTIME_ROOT STREQUAL ONNXRUNTIME_GPU_ROOT AND
+        EXISTS "${CUDA_RUNTIME_DLL_ROOT}")
+    if(WIN32)
+        file(GLOB DIALOGUE_BENCH_CUDA_RUNTIME_LIBS
+            "${CUDA_RUNTIME_DLL_ROOT}/*.dll")
+    elseif(UNIX AND NOT APPLE)
+        file(GLOB DIALOGUE_BENCH_CUDA_RUNTIME_LIBS
+            "${CUDA_RUNTIME_DLL_ROOT}/*.so*")
+    endif()
+    copy_runtime_files(dialogue_segmentation_dataset_bench
+        ${DIALOGUE_BENCH_CUDA_RUNTIME_LIBS})
+endif()
+copy_runtime_files(dialogue_segmentation_dataset_bench ${VCPKG_RUNTIME_DLLS})
+
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND
         CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
     target_compile_options(agent_semantic_cache PUBLIC -mavx2 -mfma)

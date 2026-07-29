@@ -5,6 +5,7 @@
 #include "hf_tokenizer.h"
 #include "onnx_text_embedding_model.h"
 #include "openai_llm_client.h"
+#include "optimizer.h"
 #include "thread_pool.h"
 #include "tls_context.h"
 
@@ -729,17 +730,6 @@ std::vector<LlmGateCandidate> ScanLlmGate(const std::vector<PreparedSample>& sam
     return candidates;
 }
 
-void AdamUpdate(double& value, double grad, double lr, int step, double& m, double& v) {
-    constexpr double beta1 = 0.9;
-    constexpr double beta2 = 0.999;
-    constexpr double eps = 1e-8;
-    m = beta1 * m + (1.0 - beta1) * grad;
-    v = beta2 * v + (1.0 - beta2) * grad * grad;
-    const double m_hat = m / (1.0 - std::pow(beta1, step));
-    const double v_hat = v / (1.0 - std::pow(beta2, step));
-    value -= lr * m_hat / (std::sqrt(v_hat) + eps);
-}
-
 void PrintUsage() {
     std::cerr
         << "Usage: emotion_fusion_map_calibrator --config <gateway.json> --dataset <smp.json|jsonl> --output <out.json> [options]\n"
@@ -1111,12 +1101,20 @@ int main(int argc, char** argv) {
 
         FusedEmotionAnalyzer fusion(nullptr, options);
         const auto before = Evaluate(prepared, options, fusion);
-        double m_bias = 0.0, v_bias = 0.0;
-        double m_bert = 0.0, v_bert = 0.0;
-        double m_keyword = 0.0, v_keyword = 0.0;
-        double m_vector = 0.0, v_vector = 0.0;
-        double m_llm = 0.0, v_llm = 0.0;
-        double m_margin = 0.0, v_margin = 0.0;
+        core::optimization::AdamOptions optimizer_options;
+        optimizer_options.learning_rate = args.learning_rate;
+        auto created_optimizer = core::optimization::AdamOptimizer::Create(optimizer_options);
+        if (!created_optimizer.ok()) {
+            throw std::runtime_error(created_optimizer.status().message());
+        }
+        auto optimizer = std::move(created_optimizer).value();
+        std::array<double, 5> optimized_parameters{
+            options.head_bias,
+            options.bert_signal_weight,
+            options.keyword_signal_weight,
+            options.vector_signal_weight,
+            options.margin_signal_weight,
+        };
         for (int epoch = 1; epoch <= args.epochs; ++epoch) {
             FeatureGradient grad;
             double loss = 0.0;
@@ -1140,16 +1138,31 @@ int main(int argc, char** argv) {
             grad.vector_signal_weight = grad.vector_signal_weight * inv_n + 2.0 * args.prior_lambda * (options.vector_signal_weight - prior.vector_signal_weight);
             grad.margin_signal_weight = grad.margin_signal_weight * inv_n + 2.0 * args.prior_lambda * (options.margin_signal_weight - prior.margin_signal_weight);
 
-            AdamUpdate(options.head_bias, grad.head_bias, args.learning_rate, epoch, m_bias, v_bias);
-            AdamUpdate(options.bert_signal_weight, grad.bert_signal_weight, args.learning_rate, epoch, m_bert, v_bert);
-            AdamUpdate(options.keyword_signal_weight, grad.keyword_signal_weight, args.learning_rate, epoch, m_keyword, v_keyword);
-            AdamUpdate(options.vector_signal_weight, grad.vector_signal_weight, args.learning_rate, epoch, m_vector, v_vector);
-            AdamUpdate(options.margin_signal_weight, grad.margin_signal_weight, args.learning_rate, epoch, m_margin, v_margin);
+            const std::array<double, 5> gradients{
+                grad.head_bias,
+                grad.bert_signal_weight,
+                grad.keyword_signal_weight,
+                grad.vector_signal_weight,
+                grad.margin_signal_weight,
+            };
+            const auto optimizer_status = optimizer->Step(optimized_parameters, gradients);
+            if (!optimizer_status.ok()) {
+                throw std::runtime_error(optimizer_status.message());
+            }
+            options.head_bias = optimized_parameters[0];
+            options.bert_signal_weight = optimized_parameters[1];
+            options.keyword_signal_weight = optimized_parameters[2];
+            options.vector_signal_weight = optimized_parameters[3];
+            options.margin_signal_weight = optimized_parameters[4];
 
             options.bert_signal_weight = Clamp(options.bert_signal_weight, -10.0, 10.0);
             options.keyword_signal_weight = Clamp(options.keyword_signal_weight, -10.0, 10.0);
             options.vector_signal_weight = Clamp(options.vector_signal_weight, -10.0, 10.0);
             options.margin_signal_weight = Clamp(options.margin_signal_weight, -10.0, 10.0);
+            optimized_parameters[1] = options.bert_signal_weight;
+            optimized_parameters[2] = options.keyword_signal_weight;
+            optimized_parameters[3] = options.vector_signal_weight;
+            optimized_parameters[4] = options.margin_signal_weight;
             if (epoch % 25 == 0 || epoch == 1 || epoch == args.epochs) {
                 const auto stats = Evaluate(prepared, options, fusion);
                 std::cout << "[calibrator] epoch=" << epoch

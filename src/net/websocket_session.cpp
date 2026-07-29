@@ -66,6 +66,7 @@ WebSocketSession::WebSocketSession(tcp::socket socket,
                                    WebSocketSessionOptions options,
                                    WebSocketSessionCallbacks callbacks)
     : stream_(std::move(socket)),
+      response_timer_(stream_.get_executor()),
       request_(std::move(request)),
       lease_(std::move(lease)),
       options_(std::move(options)),
@@ -128,6 +129,7 @@ void WebSocketSession::OnAccept(beast::error_code ec) {
     if (callbacks_.accept_handler) {
         callbacks_.accept_handler(*this);
     }
+    lease_.Touch();
     DoReadSome();
 }
 
@@ -143,6 +145,12 @@ void WebSocketSession::DoReadSome() {
                  core::Status::Error(core::ErrorCode::InvalidArgument, "websocket read limits must be positive"),
                  "websocket read limits must be positive"});
         return;
+    }
+
+    if (options_.websocket.idle_timeout.count() > 0) {
+        stream_.next_layer().expires_after(options_.websocket.idle_timeout);
+    } else {
+        stream_.next_layer().expires_never();
     }
 
     const auto remaining_message_capacity =
@@ -171,12 +179,18 @@ void WebSocketSession::OnReadSome(beast::error_code ec, std::size_t bytes_transf
         DispatchReadError(MessageTooLargeStatus(ec.message()), 0, true);
         return;
     }
+    if (ec == beast::error::timeout) {
+        DoClose(ConnectionCloseInfo::IdleTimeout("websocket idle timeout"));
+        return;
+    }
     if (ec) {
         NotifyClose({ConnectionCloseReason::ProtocolError,
                      core::Status::Error(core::ErrorCode::InvalidArgument, ec.message()),
                      ec.message()});
         return;
     }
+
+    lease_.Touch();
 
     auto resize_status = read_buffer_.resize(bytes_transferred);
     if (!resize_status.ok()) {
@@ -248,12 +262,22 @@ void WebSocketSession::DoWrite() {
     current_write_ = std::move(frame);
     stream_.text(current_write_.kind == WebSocketMessageKind::Text);
     writing_ = true;
+    if (options_.websocket.response_timeout.count() > 0) {
+        response_timer_.expires_after(options_.websocket.response_timeout);
+        response_timer_.async_wait([self = shared_from_this()](beast::error_code ec) {
+            if (!ec && self->writing_ && !self->closing_) {
+                self->DoClose(ConnectionCloseInfo::Timeout("websocket response timeout"));
+            }
+        });
+    }
     stream_.async_write(
         asio::buffer(current_write_.payload.data(), current_write_.payload.size()),
         beast::bind_front_handler(&WebSocketSession::OnWrite, shared_from_this()));
 }
 
 void WebSocketSession::OnWrite(beast::error_code ec, std::size_t) {
+    beast::error_code timer_ec;
+    response_timer_.cancel(timer_ec);
     writing_ = false;
     current_write_.reset();
     if (ec) {
@@ -262,6 +286,7 @@ void WebSocketSession::OnWrite(beast::error_code ec, std::size_t) {
                      ec.message()});
         return;
     }
+    lease_.Touch();
     DoWrite();
 }
 
@@ -270,6 +295,9 @@ void WebSocketSession::DoClose(ConnectionCloseInfo close_info) {
         return;
     }
     closing_ = true;
+    stream_.next_layer().expires_never();
+    beast::error_code timer_ec;
+    response_timer_.cancel(timer_ec);
     NotifyClose(close_info);
     websocket::close_reason reason;
     reason.reason = close_info.detail;
@@ -290,6 +318,7 @@ void WebSocketSession::NotifyClose(const ConnectionCloseInfo& close_info) {
 }
 
 void WebSocketSession::OnControl(websocket::frame_type type, beast::string_view payload) {
+    lease_.Touch();
     if (type == websocket::frame_type::close) {
         NotifyClose(ConnectionCloseInfo::Remote(std::string(payload)));
     }

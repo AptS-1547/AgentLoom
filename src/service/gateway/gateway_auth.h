@@ -4,6 +4,7 @@
 #include "logger_adapter.h"
 #include "result.h"
 
+#include <cstddef>
 #include <chrono>
 #include <memory>
 #include <optional>
@@ -66,6 +67,7 @@ struct AuthSessionRecord {
     std::string subject;
     std::chrono::system_clock::time_point issued_at{};
     std::chrono::system_clock::time_point expires_at{};
+    std::chrono::system_clock::time_point updated_at{};
     bool revoked = false;
 };
 
@@ -91,6 +93,9 @@ public:
     virtual core::Status UpsertUser(const AuthUserRecord& record) = 0;
     virtual core::Status UpsertSession(const AuthSessionRecord& record) = 0;
     virtual core::Status RevokeSession(std::string_view token_id, std::string_view reason) = 0;
+    virtual core::Result<std::size_t> CleanupExpired(
+        std::chrono::system_clock::time_point now,
+        std::size_t max_records) = 0;
 };
 
 class IGatewayAuthenticator {
@@ -178,6 +183,9 @@ public:
     core::Status UpsertUser(const AuthUserRecord& record) override;
     core::Status UpsertSession(const AuthSessionRecord& record) override;
     core::Status RevokeSession(std::string_view token_id, std::string_view reason) override;
+    core::Result<std::size_t> CleanupExpired(
+        std::chrono::system_clock::time_point now,
+        std::size_t max_records) override;
 
 private:
     std::string database_path_;
@@ -194,6 +202,9 @@ public:
     core::Status UpsertUser(const AuthUserRecord& record) override;
     core::Status UpsertSession(const AuthSessionRecord& record) override;
     core::Status RevokeSession(std::string_view token_id, std::string_view reason) override;
+    core::Result<std::size_t> CleanupExpired(
+        std::chrono::system_clock::time_point now,
+        std::size_t max_records) override;
 
 private:
     std::string SessionKey(std::string_view token_id) const;

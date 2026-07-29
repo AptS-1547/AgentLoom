@@ -26,6 +26,7 @@ DECLARE_CONFIG_SECTION(PersonaGatewayConfigSection, "persona_gateway")
     CONFIG_CLI_STRING(kIoQueue, "--gateway-io-queue");
     CONFIG_CLI_STRING(kSessionIdle, "--gateway-session-idle-minutes");
     CONFIG_CLI_STRING(kSessionTurns, "--gateway-session-max-recent-turns");
+    CONFIG_CLI_STRING(kSessionMaxActive, "--gateway-session-max-active");
     CONFIG_CLI_STRING(kRecentRawTurns, "--gateway-runtime-recent-raw-turns");
     CONFIG_CLI_STRING(kDefaultModel, "--gateway-runtime-model");
     CONFIG_CLI_STRING(kFilterDisabled, "--gateway-filter-disabled");
@@ -303,6 +304,7 @@ void PersonaGatewayConfigSection::LoadJson(const Json& root, MultimodalServerOpt
     LoadThreadPoolJson(*section, Name(), "io_pool", options.persona_gateway.io_pool);
     SetInt(*section, Name(), "session_idle_timeout_minutes", options.persona_gateway.session_idle_timeout_minutes, 1, 1440);
     SetSize(*section, Name(), "session_max_recent_turns", options.persona_gateway.session_max_recent_turns, 1);
+    SetSize(*section, Name(), "session_max_active_sessions", options.persona_gateway.session_max_active_sessions, 1);
     SetSize(*section, Name(), "runtime_recent_raw_turns", options.persona_gateway.runtime_recent_raw_turns, 1);
     SetString(*section, Name(), "runtime_default_model", options.persona_gateway.runtime_default_model);
     if (const Json* filter = FindField(*section, Name(), "request_filter")) {
@@ -360,6 +362,7 @@ bool PersonaGatewayConfigSection::LoadCli(CliCursor& cursor, MultimodalServerOpt
     CONFIG_VALUE_ARG(kIoQueue, value, options.persona_gateway.io_pool.queue_capacity = ParseNonNegativeOption(kIoQueue, *value);)
     CONFIG_VALUE_ARG(kSessionIdle, value, options.persona_gateway.session_idle_timeout_minutes = ParsePositiveOption(kSessionIdle, *value);)
     CONFIG_VALUE_ARG(kSessionTurns, value, options.persona_gateway.session_max_recent_turns = ParsePositiveOption(kSessionTurns, *value);)
+    CONFIG_VALUE_ARG(kSessionMaxActive, value, options.persona_gateway.session_max_active_sessions = ParsePositiveOption(kSessionMaxActive, *value);)
     CONFIG_VALUE_ARG(kRecentRawTurns, value, options.persona_gateway.runtime_recent_raw_turns = ParsePositiveOption(kRecentRawTurns, *value);)
     CONFIG_VALUE_ARG(kDefaultModel, value, options.persona_gateway.runtime_default_model = *value;)
     CONFIG_FLAG_ARG(kFilterDisabled, options.persona_gateway.request_filter_enabled = false;)

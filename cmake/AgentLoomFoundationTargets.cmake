@@ -9,6 +9,8 @@ add_library(agent_core STATIC
     src/core/memory_pool.cpp
     src/core/memory_pool.h
     src/core/object_pool.h
+    src/core/optimizer.cpp
+    src/core/optimizer.h
     src/core/ordered_bitmap_window.h
     src/core/result.h
     src/core/shared_memory_block.h
@@ -130,6 +132,8 @@ endif()
 add_library(agent_llm STATIC
     src/llm/openai_llm_client.h
     src/llm/openai_llm_client.cpp
+    src/llm/cloud_task_coordinator.h
+    src/llm/cloud_task_coordinator.cpp
     src/llm/local_llm_client.h
     src/llm/local_llm_client.cpp
 )
@@ -149,6 +153,7 @@ target_link_libraries(agent_llm PUBLIC
 if(BERT_BUILD_TESTS)
     add_executable(llm_tests
         tests/llm/openai_llm_client_test.cpp
+        tests/llm/cloud_task_coordinator_test.cpp
     )
     target_link_libraries(llm_tests PRIVATE
         agent_llm

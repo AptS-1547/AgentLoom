@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <sstream>
 #include <string>
@@ -80,7 +81,7 @@ struct OnnxTextEmbeddingModel::Impl {
     bool output_is_already_pooled = false;
 
     // Detected hidden dim. 0 means "not yet known" -> learn on first run.
-    std::size_t hidden_size = 0;
+    std::atomic<std::size_t> hidden_size{0};
 };
 
 OnnxTextEmbeddingModel::OnnxTextEmbeddingModel() : impl_(std::make_unique<Impl>()) {}
@@ -89,7 +90,7 @@ OnnxTextEmbeddingModel::OnnxTextEmbeddingModel(OnnxTextEmbeddingModel&&) noexcep
 OnnxTextEmbeddingModel& OnnxTextEmbeddingModel::operator=(OnnxTextEmbeddingModel&&) noexcept = default;
 
 std::size_t OnnxTextEmbeddingModel::Dimension() const noexcept {
-    return impl_ ? impl_->hidden_size : 0;
+    return impl_ ? impl_->hidden_size.load(std::memory_order_relaxed) : 0;
 }
 
 PoolingStrategy OnnxTextEmbeddingModel::Pooling() const noexcept {
@@ -333,7 +334,7 @@ core::Result<EmbeddingBatch> OnnxTextEmbeddingModel::Embed(const TokenizedBatch&
                             "embedding dimension differs from expected");
     }
 
-    impl_->hidden_size = result.dimension;
+    impl_->hidden_size.store(result.dimension, std::memory_order_relaxed);
     return result;
 }
 
@@ -349,7 +350,7 @@ std::string OnnxTextEmbeddingModel::GetInfo() const {
         << ", pooling=" << (impl_->options.pooling == PoolingStrategy::Mean ? "mean" : "cls")
         << ", normalize=" << (impl_->options.normalize ? "true" : "false")
         << ", provider=" << impl_->session_info.active_provider
-        << ", hidden=" << impl_->hidden_size
+        << ", hidden=" << impl_->hidden_size.load(std::memory_order_relaxed)
         << ")";
     return oss.str();
 }

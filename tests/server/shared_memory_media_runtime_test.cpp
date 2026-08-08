@@ -103,6 +103,33 @@ core::Status PublishWithBackpressure(
     return core::Status::Error(core::ErrorCode::Timeout, "test publish timed out");
 }
 
+TEST(SharedMemoryMediaRuntimeTest, RejectsInvalidGlobalSpoolByteLimit) {
+    FakeMultimodalService backend;
+    ipc::media::InferenceFrameIpcGrantReceiver grant_receiver;
+
+    auto smaller_than_segment = service::SharedMemoryMediaRuntime::Create(
+        backend,
+        grant_receiver,
+        {
+            .spool_segment_bytes = 1024,
+            .max_spool_bytes_per_execution = 4096,
+            .max_spool_bytes_total = 512,
+        });
+    ASSERT_FALSE(smaller_than_segment.ok());
+    EXPECT_EQ(smaller_than_segment.status().code(), core::ErrorCode::InvalidArgument);
+
+    auto zero = service::SharedMemoryMediaRuntime::Create(
+        backend,
+        grant_receiver,
+        {
+            .spool_segment_bytes = 1024,
+            .max_spool_bytes_per_execution = 4096,
+            .max_spool_bytes_total = 0,
+        });
+    ASSERT_FALSE(zero.ok());
+    EXPECT_EQ(zero.status().code(), core::ErrorCode::InvalidArgument);
+}
+
 TEST(SharedMemoryMediaRuntimeTest, RoutesMultipleExecutionsAndDrainsExactlyOnce) {
     const auto channel_name = UniqueName("shared_media_runtime");
     const auto spool_root = std::filesystem::path("build") / "test-shared-media-runtime" / channel_name;
@@ -137,6 +164,7 @@ TEST(SharedMemoryMediaRuntimeTest, RoutesMultipleExecutionsAndDrainsExactlyOnce)
             .max_results_per_execution = 16,
             .spool_segment_bytes = 1024 * 1024,
             .max_spool_bytes_per_execution = 16 * 1024 * 1024,
+            .max_spool_bytes_total = 32 * 1024 * 1024,
             .seal_wait_timeout = 5s,
         });
     ASSERT_TRUE(runtime.ok()) << runtime.status().message();

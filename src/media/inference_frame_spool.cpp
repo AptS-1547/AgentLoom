@@ -229,6 +229,80 @@ core::Status ValidateRecordMetadata(const MappedInferenceFrameSpoolOptions& opti
 
 } // namespace
 
+class MappedSpoolByteBudget::Impl {
+public:
+    explicit Impl(std::size_t max_bytes) : max_bytes_(max_bytes) {}
+
+    core::Status TryReserve(std::size_t bytes) {
+        if (bytes == 0) {
+            return core::Status::Error(core::ErrorCode::InvalidArgument, "spool budget reservation must be positive");
+        }
+        std::lock_guard lock(mutex_);
+        if (bytes > max_bytes_ - reserved_bytes_) {
+            return core::Status::Error(core::ErrorCode::ResourceExhausted, "global spool byte limit reached");
+        }
+        reserved_bytes_ += bytes;
+        return core::Status::Ok();
+    }
+
+    core::Status Release(std::size_t bytes) {
+        if (bytes == 0) {
+            return core::Status::Error(core::ErrorCode::InvalidArgument, "spool budget release must be positive");
+        }
+        std::lock_guard lock(mutex_);
+        if (bytes > reserved_bytes_) {
+            return core::Status::Error(core::ErrorCode::InternalError, "spool budget release exceeds reservation");
+        }
+        reserved_bytes_ -= bytes;
+        return core::Status::Ok();
+    }
+
+    MappedSpoolByteBudgetSnapshot Snapshot() const {
+        std::lock_guard lock(mutex_);
+        return {
+            .max_bytes = max_bytes_,
+            .reserved_bytes = reserved_bytes_,
+            .available_bytes = max_bytes_ - reserved_bytes_,
+        };
+    }
+
+private:
+    const std::size_t max_bytes_;
+    mutable std::mutex mutex_;
+    std::size_t reserved_bytes_ = 0;
+};
+
+core::Result<std::shared_ptr<MappedSpoolByteBudget>> MappedSpoolByteBudget::Create(
+    std::size_t max_bytes) {
+    if (max_bytes == 0) {
+        return core::Status::Error(core::ErrorCode::InvalidArgument, "global spool byte limit must be positive");
+    }
+    try {
+        return std::shared_ptr<MappedSpoolByteBudget>(
+            new MappedSpoolByteBudget(std::make_unique<Impl>(max_bytes)));
+    } catch (const std::bad_alloc&) {
+        return core::Status::Error(core::ErrorCode::OutOfMemory, "failed to allocate spool byte budget");
+    } catch (const std::exception&) {
+        return core::Status::Error(core::ErrorCode::InternalError, "failed to create spool byte budget");
+    }
+}
+
+MappedSpoolByteBudget::MappedSpoolByteBudget(std::unique_ptr<Impl> impl) noexcept
+    : impl_(std::move(impl)) {}
+MappedSpoolByteBudget::~MappedSpoolByteBudget() = default;
+
+core::Status MappedSpoolByteBudget::TryReserve(std::size_t bytes) {
+    return impl_->TryReserve(bytes);
+}
+
+core::Status MappedSpoolByteBudget::Release(std::size_t bytes) {
+    return impl_->Release(bytes);
+}
+
+MappedSpoolByteBudgetSnapshot MappedSpoolByteBudget::Snapshot() const {
+    return impl_->Snapshot();
+}
+
 class MappedSpoolFrameLease::Impl {
 public:
     Impl(std::shared_ptr<SegmentMapping> segment,
@@ -544,6 +618,18 @@ public:
         if (ec) {
             return core::Status::Error(core::ErrorCode::Unavailable, "failed to remove spool execution directory");
         }
+        if (options_.shared_byte_budget && reserved_bytes_ > 0) {
+            auto release = options_.shared_byte_budget->Release(reserved_bytes_);
+            if (!release.ok()) {
+                logger_.error("[media-spool] failed to release global budget directory={} bytes={} code={} message={}",
+                              PathUtf8(directory_),
+                              reserved_bytes_,
+                              static_cast<int>(release.code()),
+                              release.message());
+                return release;
+            }
+            reserved_bytes_ = 0;
+        }
         cleaned_ = true;
         return core::Status::Ok();
     }
@@ -553,13 +639,65 @@ private:
         if (allocated_bytes_ > options_.max_spool_bytes - options_.segment_bytes) {
             return core::Status::Error(core::ErrorCode::ResourceExhausted, "spool byte limit reached");
         }
+        if (options_.shared_byte_budget) {
+            auto reserve = options_.shared_byte_budget->TryReserve(options_.segment_bytes);
+            if (!reserve.ok()) {
+                return reserve;
+            }
+        }
+        const auto segment_path = directory_ / SegmentFileName(segments_.size());
         auto segment = CreateSegment(directory_, segments_.size(), options_.segment_bytes);
         if (!segment.ok()) {
+            RollbackSegmentReservationLocked(segment_path);
             return segment.status();
         }
-        segments_.push_back(std::move(segment).value());
+        auto created_segment = std::move(segment).value();
+        try {
+            segments_.push_back(std::move(created_segment));
+        } catch (const std::bad_alloc&) {
+            created_segment.reset();
+            RollbackSegmentReservationLocked(segment_path);
+            return core::Status::Error(core::ErrorCode::OutOfMemory, "failed to retain mapped spool segment");
+        } catch (const std::exception&) {
+            created_segment.reset();
+            RollbackSegmentReservationLocked(segment_path);
+            return core::Status::Error(core::ErrorCode::InternalError, "failed to retain mapped spool segment");
+        }
         allocated_bytes_ += options_.segment_bytes;
+        if (options_.shared_byte_budget) {
+            reserved_bytes_ += options_.segment_bytes;
+        }
         return core::Status::Ok();
+    }
+
+    void RollbackSegmentReservationLocked(const std::filesystem::path& segment_path) {
+        std::error_code ec;
+        std::filesystem::remove(segment_path, ec);
+        if (!options_.shared_byte_budget) {
+            if (ec) {
+                logger_.warn("[media-spool] failed to remove incomplete segment path={} message={}",
+                             PathUtf8(segment_path),
+                             ec.message());
+            }
+            return;
+        }
+        if (ec) {
+            reserved_bytes_ += options_.segment_bytes;
+            logger_.warn("[media-spool] retained global budget for incomplete segment path={} bytes={} message={}",
+                         PathUtf8(segment_path),
+                         options_.segment_bytes,
+                         ec.message());
+            return;
+        }
+        auto release = options_.shared_byte_budget->Release(options_.segment_bytes);
+        if (!release.ok()) {
+            reserved_bytes_ += options_.segment_bytes;
+            logger_.error("[media-spool] failed to roll back global budget path={} bytes={} code={} message={}",
+                          PathUtf8(segment_path),
+                          options_.segment_bytes,
+                          static_cast<int>(release.code()),
+                          release.message());
+        }
     }
 
     core::Status SealSegmentLocked(SegmentMapping& segment) {
@@ -583,6 +721,7 @@ private:
     std::size_t replayed_records_ = 0;
     std::size_t payload_bytes_ = 0;
     std::size_t allocated_bytes_ = 0;
+    std::size_t reserved_bytes_ = 0;
     std::unordered_set<std::uint64_t> selected_sequences_;
     std::size_t replay_segment_index_ = 0;
     std::size_t replay_offset_ = sizeof(SegmentHeader);

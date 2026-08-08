@@ -58,6 +58,7 @@ struct SharedMemoryMediaRuntimeOptions {
     std::size_t max_results_per_execution = 4096;
     std::size_t spool_segment_bytes = 64 * 1024 * 1024;
     std::size_t max_spool_bytes_per_execution = 2ull * 1024 * 1024 * 1024;
+    std::size_t max_spool_bytes_total = 16ull * 1024 * 1024 * 1024;
     std::chrono::milliseconds receiver_idle_delay{1};
     std::chrono::milliseconds seal_wait_timeout{30000};
     int max_tokens = 128;

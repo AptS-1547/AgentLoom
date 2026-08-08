@@ -245,9 +245,16 @@ public:
     core::Status Start() {
         if (options_.receiver_workers == 0 || options_.vlm_workers == 0 || options_.max_executions == 0 ||
             options_.backlog_segments_per_session == 0 || options_.backlog_slots_per_segment == 0 ||
-            options_.spool_segment_bytes == 0 || options_.max_spool_bytes_per_execution == 0) {
+            options_.spool_segment_bytes == 0 ||
+            options_.max_spool_bytes_per_execution < options_.spool_segment_bytes ||
+            options_.max_spool_bytes_total < options_.spool_segment_bytes) {
             return core::Status::Error(core::ErrorCode::InvalidArgument, "shared media runtime limits are invalid");
         }
+        auto byte_budget = media::inference::MappedSpoolByteBudget::Create(options_.max_spool_bytes_total);
+        if (!byte_budget.ok()) {
+            return byte_budget.status();
+        }
+        spool_byte_budget_ = std::move(byte_budget).value();
         std::error_code ec;
         std::filesystem::create_directories(options_.spool_root, ec);
         if (ec) {
@@ -355,6 +362,7 @@ public:
             .execution_id = request.execution_id,
             .segment_bytes = options_.spool_segment_bytes,
             .max_spool_bytes = options_.max_spool_bytes_per_execution,
+            .shared_byte_budget = spool_byte_budget_,
             .flush_on_append = false,
             .remove_on_destroy = true,
         }, logger_);
@@ -617,6 +625,7 @@ private:
     SharedMemoryMediaRuntimeOptions options_;
     core::LoggerAdapter logger_;
     core::BucketMemoryPool memory_pool_;
+    std::shared_ptr<media::inference::IMappedSpoolByteBudget> spool_byte_budget_;
     std::shared_ptr<media::inference::SegmentedInferenceFrameBacklog> backlog_;
     std::shared_ptr<media::inference::SessionInferenceFrameResultTable> result_table_;
     std::shared_ptr<agent::service::persona::MediaInferenceExecutionRuntime> execution_runtime_;

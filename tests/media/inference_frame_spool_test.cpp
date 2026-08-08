@@ -179,6 +179,138 @@ TEST(MappedInferenceFrameSpoolTest, RejectsDuplicateSequenceAndCapacityOverflow)
     EXPECT_EQ(overflow.status().code(), core::ErrorCode::ResourceExhausted);
 }
 
+TEST(MappedInferenceFrameSpoolTest, SharedByteBudgetLimitsExecutionsAndCleanupReleasesCapacity) {
+    TemporaryDirectory temporary;
+    auto budget = media::inference::MappedSpoolByteBudget::Create(1024);
+    ASSERT_TRUE(budget.ok()) << budget.status().message();
+
+    auto create_spool = [&](std::string execution_id) {
+        return media::inference::MappedInferenceFrameSpool::Create({
+            .root_directory = temporary.path(),
+            .execution_id = std::move(execution_id),
+            .segment_bytes = 512,
+            .max_spool_bytes = 2048,
+            .shared_byte_budget = budget.value(),
+            .flush_on_append = false,
+            .remove_on_destroy = false,
+        });
+    };
+
+    auto first = create_spool("execution-budget-first");
+    auto second = create_spool("execution-budget-second");
+    auto waiting = create_spool("execution-budget-waiting");
+    ASSERT_TRUE(first.ok()) << first.status().message();
+    ASSERT_TRUE(second.ok()) << second.status().message();
+    ASSERT_TRUE(waiting.ok()) << waiting.status().message();
+
+    const auto payload = MakePayload(64, 0x61);
+    ASSERT_TRUE(first.value()->Append(MakeMetadata("execution-budget-first", 1, 1), payload).ok());
+    ASSERT_TRUE(second.value()->Append(MakeMetadata("execution-budget-second", 1, 2), payload).ok());
+    auto exhausted = waiting.value()->Append(MakeMetadata("execution-budget-waiting", 1, 3), payload);
+    ASSERT_FALSE(exhausted.ok());
+    EXPECT_EQ(exhausted.status().code(), core::ErrorCode::ResourceExhausted);
+
+    auto full = budget.value()->Snapshot();
+    EXPECT_EQ(full.max_bytes, 1024u);
+    EXPECT_EQ(full.reserved_bytes, 1024u);
+    EXPECT_EQ(full.available_bytes, 0u);
+
+    ASSERT_TRUE(first.value()->Cleanup().ok());
+    EXPECT_EQ(budget.value()->Snapshot().reserved_bytes, 512u);
+    ASSERT_TRUE(waiting.value()->Append(MakeMetadata("execution-budget-waiting", 1, 3), payload).ok());
+    EXPECT_EQ(budget.value()->Snapshot().reserved_bytes, 1024u);
+
+    ASSERT_TRUE(second.value()->Cleanup().ok());
+    ASSERT_TRUE(waiting.value()->Cleanup().ok());
+    EXPECT_EQ(budget.value()->Snapshot().reserved_bytes, 0u);
+}
+
+TEST(MappedInferenceFrameSpoolTest, ActiveReadLeaseKeepsSharedBudgetReserved) {
+    TemporaryDirectory temporary;
+    auto budget = media::inference::MappedSpoolByteBudget::Create(1024);
+    ASSERT_TRUE(budget.ok()) << budget.status().message();
+
+    const std::string execution_id = "execution-budget-lease";
+    auto spool = media::inference::MappedInferenceFrameSpool::Create({
+        .root_directory = temporary.path(),
+        .execution_id = execution_id,
+        .segment_bytes = 1024,
+        .max_spool_bytes = 1024,
+        .shared_byte_budget = budget.value(),
+        .flush_on_append = false,
+        .remove_on_destroy = false,
+    });
+    ASSERT_TRUE(spool.ok()) << spool.status().message();
+    const auto payload = MakePayload(64, 0x62);
+    ASSERT_TRUE(spool.value()->Append(MakeMetadata(execution_id, 1, 1), payload).ok());
+    ASSERT_TRUE(spool.value()->Seal().ok());
+    auto replayed = spool.value()->ReplayNext();
+    ASSERT_TRUE(replayed.ok()) << replayed.status().message();
+    ASSERT_TRUE(replayed.value().has_value());
+    auto lease = std::move(replayed).value().value();
+
+    auto cleanup = spool.value()->Cleanup();
+    EXPECT_EQ(cleanup.code(), core::ErrorCode::FailedPrecondition);
+    EXPECT_EQ(budget.value()->Snapshot().reserved_bytes, 1024u);
+
+    lease = {};
+    ASSERT_TRUE(spool.value()->Cleanup().ok());
+    EXPECT_EQ(budget.value()->Snapshot().reserved_bytes, 0u);
+}
+
+TEST(MappedInferenceFrameSpoolTest, ConcurrentExecutionsCannotExceedSharedByteBudget) {
+    TemporaryDirectory temporary;
+    constexpr std::size_t kSegmentBytes = 512;
+    constexpr std::size_t kBudgetSegments = 4;
+    constexpr std::size_t kExecutionCount = 12;
+    auto budget = media::inference::MappedSpoolByteBudget::Create(kSegmentBytes * kBudgetSegments);
+    ASSERT_TRUE(budget.ok()) << budget.status().message();
+
+    std::vector<std::unique_ptr<media::inference::MappedInferenceFrameSpool>> spools;
+    std::vector<std::string> execution_ids;
+    for (std::size_t index = 0; index < kExecutionCount; ++index) {
+        auto execution_id = "execution-budget-concurrent-" + std::to_string(index);
+        auto spool = media::inference::MappedInferenceFrameSpool::Create({
+            .root_directory = temporary.path(),
+            .execution_id = execution_id,
+            .segment_bytes = kSegmentBytes,
+            .max_spool_bytes = kSegmentBytes,
+            .shared_byte_budget = budget.value(),
+            .flush_on_append = false,
+            .remove_on_destroy = false,
+        });
+        ASSERT_TRUE(spool.ok()) << spool.status().message();
+        execution_ids.push_back(std::move(execution_id));
+        spools.push_back(std::move(spool).value());
+    }
+
+    const auto payload = MakePayload(64, 0x63);
+    std::atomic<std::size_t> admitted{0};
+    std::atomic<std::size_t> exhausted{0};
+    std::vector<std::thread> writers;
+    for (std::size_t index = 0; index < spools.size(); ++index) {
+        writers.emplace_back([&, index] {
+            auto append = spools[index]->Append(MakeMetadata(execution_ids[index], 1, index + 1), payload);
+            if (append.ok()) {
+                admitted.fetch_add(1, std::memory_order_relaxed);
+            } else if (append.status().code() == core::ErrorCode::ResourceExhausted) {
+                exhausted.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+    for (auto& writer : writers) {
+        writer.join();
+    }
+
+    EXPECT_EQ(admitted.load(std::memory_order_relaxed), kBudgetSegments);
+    EXPECT_EQ(exhausted.load(std::memory_order_relaxed), kExecutionCount - kBudgetSegments);
+    EXPECT_EQ(budget.value()->Snapshot().reserved_bytes, kSegmentBytes * kBudgetSegments);
+    for (auto& spool : spools) {
+        ASSERT_TRUE(spool->Cleanup().ok());
+    }
+    EXPECT_EQ(budget.value()->Snapshot().reserved_bytes, 0u);
+}
+
 TEST(MappedInferenceFrameSpoolTest, CleanupWaitsForMappedReadLease) {
     TemporaryDirectory temporary;
     const std::string execution_id = "execution-spool-lease";

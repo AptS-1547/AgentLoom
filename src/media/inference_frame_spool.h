@@ -13,11 +13,47 @@
 
 namespace media::inference {
 
+struct MappedSpoolByteBudgetSnapshot {
+    std::size_t max_bytes = 0;
+    std::size_t reserved_bytes = 0;
+    std::size_t available_bytes = 0;
+};
+
+class IMappedSpoolByteBudget {
+public:
+    virtual ~IMappedSpoolByteBudget() = default;
+
+    virtual core::Status TryReserve(std::size_t bytes) = 0;
+    virtual core::Status Release(std::size_t bytes) = 0;
+    virtual MappedSpoolByteBudgetSnapshot Snapshot() const = 0;
+};
+
+class MappedSpoolByteBudget final : public IMappedSpoolByteBudget {
+public:
+    static core::Result<std::shared_ptr<MappedSpoolByteBudget>> Create(std::size_t max_bytes);
+
+    ~MappedSpoolByteBudget() override;
+
+    MappedSpoolByteBudget(const MappedSpoolByteBudget&) = delete;
+    MappedSpoolByteBudget& operator=(const MappedSpoolByteBudget&) = delete;
+
+    core::Status TryReserve(std::size_t bytes) override;
+    core::Status Release(std::size_t bytes) override;
+    MappedSpoolByteBudgetSnapshot Snapshot() const override;
+
+private:
+    class Impl;
+    explicit MappedSpoolByteBudget(std::unique_ptr<Impl> impl) noexcept;
+
+    std::unique_ptr<Impl> impl_;
+};
+
 struct MappedInferenceFrameSpoolOptions {
     std::filesystem::path root_directory;
     std::string execution_id;
     std::size_t segment_bytes = 64 * 1024 * 1024;
     std::size_t max_spool_bytes = 1024 * 1024 * 1024;
+    std::shared_ptr<IMappedSpoolByteBudget> shared_byte_budget;
     bool flush_on_append = true;
     bool remove_on_destroy = true;
 };

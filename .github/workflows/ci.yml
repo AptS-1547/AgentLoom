@@ -245,7 +245,8 @@ jobs:
           if [[ ! -d deps/faiss-1.14.1-cpu-linux ]]; then
             ensure_conda "$FAISS_CONDA_URL" deps/faiss-cpu-linux.conda
             python - <<'PY'
-          import pathlib, shutil, subprocess, tarfile, zipfile
+          import pathlib, shutil, tarfile, zipfile
+          import zstandard
           archive = pathlib.Path("deps/faiss-cpu-linux.conda")
           work = pathlib.Path("deps/faiss-conda-extract")
           out = pathlib.Path("deps/faiss-1.14.1-cpu-linux")
@@ -255,8 +256,10 @@ jobs:
           with zipfile.ZipFile(archive) as zf:
               zf.extractall(work)
           pkg = next(work.glob("pkg-*.tar.zst"))
-          subprocess.run(["python", "-m", "zstandard", "-d", str(pkg), "-o", str(work / "pkg.tar")], check=True)
-          with tarfile.open(work / "pkg.tar") as tf:
+          tar_path = work / "pkg.tar"
+          with pkg.open("rb") as source, tar_path.open("wb") as destination:
+              zstandard.ZstdDecompressor().copy_stream(source, destination)
+          with tarfile.open(tar_path) as tf:
               tf.extractall(out)
           PY
             if [[ ! -f deps/faiss-1.14.1-cpu-linux/lib/libfaiss.so ]]; then
@@ -270,7 +273,8 @@ jobs:
           if [[ ! -d deps/mkl-2023.1.0-linux ]]; then
             ensure_conda "$MKL_CONDA_URL" deps/mkl-linux.conda
             python - <<'PY'
-          import pathlib, shutil, subprocess, tarfile, zipfile
+          import pathlib, shutil, tarfile, zipfile
+          import zstandard
           archive = pathlib.Path("deps/mkl-linux.conda")
           work = pathlib.Path("deps/mkl-conda-extract")
           out = pathlib.Path("deps/mkl-2023.1.0-linux")
@@ -280,8 +284,10 @@ jobs:
           with zipfile.ZipFile(archive) as zf:
               zf.extractall(work)
           pkg = next(work.glob("pkg-*.tar.zst"))
-          subprocess.run(["python", "-m", "zstandard", "-d", str(pkg), "-o", str(work / "pkg.tar")], check=True)
-          with tarfile.open(work / "pkg.tar") as tf:
+          tar_path = work / "pkg.tar"
+          with pkg.open("rb") as source, tar_path.open("wb") as destination:
+              zstandard.ZstdDecompressor().copy_stream(source, destination)
+          with tarfile.open(tar_path) as tf:
               tf.extractall(out)
           PY
             if [[ ! -f deps/mkl-2023.1.0-linux/lib/libmkl_rt.so ]]; then

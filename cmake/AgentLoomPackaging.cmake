@@ -20,7 +20,7 @@ set(_agentloom_public_target_names
     emotion_server server
 )
 
-if(NOT BERT_BUILD_MULTIMODAL_INFERENCE_SERVER)
+if(NOT AGENTLOOM_BUILD_LOCAL_LLM)
     list(REMOVE_ITEM _agentloom_public_targets agent_models agent_cache agent_server)
     list(REMOVE_ITEM _agentloom_public_target_names models cache server)
 endif()
@@ -47,7 +47,7 @@ set(_agentloom_support_targets
     boost_redis_headers
     boost_interprocess_headers
     eigen_headers)
-if(BERT_BUILD_MULTIMODAL_INFERENCE_SERVER)
+if(AGENTLOOM_BUILD_LOCAL_LLM)
     list(APPEND _agentloom_support_targets agentloom_llama_cpp_dependency)
 endif()
 if(TARGET agentloom_gstreamer_dependency)

@@ -54,6 +54,7 @@ if(BERT_BUILD_TESTS)
     gtest_discover_tests(conversation_pipeline_e2e_tests DISCOVERY_MODE PRE_TEST)
 endif()
 
+if(AGENTLOOM_BUILD_TOOLS)
 add_executable(conversation_pipeline_bench
     tests/conversation/dialogue_cloud_pipeline_bench.cpp
 )
@@ -87,6 +88,7 @@ if(ONNXRUNTIME_ROOT STREQUAL ONNXRUNTIME_GPU_ROOT AND
         ${DIALOGUE_BENCH_CUDA_RUNTIME_LIBS})
 endif()
 copy_runtime_files(dialogue_segmentation_dataset_bench ${VCPKG_RUNTIME_DLLS})
+endif()
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND
         CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")

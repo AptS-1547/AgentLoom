@@ -183,7 +183,7 @@ elseif(UNIX AND NOT APPLE)
     )
 endif()
 
-if(WIN32 AND BERT_BUILD_MULTIMODAL_INFERENCE_SERVER)
+if(WIN32 AND AGENTLOOM_BUILD_LOCAL_LLM)
     if(NOT LLAMA_CPP_PREBUILT_CONFIG)
         message(FATAL_ERROR
             "Cannot determine the ABI configuration of prebuilt llama.cpp at ${LLAMA_CPP_BUILD}. "
@@ -232,7 +232,7 @@ if(WIN32 AND BERT_BUILD_MULTIMODAL_INFERENCE_SERVER)
         "build=${LLAMA_CPP_BUILD}")
 endif()
 
-if(BERT_BUILD_MULTIMODAL_INFERENCE_SERVER)
+if(AGENTLOOM_BUILD_LOCAL_LLM)
     foreach(LLAMA_CPP_INCLUDE_DIR ${LLAMA_CPP_INCLUDE_DIRS})
         require_path("${LLAMA_CPP_INCLUDE_DIR}" "llama.cpp include directory")
     endforeach()
@@ -242,32 +242,35 @@ if(BERT_BUILD_MULTIMODAL_INFERENCE_SERVER)
     endforeach()
 endif()
 
-add_library(agentloom_llama_cpp_dependency INTERFACE)
-target_include_directories(agentloom_llama_cpp_dependency INTERFACE
-    "$<BUILD_INTERFACE:${LLAMA_CPP_INCLUDE_DIRS}>")
-target_link_libraries(agentloom_llama_cpp_dependency INTERFACE
-    "$<BUILD_INTERFACE:${LLAMA_CPP_LIBS}>"
-    "$<INSTALL_INTERFACE:AgentLoom::llama_cpp_external>")
-
-if(WIN32)
-    set(BERT_DEFAULT_OPENCV_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/deps/opencv-4.10.0-windows/build")
-    set(OpenCV_DIR "${BERT_DEFAULT_OPENCV_ROOT}/x64/vc16/lib" CACHE PATH "Path to OpenCVConfig.cmake")
-    set(BERT_OPENCV_RUNTIME_DIR "${BERT_DEFAULT_OPENCV_ROOT}/x64/vc16/bin")
-    set(BERT_OPENCV_RUNTIME_GLOB "${BERT_OPENCV_RUNTIME_DIR}/opencv_world*.dll")
-    set(BERT_OPENCV_EXTRA_RUNTIME_GLOB "${BERT_OPENCV_RUNTIME_DIR}/opencv_videoio_*.dll")
-elseif(UNIX AND NOT APPLE)
-    set(BERT_DEFAULT_OPENCV_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/deps/opencv-4.10.0-linux")
-    set(OpenCV_DIR "${BERT_DEFAULT_OPENCV_ROOT}/lib/cmake/opencv4" CACHE PATH "Path to OpenCVConfig.cmake")
-    set(BERT_OPENCV_RUNTIME_DIR "${BERT_DEFAULT_OPENCV_ROOT}/lib")
-    set(BERT_OPENCV_RUNTIME_GLOB "${BERT_OPENCV_RUNTIME_DIR}/libopencv*.so*")
-    set(BERT_OPENCV_EXTRA_RUNTIME_GLOB "")
+if(AGENTLOOM_BUILD_LOCAL_LLM)
+    add_library(agentloom_llama_cpp_dependency INTERFACE)
+    target_include_directories(agentloom_llama_cpp_dependency INTERFACE
+        "$<BUILD_INTERFACE:${LLAMA_CPP_INCLUDE_DIRS}>")
+    target_link_libraries(agentloom_llama_cpp_dependency INTERFACE
+        "$<BUILD_INTERFACE:${LLAMA_CPP_LIBS}>"
+        "$<INSTALL_INTERFACE:AgentLoom::llama_cpp_external>")
 endif()
 
-find_package(OpenCV CONFIG REQUIRED COMPONENTS core imgproc videoio)
-file(GLOB BERT_OPENCV_RUNTIME_FILES
-    "${BERT_OPENCV_RUNTIME_GLOB}"
-    "${BERT_OPENCV_EXTRA_RUNTIME_GLOB}"
-)
+if(AGENTLOOM_BUILD_MEDIA)
+    if(WIN32)
+        set(BERT_DEFAULT_OPENCV_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/deps/opencv-4.10.0-windows/build")
+        set(OpenCV_DIR "${BERT_DEFAULT_OPENCV_ROOT}/x64/vc16/lib" CACHE PATH "Path to OpenCVConfig.cmake")
+        set(BERT_OPENCV_RUNTIME_DIR "${BERT_DEFAULT_OPENCV_ROOT}/x64/vc16/bin")
+        set(BERT_OPENCV_RUNTIME_GLOB "${BERT_OPENCV_RUNTIME_DIR}/opencv_world*.dll")
+        set(BERT_OPENCV_EXTRA_RUNTIME_GLOB "${BERT_OPENCV_RUNTIME_DIR}/opencv_videoio_*.dll")
+    elseif(UNIX AND NOT APPLE)
+        set(BERT_DEFAULT_OPENCV_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/deps/opencv-4.10.0-linux")
+        set(OpenCV_DIR "${BERT_DEFAULT_OPENCV_ROOT}/lib/cmake/opencv4" CACHE PATH "Path to OpenCVConfig.cmake")
+        set(BERT_OPENCV_RUNTIME_DIR "${BERT_DEFAULT_OPENCV_ROOT}/lib")
+        set(BERT_OPENCV_RUNTIME_GLOB "${BERT_OPENCV_RUNTIME_DIR}/libopencv*.so*")
+        set(BERT_OPENCV_EXTRA_RUNTIME_GLOB "")
+    endif()
+
+    find_package(OpenCV CONFIG REQUIRED COMPONENTS core imgproc videoio)
+    file(GLOB BERT_OPENCV_RUNTIME_FILES
+        "${BERT_OPENCV_RUNTIME_GLOB}"
+        "${BERT_OPENCV_EXTRA_RUNTIME_GLOB}")
+endif()
 
 set(BERT_BOOST_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/deps/boost_1_85_0" CACHE PATH "Path to Boost header package")
 require_path("${BERT_BOOST_ROOT}/boost/asio.hpp" "Boost.Asio header")
@@ -368,7 +371,7 @@ endif()
 
 # GStreamer prebuilt package for media/WebRTC probes and future media pipeline work.
 set(GSTREAMER_ROOT "D:/Program Files/gstreamer/1.0/msvc_x86_64" CACHE PATH "Path to GStreamer MSVC x64 package")
-if(EXISTS "${GSTREAMER_ROOT}/bin/gst-inspect-1.0.exe")
+if(AGENTLOOM_BUILD_MEDIA AND EXISTS "${GSTREAMER_ROOT}/bin/gst-inspect-1.0.exe")
     add_library(gstreamer_headers INTERFACE)
     target_include_directories(gstreamer_headers INTERFACE
         "${GSTREAMER_ROOT}/include/gstreamer-1.0"
@@ -398,6 +401,6 @@ if(EXISTS "${GSTREAMER_ROOT}/bin/gst-inspect-1.0.exe")
         "$<BUILD_INTERFACE:${GSTREAMER_ROOT}/lib/gstsdp-1.0.lib>"
         "$<BUILD_INTERFACE:${GSTREAMER_ROOT}/lib/gstwebrtc-1.0.lib>"
         "$<INSTALL_INTERFACE:AgentLoom::gstreamer_external>")
-else()
+elseif(AGENTLOOM_BUILD_MEDIA)
     message(STATUS "GStreamer package not found at ${GSTREAMER_ROOT}; media_gstreamer_probe will not be built")
 endif()

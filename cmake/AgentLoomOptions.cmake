@@ -1,6 +1,11 @@
 option(BERT_BUILD_TESTS "Build C++ unit tests" OFF)
 option(BERT_BUILD_MULTIMODAL_INFERENCE_SERVER "Build full multimodal inference server with VLM/llama.cpp support" ON)
 option(BERT_BUILD_EMOTION_INFERENCE_SERVER "Build CPU-only BERT emotion inference server" ON)
+option(AGENTLOOM_BUILD_MEDIA "Build media, WebRTC, and shared-memory frame targets" ON)
+option(AGENTLOOM_BUILD_LOCAL_LLM "Build llama.cpp/mtmd local LLM and VLM targets" ON)
+option(AGENTLOOM_BUILD_REFERENCE_GATEWAY "Build AgentLoom's reference Gateway implementation" ON)
+option(AGENTLOOM_BUILD_LEGACY_BERT_PROTO "Build the legacy BERT protocol and clients" ON)
+option(AGENTLOOM_BUILD_TOOLS "Build smoke, benchmark, and reference executable targets" ON)
 option(AGENT_LLAMA_STRICT_TOOLSET_ABI
     "Treat a prebuilt llama.cpp MSVC toolset mismatch as a configuration error" OFF)
 

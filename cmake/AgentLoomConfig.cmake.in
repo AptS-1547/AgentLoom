@@ -103,14 +103,14 @@ if(NOT TARGET hf_tokenizers_capi)
     endif()
 endif()
 
-if(@BERT_BUILD_MULTIMODAL_INFERENCE_SERVER@ AND NOT TARGET AgentLoom::llama_cpp_external)
+if(@AGENTLOOM_BUILD_LOCAL_LLM@ AND NOT TARGET AgentLoom::llama_cpp_external)
     add_library(AgentLoom::llama_cpp_external INTERFACE IMPORTED)
     set_target_properties(AgentLoom::llama_cpp_external PROPERTIES
         INTERFACE_INCLUDE_DIRECTORIES "${AgentLoom_LLAMA_CPP_INCLUDE_DIRS}"
         INTERFACE_LINK_LIBRARIES "${AgentLoom_LLAMA_CPP_LIBRARIES}")
 endif()
 
-if(WIN32 AND NOT TARGET AgentLoom::gstreamer_external)
+if(@AGENTLOOM_PACKAGE_HAS_MEDIA@ AND WIN32 AND NOT TARGET AgentLoom::gstreamer_external)
     add_library(AgentLoom::gstreamer_external INTERFACE IMPORTED)
     set_target_properties(AgentLoom::gstreamer_external PROPERTIES
         INTERFACE_INCLUDE_DIRECTORIES

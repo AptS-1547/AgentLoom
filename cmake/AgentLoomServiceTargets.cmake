@@ -78,6 +78,7 @@ target_link_libraries(agent_gateway_auth PUBLIC
     spdlog::spdlog
 )
 
+if(AGENTLOOM_BUILD_REFERENCE_GATEWAY)
 add_library(agent_agent_gateway STATIC
     src/service/gateway/gateway_models.h
     src/service/gateway/persona_gateway_service.cpp
@@ -205,6 +206,7 @@ if(TARGET agent_media)
         agent_media
     )
 endif()
+endif()
 
 add_library(agent_service INTERFACE)
 
@@ -212,13 +214,17 @@ target_link_libraries(agent_service INTERFACE
     agent_service_core
     agent_agent_runtime
     agent_gateway_auth
-    agent_agent_gateway
-    agent_classroom_gateway
-    agent_training_report_gateway
-    agent_document_gateway
-    agent_gateway_server_lib
 )
+if(AGENTLOOM_BUILD_REFERENCE_GATEWAY)
+    target_link_libraries(agent_service INTERFACE
+        agent_agent_gateway
+        agent_classroom_gateway
+        agent_training_report_gateway
+        agent_document_gateway
+        agent_gateway_server_lib)
+endif()
 
+if(AGENTLOOM_BUILD_REFERENCE_GATEWAY)
 foreach(_gateway_route_target IN ITEMS
         document_analysis_e2e_test
         persona_gateway_e2e_server
@@ -231,6 +237,7 @@ foreach(_gateway_route_target IN ITEMS
         link_whole_archive(${_gateway_route_target} agent_document_gateway)
     endif()
 endforeach()
+endif()
 
 if(TARGET agent_media)
     add_library(agent_skill_media STATIC
@@ -288,10 +295,12 @@ if(BERT_BUILD_TESTS)
     copy_runtime_files(service_tests "${BERT_SQLITE_DLL}")
     copy_runtime_files(service_tests ${BERT_FAISS_RUNTIME_FILES})
     copy_runtime_files(service_tests ${VCPKG_RUNTIME_DLLS})
-    link_whole_archive(service_tests agent_agent_gateway)
-    link_whole_archive(service_tests agent_classroom_gateway)
-    link_whole_archive(service_tests agent_training_report_gateway)
-    link_whole_archive(service_tests agent_document_gateway)
+    if(AGENTLOOM_BUILD_REFERENCE_GATEWAY)
+        link_whole_archive(service_tests agent_agent_gateway)
+        link_whole_archive(service_tests agent_classroom_gateway)
+        link_whole_archive(service_tests agent_training_report_gateway)
+        link_whole_archive(service_tests agent_document_gateway)
+    endif()
 
     gtest_discover_tests(service_tests DISCOVERY_MODE PRE_TEST)
 endif()

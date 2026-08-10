@@ -18,13 +18,16 @@ permissions:
 jobs:
   linux-tests:
     name: Linux Release Tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
+      CACHE_PLATFORM: ubuntu-24.04
       BUILD_DIR: build/gha-linux-tests
-      VCPKG_TRIPLET: x64-linux
+      VCPKG_TRIPLET: x64-linux-release
+      VCPKG_INSTALL_ROOT: build/linux-vcpkg-installed
       VCPKG_BINARY_CACHE: build/vcpkg-binary-cache
       VCPKG_MAX_CONCURRENCY: 2
       CMAKE_BUILD_PARALLEL_LEVEL: 2
+      DEPS_CACHE_VERSION: v1
       ONNXRUNTIME_URL: https://github.com/microsoft/onnxruntime/releases/download/v1.17.1/onnxruntime-linux-x64-1.17.1.tgz
       ONNXRUNTIME_ARCHIVE: deps/onnxruntime-linux-x64-1.17.1.tgz
       ONNXRUNTIME_ROOT: deps/onnxruntime-linux-x64-1.17.1
@@ -33,7 +36,7 @@ jobs:
       LLAMA_CPP_BINARY_ARCHIVE: deps/llama-b9360-bin-ubuntu-x64.tar.gz
       LLAMA_CPP_ROOT: deps/llama.cpp
       LLAMA_CPP_BUILD: deps/llama.cpp/build
-      SQLITE_AMALGAMATION_URL: https://www.sqlite.org/2025/sqlite-amalgamation-3530100.zip
+      SQLITE_AMALGAMATION_URL: https://www.sqlite.org/2026/sqlite-amalgamation-3530100.zip
       FAISS_CONDA_URL: https://conda.anaconda.org/pytorch/linux-64/faiss-cpu-1.14.2-py3.12_hf65b397_0_cpu.conda
       MKL_CONDA_URL: https://conda.anaconda.org/conda-forge/linux-64/mkl-2023.1.0-h84fe81f_48680.conda
 
@@ -82,16 +85,18 @@ jobs:
             libopencv-dev
 
       - name: Cache vcpkg install root
+        id: cache-vcpkg
         uses: actions/cache@v4
         with:
           path: |
-            vcpkg_installed
+            build/linux-vcpkg-installed
             build/vcpkg-binary-cache
-          key: ${{ runner.os }}-${{ env.VCPKG_TRIPLET }}-vcpkg-${{ hashFiles('vcpkg.json', 'triplets/**', '.github/workflows/ci.yml') }}
+          key: ${{ env.CACHE_PLATFORM }}-${{ env.VCPKG_TRIPLET }}-vcpkg-features-tests-${{ hashFiles('vcpkg.json', 'triplets/ci/x64-linux-release.cmake') }}
           restore-keys: |
-            ${{ runner.os }}-${{ env.VCPKG_TRIPLET }}-vcpkg-
+            ${{ env.CACHE_PLATFORM }}-${{ env.VCPKG_TRIPLET }}-vcpkg-features-tests-
 
       - name: Cache binary dependency archives
+        id: cache-dependency-archives
         uses: actions/cache@v4
         with:
           path: |
@@ -99,53 +104,45 @@ jobs:
             deps/*.tar.gz
             deps/*.zip
             deps/*.conda
-            ~/.cache/ccache
-          key: ${{ runner.os }}-ci-deps-${{ hashFiles('.github/workflows/ci.yml', 'CMakeLists.txt', 'vcpkg.json') }}
+          key: ${{ env.CACHE_PLATFORM }}-ci-deps-${{ env.DEPS_CACHE_VERSION }}
           restore-keys: |
-            ${{ runner.os }}-ci-deps-
+            ${{ env.CACHE_PLATFORM }}-ci-deps-
+
+      - name: Cache compiler outputs
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ${{ env.CACHE_PLATFORM }}-${{ env.VCPKG_TRIPLET }}-ccache-${{ github.sha }}
+          restore-keys: |
+            ${{ env.CACHE_PLATFORM }}-${{ env.VCPKG_TRIPLET }}-ccache-
 
       - name: Bootstrap vcpkg
         shell: bash
         run: |
-          if [[ ! -d vcpkg ]]; then
-            git clone --depth 1 https://github.com/microsoft/vcpkg.git vcpkg
-          fi
-          ./vcpkg/bootstrap-vcpkg.sh -disableMetrics
-          python - <<'PY'
+          vcpkg_baseline="$(python - <<'PY'
           import json
           import pathlib
-          import subprocess
-          manifest = pathlib.Path("vcpkg.json")
-          data = json.loads(manifest.read_text(encoding="utf-8"))
-          data["builtin-baseline"] = subprocess.check_output(
-              ["git", "-C", "vcpkg", "rev-parse", "HEAD"],
-              text=True,
-          ).strip()
-          deps = data.setdefault("dependencies", [])
-          if "gtest" not in deps:
-              deps.append("gtest")
-          manifest.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+          print(json.loads(pathlib.Path("vcpkg.json").read_text(encoding="utf-8"))["builtin-baseline"])
           PY
-          mkdir -p triplets/ci
-          cat > triplets/ci/x64-linux-release.cmake <<'EOF'
-          set(VCPKG_TARGET_ARCHITECTURE x64)
-          set(VCPKG_CRT_LINKAGE dynamic)
-          set(VCPKG_LIBRARY_LINKAGE dynamic)
-          set(VCPKG_CMAKE_SYSTEM_NAME Linux)
-          set(VCPKG_BUILD_TYPE release)
-          EOF
-          echo "VCPKG_TRIPLET=x64-linux-release" >> "$GITHUB_ENV"
+          )"
+          git init vcpkg
+          git -C vcpkg remote add origin https://github.com/microsoft/vcpkg.git
+          git -C vcpkg fetch --depth 1 origin "$vcpkg_baseline"
+          git -C vcpkg checkout --detach FETCH_HEAD
+          ./vcpkg/bootstrap-vcpkg.sh -disableMetrics
 
       - name: Install vcpkg dependencies
         shell: bash
         run: |
           ./vcpkg/vcpkg install \
             --triplet "$VCPKG_TRIPLET" \
+            --x-feature=tests \
             --x-manifest-root="$GITHUB_WORKSPACE" \
-            --x-install-root="$GITHUB_WORKSPACE/vcpkg_installed" \
+            --x-install-root="$GITHUB_WORKSPACE/$VCPKG_INSTALL_ROOT" \
             --overlay-triplets="$GITHUB_WORKSPACE/triplets/ci" \
             "--binarysource=clear;files,$GITHUB_WORKSPACE/$VCPKG_BINARY_CACHE,readwrite" \
             --clean-after-build
+          ln -s "$GITHUB_WORKSPACE/$VCPKG_INSTALL_ROOT" "$GITHUB_WORKSPACE/vcpkg_installed"
 
       - name: Download ONNX Runtime
         shell: bash

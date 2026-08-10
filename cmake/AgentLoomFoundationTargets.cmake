@@ -134,9 +134,12 @@ add_library(agent_llm STATIC
     src/llm/openai_llm_client.cpp
     src/llm/cloud_task_coordinator.h
     src/llm/cloud_task_coordinator.cpp
-    src/llm/local_llm_client.h
-    src/llm/local_llm_client.cpp
 )
+if(AGENTLOOM_BUILD_LOCAL_LLM)
+    target_sources(agent_llm PRIVATE
+        src/llm/local_llm_client.h
+        src/llm/local_llm_client.cpp)
+endif()
 
 target_include_directories(agent_llm PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src/llm
@@ -146,9 +149,10 @@ target_include_directories(agent_llm PUBLIC
 
 target_link_libraries(agent_llm PUBLIC
     agent_http_client
-    multimodal_proto
-    gRPC::grpc++
 )
+if(AGENTLOOM_BUILD_LOCAL_LLM)
+    target_link_libraries(agent_llm PUBLIC multimodal_proto gRPC::grpc++)
+endif()
 
 if(BERT_BUILD_TESTS)
     add_executable(llm_tests
@@ -175,6 +179,7 @@ if(BERT_BUILD_TESTS)
     gtest_discover_tests(llm_integration_tests DISCOVERY_MODE PRE_TEST)
 endif()
 
+if(AGENTLOOM_BUILD_TOOLS)
 # ──────────── Manual smoke test against a real LLM API (not part of CTest) ────────────
 add_executable(llm_smoke_test
     tools/llm_smoke_test.cpp
@@ -340,3 +345,4 @@ target_link_libraries(redis_stress_test PRIVATE
 )
 
 # ──────────── Semantic cache pipeline (skeleton — Phase 5) ────────────
+endif()

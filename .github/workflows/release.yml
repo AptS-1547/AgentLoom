@@ -30,8 +30,8 @@ jobs:
       matrix:
         include:
           - name: Ubuntu Release
-            os: ubuntu-latest
-            triplet: x64-linux
+            os: ubuntu-24.04
+            triplet: x64-linux-release
             build_dir: build/gha-linux
             artifact_dir: build/gha-linux
             ort_url: https://github.com/microsoft/onnxruntime/releases/download/v1.17.1/onnxruntime-linux-x64-1.17.1.tgz
@@ -71,18 +71,21 @@ jobs:
           df -h
 
       - name: Cache vcpkg install root
+        id: cache-vcpkg
         uses: actions/cache@v4
         with:
-          path: vcpkg_installed
-          key: ${{ runner.os }}-${{ matrix.triplet }}-vcpkg-${{ hashFiles('vcpkg.json', 'triplets/**') }}
+          path: |
+            build/linux-vcpkg-installed
+            build/vcpkg-binary-cache
+          key: ${{ matrix.os }}-${{ matrix.triplet }}-vcpkg-features-core-${{ hashFiles('vcpkg.json', 'triplets/ci/x64-linux-release.cmake') }}
           restore-keys: |
-            ${{ runner.os }}-${{ matrix.triplet }}-vcpkg-
+            ${{ matrix.os }}-${{ matrix.triplet }}-vcpkg-features-core-
 
       - name: Cache ONNX Runtime archive
         uses: actions/cache@v4
         with:
           path: ${{ matrix.ort_archive }}
-          key: ${{ runner.os }}-ort-release-${{ hashFiles('.github/workflows/release.yml') }}-${{ matrix.ort_archive }}
+          key: ${{ matrix.os }}-ort-release-${{ hashFiles('.github/workflows/release.yml') }}-${{ matrix.ort_archive }}
 
       - name: Install build tools
         run: |
@@ -93,22 +96,36 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/ccache
-          key: ${{ runner.os }}-${{ matrix.triplet }}-ccache-${{ hashFiles('CMakeLists.txt', 'src/**', 'proto/**') }}
+          key: ${{ matrix.os }}-${{ matrix.triplet }}-ccache-${{ github.sha }}
           restore-keys: |
-            ${{ runner.os }}-${{ matrix.triplet }}-ccache-
+            ${{ matrix.os }}-${{ matrix.triplet }}-ccache-
 
       - name: Bootstrap vcpkg
         shell: bash
         run: |
-          if [[ ! -d vcpkg ]]; then
-            git clone --depth 1 https://github.com/microsoft/vcpkg.git vcpkg
-          fi
+          vcpkg_baseline="$(python - <<'PY'
+          import json
+          import pathlib
+          print(json.loads(pathlib.Path("vcpkg.json").read_text(encoding="utf-8"))["builtin-baseline"])
+          PY
+          )"
+          git init vcpkg
+          git -C vcpkg remote add origin https://github.com/microsoft/vcpkg.git
+          git -C vcpkg fetch --depth 1 origin "$vcpkg_baseline"
+          git -C vcpkg checkout --detach FETCH_HEAD
           ./vcpkg/bootstrap-vcpkg.sh -disableMetrics
 
       - name: Install dependencies
         shell: bash
         run: |
-          ./vcpkg/vcpkg install --triplet ${{ matrix.triplet }} --x-manifest-root="$GITHUB_WORKSPACE" --x-install-root="$GITHUB_WORKSPACE/vcpkg_installed" --clean-after-build
+          ./vcpkg/vcpkg install \
+            --triplet ${{ matrix.triplet }} \
+            --x-manifest-root="$GITHUB_WORKSPACE" \
+            --x-install-root="$GITHUB_WORKSPACE/build/linux-vcpkg-installed" \
+            --overlay-triplets="$GITHUB_WORKSPACE/triplets/ci" \
+            "--binarysource=clear;files,$GITHUB_WORKSPACE/build/vcpkg-binary-cache,readwrite" \
+            --clean-after-build
+          ln -s "$GITHUB_WORKSPACE/build/linux-vcpkg-installed" "$GITHUB_WORKSPACE/vcpkg_installed"
 
       - name: Download ONNX Runtime
         shell: bash

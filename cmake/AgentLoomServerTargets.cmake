@@ -36,6 +36,7 @@ else()
     target_link_libraries(agent_emotion_server PUBLIC agent_net)
 endif()
 
+if(AGENTLOOM_BUILD_LOCAL_LLM AND AGENTLOOM_BUILD_MEDIA)
 add_library(agent_server STATIC
     src/server/grpc/grpc_error.cpp
     src/server/grpc/grpc_error.h
@@ -71,6 +72,7 @@ target_link_libraries(agent_server PUBLIC
     nlohmann_json::nlohmann_json
     spdlog::spdlog
 )
+endif()
 
 if(BERT_BUILD_EMOTION_INFERENCE_SERVER)
     add_executable(emotion_inference_server
@@ -81,7 +83,7 @@ if(BERT_BUILD_EMOTION_INFERENCE_SERVER)
     link_whole_archive(emotion_inference_server agent_config)
 endif()
 
-if(BERT_BUILD_MULTIMODAL_INFERENCE_SERVER)
+if(BERT_BUILD_MULTIMODAL_INFERENCE_SERVER AND TARGET agent_server)
     add_executable(multimodal_inference_server
         src/server/main/multimodal_inference_server.cpp
     )
@@ -149,16 +151,18 @@ endif()
 
 # ==================== 客户端工具（BERT 协议，用于向后兼容测试） ====================
 
-add_executable(bert_inference_client
-    src/client/client_test.cpp
-)
+if(AGENTLOOM_BUILD_LEGACY_BERT_PROTO)
+    add_executable(bert_inference_client
+        src/client/client_test.cpp
+    )
 
-target_include_directories(bert_inference_client PRIVATE ${GENERATED_DIR})
-target_link_libraries(bert_inference_client PRIVATE bert_proto gRPC::grpc++)
+    target_include_directories(bert_inference_client PRIVATE ${GENERATED_DIR})
+    target_link_libraries(bert_inference_client PRIVATE bert_proto gRPC::grpc++)
 
-add_executable(bert_benchmark_client
-    src/client/benchmark_client.cpp
-)
+    add_executable(bert_benchmark_client
+        src/client/benchmark_client.cpp
+    )
 
-target_include_directories(bert_benchmark_client PRIVATE ${GENERATED_DIR})
-target_link_libraries(bert_benchmark_client PRIVATE bert_proto gRPC::grpc++)
+    target_include_directories(bert_benchmark_client PRIVATE ${GENERATED_DIR})
+    target_link_libraries(bert_benchmark_client PRIVATE bert_proto gRPC::grpc++)
+endif()

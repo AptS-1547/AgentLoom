@@ -23,7 +23,9 @@ function(agentloom_generate_proto proto_name)
     set(${proto_name}_GRPC_HDR "${grpc_hdr}" PARENT_SCOPE)
 endfunction()
 
-agentloom_generate_proto(bert_inference)
+if(AGENTLOOM_BUILD_LEGACY_BERT_PROTO)
+    agentloom_generate_proto(bert_inference)
+endif()
 agentloom_generate_proto(multimodal_inference)
 
 # 兼容现有客户端与安装逻辑使用的变量名。
@@ -36,16 +38,22 @@ set(MULTIMODAL_PROTO_HDR "${multimodal_inference_PROTO_HDR}")
 set(MULTIMODAL_GRPC_SRC "${multimodal_inference_GRPC_SRC}")
 set(MULTIMODAL_GRPC_HDR "${multimodal_inference_GRPC_HDR}")
 
-add_custom_target(generate_proto ALL DEPENDS
-    ${bert_inference_PROTO_SRC} ${bert_inference_PROTO_HDR}
-    ${bert_inference_GRPC_SRC} ${bert_inference_GRPC_HDR}
+set(_agentloom_proto_outputs
     ${multimodal_inference_PROTO_SRC} ${multimodal_inference_PROTO_HDR}
     ${multimodal_inference_GRPC_SRC} ${multimodal_inference_GRPC_HDR})
+if(AGENTLOOM_BUILD_LEGACY_BERT_PROTO)
+    list(APPEND _agentloom_proto_outputs
+        ${bert_inference_PROTO_SRC} ${bert_inference_PROTO_HDR}
+        ${bert_inference_GRPC_SRC} ${bert_inference_GRPC_HDR})
+endif()
+add_custom_target(generate_proto ALL DEPENDS ${_agentloom_proto_outputs})
 
-add_library(bert_proto STATIC ${bert_inference_PROTO_SRC} ${bert_inference_GRPC_SRC})
-add_dependencies(bert_proto generate_proto)
-target_include_directories(bert_proto PUBLIC "${GENERATED_DIR}")
-target_link_libraries(bert_proto PUBLIC protobuf::libprotobuf gRPC::grpc++)
+if(AGENTLOOM_BUILD_LEGACY_BERT_PROTO)
+    add_library(bert_proto STATIC ${bert_inference_PROTO_SRC} ${bert_inference_GRPC_SRC})
+    add_dependencies(bert_proto generate_proto)
+    target_include_directories(bert_proto PUBLIC "${GENERATED_DIR}")
+    target_link_libraries(bert_proto PUBLIC protobuf::libprotobuf gRPC::grpc++)
+endif()
 
 add_library(multimodal_proto STATIC ${multimodal_inference_PROTO_SRC} ${multimodal_inference_GRPC_SRC})
 add_dependencies(multimodal_proto generate_proto)

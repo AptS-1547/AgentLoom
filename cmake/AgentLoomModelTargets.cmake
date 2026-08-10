@@ -30,6 +30,7 @@ target_link_libraries(agent_bert_models PUBLIC
     spdlog::spdlog
 )
 
+if(AGENTLOOM_BUILD_LOCAL_LLM)
 add_library(agent_models STATIC
     src/models/llama_handles.h
     src/models/llama_runner.cpp
@@ -64,6 +65,7 @@ target_link_libraries(agent_cache PUBLIC
     agent_models
     spdlog::spdlog
 )
+endif()
 
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/HfTokenizersCapi.cmake")
 

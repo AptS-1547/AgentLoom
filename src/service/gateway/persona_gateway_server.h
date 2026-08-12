@@ -41,11 +41,21 @@ struct GatewayDocumentStoreOptions {
     bool enable_path_analyze_test_endpoint = false;
 };
 
+struct GatewayThreadPoolConcurrencyOptions {
+    std::string scheduler = "default_fifo";
+    std::size_t max_active_keys = 1024;
+    std::size_t max_outstanding_per_key = 8;
+    std::size_t max_outstanding_per_fairness_key = 32;
+    std::size_t max_outstanding_per_tenant = 256;
+};
+
 struct PersonaGatewayServerOptions {
     ::net::HttpServerOptions http;
     GatewayAuthOptions auth;
     core::ThreadPoolOptions compute_pool;
+    GatewayThreadPoolConcurrencyOptions compute_pool_concurrency;
     core::ThreadPoolOptions io_pool;
+    GatewayThreadPoolConcurrencyOptions io_pool_concurrency;
     persona::SessionOptions session;
     persona::PersonaRuntimeOptions runtime;
     std::optional<::net::StaticFileOptions> static_files;

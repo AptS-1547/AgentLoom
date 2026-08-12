@@ -303,6 +303,18 @@ Json ThreadPoolStatsToJson(const core::ThreadPoolStats& stats) {
         {"completedTasks", stats.completed_tasks},
         {"failedTasks", stats.failed_tasks},
         {"rejectedTasks", stats.rejected_tasks},
+        {"scheduler", {
+            {"activeKeys", stats.scheduler.active_keys},
+            {"readyKeys", stats.scheduler.ready_keys},
+            {"queuedTasks", stats.scheduler.queued_tasks},
+            {"runningTasks", stats.scheduler.running_tasks},
+            {"rejectedTasks", stats.scheduler.rejected_tasks},
+            {"rejectedGlobal", stats.scheduler.rejected_global},
+            {"rejectedPerKey", stats.scheduler.rejected_per_key},
+            {"rejectedPerFairnessKey", stats.scheduler.rejected_per_fairness_key},
+            {"rejectedPerTenant", stats.scheduler.rejected_per_tenant},
+            {"maxLaneDepth", stats.scheduler.max_lane_depth},
+        }},
     };
 }
 

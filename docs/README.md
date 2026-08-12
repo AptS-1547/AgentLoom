@@ -31,6 +31,8 @@
 | [CONFIG_SYSTEM.md](CONFIG_SYSTEM.md) | 当前规范 | JSON section、CLI override 和配置扩展方式 |
 | [FRONTEND_BACKEND_API_PROTOCOL.md](FRONTEND_BACKEND_API_PROTOCOL.md) | 当前规范 | HTTP、WebSocket、认证、文档和 Skill API |
 | [GATEWAY_FRONTEND_SESSION_ALIGNMENT.md](GATEWAY_FRONTEND_SESSION_ALIGNMENT.md) | 当前设计 | Gateway、前端和 session 生命周期对齐 |
+| [GATEWAY_SESSION_AFFINITY_SCHEDULER.md](GATEWAY_SESSION_AFFINITY_SCHEDULER.md) | 当前设计 | Gateway 会话亲和、可选 ThreadPool 调度接口和公平准入 |
+| [GATEWAY_SESSION_AFFINITY_BENCHMARK.md](GATEWAY_SESSION_AFFINITY_BENCHMARK.md) | 实验记录 | 默认 FIFO 与 session affinity 的排队延迟和公平性 A/B 数据 |
 | [SKILL_SESSION_PROTOCOL.md](SKILL_SESSION_PROTOCOL.md) | 当前规范 | 通用 Skill Session 生命周期与接口约束 |
 | [SKILL_MEDIA_DRAIN_SPOOL_DESIGN.md](SKILL_MEDIA_DRAIN_SPOOL_DESIGN.md) | 当前设计 | 有限媒体输入的 Seal、Drain、mapped spool 和关闭语义 |
 | [MULTIMODAL_PERCEPTION_LAYERS.md](MULTIMODAL_PERCEPTION_LAYERS.md) | 当前设计 | ViT/VLM 分层、视觉事件可信度和隐私边界 |

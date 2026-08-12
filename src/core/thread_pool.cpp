@@ -10,7 +10,9 @@ namespace core {
 
 ThreadPool::ThreadPool(ThreadPoolOptions options)
     : options_(std::move(options)),
-      queue_(options_.queue_capacity) {}
+      scheduler_(options_.scheduler
+                     ? options_.scheduler
+                     : std::make_shared<DefaultFifoThreadPoolTaskScheduler>()) {}
 
 ThreadPool::~ThreadPool() {
     Shutdown(false);
@@ -21,11 +23,19 @@ Status ThreadPool::Start() {
     if (running_.load(std::memory_order_acquire)) {
         return Status::Ok();
     }
-    if (queue_.closed()) {
+    if (!scheduler_ || scheduler_->closed()) {
         return Status::Error(ErrorCode::Unavailable, "thread pool has been shut down");
     }
 
     const auto worker_count = ResolveWorkerCount(options_.worker_count);
+    auto scheduler_status = scheduler_->Start(ThreadPoolSchedulerOptions{
+        .worker_count = worker_count,
+        .queue_capacity = options_.queue_capacity,
+        .pool_name = options_.name,
+    });
+    if (!scheduler_status.ok()) {
+        return scheduler_status;
+    }
     try {
         workers_.reserve(worker_count);
         InitializeWorkerStatuses(worker_count);
@@ -36,7 +46,7 @@ Status ThreadPool::Start() {
         }
     } catch (const std::exception& e) {
         const auto status = Status::Error(ErrorCode::InternalError, e.what());
-        queue_.Close(true);
+        scheduler_->Close(true);
         for (auto& worker : workers_) {
             worker.request_stop();
         }
@@ -68,7 +78,7 @@ void ThreadPool::Shutdown(bool drain) {
             }
         }
 
-        queue_.Close(!drain);
+        scheduler_->Close(!drain);
         workers = std::move(workers_);
     }
 
@@ -79,7 +89,10 @@ void ThreadPool::Shutdown(bool drain) {
     }
 }
 
-Status ThreadPool::SubmitTask(TaskFunction task, SharedMemoryBlock payload, std::string name) {
+Status ThreadPool::SubmitTask(TaskFunction task,
+                              SharedMemoryBlock payload,
+                              std::string name,
+                              ThreadPoolTaskMetadata metadata) {
     if (!task) {
         rejected_tasks_.fetch_add(1, std::memory_order_relaxed);
         return Status::Error(ErrorCode::InvalidArgument, "task is empty");
@@ -94,8 +107,14 @@ Status ThreadPool::SubmitTask(TaskFunction task, SharedMemoryBlock payload, std:
         trace_id = current_trace->trace_id;
     }
 
-    auto status = queue_.TryPush(QueuedTask{
-        std::move(task), std::move(payload), std::move(name), std::move(trace_id), {}});
+    auto item = std::shared_ptr<ThreadPoolWorkItem>(new ThreadPoolWorkItem(
+        std::move(task),
+        std::move(payload),
+        std::move(name),
+        std::move(trace_id),
+        std::move(metadata),
+        {}));
+    auto status = scheduler_->TryEnqueue(item);
     if (!status.ok()) {
         rejected_tasks_.fetch_add(1, std::memory_order_relaxed);
         return status;
@@ -108,19 +127,25 @@ Status ThreadPool::SubmitTask(TaskFunction task, SharedMemoryBlock payload, std:
 Status ThreadPool::SubmitTask(TaskGroup& group,
                               TaskFunction task,
                               SharedMemoryBlock payload,
-                              std::string name) {
+                              std::string name,
+                              ThreadPoolTaskMetadata metadata) {
     auto token = group.AcquireRoot();
     if (!token.ok()) {
         rejected_tasks_.fetch_add(1, std::memory_order_relaxed);
         return token.status();
     }
-    return SubmitTask(std::move(token).value(), std::move(task), std::move(payload), std::move(name));
+    return SubmitTask(std::move(token).value(),
+                      std::move(task),
+                      std::move(payload),
+                      std::move(name),
+                      std::move(metadata));
 }
 
 Status ThreadPool::SubmitTask(TaskGroupToken token,
                               TaskFunction task,
                               SharedMemoryBlock payload,
-                              std::string name) {
+                              std::string name,
+                              ThreadPoolTaskMetadata metadata) {
     if (!token.valid()) {
         rejected_tasks_.fetch_add(1, std::memory_order_relaxed);
         return Status::Error(ErrorCode::InvalidArgument, "task group token is inactive");
@@ -144,13 +169,14 @@ Status ThreadPool::SubmitTask(TaskGroupToken token,
     }
 
     auto tracking_token = std::make_shared<TaskGroupToken>(std::move(token));
-    auto status = queue_.TryPush(QueuedTask{
+    auto item = std::shared_ptr<ThreadPoolWorkItem>(new ThreadPoolWorkItem(
         std::move(task),
         std::move(payload),
         std::move(name),
         std::move(trace_id),
-        tracking_token,
-    });
+        std::move(metadata),
+        tracking_token));
+    auto status = scheduler_->TryEnqueue(item);
     if (!status.ok()) {
         rejected_tasks_.fetch_add(1, std::memory_order_relaxed);
         tracking_token->Complete(status);
@@ -165,12 +191,15 @@ ThreadPoolStats ThreadPool::Stats() const {
     std::lock_guard lock(lifecycle_mutex_);
     ThreadPoolStats stats;
     stats.worker_count = worker_statuses_.size();
-    stats.queued_tasks = queue_.size();
+    stats.queued_tasks = scheduler_ ? scheduler_->QueuedTaskCount() : 0;
     stats.active_workers = active_workers_.load(std::memory_order_relaxed);
     stats.submitted_tasks = submitted_tasks_.load(std::memory_order_relaxed);
     stats.completed_tasks = completed_tasks_.load(std::memory_order_relaxed);
     stats.failed_tasks = failed_tasks_.load(std::memory_order_relaxed);
     stats.rejected_tasks = rejected_tasks_.load(std::memory_order_relaxed);
+    if (scheduler_) {
+        stats.scheduler = scheduler_->Snapshot();
+    }
     return stats;
 }
 
@@ -194,7 +223,7 @@ void ThreadPool::WorkerLoop(std::stop_token stop_token, std::size_t worker_index
     SetWorkerState(worker_index, WorkerState::Idle);
 
     while (!stop_token.stop_requested()) {
-        auto task_result = queue_.WaitPop();
+        auto task_result = scheduler_->WaitDequeue(worker_index, stop_token);
         if (!task_result) {
             SetWorkerState(worker_index, WorkerState::Stopping);
             break;
@@ -202,17 +231,17 @@ void ThreadPool::WorkerLoop(std::stop_token stop_token, std::size_t worker_index
 
         auto queued = std::move(task_result).value();
         active_workers_.fetch_add(1, std::memory_order_relaxed);
-        SetWorkerState(worker_index, WorkerState::Running, std::move(queued.name));
-        context.set_payload(std::move(queued.payload));
-        context.set_task_group_token(queued.task_group_token.get());
+        SetWorkerState(worker_index, WorkerState::Running, queued->name_);
+        context.set_payload(std::move(queued->payload_));
+        context.set_task_group_token(queued->task_group_token_.get());
 
         TraceContext trace_ctx;
-        trace_ctx.trace_id = std::move(queued.trace_id);
+        trace_ctx.trace_id = queued->trace_id_;
         TraceScope trace_scope(trace_ctx);
 
         Status status = Status::Ok();
         try {
-            status = queued.task(context);
+            status = queued->task_(context);
         } catch (const AppException& e) {
             status = e.status();
         } catch (const std::exception& e) {
@@ -225,8 +254,9 @@ void ThreadPool::WorkerLoop(std::stop_token stop_token, std::size_t worker_index
         context.set_task_group_token(nullptr);
         active_workers_.fetch_sub(1, std::memory_order_relaxed);
         const auto task_ok = status.ok();
-        if (queued.task_group_token) {
-            queued.task_group_token->Complete(status);
+        scheduler_->Complete(*queued, worker_index, status);
+        if (queued->task_group_token_) {
+            queued->task_group_token_->Complete(status);
         }
         FinishWorkerTask(worker_index, std::move(status));
 

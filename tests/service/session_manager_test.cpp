@@ -1,4 +1,5 @@
 #include "session_manager.h"
+#include "gateway_session_affinity_scheduler.h"
 #include "runtime_maintenance_service.h"
 #include "inference_frame_ipc_control.h"
 
@@ -17,6 +18,8 @@ using namespace std::chrono_literals;
 using agent::service::persona::ConversationTurn;
 using agent::service::persona::CreateSessionRequest;
 using agent::service::persona::DispatchOptions;
+using agent::service::persona::GatewaySessionAffinityScheduler;
+using agent::service::persona::GatewaySessionAffinitySchedulerOptions;
 using agent::service::persona::PersonalityConfig;
 using agent::service::persona::SessionManager;
 using agent::service::persona::SessionOptions;
@@ -228,7 +231,7 @@ TEST(SessionManagerTest, DispatchPropagatesTraceIdIntoComputeAndIoPools) {
     io.Shutdown(true);
 }
 
-TEST(SessionManagerTest, DispatchReportsNotFoundWhenSessionWasClosedBeforeExecution) {
+TEST(SessionManagerTest, DispatchRejectsSessionClosedBeforeSubmission) {
     core::ThreadPool compute({1, 8, "test-compute"});
     core::ThreadPool io({1, 8, "test-io"});
     ASSERT_TRUE(compute.Start().ok());
@@ -245,12 +248,199 @@ TEST(SessionManagerTest, DispatchReportsNotFoundWhenSessionWasClosedBeforeExecut
             ran.store(true, std::memory_order_relaxed);
             return core::Status::Ok();
         });
-    ASSERT_TRUE(status.ok()) << status.message();
+    ASSERT_FALSE(status.ok());
+    EXPECT_EQ(status.code(), core::ErrorCode::NotFound);
 
     compute.Shutdown(true);
     io.Shutdown(true);
     EXPECT_FALSE(ran.load(std::memory_order_relaxed));
-    EXPECT_EQ(compute.Stats().failed_tasks, 1u);
+    EXPECT_EQ(compute.Stats().failed_tasks, 0u);
+}
+
+TEST(SessionManagerTest, DispatchUsesRegisteredIdentityForCrossSessionFairness) {
+    auto scheduler = std::make_shared<GatewaySessionAffinityScheduler>(
+        GatewaySessionAffinitySchedulerOptions{
+            .max_active_keys = 8,
+            .max_outstanding_per_key = 4,
+            .max_outstanding_per_fairness_key = 1,
+            .max_outstanding_per_tenant = 8,
+        });
+    core::ThreadPool compute({
+        .worker_count = 1,
+        .queue_capacity = 8,
+        .name = "trusted-fairness-test",
+        .scheduler = scheduler,
+    });
+    core::ThreadPool io({1, 8, "test-io"});
+    ASSERT_TRUE(compute.Start().ok());
+    ASSERT_TRUE(io.Start().ok());
+
+    SessionManager manager(compute, io);
+    auto first_request = MakeCreateRequest("session-fairness-a");
+    first_request.tenant_id = "tenant-a";
+    auto second_request = MakeCreateRequest("session-fairness-b");
+    second_request.tenant_id = "tenant-a";
+    ASSERT_TRUE(manager.CreateSession(std::move(first_request)).ok());
+    ASSERT_TRUE(manager.CreateSession(std::move(second_request)).ok());
+
+    std::promise<void> first_started;
+    auto first_started_future = first_started.get_future();
+    std::promise<void> finish_first;
+    auto finish_first_future = finish_first.get_future().share();
+    ASSERT_TRUE(manager.SubmitCompute(
+                           DispatchOptions{
+                               .session_id = "session-fairness-a",
+                               .trace_id = "trace-fairness-a",
+                               .user_uuid = "spoofed-user-a",
+                           },
+                           [&](auto&, core::ThreadPoolContext&) {
+                               first_started.set_value();
+                               finish_first_future.wait();
+                               return core::Status::Ok();
+                           })
+                    .ok());
+    ASSERT_EQ(first_started_future.wait_for(2s), std::future_status::ready);
+
+    const auto rejected = manager.SubmitCompute(
+        DispatchOptions{
+            .session_id = "session-fairness-b",
+            .trace_id = "trace-fairness-b",
+            .user_uuid = "spoofed-user-b",
+        },
+        [](auto&, core::ThreadPoolContext&) { return core::Status::Ok(); });
+    EXPECT_EQ(rejected.code(), core::ErrorCode::ResourceExhausted);
+    EXPECT_EQ(scheduler->Snapshot().rejected_per_fairness_key, 1u);
+
+    finish_first.set_value();
+    compute.Shutdown(true);
+    io.Shutdown(true);
+    EXPECT_EQ(scheduler->Snapshot().active_keys, 0u);
+}
+
+TEST(GatewaySessionAffinitySchedulerTest, SerializesSessionKeyAndRejectsExcessOutstandingWork) {
+    auto scheduler = std::make_shared<GatewaySessionAffinityScheduler>(
+        GatewaySessionAffinitySchedulerOptions{
+            .max_active_keys = 8,
+            .max_outstanding_per_key = 2,
+            .max_outstanding_per_fairness_key = 4,
+        });
+    core::ThreadPool pool({
+        .worker_count = 2,
+        .queue_capacity = 8,
+        .name = "session-affinity-test",
+        .scheduler = scheduler,
+    });
+    ASSERT_TRUE(pool.Start().ok());
+
+    std::promise<void> first_started;
+    auto first_started_future = first_started.get_future();
+    std::promise<void> allow_first_finish;
+    auto allow_first_finish_future = allow_first_finish.get_future().share();
+    std::promise<void> other_session_ran;
+    auto other_session_future = other_session_ran.get_future();
+    std::promise<void> second_session_a_ran;
+    auto second_session_a_future = second_session_a_ran.get_future();
+
+    core::ThreadPoolTaskMetadata first_metadata;
+    first_metadata.concurrency_key = "session-a";
+    first_metadata.fairness_key = "user-a";
+    ASSERT_TRUE(pool.Submit(
+                        [&] {
+                            first_started.set_value();
+                            allow_first_finish_future.wait();
+                        },
+                        {},
+                        "session-a-first",
+                        std::move(first_metadata))
+                        .ok());
+    ASSERT_EQ(first_started_future.wait_for(2s), std::future_status::ready);
+
+    core::ThreadPoolTaskMetadata second_metadata;
+    second_metadata.concurrency_key = "session-a";
+    second_metadata.fairness_key = "user-a";
+    ASSERT_TRUE(pool.Submit(
+                        [&] { second_session_a_ran.set_value(); },
+                        {},
+                        "session-a-second",
+                        std::move(second_metadata))
+                        .ok());
+    EXPECT_EQ(second_session_a_future.wait_for(100ms), std::future_status::timeout);
+
+    core::ThreadPoolTaskMetadata rejected_metadata;
+    rejected_metadata.concurrency_key = "session-a";
+    rejected_metadata.fairness_key = "user-a";
+    const auto rejected = pool.Submit(
+        [] {}, {}, "session-a-rejected", std::move(rejected_metadata));
+    EXPECT_EQ(rejected.code(), core::ErrorCode::ResourceExhausted);
+
+    core::ThreadPoolTaskMetadata other_metadata;
+    other_metadata.concurrency_key = "session-b";
+    other_metadata.fairness_key = "user-b";
+    ASSERT_TRUE(pool.Submit(
+                        [&] { other_session_ran.set_value(); },
+                        {},
+                        "session-b",
+                        std::move(other_metadata))
+                        .ok());
+    EXPECT_EQ(other_session_future.wait_for(2s), std::future_status::ready);
+
+    allow_first_finish.set_value();
+    EXPECT_EQ(second_session_a_future.wait_for(2s), std::future_status::ready);
+    pool.Shutdown(true);
+
+    const auto snapshot = scheduler->Snapshot();
+    EXPECT_EQ(snapshot.active_keys, 0u);
+    EXPECT_EQ(snapshot.queued_tasks, 0u);
+    EXPECT_EQ(snapshot.running_tasks, 0u);
+    EXPECT_GE(snapshot.rejected_tasks, 1u);
+}
+
+TEST(GatewaySessionAffinitySchedulerTest, EnforcesTenantOutstandingLimitAcrossUsers) {
+    auto scheduler = std::make_shared<GatewaySessionAffinityScheduler>(
+        GatewaySessionAffinitySchedulerOptions{
+            .max_active_keys = 8,
+            .max_outstanding_per_key = 4,
+            .max_outstanding_per_fairness_key = 4,
+            .max_outstanding_per_tenant = 1,
+        });
+    core::ThreadPool pool({
+        .worker_count = 1,
+        .queue_capacity = 8,
+        .name = "tenant-affinity-test",
+        .scheduler = scheduler,
+    });
+    ASSERT_TRUE(pool.Start().ok());
+
+    std::promise<void> started;
+    auto started_future = started.get_future();
+    std::promise<void> finish;
+    auto finish_future = finish.get_future().share();
+    core::ThreadPoolTaskMetadata first;
+    first.concurrency_key = "session-a";
+    first.fairness_key = "tenant-a:user-a";
+    first.tenant_key = "tenant-a";
+    ASSERT_TRUE(pool.Submit(
+                        [&] {
+                            started.set_value();
+                            finish_future.wait();
+                        },
+                        {},
+                        "tenant-a-first",
+                        std::move(first))
+                        .ok());
+    ASSERT_EQ(started_future.wait_for(2s), std::future_status::ready);
+
+    core::ThreadPoolTaskMetadata second;
+    second.concurrency_key = "session-b";
+    second.fairness_key = "tenant-a:user-b";
+    second.tenant_key = "tenant-a";
+    const auto rejected = pool.Submit([] {}, {}, "tenant-a-second", std::move(second));
+    EXPECT_EQ(rejected.code(), core::ErrorCode::ResourceExhausted);
+    EXPECT_EQ(scheduler->Snapshot().rejected_per_tenant, 1u);
+
+    finish.set_value();
+    pool.Shutdown(true);
+    EXPECT_EQ(scheduler->Snapshot().active_keys, 0u);
 }
 
 TEST(RuntimeMaintenanceServiceTest, RunsRegisteredTaskOnDedicatedWorker) {

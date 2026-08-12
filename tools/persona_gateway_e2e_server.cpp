@@ -329,6 +329,21 @@ std::vector<agent::service::persona::EmotionKeywordRule> ParseEmotionKeywordRule
     return rules;
 }
 
+void ValidateThreadPoolConcurrency(
+    std::string_view pool_name,
+    const agent::service::gateway::GatewayThreadPoolConcurrencyOptions& options) {
+    if (options.scheduler != "default_fifo" && options.scheduler != "session_affinity") {
+        throw std::runtime_error(std::string(pool_name) +
+                                 ".scheduler must be default_fifo or session_affinity");
+    }
+    if (options.max_active_keys == 0 ||
+        options.max_outstanding_per_key == 0 ||
+        options.max_outstanding_per_fairness_key == 0 ||
+        options.max_outstanding_per_tenant == 0) {
+        throw std::runtime_error(std::string(pool_name) + " scheduler limits must be positive");
+    }
+}
+
 ToolConfig LoadConfig(const fs::path& config_path) {
     std::ifstream file(config_path);
     if (!file) {
@@ -360,10 +375,30 @@ ToolConfig LoadConfig(const fs::path& config_path) {
     const auto compute_pool = gateway.value("compute_pool", Json::object());
     config.gateway.compute_pool.worker_count = GetSize(compute_pool, "worker_count", 2);
     config.gateway.compute_pool.queue_capacity = GetSize(compute_pool, "queue_capacity", 256);
+    config.gateway.compute_pool_concurrency.scheduler = GetString(compute_pool, "scheduler", "default_fifo");
+    config.gateway.compute_pool_concurrency.max_active_keys = GetSize(compute_pool, "max_active_keys", 1024);
+    config.gateway.compute_pool_concurrency.max_outstanding_per_key =
+        GetSize(compute_pool, "max_outstanding_per_key", 8);
+    config.gateway.compute_pool_concurrency.max_outstanding_per_fairness_key =
+        GetSize(compute_pool, "max_outstanding_per_fairness_key", 32);
+    config.gateway.compute_pool_concurrency.max_outstanding_per_tenant =
+        GetSize(compute_pool, "max_outstanding_per_tenant", 256);
+    ValidateThreadPoolConcurrency("persona_gateway.compute_pool",
+                                  config.gateway.compute_pool_concurrency);
 
     const auto io_pool = gateway.value("io_pool", Json::object());
     config.gateway.io_pool.worker_count = GetSize(io_pool, "worker_count", 2);
     config.gateway.io_pool.queue_capacity = GetSize(io_pool, "queue_capacity", 256);
+    config.gateway.io_pool_concurrency.scheduler = GetString(io_pool, "scheduler", "default_fifo");
+    config.gateway.io_pool_concurrency.max_active_keys = GetSize(io_pool, "max_active_keys", 1024);
+    config.gateway.io_pool_concurrency.max_outstanding_per_key =
+        GetSize(io_pool, "max_outstanding_per_key", 8);
+    config.gateway.io_pool_concurrency.max_outstanding_per_fairness_key =
+        GetSize(io_pool, "max_outstanding_per_fairness_key", 32);
+    config.gateway.io_pool_concurrency.max_outstanding_per_tenant =
+        GetSize(io_pool, "max_outstanding_per_tenant", 256);
+    ValidateThreadPoolConcurrency("persona_gateway.io_pool",
+                                  config.gateway.io_pool_concurrency);
 
     config.gateway.session.idle_timeout = std::chrono::minutes(GetInt(gateway, "session_idle_timeout_minutes", 15));
     config.gateway.session.max_recent_turns = GetSize(gateway, "session_max_recent_turns", 20);

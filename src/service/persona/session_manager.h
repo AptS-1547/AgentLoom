@@ -73,6 +73,7 @@ public:
 };
 
 struct CreateSessionRequest {
+    std::string tenant_id = "default";
     std::string user_uuid;
     std::string persona_id;
     std::string session_id;
@@ -85,6 +86,7 @@ struct CreateSessionRequest {
 
 struct SessionSnapshot {
     std::string session_id;
+    std::string tenant_id = "default";
     std::string user_uuid;
     std::string persona_id;
     std::string last_trace_id;
@@ -113,6 +115,7 @@ struct SessionThreadPoolStats {
 
 struct SessionState {
     std::string session_id;
+    std::string tenant_id = "default";
     std::string user_uuid;
     std::string persona_id;
     std::string last_trace_id;

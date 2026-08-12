@@ -1,9 +1,9 @@
 #pragma once
 
-#include "blocking_queue.h"
 #include "result.h"
 #include "shared_memory_block.h"
 #include "task_group.h"
+#include "thread_pool_scheduler.h"
 #include "trace_context.h"
 
 #include <atomic>
@@ -23,6 +23,7 @@ struct ThreadPoolOptions {
     std::size_t worker_count = 0;
     std::size_t queue_capacity = 0;
     std::string name = "core-thread-pool";
+    std::shared_ptr<IThreadPoolTaskScheduler> scheduler;
 };
 
 struct ThreadPoolStats {
@@ -33,6 +34,7 @@ struct ThreadPoolStats {
     std::size_t completed_tasks = 0;
     std::size_t failed_tasks = 0;
     std::size_t rejected_tasks = 0;
+    ThreadPoolConcurrencySnapshot scheduler;
 };
 
 enum class WorkerState {
@@ -129,33 +131,57 @@ public:
     Status Start();
     void Shutdown(bool drain = true);
 
-    Status SubmitTask(TaskFunction task, SharedMemoryBlock payload = {}, std::string name = {});
+    Status SubmitTask(TaskFunction task,
+                      SharedMemoryBlock payload = {},
+                      std::string name = {},
+                      ThreadPoolTaskMetadata metadata = {});
     Status SubmitTask(TaskGroup& group,
                       TaskFunction task,
                       SharedMemoryBlock payload = {},
-                      std::string name = {});
+                      std::string name = {},
+                      ThreadPoolTaskMetadata metadata = {});
     Status SubmitTask(TaskGroupToken token,
                       TaskFunction task,
                       SharedMemoryBlock payload = {},
-                      std::string name = {});
+                      std::string name = {},
+                      ThreadPoolTaskMetadata metadata = {});
 
     template <typename Fn>
-    Status Submit(Fn&& fn, SharedMemoryBlock payload = {}, std::string name = {}) {
-        return SubmitTask(MakeTask(std::forward<Fn>(fn)), std::move(payload), std::move(name));
+    Status Submit(Fn&& fn,
+                  SharedMemoryBlock payload = {},
+                  std::string name = {},
+                  ThreadPoolTaskMetadata metadata = {}) {
+        return SubmitTask(MakeTask(std::forward<Fn>(fn)),
+                          std::move(payload),
+                          std::move(name),
+                          std::move(metadata));
     }
 
     template <typename Fn>
-    Status Submit(TaskGroup& group, Fn&& fn, SharedMemoryBlock payload = {}, std::string name = {}) {
-        return SubmitTask(group, MakeTask(std::forward<Fn>(fn)), std::move(payload), std::move(name));
+    Status Submit(TaskGroup& group,
+                  Fn&& fn,
+                  SharedMemoryBlock payload = {},
+                  std::string name = {},
+                  ThreadPoolTaskMetadata metadata = {}) {
+        return SubmitTask(group,
+                          MakeTask(std::forward<Fn>(fn)),
+                          std::move(payload),
+                          std::move(name),
+                          std::move(metadata));
     }
 
     template <typename Fn>
-    Status Submit(TaskGroupToken token, Fn&& fn, SharedMemoryBlock payload = {}, std::string name = {}) {
+    Status Submit(TaskGroupToken token,
+                  Fn&& fn,
+                  SharedMemoryBlock payload = {},
+                  std::string name = {},
+                  ThreadPoolTaskMetadata metadata = {}) {
         return SubmitTask(
             std::move(token),
             MakeTask(std::forward<Fn>(fn)),
             std::move(payload),
-            std::move(name));
+            std::move(name),
+            std::move(metadata));
     }
 
     ThreadPoolStats Stats() const;
@@ -191,14 +217,6 @@ private:
             }
         };
     }
-    struct QueuedTask {
-        TaskFunction task;
-        SharedMemoryBlock payload;
-        std::string name;
-        std::string trace_id;
-        std::shared_ptr<TaskGroupToken> task_group_token;
-    };
-
     struct WorkerRuntime {
         mutable std::mutex mutex;
         WorkerStatus status;
@@ -211,7 +229,7 @@ private:
     static std::size_t ResolveWorkerCount(std::size_t requested) noexcept;
 
     ThreadPoolOptions options_;
-    BlockingQueue<QueuedTask> queue_;
+    std::shared_ptr<IThreadPoolTaskScheduler> scheduler_;
     mutable std::mutex lifecycle_mutex_;
     std::vector<std::jthread> workers_;
     std::vector<std::unique_ptr<WorkerRuntime>> worker_statuses_;

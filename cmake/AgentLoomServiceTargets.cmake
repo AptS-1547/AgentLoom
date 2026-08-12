@@ -21,6 +21,8 @@ add_library(agent_agent_runtime STATIC
     src/service/persona/persona_algorithm.h
     src/service/persona/session_manager.cpp
     src/service/persona/session_manager.h
+    src/service/persona/gateway_session_affinity_scheduler.cpp
+    src/service/persona/gateway_session_affinity_scheduler.h
     src/service/persona/persona_runtime.cpp
     src/service/persona/persona_runtime.h
     src/service/persona/skill_session_manager.cpp
@@ -268,6 +270,13 @@ if(TARGET agent_media)
 endif()
 
 if(BERT_BUILD_TESTS)
+    add_executable(gateway_session_affinity_bench
+        tests/service/gateway_session_affinity_bench.cpp
+    )
+    target_link_libraries(gateway_session_affinity_bench PRIVATE
+        agent_agent_runtime
+    )
+
     add_executable(service_tests
         tests/service/persona_algorithm_test.cpp
         tests/service/session_manager_test.cpp

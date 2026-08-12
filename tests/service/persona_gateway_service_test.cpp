@@ -1730,6 +1730,19 @@ TEST(PersonaGatewayHttpAdapterTest, HealthRouteBypassesAuthenticatorAndReportsRe
     EXPECT_TRUE(body["data"].contains("sessionCount"));
     EXPECT_TRUE(body["data"]["pools"].contains("compute"));
     EXPECT_TRUE(body["data"]["pools"].contains("io"));
+    for (const auto* pool_name : {"compute", "io"}) {
+        const auto& scheduler = body["data"]["pools"][pool_name]["scheduler"];
+        EXPECT_TRUE(scheduler.contains("activeKeys"));
+        EXPECT_TRUE(scheduler.contains("readyKeys"));
+        EXPECT_TRUE(scheduler.contains("queuedTasks"));
+        EXPECT_TRUE(scheduler.contains("runningTasks"));
+        EXPECT_TRUE(scheduler.contains("rejectedTasks"));
+        EXPECT_TRUE(scheduler.contains("rejectedGlobal"));
+        EXPECT_TRUE(scheduler.contains("rejectedPerKey"));
+        EXPECT_TRUE(scheduler.contains("rejectedPerFairnessKey"));
+        EXPECT_TRUE(scheduler.contains("rejectedPerTenant"));
+        EXPECT_TRUE(scheduler.contains("maxLaneDepth"));
+    }
     server.Stop();
 }
 

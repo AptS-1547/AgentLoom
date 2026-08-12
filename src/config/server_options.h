@@ -273,6 +273,11 @@ struct GatewayStaticFilesConfigOptions {
 struct GatewayThreadPoolConfigOptions {
     std::size_t worker_count = 0;
     std::size_t queue_capacity = 0;
+    std::string scheduler = "default_fifo";
+    std::size_t max_active_keys = 1024;
+    std::size_t max_outstanding_per_key = 8;
+    std::size_t max_outstanding_per_fairness_key = 32;
+    std::size_t max_outstanding_per_tenant = 256;
 };
 
 struct GatewayDocumentStoreConfigOptions {
@@ -430,8 +435,24 @@ PersonaGatewayServerOptionsT ToPersonaGatewayServerOptions(const MultimodalServe
     options.websocket_path = config.persona_gateway.websocket_path;
     options.compute_pool.worker_count = config.persona_gateway.compute_pool.worker_count;
     options.compute_pool.queue_capacity = config.persona_gateway.compute_pool.queue_capacity;
+    options.compute_pool_concurrency.scheduler = config.persona_gateway.compute_pool.scheduler;
+    options.compute_pool_concurrency.max_active_keys = config.persona_gateway.compute_pool.max_active_keys;
+    options.compute_pool_concurrency.max_outstanding_per_key =
+        config.persona_gateway.compute_pool.max_outstanding_per_key;
+    options.compute_pool_concurrency.max_outstanding_per_fairness_key =
+        config.persona_gateway.compute_pool.max_outstanding_per_fairness_key;
+    options.compute_pool_concurrency.max_outstanding_per_tenant =
+        config.persona_gateway.compute_pool.max_outstanding_per_tenant;
     options.io_pool.worker_count = config.persona_gateway.io_pool.worker_count;
     options.io_pool.queue_capacity = config.persona_gateway.io_pool.queue_capacity;
+    options.io_pool_concurrency.scheduler = config.persona_gateway.io_pool.scheduler;
+    options.io_pool_concurrency.max_active_keys = config.persona_gateway.io_pool.max_active_keys;
+    options.io_pool_concurrency.max_outstanding_per_key =
+        config.persona_gateway.io_pool.max_outstanding_per_key;
+    options.io_pool_concurrency.max_outstanding_per_fairness_key =
+        config.persona_gateway.io_pool.max_outstanding_per_fairness_key;
+    options.io_pool_concurrency.max_outstanding_per_tenant =
+        config.persona_gateway.io_pool.max_outstanding_per_tenant;
     options.session.idle_timeout = std::chrono::minutes(config.persona_gateway.session_idle_timeout_minutes);
     options.session.max_recent_turns = config.persona_gateway.session_max_recent_turns;
     options.session.max_active_sessions = config.persona_gateway.session_max_active_sessions;

@@ -55,6 +55,27 @@ void LoadThreadPoolJson(const Json& section,
     }
     SetSize(*pool, field_name, "worker_count", options.worker_count, 0);
     SetSize(*pool, field_name, "queue_capacity", options.queue_capacity, 0);
+    SetString(*pool, field_name, "scheduler", options.scheduler);
+    SetSize(*pool, field_name, "max_active_keys", options.max_active_keys, 1);
+    SetSize(*pool, field_name, "max_outstanding_per_key", options.max_outstanding_per_key, 1);
+    SetSize(*pool,
+            field_name,
+            "max_outstanding_per_fairness_key",
+            options.max_outstanding_per_fairness_key,
+            1);
+    SetSize(*pool,
+            field_name,
+            "max_outstanding_per_tenant",
+            options.max_outstanding_per_tenant,
+            1);
+}
+
+void ValidateThreadPool(std::string_view field_name,
+                        const GatewayThreadPoolConfigOptions& options) {
+    if (options.scheduler != "default_fifo" && options.scheduler != "session_affinity") {
+        throw std::runtime_error("persona_gateway." + std::string(field_name) +
+                                 ".scheduler must be default_fifo or session_affinity");
+    }
 }
 
 void SetDoubleField(const Json& section,
@@ -373,6 +394,8 @@ bool PersonaGatewayConfigSection::LoadCli(CliCursor& cursor, MultimodalServerOpt
 
 void PersonaGatewayConfigSection::Validate(MultimodalServerOptions& options) const {
     auto& gateway = options.persona_gateway;
+    ValidateThreadPool("compute_pool", gateway.compute_pool);
+    ValidateThreadPool("io_pool", gateway.io_pool);
     if (gateway.websocket_path.empty() || gateway.websocket_path.front() != '/') {
         throw std::runtime_error("persona_gateway.websocket_path must start with '/'");
     }

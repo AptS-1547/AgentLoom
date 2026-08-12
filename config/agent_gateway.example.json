@@ -21,11 +21,21 @@
     "runtime_default_model": "deepseek-chat",
     "compute_pool": {
       "worker_count": 4,
-      "queue_capacity": 512
+      "queue_capacity": 512,
+      "scheduler": "session_affinity",
+      "max_active_keys": 1024,
+      "max_outstanding_per_key": 8,
+      "max_outstanding_per_fairness_key": 32,
+      "max_outstanding_per_tenant": 256
     },
     "io_pool": {
       "worker_count": 8,
-      "queue_capacity": 1024
+      "queue_capacity": 1024,
+      "scheduler": "session_affinity",
+      "max_active_keys": 1024,
+      "max_outstanding_per_key": 16,
+      "max_outstanding_per_fairness_key": 64,
+      "max_outstanding_per_tenant": 512
     },
     "request_filter": {
       "enabled": true,

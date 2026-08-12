@@ -18,6 +18,8 @@ add_library(agent_core STATIC
     src/core/task_group.h
     src/core/thread_pool.cpp
     src/core/thread_pool.h
+    src/core/thread_pool_scheduler.cpp
+    src/core/thread_pool_scheduler.h
     src/core/unique_handle.h
 )
 

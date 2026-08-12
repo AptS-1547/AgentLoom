@@ -60,6 +60,7 @@ core::Result<SessionSnapshot> SessionManager::CreateSession(CreateSessionRequest
         std::lock_guard lock(slot->mutex);
         auto now = std::chrono::steady_clock::now();
         slot->state.session_id = request.session_id.empty() ? MakeSessionId() : std::move(request.session_id);
+        slot->state.tenant_id = request.tenant_id.empty() ? "default" : std::move(request.tenant_id);
         slot->state.user_uuid = std::move(request.user_uuid);
         slot->state.persona_id = std::move(request.persona_id);
         slot->state.last_trace_id = trace.trace_id;
@@ -306,9 +307,30 @@ core::Status SessionManager::Submit(core::ThreadPool& pool,
     const std::string task_name = TaskName(pool_role, options);
     auto trace = MakeTrace(options);
     const std::string trace_id = trace.trace_id;
-    const std::string user_uuid = options.user_uuid;
+    std::string trusted_tenant_id;
+    std::string trusted_user_uuid;
+    auto admission_slot = FindSlot(task_session_id);
+    if (!admission_slot.ok()) {
+        return admission_slot.status();
+    }
+    {
+        std::lock_guard slot_lock(admission_slot.value()->mutex);
+        if (admission_slot.value()->state.status != SessionStatus::Active) {
+            return core::Status::Error(core::ErrorCode::FailedPrecondition, "session is not active");
+        }
+        trusted_tenant_id = admission_slot.value()->state.tenant_id;
+        trusted_user_uuid = admission_slot.value()->state.user_uuid;
+    }
+    const std::string user_uuid = trusted_user_uuid;
     const std::string module = options.module.empty() ? "session" : options.module;
     const std::string operation = options.operation.empty() ? "task" : options.operation;
+    core::ThreadPoolTaskMetadata scheduler_metadata;
+    scheduler_metadata.concurrency_key = task_session_id;
+    scheduler_metadata.tenant_key = trusted_tenant_id;
+    if (!trusted_user_uuid.empty()) {
+        scheduler_metadata.fairness_key = trusted_tenant_id + ":" + trusted_user_uuid;
+    }
+    scheduler_metadata.execution_id = options.span_id;
 
     core::TraceScope trace_scope(trace);
     logger_.info("[trace={}] [session] submit pool={} module={} op={} session={}",
@@ -379,7 +401,8 @@ core::Status SessionManager::Submit(core::ThreadPool& pool,
             return task_status;
         },
         {},
-        task_name);
+        task_name,
+        std::move(scheduler_metadata));
 
     if (!status.ok()) {
         logger_.warn("[trace={}] [session] submit rejected pool={} module={} op={} session={} reason={}",
@@ -405,6 +428,7 @@ core::Result<std::shared_ptr<SessionManager::SessionSlot>> SessionManager::FindS
 SessionSnapshot SessionManager::SnapshotLocked(const SessionState& state) const {
     SessionSnapshot snapshot;
     snapshot.session_id = state.session_id;
+    snapshot.tenant_id = state.tenant_id;
     snapshot.user_uuid = state.user_uuid;
     snapshot.persona_id = state.persona_id;
     snapshot.last_trace_id = state.last_trace_id;

@@ -28,11 +28,21 @@
     },
     "compute_pool": {
       "worker_count": 2,
-      "queue_capacity": 256
+      "queue_capacity": 256,
+      "scheduler": "session_affinity",
+      "max_active_keys": 1024,
+      "max_outstanding_per_key": 8,
+      "max_outstanding_per_fairness_key": 32,
+      "max_outstanding_per_tenant": 256
     },
     "io_pool": {
       "worker_count": 32,
-      "queue_capacity": 1024
+      "queue_capacity": 1024,
+      "scheduler": "session_affinity",
+      "max_active_keys": 1024,
+      "max_outstanding_per_key": 16,
+      "max_outstanding_per_fairness_key": 64,
+      "max_outstanding_per_tenant": 512
     },
     "session_idle_timeout_minutes": 15,
     "session_max_recent_turns": 20,

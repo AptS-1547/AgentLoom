@@ -1,6 +1,7 @@
 #include "persona_gateway_server.h"
 
 #include "document_file_store.h"
+#include "gateway_session_affinity_scheduler.h"
 #include "http_types.h"
 #include "l0_memory_cache_adapter.h"
 #include "redis_connection_pool.h"
@@ -15,6 +16,23 @@ namespace {
 core::ThreadPoolOptions WithDefaultPoolName(core::ThreadPoolOptions options, std::string name) {
     if (options.name.empty() || options.name == "core-thread-pool") {
         options.name = std::move(name);
+    }
+    return options;
+}
+
+core::ThreadPoolOptions ResolvePoolOptions(
+    core::ThreadPoolOptions options,
+    const GatewayThreadPoolConcurrencyOptions& concurrency,
+    std::string name) {
+    options = WithDefaultPoolName(std::move(options), std::move(name));
+    if (!options.scheduler && concurrency.scheduler == "session_affinity") {
+        options.scheduler = std::make_shared<persona::GatewaySessionAffinityScheduler>(
+            persona::GatewaySessionAffinitySchedulerOptions{
+                .max_active_keys = concurrency.max_active_keys,
+                .max_outstanding_per_key = concurrency.max_outstanding_per_key,
+                .max_outstanding_per_fairness_key = concurrency.max_outstanding_per_fairness_key,
+                .max_outstanding_per_tenant = concurrency.max_outstanding_per_tenant,
+            });
     }
     return options;
 }
@@ -94,8 +112,14 @@ PersonaGatewayServer::PersonaGatewayServer(PersonaGatewayServerOptions options,
     : options_(std::move(options)),
       dependencies_(std::move(dependencies)),
       logger_(std::move(logger)),
-      compute_pool_(WithDefaultPoolName(options_.compute_pool, "gateway-compute-pool")),
-      io_pool_(WithDefaultPoolName(options_.io_pool, "gateway-io-pool")),
+      compute_pool_(ResolvePoolOptions(
+          options_.compute_pool,
+          options_.compute_pool_concurrency,
+          "gateway-compute-pool")),
+      io_pool_(ResolvePoolOptions(
+          options_.io_pool,
+          options_.io_pool_concurrency,
+          "gateway-io-pool")),
       sessions_(compute_pool_, io_pool_, options_.session, logger_),
       runtime_(sessions_,
                dependencies_.memory_provider,

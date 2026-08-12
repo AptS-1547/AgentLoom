@@ -768,6 +768,7 @@ core::Result<SessionGatewayResponse> PersonaGatewayService::CreateSession(Create
     }
 
     persona::CreateSessionRequest create;
+    create.tenant_id = request.tenant_id.empty() ? "default" : request.tenant_id;
     create.user_uuid = std::move(request.user_uuid);
     create.persona_id = std::move(request.persona_id);
     create.session_id = std::move(request.session_id);
@@ -798,6 +799,7 @@ core::Result<SessionGatewayResponse> PersonaGatewayService::CreateSession(Create
                     continue;
                 }
                 persona::CreateSessionRequest classroom_create;
+                classroom_create.tenant_id = request.tenant_id.empty() ? "default" : request.tenant_id;
                 classroom_create.user_uuid = snapshot.value().user_uuid;
                 classroom_create.persona_id = record.persona_id;
                 classroom_create.trace_id = request.trace_id;

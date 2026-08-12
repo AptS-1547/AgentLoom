@@ -741,7 +741,12 @@ TEST(ConfigPersonaGatewaySectionTest, JsonLoadsE2EGatewayOptionsAndResolvesStati
             },
             "compute_pool": {
                 "worker_count": 4,
-                "queue_capacity": 256
+                "queue_capacity": 256,
+                "scheduler": "session_affinity",
+                "max_active_keys": 111,
+                "max_outstanding_per_key": 7,
+                "max_outstanding_per_fairness_key": 29,
+                "max_outstanding_per_tenant": 101
             },
             "io_pool": {
                 "worker_count": 2,
@@ -806,6 +811,11 @@ TEST(ConfigPersonaGatewaySectionTest, JsonLoadsE2EGatewayOptionsAndResolvesStati
     EXPECT_TRUE(opts.persona_gateway.document_store.enable_path_analyze_test_endpoint);
     EXPECT_EQ(opts.persona_gateway.compute_pool.worker_count, 4u);
     EXPECT_EQ(opts.persona_gateway.compute_pool.queue_capacity, 256u);
+    EXPECT_EQ(opts.persona_gateway.compute_pool.scheduler, "session_affinity");
+    EXPECT_EQ(opts.persona_gateway.compute_pool.max_active_keys, 111u);
+    EXPECT_EQ(opts.persona_gateway.compute_pool.max_outstanding_per_key, 7u);
+    EXPECT_EQ(opts.persona_gateway.compute_pool.max_outstanding_per_fairness_key, 29u);
+    EXPECT_EQ(opts.persona_gateway.compute_pool.max_outstanding_per_tenant, 101u);
     EXPECT_EQ(opts.persona_gateway.io_pool.worker_count, 2u);
     EXPECT_EQ(opts.persona_gateway.io_pool.queue_capacity, 128u);
     EXPECT_EQ(opts.persona_gateway.session_idle_timeout_minutes, 30);
@@ -888,6 +898,26 @@ TEST(ConfigPersonaGatewaySectionTest, RejectsInvalidWebSocketPath) {
     WriteFile(config_file, R"({
         "persona_gateway": {
             "websocket_path": "ws/no-leading-slash"
+        }
+    })");
+
+    EXPECT_THROW(
+        Parse({
+            "server",
+            "--llm", "llm.gguf",
+            "--config", config_file.string(),
+        }),
+        std::runtime_error);
+}
+
+TEST(ConfigPersonaGatewaySectionTest, RejectsUnknownThreadPoolScheduler) {
+    ScopedTempDirectory tmp("persona_gateway_bad_scheduler");
+    auto config_file = tmp.path() / "config.json";
+    WriteFile(config_file, R"({
+        "persona_gateway": {
+            "compute_pool": {
+                "scheduler": "unknown"
+            }
         }
     })");
 

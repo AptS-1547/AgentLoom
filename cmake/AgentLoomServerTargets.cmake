@@ -1,8 +1,28 @@
 # ==================== 推理服务端 ====================
 
+add_library(agent_grpc_runtime STATIC
+    src/server/grpc/async_grpc_runtime.cpp
+    src/server/grpc/async_grpc_runtime.h
+    src/server/grpc/grpc_status.cpp
+    src/server/grpc/grpc_status.h
+)
+
+target_include_directories(agent_grpc_runtime PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/core
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/server/grpc
+)
+
+target_link_libraries(agent_grpc_runtime PUBLIC
+    agent_core
+    gRPC::grpc++
+    spdlog::spdlog
+)
+
 add_library(agent_emotion_server STATIC
     src/server/grpc/grpc_error.cpp
     src/server/grpc/grpc_error.h
+    src/server/grpc/async_emotion_grpc_service.cpp
+    src/server/grpc/async_emotion_grpc_service.h
     src/server/grpc/emotion_grpc_service.cpp
     src/server/grpc/emotion_grpc_service.h
     src/service/inference/emotion_inference_service.cpp
@@ -23,6 +43,7 @@ if(UNIX AND NOT APPLE)
 endif()
 
 target_link_libraries(agent_emotion_server PUBLIC
+    agent_grpc_runtime
     multimodal_proto
     agent_core
     agent_bert_models
@@ -56,6 +77,7 @@ target_include_directories(agent_server PUBLIC
 )
 
 target_link_libraries(agent_server PUBLIC
+    agent_grpc_runtime
     multimodal_proto
     agent_core
     agent_ipc
@@ -111,6 +133,7 @@ if(BERT_BUILD_TESTS)
     )
 
     target_link_libraries(inference_grpc_tests PRIVATE
+        agent_grpc_runtime
         multimodal_proto
         agent_core
         agent_ipc_grpc
@@ -124,6 +147,24 @@ if(BERT_BUILD_TESTS)
 
     copy_runtime_files(inference_grpc_tests ${VCPKG_RUNTIME_DLLS})
     gtest_discover_tests(inference_grpc_tests DISCOVERY_MODE PRE_TEST)
+
+    add_executable(async_grpc_runtime_tests
+        tests/server/async_grpc_runtime_test.cpp
+        src/server/grpc/async_emotion_grpc_service.cpp
+    )
+
+    target_include_directories(async_grpc_runtime_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/server/grpc
+    )
+
+    target_link_libraries(async_grpc_runtime_tests PRIVATE
+        agent_grpc_runtime
+        multimodal_proto
+        GTest::gtest_main
+    )
+
+    copy_runtime_files(async_grpc_runtime_tests ${VCPKG_RUNTIME_DLLS})
+    gtest_discover_tests(async_grpc_runtime_tests DISCOVERY_MODE PRE_TEST)
 
     add_executable(shared_media_runtime_tests
         tests/server/shared_memory_media_runtime_test.cpp

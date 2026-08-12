@@ -49,5 +49,6 @@ agentloom_add_alias(media agent_media)
 agentloom_add_alias(runtime agent_agent_runtime)
 agentloom_add_alias(gateway agent_gateway_server_lib)
 agentloom_add_alias(service agent_service)
+agentloom_add_alias(grpc_runtime agent_grpc_runtime)
 
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/AgentLoomPackaging.cmake")

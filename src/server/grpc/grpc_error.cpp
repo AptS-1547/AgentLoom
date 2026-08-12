@@ -12,39 +12,6 @@ namespace grpc_error {
 
 namespace {
 
-grpc::StatusCode ToGrpcStatusCode(core::ErrorCode code) {
-    switch (code) {
-    case core::ErrorCode::Ok:
-        return grpc::StatusCode::OK;
-    case core::ErrorCode::InvalidArgument:
-        return grpc::StatusCode::INVALID_ARGUMENT;
-    case core::ErrorCode::OutOfMemory:
-        return grpc::StatusCode::RESOURCE_EXHAUSTED;
-    case core::ErrorCode::NotFound:
-        return grpc::StatusCode::NOT_FOUND;
-    case core::ErrorCode::Timeout:
-        return grpc::StatusCode::DEADLINE_EXCEEDED;
-    case core::ErrorCode::Cancelled:
-        return grpc::StatusCode::CANCELLED;
-    case core::ErrorCode::AlreadyExists:
-        return grpc::StatusCode::ALREADY_EXISTS;
-    case core::ErrorCode::PermissionDenied:
-        return grpc::StatusCode::PERMISSION_DENIED;
-    case core::ErrorCode::FailedPrecondition:
-        return grpc::StatusCode::FAILED_PRECONDITION;
-    case core::ErrorCode::Unimplemented:
-        return grpc::StatusCode::UNIMPLEMENTED;
-    case core::ErrorCode::ResourceExhausted:
-        return grpc::StatusCode::RESOURCE_EXHAUSTED;
-    case core::ErrorCode::Unavailable:
-        return grpc::StatusCode::UNAVAILABLE;
-    case core::ErrorCode::InternalError:
-    case core::ErrorCode::Unknown:
-    default:
-        return grpc::StatusCode::INTERNAL;
-    }
-}
-
 std::string_view ErrorCodeName(core::ErrorCode code) noexcept {
     switch (code) {
     case core::ErrorCode::Ok: return "OK";
@@ -89,16 +56,6 @@ std::string_view GrpcStatusCodeName(grpc::StatusCode code) noexcept {
     return "UNKNOWN";
 }
 
-std::string MetadataValue(const grpc::ServerContext& context, std::string_view key) {
-    const auto& metadata = context.client_metadata();
-    const grpc::string_ref lookup_key(key.data(), key.size());
-    const auto it = metadata.find(lookup_key);
-    if (it == metadata.end()) {
-        return {};
-    }
-    return std::string(it->second.data(), it->second.length());
-}
-
 std::string NormalizeLogIdentifier(std::string value) {
     constexpr std::size_t kMaxIdentifierLength = 128;
     if (value.empty() || value.size() > kMaxIdentifierLength) {
@@ -108,17 +65,6 @@ std::string NormalizeLogIdentifier(std::string value) {
         return std::isalnum(ch) != 0 || ch == '-' || ch == '_' || ch == '.' || ch == ':';
     });
     return valid ? std::move(value) : std::string{};
-}
-
-std::string ResolveTraceId(const grpc::ServerContext& context) {
-    auto trace_id = NormalizeLogIdentifier(MetadataValue(context, "x-trace-id"));
-    if (trace_id.empty()) {
-        trace_id = NormalizeLogIdentifier(MetadataValue(context, "x-request-id"));
-    }
-    if (trace_id.empty()) {
-        trace_id = core::GenerateTraceId();
-    }
-    return trace_id;
 }
 
 const char* IdentifierOrDash(const std::string& value) noexcept {
@@ -142,20 +88,6 @@ bool IsExpectedClientFailure(core::ErrorCode code) noexcept {
 
 } // namespace
 
-grpc::Status ToGrpcStatus(const core::Status& status) {
-    if (status.ok()) {
-        return grpc::Status::OK;
-    }
-    return grpc::Status(ToGrpcStatusCode(status.code()), status.message());
-}
-
-grpc::Status ToGrpcStatus(const core::Status& status, grpc::StatusCode override_code) {
-    if (status.ok()) {
-        return grpc::Status::OK;
-    }
-    return grpc::Status(override_code, status.message());
-}
-
 RpcCall::RpcCall(grpc::ServerContext& context,
                  server_common::RuntimeStats& stats,
                  std::string method_name,
@@ -168,7 +100,7 @@ RpcCall::RpcCall(grpc::ServerContext& context,
       method_name_(std::move(method_name)),
       log_context_(std::move(log_context)),
       logger_(logger.valid() ? std::move(logger) : core::LoggerAdapter::ForModule("inference-grpc")),
-      trace_context_{ResolveTraceId(context_), {}, {}},
+      trace_context_{grpc_runtime::ResolveTraceId(context_), {}, {}},
       trace_scope_(trace_context_),
       request_stats_(stats, method_name_, sample_count, is_batch, slow_request_ms, trace_context_.trace_id),
       started_at_(std::chrono::steady_clock::now()) {
@@ -203,7 +135,7 @@ grpc::Status RpcCall::Success() {
 }
 
 grpc::Status RpcCall::Failure(const core::Status& status) {
-    return FinishFailure(status, ToGrpcStatusCode(status.code()));
+    return FinishFailure(status, grpc_runtime::ToGrpcStatusCode(status.code()));
 }
 
 grpc::Status RpcCall::Failure(const core::Status& status, grpc::StatusCode override_code) {

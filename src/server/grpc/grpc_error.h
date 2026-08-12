@@ -1,6 +1,7 @@
 #pragma once
 
 #include "exception.h"
+#include "grpc_status.h"
 #include "logger_adapter.h"
 #include "result.h"
 #include "server_common.h"
@@ -18,8 +19,7 @@
 
 namespace grpc_error {
 
-grpc::Status ToGrpcStatus(const core::Status& status);
-grpc::Status ToGrpcStatus(const core::Status& status, grpc::StatusCode override_code);
+using grpc_runtime::ToGrpcStatus;
 
 struct RpcLogContext {
     std::string request_id;

@@ -9,14 +9,14 @@ set(_agentloom_public_targets
     server_runtime agent_bert_models agent_models agent_cache agent_vector agent_config
     agent_service_core agent_agent_runtime agent_gateway_auth agent_agent_gateway
     agent_classroom_gateway agent_training_report_gateway agent_document_gateway
-    agent_gateway_server_lib agent_service agent_skill_media agent_emotion_server agent_server
+    agent_gateway_server_lib agent_service agent_skill_media agent_grpc_runtime agent_emotion_server agent_server
 )
 
 set(_agentloom_public_target_names
     bert_proto multimodal_proto core net tls http_client llm semantic_cache document
     memory storage vector_storage conversation ipc ipc_grpc media_inference vlm_client media runtime bert_models
     models cache vector config service_core agent_runtime gateway_auth agent_gateway
-    classroom_gateway training_report_gateway document_gateway gateway service skill_media
+    classroom_gateway training_report_gateway document_gateway gateway service skill_media grpc_runtime
     emotion_server server
 )
 

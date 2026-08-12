@@ -82,6 +82,7 @@ jobs:
             tar \
             unzip \
             zip \
+            libopenblas-dev \
             libopencv-dev
 
       - name: Cache vcpkg install root
@@ -316,74 +317,20 @@ jobs:
             fi
           fi
 
-      - name: Apply Linux CI CMake dependency shim
+      - name: Verify Linux native dependencies
         shell: bash
         run: |
-          python - <<'PY'
-          from pathlib import Path
-          p = Path("CMakeLists.txt")
-          s = p.read_text(encoding="utf-8")
-          s = s.replace(
-              'require_path("${BERT_SQLITE_DLL}" "SQLite runtime")\n'
-              'require_path("${BERT_SQLITE_DEF}" "SQLite module definition")\n\n'
-              'if(WIN32)',
-              'if(WIN32)\n'
-              '    require_path("${BERT_SQLITE_DLL}" "SQLite runtime")\n'
-              '    require_path("${BERT_SQLITE_DEF}" "SQLite module definition")'
-          )
-          s = s.replace(
-              'else()\n'
-              '    message(FATAL_ERROR "SQLite prebuilt dependency currently expects the Windows package")\n'
-              'endif()\n\n'
-              'set(BERT_FAISS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/deps/faiss-1.14.1-cpu-win64" CACHE PATH "Path to Faiss CPU package")\n'
-              'set(BERT_MKL_RUNTIME_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/deps/mkl-2023.1.0-win64" CACHE PATH "Path to MKL runtime package")\n\n'
-              'require_path("${BERT_FAISS_ROOT}/include/faiss/IndexFlat.h" "Faiss headers")\n'
-              'require_path("${BERT_FAISS_ROOT}/lib/faiss.lib" "Faiss import library")\n'
-              'require_path("${BERT_FAISS_ROOT}/bin/faiss.dll" "Faiss runtime")\n'
-              'require_path("${BERT_MKL_RUNTIME_ROOT}/Library/bin/mkl_rt.2.dll" "MKL runtime")\n\n'
-              'set(faiss_DIR "${BERT_FAISS_ROOT}/share/faiss" CACHE PATH "Path to Faiss config package")\n'
-              'find_package(faiss CONFIG REQUIRED)\n'
-              'set(BERT_FAISS_RUNTIME_FILES\n'
-              '    "${BERT_FAISS_ROOT}/bin/faiss.dll"\n'
-              '    "${BERT_MKL_RUNTIME_ROOT}/Library/bin/mkl_rt.2.dll"\n'
-              ')\n',
-              'elseif(UNIX AND NOT APPLE)\n'
-              '    require_path("${BERT_SQLITE_INCLUDE_DIR}/sqlite3.c" "SQLite amalgamation source")\n'
-              '    add_library(sqlite3 STATIC "${BERT_SQLITE_INCLUDE_DIR}/sqlite3.c")\n'
-              '    target_include_directories(sqlite3 PUBLIC "${BERT_SQLITE_INCLUDE_DIR}")\n'
-              '    target_link_libraries(sqlite3 PUBLIC dl pthread)\n'
-              'endif()\n\n'
-              'if(WIN32)\n'
-              '    set(BERT_DEFAULT_FAISS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/deps/faiss-1.14.1-cpu-win64")\n'
-              '    set(BERT_DEFAULT_MKL_RUNTIME_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/deps/mkl-2023.1.0-win64")\n'
-              '    set(BERT_FAISS_RUNTIME_FILES\n'
-              '        "${BERT_DEFAULT_FAISS_ROOT}/bin/faiss.dll"\n'
-              '        "${BERT_DEFAULT_MKL_RUNTIME_ROOT}/Library/bin/mkl_rt.2.dll"\n'
-              '    )\n'
-              'elseif(UNIX AND NOT APPLE)\n'
-              '    set(BERT_DEFAULT_FAISS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/deps/faiss-1.14.1-cpu-linux")\n'
-              '    set(BERT_DEFAULT_MKL_RUNTIME_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/deps/mkl-2023.1.0-linux")\n'
-              '    set(BERT_FAISS_RUNTIME_FILES\n'
-              '        "${BERT_DEFAULT_FAISS_ROOT}/lib/libfaiss.so"\n'
-              '        "${BERT_DEFAULT_MKL_RUNTIME_ROOT}/lib/libmkl_rt.so"\n'
-              '    )\n'
-              'endif()\n\n'
-              'set(BERT_FAISS_ROOT "${BERT_DEFAULT_FAISS_ROOT}" CACHE PATH "Path to Faiss CPU package")\n'
-              'set(BERT_MKL_RUNTIME_ROOT "${BERT_DEFAULT_MKL_RUNTIME_ROOT}" CACHE PATH "Path to MKL runtime package")\n\n'
-              'require_path("${BERT_FAISS_ROOT}/include/faiss/IndexFlat.h" "Faiss headers")\n'
-              'if(WIN32)\n'
-              '    set(faiss_DIR "${BERT_FAISS_ROOT}/share/faiss" CACHE PATH "Path to Faiss config package")\n'
-              '    find_package(faiss CONFIG REQUIRED)\n'
-              'elseif(UNIX AND NOT APPLE)\n'
-              '    add_library(faiss SHARED IMPORTED)\n'
-              '    set_target_properties(faiss PROPERTIES\n'
-              '        IMPORTED_LOCATION "${BERT_FAISS_ROOT}/lib/libfaiss.so"\n'
-              '        INTERFACE_INCLUDE_DIRECTORIES "${BERT_FAISS_ROOT}/include"\n'
-              '    )\n'
-              'endif()\n'
-          )
-          p.write_text(s, encoding="utf-8", newline="\n")
-          PY
+          set -euo pipefail
+          openblas_path="$(ldconfig -p | awk '/libopenblas\.so/ && !found {print $NF; found=1}')"
+          if [[ -z "$openblas_path" || ! -f "$openblas_path" ]]; then
+            echo "libopenblas.so was not found after installing libopenblas-dev" >&2
+            ldconfig -p | grep -i blas >&2 || true
+            exit 1
+          fi
+          test -f deps/faiss-1.14.1-cpu-linux/include/faiss/IndexFlat.h
+          test -f deps/faiss-1.14.1-cpu-linux/lib/libfaiss.so
+          echo "BERT_OPENBLAS_LIBRARY=$openblas_path" >> "$GITHUB_ENV"
+          echo "Using OpenBLAS: $openblas_path"
 
       - name: Configure tests
         shell: bash
@@ -401,6 +348,7 @@ jobs:
             -DBERT_BUILD_TESTS=ON \
             -DBERT_VCPKG_TRIPLET="$VCPKG_TRIPLET" \
             -DBERT_USE_ONNXRUNTIME_GPU=OFF \
+            -DBERT_OPENBLAS_LIBRARY="$BERT_OPENBLAS_LIBRARY" \
             -DONNXRUNTIME_CPU_ROOT="$GITHUB_WORKSPACE/$ONNXRUNTIME_ROOT" \
             -DLLAMA_CPP_ROOT="$GITHUB_WORKSPACE/$LLAMA_CPP_ROOT" \
             -DLLAMA_CPP_BUILD="$GITHUB_WORKSPACE/$LLAMA_CPP_BUILD" \
@@ -423,6 +371,7 @@ jobs:
             document_tests \
             config_tests \
             service_tests \
+            async_grpc_runtime_tests \
             --parallel
           ccache --show-stats || true
 
@@ -430,5 +379,5 @@ jobs:
         shell: bash
         run: |
           ctest --test-dir "$BUILD_DIR" -C Release \
-            -R "(Core|Net|HttpClient|Tls|Storage|SemanticCache|Document|Config|PersonaGateway|SessionManager|PersonaRuntime|PersonaAlgorithm)" \
+            -R "(Core|Net|HttpClient|Tls|Storage|SemanticCache|Document|Config|PersonaGateway|SessionManager|PersonaRuntime|PersonaAlgorithm|AsyncGrpcRuntime)" \
             --output-on-failure

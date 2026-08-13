@@ -348,6 +348,7 @@ public:
                 {"pools", {
                     {"compute", ThreadPoolStatsToJson(stats.value().pools.compute)},
                     {"io", ThreadPoolStatsToJson(stats.value().pools.io)},
+                    {"llm", ThreadPoolStatsToJson(stats.value().pools.llm)},
                 }},
             }},
         };

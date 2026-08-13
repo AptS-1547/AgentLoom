@@ -13,6 +13,7 @@
 #include "openai_llm_client.h"
 #include "local_llm_client.h"
 #include "beast_http_client.h"
+#include "async_beast_http_client.h"
 #include "tls_context.h"
 #include "logger.h"
 #include "redis_connection_pool.h"
@@ -219,9 +220,15 @@ agent::service::persona::EmotionFusionAnalyzerOptions BuildEmotionFusionOptions(
     return options;
 }
 
-core::Result<std::shared_ptr<agent::llm::ILlmClient>> CreateLlmClient(const ToolConfig& config,
-                                                                      std::string_view default_model) {
+struct LlmClientBundle {
+    std::shared_ptr<agent::llm::ILlmClient> sync;
+    std::shared_ptr<agent::llm::IAsyncLlmClient> async;
+};
+
+core::Result<LlmClientBundle> CreateLlmClient(const ToolConfig& config,
+                                              std::string_view default_model) {
     std::shared_ptr<agent::llm::ILlmClient> primary;
+    std::shared_ptr<agent::llm::IAsyncLlmClient> async_primary;
     std::shared_ptr<agent::llm::ILlmClient> fallback;
 
     if (config.llm.enabled && !config.llm.base_url.empty()) {
@@ -248,7 +255,8 @@ core::Result<std::shared_ptr<agent::llm::ILlmClient>> CreateLlmClient(const Tool
             return tls.status();
         }
         agent::net::BeastHttpClientOptions http_opts;
-        http_opts.tls_context = std::move(tls).value();
+        auto tls_context = std::move(tls).value();
+        http_opts.tls_context = tls_context;
         auto http = agent::net::BeastHttpClient::Create(std::move(http_opts));
         if (!http.ok()) {
             return http.status();
@@ -278,6 +286,41 @@ core::Result<std::shared_ptr<agent::llm::ILlmClient>> CreateLlmClient(const Tool
         holder->transport = std::move(http_client);
         holder->client = std::move(cloud).value();
         primary = holder;
+
+        agent::net::AsyncBeastHttpClientOptions async_http_options;
+        async_http_options.tls_context = std::move(tls_context);
+        async_http_options.io_thread_count = config.llm.async_http_io_threads;
+        async_http_options.enable_keep_alive = config.llm.http_keep_alive;
+        async_http_options.max_idle_connections = config.llm.http_max_idle_connections;
+        async_http_options.max_idle_connections_per_origin =
+            config.llm.http_max_idle_connections_per_origin;
+        async_http_options.idle_connection_timeout =
+            std::chrono::milliseconds(config.llm.http_idle_timeout_ms);
+        auto async_http = agent::net::AsyncBeastHttpClient::Create(std::move(async_http_options));
+        if (!async_http.ok()) {
+            return async_http.status();
+        }
+        auto async_http_client = std::shared_ptr<agent::net::IAsyncHttpClient>(
+            std::move(async_http).value());
+        auto async_cloud = agent::llm::OpenAiAsyncLlmClient::Create(
+            cloud_options, *async_http_client);
+        if (!async_cloud.ok()) {
+            return async_cloud.status();
+        }
+        struct AsyncClientWithTransport final : public agent::llm::IAsyncLlmClient {
+            std::shared_ptr<agent::net::IAsyncHttpClient> transport;
+            std::unique_ptr<agent::llm::OpenAiAsyncLlmClient> client;
+
+            core::Result<std::shared_ptr<agent::llm::IAsyncLlmOperation>> CompleteAsync(
+                agent::llm::ChatCompletionRequest request,
+                Callback callback) override {
+                return client->CompleteAsync(std::move(request), std::move(callback));
+            }
+        };
+        auto async_holder = std::make_shared<AsyncClientWithTransport>();
+        async_holder->transport = std::move(async_http_client);
+        async_holder->client = std::move(async_cloud).value();
+        async_primary = std::move(async_holder);
     }
 
     if (config.local_llm.enabled) {
@@ -295,17 +338,19 @@ core::Result<std::shared_ptr<agent::llm::ILlmClient>> CreateLlmClient(const Tool
     }
 
     if (primary && fallback) {
-        return std::shared_ptr<agent::llm::ILlmClient>(
-            std::make_shared<agent::llm::FallbackLlmClient>(primary, fallback));
+        // Fallback 当前仍是同步组合接口；在完成异步 gRPC fallback 编排前保留既有语义。
+        return LlmClientBundle{
+            .sync = std::make_shared<agent::llm::FallbackLlmClient>(primary, fallback),
+        };
     }
     if (primary) {
-        return primary;
+        return LlmClientBundle{.sync = std::move(primary), .async = std::move(async_primary)};
     }
     if (fallback) {
-        return fallback;
+        return LlmClientBundle{.sync = std::move(fallback)};
     }
     if (config.llm.allow_placeholder) {
-        return std::shared_ptr<agent::llm::ILlmClient>(std::make_shared<PlaceholderLlmClient>());
+        return LlmClientBundle{.sync = std::make_shared<PlaceholderLlmClient>()};
     }
     return core::Status::Error(core::ErrorCode::FailedPrecondition, "no LLM client configured");
 }
@@ -742,7 +787,8 @@ int main(int argc, char** argv) {
             logging::Shutdown();
             return Fail("LLM client: " + llm.status().message());
         }
-        auto llm_client = std::move(llm).value();
+        auto llm_bundle = std::move(llm).value();
+        auto llm_client = llm_bundle.sync;
 
         auto loaded_embedding_model = CreateEmbeddingModel(config);
         if (!loaded_embedding_model.ok()) {
@@ -818,6 +864,7 @@ int main(int argc, char** argv) {
         dependencies.memory_provider = std::move(memory);
         dependencies.emotion_analyzer = std::move(emotion).value();
         dependencies.llm_client = llm_client;
+        dependencies.async_llm_client = std::move(llm_bundle.async);
         dependencies.document_embedding_provider = std::move(document_embedding).value();
         dependencies.document_llm_chunk_cache = std::move(document_llm_chunk_cache).value();
         dependencies.document_semantic_cache = std::move(document_semantic_cache).value();

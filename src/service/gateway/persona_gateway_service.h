@@ -4,6 +4,7 @@
 #include "gateway_models.h"
 #include "logger_adapter.h"
 #include "persona_runtime.h"
+#include "persona_interaction.h"
 #include "report_evaluator.h"
 #include "session_manager.h"
 
@@ -185,6 +186,7 @@ private:
 
     persona::SessionManager& sessions_;
     persona::PersonaRuntime& runtime_;
+    persona::PersonaInteraction interaction_;
     IClassroomScheduler* classroom_scheduler_ = nullptr;
     std::shared_ptr<IReportEvaluator> report_evaluator_;
     std::shared_ptr<IPersonaMetadataStore> persona_metadata_store_;

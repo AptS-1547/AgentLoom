@@ -33,8 +33,6 @@ add_library(agent_agent_runtime STATIC
     src/service/persona/emotion_fusion_analyzer.h
     src/service/persona/grpc_emotion_analyzer.cpp
     src/service/persona/grpc_emotion_analyzer.h
-    src/service/gateway/classroom_scheduler.cpp
-    src/service/gateway/classroom_scheduler.h
 )
 
 target_include_directories(agent_agent_runtime PUBLIC
@@ -57,6 +55,7 @@ target_link_libraries(agent_agent_runtime PUBLIC
     spdlog::spdlog
 )
 
+if(AGENTLOOM_BUILD_REFERENCE_GATEWAY)
 add_library(agent_gateway_auth STATIC
     src/service/gateway/gateway_auth.cpp
     src/service/gateway/gateway_auth.h
@@ -79,13 +78,121 @@ target_link_libraries(agent_gateway_auth PUBLIC
     OpenSSL::Crypto
     spdlog::spdlog
 )
+endif()
+
+add_library(agent_persona_interaction STATIC
+    src/service/persona/persona_interaction.cpp
+    src/service/persona/persona_interaction.h
+)
+
+target_include_directories(agent_persona_interaction PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/service/persona
+)
+
+target_link_libraries(agent_persona_interaction PUBLIC
+    agent_agent_runtime
+    agent_core
+    spdlog::spdlog
+)
+
+add_library(agent_gateway_routing INTERFACE)
+
+target_include_directories(agent_gateway_routing INTERFACE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/service/gateway
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/net
+)
+
+target_link_libraries(agent_gateway_routing INTERFACE
+    agent_core
+    agent_net
+)
+
+add_library(agent_gateway_foundation STATIC
+    src/service/gateway/gateway_lifecycle.cpp
+    src/service/gateway/gateway_lifecycle.h
+    src/service/gateway/gateway_maintenance.cpp
+    src/service/gateway/gateway_maintenance.h
+)
+
+target_include_directories(agent_gateway_foundation PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/service/gateway
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/service/persona
+)
+
+target_link_libraries(agent_gateway_foundation PUBLIC
+    agent_agent_runtime
+    agent_gateway_routing
+    agent_core
+    agent_net
+    spdlog::spdlog
+)
+
+add_library(agent_gateway INTERFACE)
+
+target_link_libraries(agent_gateway INTERFACE
+    agent_gateway_foundation
+    agent_persona_interaction
+    agent_gateway_routing
+)
 
 if(AGENTLOOM_BUILD_REFERENCE_GATEWAY)
-add_library(agent_agent_gateway STATIC
+add_library(agent_gateway_server_lib STATIC
+    src/service/gateway/classroom_scheduler.cpp
+    src/service/gateway/classroom_scheduler.h
     src/service/gateway/gateway_models.h
+    src/service/gateway/persona_gateway_http_adapter.cpp
+    src/service/gateway/persona_gateway_http_adapter.h
+    src/service/gateway/persona_gateway_route_core.h
+    src/service/gateway/persona_gateway_route_helpers.h
     src/service/gateway/persona_gateway_service.cpp
     src/service/gateway/persona_gateway_service.h
     src/service/gateway/report_evaluator.h
+    src/service/gateway/runtime_maintenance_service.cpp
+    src/service/gateway/runtime_maintenance_service.h
+    src/service/gateway/persona_gateway_server.cpp
+    src/service/gateway/persona_gateway_server.h
+)
+
+target_include_directories(agent_gateway_server_lib PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/document
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/document/ooxml
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/service/persona
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/service/gateway
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/net
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/llm
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/semantic_cache
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/memory
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/storage
+)
+
+target_link_libraries(agent_gateway_server_lib PUBLIC
+    agent_service_core
+    agent_agent_runtime
+    agent_persona_interaction
+    agent_gateway_foundation
+    agent_gateway_routing
+    agent_gateway_auth
+    agent_config
+    agent_llm
+    agent_semantic_cache
+    agent_memory
+    agent_storage
+    agent_document
+    agent_ipc
+    agent_core
+    agent_net
+    nlohmann_json::nlohmann_json
+    OpenSSL::SSL
+    OpenSSL::Crypto
+    spdlog::spdlog
+)
+
+if(TARGET agent_media)
+    target_compile_definitions(agent_gateway_server_lib PRIVATE AGENTLOOM_HAS_MEDIA=1)
+    target_link_libraries(agent_gateway_server_lib PRIVATE agent_media)
+endif()
+
+add_library(agent_agent_gateway STATIC
     src/service/gateway/persona_gateway_agent_routes.cpp
     src/service/gateway/persona_gateway_route_core.h
     src/service/gateway/persona_gateway_route_helpers.h
@@ -99,14 +206,7 @@ target_include_directories(agent_agent_gateway PUBLIC
 )
 
 target_link_libraries(agent_agent_gateway PUBLIC
-    agent_agent_runtime
-    agent_gateway_auth
-    agent_service_core
-    agent_storage
-    agent_semantic_cache
-    agent_core
-    nlohmann_json::nlohmann_json
-    spdlog::spdlog
+    agent_gateway_server_lib
 )
 
 add_library(agent_classroom_gateway STATIC
@@ -160,54 +260,6 @@ target_link_libraries(agent_document_gateway PUBLIC
     agent_service_core
 )
 
-add_library(agent_gateway_server_lib STATIC
-    src/service/gateway/persona_gateway_http_adapter.cpp
-    src/service/gateway/persona_gateway_http_adapter.h
-    src/service/gateway/persona_gateway_route_core.h
-    src/service/gateway/persona_gateway_route_helpers.h
-    src/service/gateway/runtime_maintenance_service.cpp
-    src/service/gateway/runtime_maintenance_service.h
-    src/service/gateway/persona_gateway_server.cpp
-    src/service/gateway/persona_gateway_server.h
-)
-
-target_include_directories(agent_gateway_server_lib PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/document
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/document/ooxml
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/service/persona
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/service/gateway
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/net
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/llm
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/semantic_cache
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/memory
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/storage
-)
-
-target_link_libraries(agent_gateway_server_lib PUBLIC
-    agent_service_core
-    agent_agent_gateway
-    agent_gateway_auth
-    agent_config
-    agent_llm
-    agent_semantic_cache
-    agent_memory
-    agent_storage
-    agent_document
-    agent_ipc
-    agent_core
-    agent_net
-    nlohmann_json::nlohmann_json
-    OpenSSL::SSL
-    OpenSSL::Crypto
-    spdlog::spdlog
-)
-
-if(TARGET agent_media)
-    target_compile_definitions(agent_gateway_server_lib PRIVATE AGENTLOOM_HAS_MEDIA=1)
-    target_link_libraries(agent_gateway_server_lib PRIVATE
-        agent_media
-    )
-endif()
 endif()
 
 add_library(agent_service INTERFACE)
@@ -215,15 +267,16 @@ add_library(agent_service INTERFACE)
 target_link_libraries(agent_service INTERFACE
     agent_service_core
     agent_agent_runtime
-    agent_gateway_auth
+    agent_gateway
 )
 if(AGENTLOOM_BUILD_REFERENCE_GATEWAY)
     target_link_libraries(agent_service INTERFACE
+        agent_gateway_auth
+        agent_gateway_server_lib
         agent_agent_gateway
         agent_classroom_gateway
         agent_training_report_gateway
-        agent_document_gateway
-        agent_gateway_server_lib)
+        agent_document_gateway)
 endif()
 
 if(AGENTLOOM_BUILD_REFERENCE_GATEWAY)
@@ -277,12 +330,20 @@ if(BERT_BUILD_TESTS)
         agent_agent_runtime
     )
 
+    add_executable(persona_llm_pool_bench
+        tests/service/persona_llm_pool_bench.cpp
+    )
+    target_link_libraries(persona_llm_pool_bench PRIVATE
+        agent_agent_runtime
+    )
+
     add_executable(service_tests
         tests/service/persona_algorithm_test.cpp
         tests/service/session_manager_test.cpp
         tests/service/persona_runtime_test.cpp
         tests/service/media_inference_execution_test.cpp
         tests/service/emotion_fusion_analyzer_test.cpp
+        tests/service/gateway_foundation_test.cpp
         tests/service/persona_gateway_service_test.cpp
     )
 

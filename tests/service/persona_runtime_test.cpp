@@ -1,4 +1,5 @@
 #include "persona_runtime.h"
+#include "gateway_session_affinity_scheduler.h"
 #include "runtime_maintenance_service.h"
 #include "skill_session_manager.h"
 #include "skill_vision_event_sink.h"
@@ -6,6 +7,7 @@
 #include <gtest/gtest.h>
 
 #include <future>
+#include <condition_variable>
 #include <mutex>
 #include <thread>
 
@@ -22,6 +24,8 @@ using agent::service::persona::ChatResponse;
 using agent::service::persona::CreateSessionRequest;
 using agent::service::persona::EmotionAnalysis;
 using agent::service::persona::EmotionCalibrationSample;
+using agent::service::persona::GatewaySessionAffinityScheduler;
+using agent::service::persona::GatewaySessionAffinitySchedulerOptions;
 using agent::service::persona::NeutralEmotionAnalyzer;
 using agent::service::persona::PersonaRuntime;
 using agent::service::persona::PersonaRuntimeOptions;
@@ -78,6 +82,86 @@ public:
     ChatCompletionRequest last_request;
     std::mutex mutex_;
 };
+
+class ManualAsyncLlmClient final : public agent::llm::IAsyncLlmClient {
+private:
+    struct Pending;
+
+    class Operation final : public agent::llm::IAsyncLlmOperation {
+    public:
+        explicit Operation(std::weak_ptr<Pending> pending)
+            : pending_(std::move(pending)) {}
+
+        void Cancel() noexcept override;
+
+    private:
+        std::weak_ptr<Pending> pending_;
+    };
+
+    struct Pending {
+        ChatCompletionRequest request;
+        Callback callback;
+        std::atomic<bool> completed{false};
+
+        void Finish(core::Result<ChatCompletionResponse> result) noexcept {
+            if (completed.exchange(true, std::memory_order_acq_rel)) {
+                return;
+            }
+            callback(std::move(result));
+        }
+    };
+
+public:
+    core::Result<std::shared_ptr<agent::llm::IAsyncLlmOperation>> CompleteAsync(
+        ChatCompletionRequest request,
+        Callback callback) override {
+        auto pending = std::make_shared<Pending>();
+        pending->request = std::move(request);
+        pending->callback = std::move(callback);
+        {
+            std::lock_guard lock(mutex_);
+            pending_.push_back(pending);
+        }
+        condition_.notify_all();
+        return std::shared_ptr<agent::llm::IAsyncLlmOperation>(
+            std::make_shared<Operation>(pending));
+    }
+
+    bool WaitForCount(std::size_t count, std::chrono::milliseconds timeout) {
+        std::unique_lock lock(mutex_);
+        return condition_.wait_for(lock, timeout, [&] { return pending_.size() >= count; });
+    }
+
+    void Complete(std::size_t index, std::string content) {
+        std::shared_ptr<Pending> pending;
+        {
+            std::lock_guard lock(mutex_);
+            ASSERT_LT(index, pending_.size());
+            pending = pending_[index];
+        }
+        ChatCompletionResponse response;
+        response.content = std::move(content);
+        response.model = "async-test-model";
+        pending->Finish(std::move(response));
+    }
+
+    std::size_t Count() const {
+        std::lock_guard lock(mutex_);
+        return pending_.size();
+    }
+
+private:
+    mutable std::mutex mutex_;
+    std::condition_variable condition_;
+    std::vector<std::shared_ptr<Pending>> pending_;
+};
+
+void ManualAsyncLlmClient::Operation::Cancel() noexcept {
+    if (auto pending = pending_.lock()) {
+        pending->Finish(core::Status::Error(core::ErrorCode::Cancelled,
+                                            "manual async LLM operation cancelled"));
+    }
+}
 
 class FixedEmotionAnalyzer final : public agent::service::persona::IEmotionAnalyzer {
 public:
@@ -163,6 +247,165 @@ EmotionAnalysis MakeUncertainEmotion() {
     analysis.behavior = "unknown";
     analysis.tone = "neutral";
     return analysis;
+}
+
+TEST(PersonaRuntimeTest, AsyncLlmReleasesWorkerAndPreservesPerSessionOrder) {
+    core::ThreadPool compute({1, 32, "runtime-async-compute"});
+    core::ThreadPool io({1, 32, "runtime-async-io"});
+    core::ThreadPool llm_pool({1, 32, "runtime-async-llm",
+                               std::make_shared<GatewaySessionAffinityScheduler>(
+                                   GatewaySessionAffinitySchedulerOptions{
+                                       .max_active_keys = 8,
+                                       .max_outstanding_per_key = 4,
+                                       .max_outstanding_per_fairness_key = 8,
+                                       .max_outstanding_per_tenant = 16})});
+    ASSERT_TRUE(compute.Start().ok());
+    ASSERT_TRUE(io.Start().ok());
+    ASSERT_TRUE(llm_pool.Start().ok());
+
+    SessionManager sessions(
+        compute, io, {}, core::LoggerAdapter::ForModule("service"), &llm_pool);
+    auto first_session = MakeSessionRequest();
+    first_session.session_id = "session-async-runtime-a";
+    ASSERT_TRUE(sessions.CreateSession(std::move(first_session)).ok());
+    auto second_session = MakeSessionRequest();
+    second_session.session_id = "session-async-runtime-b";
+    second_session.user_uuid = "user-runtime-b";
+    ASSERT_TRUE(sessions.CreateSession(std::move(second_session)).ok());
+
+    auto cache = std::make_shared<FakeSemanticCache>();
+    cache->lookup_hit = false;
+    auto memory = std::make_shared<SemanticMemoryContextProvider>(cache);
+    auto emotion = std::make_shared<NeutralEmotionAnalyzer>();
+    auto sync_llm = std::make_shared<FakeLlmClient>();
+    auto async_llm = std::make_shared<ManualAsyncLlmClient>();
+    PersonaRuntime runtime(
+        sessions,
+        memory,
+        emotion,
+        sync_llm,
+        PersonaRuntimeOptions{.recent_raw_turns = 10, .default_model = "test-model"},
+        nullptr,
+        nullptr,
+        nullptr,
+        core::LoggerAdapter::ForModule("service"),
+        nullptr,
+        async_llm);
+
+    auto submit = [&runtime](std::string session_id,
+                             std::string input,
+                             std::string trace_id,
+                             std::promise<core::Result<ChatResponse>>& promise) {
+        ChatRequest request;
+        request.session_id = std::move(session_id);
+        request.user_input = std::move(input);
+        request.trace_id = std::move(trace_id);
+        return runtime.SubmitChat(
+            std::move(request),
+            [&promise](auto result) { promise.set_value(std::move(result)); });
+    };
+
+    std::promise<core::Result<ChatResponse>> first_done;
+    auto first_done_future = first_done.get_future();
+    ASSERT_TRUE(submit("session-async-runtime-a", "a-first", "trace-a1", first_done).ok());
+    ASSERT_TRUE(async_llm->WaitForCount(1, std::chrono::seconds(1)));
+
+    std::promise<core::Result<ChatResponse>> same_session_done;
+    auto same_session_done_future = same_session_done.get_future();
+    ASSERT_TRUE(submit("session-async-runtime-a", "a-second", "trace-a2", same_session_done).ok());
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    EXPECT_EQ(async_llm->Count(), 1u);
+
+    std::promise<core::Result<ChatResponse>> other_session_done;
+    auto other_session_done_future = other_session_done.get_future();
+    ASSERT_TRUE(submit("session-async-runtime-b", "b-first", "trace-b1", other_session_done).ok());
+    ASSERT_TRUE(async_llm->WaitForCount(2, std::chrono::seconds(1)));
+
+    async_llm->Complete(1, "b-response");
+    ASSERT_EQ(other_session_done_future.wait_for(std::chrono::seconds(1)),
+              std::future_status::ready);
+    auto other_result = other_session_done_future.get();
+    ASSERT_TRUE(other_result.ok()) << other_result.status().message();
+    EXPECT_EQ(other_result.value().response, "b-response");
+    EXPECT_EQ(other_result.value().turn_index, 1u);
+
+    async_llm->Complete(0, "a-first-response");
+    ASSERT_EQ(first_done_future.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+    auto first_result = first_done_future.get();
+    ASSERT_TRUE(first_result.ok()) << first_result.status().message();
+    EXPECT_EQ(first_result.value().turn_index, 1u);
+    ASSERT_TRUE(async_llm->WaitForCount(3, std::chrono::seconds(1)));
+
+    async_llm->Complete(2, "a-second-response");
+    ASSERT_EQ(same_session_done_future.wait_for(std::chrono::seconds(1)),
+              std::future_status::ready);
+    auto second_result = same_session_done_future.get();
+    ASSERT_TRUE(second_result.ok()) << second_result.status().message();
+    EXPECT_EQ(second_result.value().response, "a-second-response");
+    EXPECT_EQ(second_result.value().turn_index, 2u);
+
+    auto snapshot = sessions.GetSessionSnapshot("session-async-runtime-a");
+    ASSERT_TRUE(snapshot.ok());
+    EXPECT_EQ(snapshot.value().metrics.turn_count, 2u);
+    EXPECT_EQ(snapshot.value().recent_turn_count, 2u);
+
+    sessions.CloseSession("session-async-runtime-a");
+    sessions.CloseSession("session-async-runtime-b");
+    llm_pool.Shutdown(true);
+    io.Shutdown(true);
+    compute.Shutdown(true);
+}
+
+TEST(PersonaRuntimeTest, ShutdownCancelsInflightAsyncLlmAndReleasesTurnLane) {
+    core::ThreadPool compute({1, 16, "runtime-shutdown-compute"});
+    core::ThreadPool io({1, 16, "runtime-shutdown-io"});
+    core::ThreadPool llm_pool({1, 16, "runtime-shutdown-llm",
+                               std::make_shared<GatewaySessionAffinityScheduler>()});
+    ASSERT_TRUE(compute.Start().ok());
+    ASSERT_TRUE(io.Start().ok());
+    ASSERT_TRUE(llm_pool.Start().ok());
+    SessionManager sessions(
+        compute, io, {}, core::LoggerAdapter::ForModule("service"), &llm_pool);
+    ASSERT_TRUE(sessions.CreateSession(MakeSessionRequest()).ok());
+
+    auto cache = std::make_shared<FakeSemanticCache>();
+    cache->lookup_hit = false;
+    auto async_llm = std::make_shared<ManualAsyncLlmClient>();
+    PersonaRuntime runtime(
+        sessions,
+        std::make_shared<SemanticMemoryContextProvider>(cache),
+        std::make_shared<NeutralEmotionAnalyzer>(),
+        std::make_shared<FakeLlmClient>(),
+        PersonaRuntimeOptions{.default_model = "test-model"},
+        nullptr,
+        nullptr,
+        nullptr,
+        core::LoggerAdapter::ForModule("service"),
+        nullptr,
+        async_llm);
+
+    std::promise<core::Result<ChatResponse>> completed;
+    auto completed_future = completed.get_future();
+    ChatRequest request;
+    request.session_id = "session-runtime";
+    request.user_input = "cancel this request";
+    request.trace_id = "trace-runtime-shutdown";
+    ASSERT_TRUE(runtime.SubmitChat(
+        std::move(request),
+        [&completed](auto result) { completed.set_value(std::move(result)); }).ok());
+    ASSERT_TRUE(async_llm->WaitForCount(1, std::chrono::seconds(1)));
+
+    runtime.Shutdown();
+    ASSERT_EQ(completed_future.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+    auto result = completed_future.get();
+    ASSERT_FALSE(result.ok());
+    EXPECT_EQ(result.status().code(), core::ErrorCode::Cancelled);
+
+    sessions.Shutdown();
+    llm_pool.Shutdown(true);
+    EXPECT_EQ(llm_pool.Stats().scheduler.running_tasks, 0u);
+    io.Shutdown(true);
+    compute.Shutdown(true);
 }
 
 TEST(PersonaRuntimeTest, BuildsMessagesFromL0AndLastTenRawTurns) {

@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <initializer_list>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -65,6 +66,21 @@ private:
     std::vector<Entry> entries_;
 };
 
+class ConfigSectionSelection {
+public:
+    static ConfigSectionSelection All();
+    static ConfigSectionSelection Only(std::initializer_list<std::string_view> names);
+    static ConfigSectionSelection Only(std::vector<std::string> names);
+
+    bool Includes(std::string_view name) const noexcept;
+
+private:
+    ConfigSectionSelection(bool include_all, std::vector<std::string> names);
+
+    bool include_all_ = true;
+    std::vector<std::string> names_;
+};
+
 template <typename T>
 class ConfigSectionRegistrar {
 public:
@@ -78,7 +94,9 @@ public:
 };
 
 std::vector<std::unique_ptr<IConfigSection>> BuildConfigSections();
+std::vector<std::unique_ptr<IConfigSection>> BuildConfigSections(const ConfigSectionSelection& selection);
 void ValidateOptions(MultimodalServerOptions& options);
+void ValidateOptions(MultimodalServerOptions& options, const ConfigSectionSelection& selection);
 
 int ParseCliInt(std::string_view flag, const std::string& value);
 int ParsePositiveOption(std::string_view flag, const std::string& value);

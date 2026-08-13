@@ -20,14 +20,21 @@
 #include <stop_token>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace grpc_runtime {
+
+struct AsyncGrpcMetadataEntry {
+    std::string key;
+    std::string value;
+};
 
 struct AsyncGrpcCallContext {
     std::string trace_id;
     std::string method_name;
     std::chrono::system_clock::time_point deadline;
     std::stop_token stop_token;
+    std::vector<AsyncGrpcMetadataEntry> metadata;
 };
 
 struct AsyncGrpcRuntimeOptions {
@@ -138,7 +145,8 @@ private:
               call_context_{ResolveTraceId(grpc_context_),
                             std::move(method_name),
                             grpc_context_.deadline(),
-                            stop_source_.get_token()} {}
+                            stop_source_.get_token(),
+                            CopyMetadata(grpc_context_)} {}
 
         const AsyncGrpcCallContext& context() const noexcept {
             return call_context_;
@@ -221,6 +229,19 @@ private:
             Running,
             Finishing
         };
+
+        static std::vector<AsyncGrpcMetadataEntry> CopyMetadata(
+            const grpc::CallbackServerContext& context) {
+            std::vector<AsyncGrpcMetadataEntry> entries;
+            const auto& metadata = context.client_metadata();
+            entries.reserve(metadata.size());
+            for (const auto& [key, value] : metadata) {
+                entries.push_back(AsyncGrpcMetadataEntry{
+                    std::string(key.data(), key.length()),
+                    std::string(value.data(), value.length())});
+            }
+            return entries;
+        }
 
         core::Status CancellationStatus() const {
             if (std::chrono::system_clock::now() >= call_context_.deadline) {

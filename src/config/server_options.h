@@ -98,18 +98,25 @@ struct LlmOptions {
     std::string base_url;
     std::string api_key_env = "AGENT_LLM_API_KEY";
     std::string api_key_file;
-    /// Resolved at Validate time — do not set in config file.
+    /// 在配置校验阶段解析，不直接写入配置文件。
     std::string api_key;
     std::string model = "deepseek-chat";
     int timeout_ms = 30000;
     int max_retries = 2;
+    /// 异步出站 HTTP runtime 的 IO 线程数；与 Persona 业务 worker 分离。
+    std::size_t async_http_io_threads = 1;
+    /// 仅控制已完成请求的 HTTP/1.1 空闲连接复用，不限制同时在途的 Provider 请求数。
+    bool http_keep_alive = true;
+    /// 所有 origin 合计和单 origin 的空闲连接缓存上限，不是并发连接配额。
+    std::size_t http_max_idle_connections = 64;
+    std::size_t http_max_idle_connections_per_origin = 64;
+    int http_idle_timeout_ms = 30000;
     bool require_api_key = true;
     bool allow_placeholder = false;
-    /// Emergency/test-only escape hatch. Production HTTPS must keep this false.
+    /// 仅供紧急诊断或测试；生产 HTTPS 必须保持 false。
     bool disable_tls_verify_on_windows = false;
-    /// CA bundle (PEM) for HTTPS verification, relative to the config file.
-    /// Required by the Windows OpenSSL client; optional on Linux, where an
-    /// empty path selects the system trust store.
+    /// HTTPS 校验使用的 PEM CA bundle，相对配置文件解析。
+    /// Windows OpenSSL client 需要显式配置；Linux 留空时使用系统信任库。
     std::string ca_bundle_path;
     std::unordered_map<std::string, std::filesystem::path> prompts;
 };
@@ -335,6 +342,8 @@ struct PersonaGatewayConfigOptions {
     GatewayDocumentStoreConfigOptions document_store;
     GatewayThreadPoolConfigOptions compute_pool;
     GatewayThreadPoolConfigOptions io_pool;
+    /// 缺省表示兼容沿用 io_pool；存在时作为独立的长时 Persona/LLM Turn 池配置。
+    std::optional<GatewayThreadPoolConfigOptions> llm_pool;
     int session_idle_timeout_minutes = 15;
     std::size_t session_max_recent_turns = 20;
     std::size_t session_max_active_sessions = 1024;
@@ -453,6 +462,20 @@ PersonaGatewayServerOptionsT ToPersonaGatewayServerOptions(const MultimodalServe
         config.persona_gateway.io_pool.max_outstanding_per_fairness_key;
     options.io_pool_concurrency.max_outstanding_per_tenant =
         config.persona_gateway.io_pool.max_outstanding_per_tenant;
+    if (config.persona_gateway.llm_pool) {
+        typename PersonaGatewayServerOptionsT::LlmPoolOptions llm;
+        llm.pool.worker_count = config.persona_gateway.llm_pool->worker_count;
+        llm.pool.queue_capacity = config.persona_gateway.llm_pool->queue_capacity;
+        llm.concurrency.scheduler = config.persona_gateway.llm_pool->scheduler;
+        llm.concurrency.max_active_keys = config.persona_gateway.llm_pool->max_active_keys;
+        llm.concurrency.max_outstanding_per_key =
+            config.persona_gateway.llm_pool->max_outstanding_per_key;
+        llm.concurrency.max_outstanding_per_fairness_key =
+            config.persona_gateway.llm_pool->max_outstanding_per_fairness_key;
+        llm.concurrency.max_outstanding_per_tenant =
+            config.persona_gateway.llm_pool->max_outstanding_per_tenant;
+        options.llm_pool = std::move(llm);
+    }
     options.session.idle_timeout = std::chrono::minutes(config.persona_gateway.session_idle_timeout_minutes);
     options.session.max_recent_turns = config.persona_gateway.session_max_recent_turns;
     options.session.max_active_sessions = config.persona_gateway.session_max_active_sessions;

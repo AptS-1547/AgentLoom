@@ -19,6 +19,7 @@
 #include "isemantic_cache.h"
 #include "openai_llm_client.h"
 #include "local_llm_client.h"
+#include "async_beast_http_client.h"
 #include "beast_http_client.h"
 #include "tls_context.h"
 #include "crash_dump.h"
@@ -245,6 +246,11 @@ struct ToolConfig {
     logging::LoggerOptions logging;
     agent::llm::OpenAiLlmClientOptions cloud_llm;
     bool cloud_llm_enabled = false;
+    std::size_t async_http_io_threads = 1;
+    bool async_http_keep_alive = true;
+    std::size_t async_http_max_idle_connections = 64;
+    std::size_t async_http_max_idle_connections_per_origin = 64;
+    std::chrono::milliseconds async_http_idle_timeout{30000};
     bool local_llm_enabled = false;
     bool allow_placeholder_llm = false;
     bool l0_enabled = false;
@@ -400,10 +406,68 @@ ToolConfig LoadConfig(const fs::path& config_path) {
     ValidateThreadPoolConcurrency("persona_gateway.io_pool",
                                   config.gateway.io_pool_concurrency);
 
+    if (const auto llm_pool = gateway.find("llm_pool");
+        llm_pool != gateway.end() && llm_pool->is_object()) {
+        agent::service::gateway::GatewayLlmPoolOptions options;
+        options.pool.worker_count = GetSize(*llm_pool, "worker_count", 4);
+        options.pool.queue_capacity = GetSize(*llm_pool, "queue_capacity", 1024);
+        options.concurrency.scheduler = GetString(
+            *llm_pool, "scheduler", "session_affinity");
+        options.concurrency.max_active_keys = GetSize(
+            *llm_pool, "max_active_keys", 1024);
+        options.concurrency.max_outstanding_per_key = GetSize(
+            *llm_pool, "max_outstanding_per_key", 8);
+        options.concurrency.max_outstanding_per_fairness_key = GetSize(
+            *llm_pool, "max_outstanding_per_fairness_key", 1024);
+        options.concurrency.max_outstanding_per_tenant = GetSize(
+            *llm_pool, "max_outstanding_per_tenant", 1024);
+        ValidateThreadPoolConcurrency(
+            "persona_gateway.llm_pool", options.concurrency);
+        config.gateway.llm_pool = std::move(options);
+    }
+
     config.gateway.session.idle_timeout = std::chrono::minutes(GetInt(gateway, "session_idle_timeout_minutes", 15));
     config.gateway.session.max_recent_turns = GetSize(gateway, "session_max_recent_turns", 20);
     config.gateway.runtime.recent_raw_turns = GetSize(gateway, "runtime_recent_raw_turns", 10);
     config.gateway.runtime.default_model = GetString(gateway, "runtime_default_model");
+
+    // 压测与手工 E2E 可从配置提供只读默认人格，避免每个 Session 重复写入元数据后端。
+    const auto personas = gateway.value("personas", Json::array());
+    if (!personas.is_array()) {
+        throw std::runtime_error("persona_gateway.personas must be an array");
+    }
+    for (const auto& persona : personas) {
+        if (!persona.is_object()) {
+            throw std::runtime_error("persona_gateway.personas[] must be an object");
+        }
+        agent::service::gateway::PersonaMetadataRecord record;
+        record.tenant_id = "server";
+        record.user_uuid = "server";
+        record.persona_id = GetString(
+            persona, "personaId", GetString(persona, "persona_id"));
+        if (record.persona_id.empty()) {
+            throw std::runtime_error("persona_gateway.personas[] requires personaId");
+        }
+        const auto personality = persona.value("personality", Json::object());
+        record.personality.name = GetString(
+            personality, "name", record.persona_id);
+        record.personality.description = GetString(personality, "description");
+        if (const auto traits = personality.find("traits");
+            traits != personality.end() && traits->is_array()) {
+            record.personality.traits = traits->get<std::vector<std::string>>();
+        }
+        record.personality.openness = GetFloat(personality, "openness", 0.5f);
+        record.personality.extraversion = GetFloat(personality, "extraversion", 0.5f);
+        record.personality.humor_tendency = GetFloat(
+            personality, "humorTendency", 0.5f);
+        record.personality.empathy_level = GetFloat(
+            personality, "empathyLevel", 0.5f);
+        record.personality.curiosity_level = GetFloat(
+            personality, "curiosityLevel", 0.5f);
+        record.personality.formality = GetFloat(personality, "formality", 0.5f);
+        record.emotion_state_config.noise_sigma = 0.0;
+        config.gateway.default_personas.push_back(std::move(record));
+    }
 
     const auto request_filter = gateway.value("request_filter", Json::object());
     config.gateway.http.request_filter.enabled = GetBool(request_filter, "enabled", true);
@@ -423,6 +487,8 @@ ToolConfig LoadConfig(const fs::path& config_path) {
     config.gateway.auth.enabled = GetBool(auth, "enabled", true);
     config.gateway.auth.allow_dev_identity = GetBool(auth, "allow_dev_identity", false);
     config.gateway.auth.require_auth_for_api = GetBool(auth, "require_auth_for_api", true);
+    config.gateway.auth.enable_dev_registration = GetBool(
+        auth, "enable_dev_registration", false);
     config.gateway.auth.cookie_name = GetString(auth, "cookie_name", "agent_auth");
     config.gateway.auth.issuer = GetString(auth, "issuer", "agent-e2e");
     config.gateway.auth.audience = GetString(auth, "audience", "agent-gateway");
@@ -464,6 +530,22 @@ ToolConfig LoadConfig(const fs::path& config_path) {
 
     const auto llm = config.root.value("llm", Json::object());
     config.cloud_llm_enabled = GetBool(llm, "enabled", true);
+    config.async_http_io_threads = GetSize(llm, "async_http_io_threads", 1);
+    config.async_http_keep_alive = GetBool(llm, "http_keep_alive", true);
+    config.async_http_max_idle_connections = GetSize(
+        llm, "http_max_idle_connections", 64);
+    config.async_http_max_idle_connections_per_origin = GetSize(
+        llm, "http_max_idle_connections_per_origin", 64);
+    config.async_http_idle_timeout = std::chrono::milliseconds(
+        GetInt(llm, "http_idle_timeout_ms", 30000));
+    if (config.async_http_keep_alive &&
+        (config.async_http_max_idle_connections == 0 ||
+         config.async_http_max_idle_connections_per_origin == 0 ||
+         config.async_http_max_idle_connections_per_origin >
+             config.async_http_max_idle_connections ||
+         config.async_http_idle_timeout <= std::chrono::milliseconds::zero())) {
+        throw std::runtime_error("llm HTTP keep-alive pool options are invalid");
+    }
     config.allow_placeholder_llm = GetBool(llm, "allow_placeholder", false);
     config.disable_tls_verify_on_windows = GetBool(llm, "disable_tls_verify_on_windows", true);
     config.cloud_llm.base_url = GetString(llm, "base_url");
@@ -583,8 +665,14 @@ ToolConfig LoadConfig(const fs::path& config_path) {
     return config;
 }
 
-core::Result<std::shared_ptr<agent::llm::ILlmClient>> CreateLlmClient(const ToolConfig& config) {
+struct LlmClientBundle {
+    std::shared_ptr<agent::llm::ILlmClient> sync;
+    std::shared_ptr<agent::llm::IAsyncLlmClient> async;
+};
+
+core::Result<LlmClientBundle> CreateLlmClient(const ToolConfig& config) {
     std::shared_ptr<agent::llm::ILlmClient> primary;
+    std::shared_ptr<agent::llm::IAsyncLlmClient> async_primary;
     std::shared_ptr<agent::llm::ILlmClient> fallback;
 
     if (config.cloud_llm_enabled && !config.cloud_llm.base_url.empty()) {
@@ -598,8 +686,9 @@ core::Result<std::shared_ptr<agent::llm::ILlmClient>> CreateLlmClient(const Tool
         if (!tls.ok()) {
             return tls.status();
         }
+        auto tls_context = std::move(tls).value();
         agent::net::BeastHttpClientOptions http_opts;
-        http_opts.tls_context = std::move(tls).value();
+        http_opts.tls_context = tls_context;
         auto http = agent::net::BeastHttpClient::Create(std::move(http_opts));
         if (!http.ok()) {
             return http.status();
@@ -622,6 +711,41 @@ core::Result<std::shared_ptr<agent::llm::ILlmClient>> CreateLlmClient(const Tool
         holder->transport = std::move(http_client);
         holder->client = std::move(cloud).value();
         primary = holder;
+
+        agent::net::AsyncBeastHttpClientOptions async_http_options;
+        async_http_options.tls_context = std::move(tls_context);
+        async_http_options.io_thread_count = config.async_http_io_threads;
+        async_http_options.enable_keep_alive = config.async_http_keep_alive;
+        async_http_options.max_idle_connections = config.async_http_max_idle_connections;
+        async_http_options.max_idle_connections_per_origin =
+            config.async_http_max_idle_connections_per_origin;
+        async_http_options.idle_connection_timeout = config.async_http_idle_timeout;
+        auto async_http = agent::net::AsyncBeastHttpClient::Create(
+            std::move(async_http_options));
+        if (!async_http.ok()) {
+            return async_http.status();
+        }
+        auto async_http_client = std::shared_ptr<agent::net::IAsyncHttpClient>(
+            std::move(async_http).value());
+        auto async_cloud = agent::llm::OpenAiAsyncLlmClient::Create(
+            config.cloud_llm, *async_http_client);
+        if (!async_cloud.ok()) {
+            return async_cloud.status();
+        }
+        struct AsyncClientWithTransport final : public agent::llm::IAsyncLlmClient {
+            std::shared_ptr<agent::net::IAsyncHttpClient> transport;
+            std::unique_ptr<agent::llm::OpenAiAsyncLlmClient> client;
+
+            core::Result<std::shared_ptr<agent::llm::IAsyncLlmOperation>> CompleteAsync(
+                agent::llm::ChatCompletionRequest request,
+                Callback callback) override {
+                return client->CompleteAsync(std::move(request), std::move(callback));
+            }
+        };
+        auto async_holder = std::make_shared<AsyncClientWithTransport>();
+        async_holder->transport = std::move(async_http_client);
+        async_holder->client = std::move(async_cloud).value();
+        async_primary = std::move(async_holder);
     }
 
     if (config.local_llm_enabled) {
@@ -634,17 +758,19 @@ core::Result<std::shared_ptr<agent::llm::ILlmClient>> CreateLlmClient(const Tool
     }
 
     if (primary && fallback) {
-        return std::shared_ptr<agent::llm::ILlmClient>(
-            std::make_shared<agent::llm::FallbackLlmClient>(primary, fallback));
+        // 本地 fallback 尚无异步组合接口，保留与生产装配一致的同步故障切换语义。
+        return LlmClientBundle{
+            .sync = std::make_shared<agent::llm::FallbackLlmClient>(primary, fallback),
+        };
     }
     if (primary) {
-        return primary;
+        return LlmClientBundle{.sync = std::move(primary), .async = std::move(async_primary)};
     }
     if (fallback) {
-        return fallback;
+        return LlmClientBundle{.sync = std::move(fallback)};
     }
     if (config.allow_placeholder_llm) {
-        return std::shared_ptr<agent::llm::ILlmClient>(std::make_shared<PlaceholderLlmClient>());
+        return LlmClientBundle{.sync = std::make_shared<PlaceholderLlmClient>()};
     }
     return core::Status::Error(core::ErrorCode::FailedPrecondition, "no LLM client configured");
 }
@@ -798,13 +924,17 @@ int main(int argc, char** argv) {
     bool logging_initialized = false;
 
     if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <config.json> [--no-stdin-stop]\n";
+        std::cerr << "Usage: " << argv[0]
+                  << " <config.json> [--no-stdin-stop] [--sync-llm]\n";
         return 2;
     }
     bool stop_on_stdin = true;
+    bool force_sync_llm = false;
     for (int i = 2; i < argc; ++i) {
         if (std::string_view(argv[i]) == "--no-stdin-stop") {
             stop_on_stdin = false;
+        } else if (std::string_view(argv[i]) == "--sync-llm") {
+            force_sync_llm = true;
         }
     }
 
@@ -867,7 +997,13 @@ int main(int argc, char** argv) {
         agent::service::gateway::PersonaGatewayServerDependencies dependencies;
         dependencies.memory_provider = std::move(memory);
         dependencies.emotion_analyzer = std::move(emotion).value();
-        dependencies.llm_client = std::move(llm).value();
+        auto llm_bundle = std::move(llm).value();
+        dependencies.llm_client = std::move(llm_bundle.sync);
+        if (!force_sync_llm) {
+            dependencies.async_llm_client = std::move(llm_bundle.async);
+        }
+        LOG_INFO("[gateway-e2e] Persona LLM execution mode={}",
+                 force_sync_llm ? "sync" : "async");
         std::shared_ptr<agent::service::persona::SkillSessionManager> skill_sessions;
         if (config.skill_session_enabled) {
             skill_sessions = std::make_shared<agent::service::persona::SkillSessionManager>(

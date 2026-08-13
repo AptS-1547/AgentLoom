@@ -31,6 +31,7 @@ public:
     bool closed() const noexcept override;
     std::size_t QueuedTaskCount() const noexcept override;
     core::ThreadPoolConcurrencySnapshot Snapshot() const override;
+    bool SerializesConcurrencyKeyUntilCompletion() const noexcept override { return true; }
 
 private:
     struct Impl;

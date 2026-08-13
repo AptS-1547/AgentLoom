@@ -162,12 +162,12 @@ add_library(agent_config STATIC
 
 target_include_directories(agent_config PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src/config
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party
 )
 
 target_link_libraries(agent_config PUBLIC
     agent_net
     server_runtime
+    nlohmann_json::nlohmann_json
 )
 
 if(BERT_BUILD_TESTS)

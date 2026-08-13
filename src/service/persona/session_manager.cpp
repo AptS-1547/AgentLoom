@@ -30,14 +30,87 @@ std::string TaskName(std::string_view role, const DispatchOptions& options) {
 
 } // namespace
 
+class SessionManager::TurnOperation final {
+public:
+    TurnOperation(std::shared_ptr<SessionSlot> slot,
+                  SessionTurnCompletion completion,
+                  SessionClosedCallback closed_callback,
+                  std::shared_ptr<ResourceAccounting> resource_accounting,
+                  core::LoggerAdapter logger)
+        : slot_(std::move(slot)),
+          completion_(std::move(completion)),
+          closed_callback_(std::move(closed_callback)),
+          resource_accounting_(std::move(resource_accounting)),
+          logger_(std::move(logger)) {}
+
+    ~TurnOperation() {
+        if (!finished_.load(std::memory_order_acquire)) {
+            Finish(core::Status::Error(core::ErrorCode::Unavailable,
+                                       "session turn was discarded during shutdown"), true);
+        }
+    }
+
+    void Finish(core::Result<SessionTurnReceipt> result, bool notify_completion) noexcept {
+        if (finished_.exchange(true, std::memory_order_acq_rel)) {
+            return;
+        }
+        std::optional<SessionSnapshot> closed_snapshot;
+        {
+            std::lock_guard lock(slot_->mutex);
+            if (slot_->outstanding_turns > 0) {
+                --slot_->outstanding_turns;
+            }
+            if (slot_->state.status == SessionStatus::Closing &&
+                slot_->outstanding_turns == 0) {
+                slot_->state.status = SessionStatus::Closed;
+                closed_snapshot = SessionManager::SnapshotLocked(slot_->state);
+            }
+        }
+        if (notify_completion) {
+            try {
+                completion_(std::move(result));
+            } catch (const std::exception& exception) {
+                logger_.error("[session] turn completion exception: {}", exception.what());
+            } catch (...) {
+                logger_.error("[session] turn completion exception: unknown");
+            }
+        }
+        if (closed_snapshot) {
+            resource_accounting_->resident_sessions.fetch_sub(1, std::memory_order_acq_rel);
+            if (closed_callback_) {
+                closed_callback_(*closed_snapshot);
+            }
+            logger_.info("[trace={}] [session] closed session={} user={} persona={}",
+                         closed_snapshot->last_trace_id.empty() ? "-" : closed_snapshot->last_trace_id,
+                         closed_snapshot->session_id,
+                         closed_snapshot->user_uuid,
+                         closed_snapshot->persona_id);
+        }
+    }
+
+private:
+    std::shared_ptr<SessionSlot> slot_;
+    SessionTurnCompletion completion_;
+    SessionClosedCallback closed_callback_;
+    std::shared_ptr<ResourceAccounting> resource_accounting_;
+    core::LoggerAdapter logger_;
+    std::atomic<bool> finished_{false};
+};
+
 SessionManager::SessionManager(core::ThreadPool& compute_pool,
                                core::ThreadPool& io_pool,
                                SessionOptions options,
-                               core::LoggerAdapter logger)
+                               core::LoggerAdapter logger,
+                               core::ThreadPool* turn_pool)
     : compute_pool_(compute_pool),
       io_pool_(io_pool),
+      turn_pool_(turn_pool),
       options_(options),
       logger_(std::move(logger)) {}
+
+SessionManager::~SessionManager() {
+    Shutdown();
+}
 
 core::Result<SessionSnapshot> SessionManager::CreateSession(CreateSessionRequest request) {
     if (request.user_uuid.empty()) {
@@ -69,7 +142,7 @@ core::Result<SessionSnapshot> SessionManager::CreateSession(CreateSessionRequest
         slot->state.last_active = now;
         slot->state.emotion_state = EmotionStateTracker(request.emotion_state_config);
         slot->state.personality = std::make_shared<const PersonalityConfig>(request.personality);
-        slot->state.prompt_builder = std::make_unique<PromptBuilder>(
+        slot->state.prompt_builder = std::make_shared<const PromptBuilder>(
             std::move(request.personality),
             std::move(request.emotion_prompt_config),
             request.time_awareness);
@@ -83,10 +156,12 @@ core::Result<SessionSnapshot> SessionManager::CreateSession(CreateSessionRequest
         if (sessions_.find(id) != sessions_.end()) {
             return core::Status::Error(core::ErrorCode::AlreadyExists, "session already exists");
         }
-        if (sessions_.size() >= options_.max_active_sessions) {
+        const auto resident_sessions =
+            resource_accounting_->resident_sessions.load(std::memory_order_acquire);
+        if (resident_sessions >= options_.max_active_sessions) {
             logger_.warn("[trace={}] [session] active session limit reached active={} limit={}",
                          core::CurrentTraceId(),
-                         sessions_.size(),
+                         resident_sessions,
                          options_.max_active_sessions);
             return core::Status::Error(core::ErrorCode::ResourceExhausted,
                                        "active session limit reached");
@@ -96,6 +171,8 @@ core::Result<SessionSnapshot> SessionManager::CreateSession(CreateSessionRequest
             snapshot = SnapshotLocked(slot->state);
         }
         sessions_[id] = std::move(slot);
+        ++active_session_count_;
+        resource_accounting_->resident_sessions.fetch_add(1, std::memory_order_release);
     }
 
     logger_.info("[trace={}] [session] created session={} user={} persona={}",
@@ -121,6 +198,7 @@ core::Status SessionManager::CloseSession(std::string_view session_id, std::stri
     core::TraceScope trace_scope(trace);
 
     std::shared_ptr<SessionSlot> removed;
+    std::optional<SessionSnapshot> closed_snapshot;
     {
         std::unique_lock lock(sessions_mutex_);
         auto it = sessions_.find(std::string(session_id));
@@ -137,25 +215,23 @@ core::Status SessionManager::CloseSession(std::string_view session_id, std::stri
             removed->state.status = SessionStatus::Closing;
             removed->state.close_reason = "client_close";
             removed->state.last_trace_id = trace.trace_id;
+            if (active_session_count_ > 0) {
+                --active_session_count_;
+            }
+            if (removed->outstanding_turns == 0) {
+                removed->state.status = SessionStatus::Closed;
+                closed_snapshot = SnapshotLocked(removed->state);
+            }
         }
         sessions_.erase(it);
     }
-
-    SessionSnapshot snapshot;
-    {
-        std::lock_guard lock(removed->mutex);
-        removed->state.status = SessionStatus::Closed;
-        snapshot = SnapshotLocked(removed->state);
+    if (closed_snapshot) {
+        resource_accounting_->resident_sessions.fetch_sub(1, std::memory_order_acq_rel);
+        NotifySessionClosed(*closed_snapshot);
+    } else {
+        logger_.info("[trace={}] [session] closing session={} outstanding_turns={}",
+                     core::CurrentTraceId(), session_id, removed->outstanding_turns);
     }
-    if (session_closed_callback_) {
-        session_closed_callback_(snapshot);
-    }
-
-    logger_.info("[trace={}] [session] closed session={} user={} persona={}",
-                 core::CurrentTraceId(),
-                 session_id,
-                 snapshot.user_uuid,
-                 snapshot.persona_id);
     return core::Status::Ok();
 }
 
@@ -195,6 +271,9 @@ std::vector<SessionSnapshot> SessionManager::CleanupExpired() {
             }
             if (remove) {
                 expired.push_back(std::move(it->second));
+                if (active_session_count_ > 0) {
+                    --active_session_count_;
+                }
                 it = sessions_.erase(it);
             } else {
                 ++it;
@@ -205,20 +284,23 @@ std::vector<SessionSnapshot> SessionManager::CleanupExpired() {
     std::vector<SessionSnapshot> snapshots;
     snapshots.reserve(expired.size());
     for (const auto& slot : expired) {
-        SessionSnapshot snapshot;
+        std::optional<SessionSnapshot> snapshot;
         {
             std::lock_guard lock(slot->mutex);
-            slot->state.status = SessionStatus::Closed;
-            snapshot = SnapshotLocked(slot->state);
+            if (slot->outstanding_turns == 0) {
+                slot->state.status = SessionStatus::Closed;
+                snapshot = SnapshotLocked(slot->state);
+            }
         }
-        snapshots.push_back(snapshot);
-        logger_.info("[trace={}] [session] expired session={} user={} persona={}",
-                     snapshot.last_trace_id.empty() ? "-" : snapshot.last_trace_id,
-                     snapshot.session_id,
-                     snapshot.user_uuid,
-                     snapshot.persona_id);
-        if (session_closed_callback_) {
-            session_closed_callback_(snapshot);
+        if (snapshot) {
+            resource_accounting_->resident_sessions.fetch_sub(1, std::memory_order_acq_rel);
+            snapshots.push_back(*snapshot);
+            NotifySessionClosed(*snapshot);
+        } else {
+            logger_.info("[trace={}] [session] expiring session={} outstanding_turns={}",
+                         slot->state.last_trace_id.empty() ? "-" : slot->state.last_trace_id,
+                         slot->state.session_id,
+                         slot->outstanding_turns);
         }
     }
     return snapshots;
@@ -226,7 +308,40 @@ std::vector<SessionSnapshot> SessionManager::CleanupExpired() {
 
 std::size_t SessionManager::SessionCount() const {
     std::shared_lock lock(sessions_mutex_);
-    return sessions_.size();
+    return active_session_count_;
+}
+
+void SessionManager::Shutdown() {
+    std::vector<std::shared_ptr<SessionSlot>> closing;
+    {
+        std::unique_lock lock(sessions_mutex_);
+        closing.reserve(sessions_.size());
+        for (auto& [_, slot] : sessions_) {
+            closing.push_back(std::move(slot));
+        }
+        sessions_.clear();
+        active_session_count_ = 0;
+    }
+
+    std::vector<SessionSnapshot> closed;
+    for (const auto& slot : closing) {
+        std::lock_guard lock(slot->mutex);
+        if (slot->state.status == SessionStatus::Closed) {
+            continue;
+        }
+        slot->state.status = SessionStatus::Closing;
+        if (slot->state.close_reason.empty()) {
+            slot->state.close_reason = "manager_shutdown";
+        }
+        if (slot->outstanding_turns == 0) {
+            slot->state.status = SessionStatus::Closed;
+            closed.push_back(SnapshotLocked(slot->state));
+        }
+    }
+    for (const auto& snapshot : closed) {
+        resource_accounting_->resident_sessions.fetch_sub(1, std::memory_order_acq_rel);
+        NotifySessionClosed(snapshot);
+    }
 }
 
 core::Status SessionManager::AddTurn(std::string_view session_id,
@@ -281,10 +396,351 @@ core::Status SessionManager::SubmitIo(DispatchOptions options, SessionTask task)
     return Submit(io_pool_, "io", std::move(options), std::move(task));
 }
 
+core::Status SessionManager::SubmitIoFromSessionTask(const SessionState& locked_session,
+                                                     DispatchOptions options,
+                                                     SessionTask task) {
+    if (options.session_id != locked_session.session_id) {
+        return core::Status::Error(core::ErrorCode::InvalidArgument,
+                                   "dispatch session_id does not match locked session");
+    }
+    if (locked_session.status != SessionStatus::Active) {
+        return core::Status::Error(core::ErrorCode::FailedPrecondition,
+                                   "session is not active");
+    }
+    TrustedDispatchIdentity identity{
+        locked_session.tenant_id,
+        locked_session.user_uuid,
+    };
+    return Submit(io_pool_,
+                  "io",
+                  std::move(options),
+                  std::move(task),
+                  std::move(identity));
+}
+
+core::Status SessionManager::SubmitTurn(DispatchOptions options,
+                                        SessionTurnTask task,
+                                        SessionTurnCompletion completion) {
+    if (!task || !completion) {
+        return core::Status::Error(core::ErrorCode::InvalidArgument,
+                                   "session turn task and completion are required");
+    }
+    if (options.session_id.empty()) {
+        return core::Status::Error(core::ErrorCode::InvalidArgument, "session_id is required");
+    }
+
+    auto slot_result = FindSlot(options.session_id);
+    if (!slot_result.ok()) {
+        return slot_result.status();
+    }
+    auto slot = std::move(slot_result).value();
+    std::string tenant_id;
+    std::string user_uuid;
+    {
+        std::lock_guard lock(slot->mutex);
+        if (slot->state.status != SessionStatus::Active) {
+            return core::Status::Error(core::ErrorCode::FailedPrecondition,
+                                       "session is not active");
+        }
+        tenant_id = slot->state.tenant_id;
+        user_uuid = slot->state.user_uuid;
+        ++slot->outstanding_turns;
+    }
+
+    const auto session_id = options.session_id;
+    const auto trace = MakeTrace(options);
+    const auto trace_id = trace.trace_id;
+    const auto module = options.module.empty() ? std::string("session") : options.module;
+    const auto operation = options.operation.empty() ? std::string("turn") : options.operation;
+    core::ThreadPoolTaskMetadata metadata;
+    metadata.concurrency_key = session_id;
+    metadata.tenant_key = tenant_id;
+    if (!user_uuid.empty()) {
+        metadata.fairness_key = tenant_id + ":" + user_uuid;
+    }
+    metadata.execution_id = options.span_id;
+
+    auto operation_state = std::make_shared<TurnOperation>(
+        slot,
+        std::move(completion),
+        session_closed_callback_,
+        resource_accounting_,
+        logger_);
+    auto& execution_pool = turn_pool_ ? *turn_pool_ : io_pool_;
+    auto status = execution_pool.Submit(
+        [this, slot, operation_state, session_id, trace_id, user_uuid, module, operation,
+         task = std::move(task)](
+            core::ThreadPoolContext& context) mutable -> core::Status {
+            core::TraceContext task_trace;
+            task_trace.trace_id = trace_id;
+            task_trace.user_uuid = user_uuid;
+            core::TraceScope trace_scope(task_trace);
+
+            // 外部 pool 可能是普通 FIFO；manager 自身 gate 保证跨 pool/调度器的完整 Turn 保序。
+            std::unique_lock turn_lock(slot->turn_gate);
+
+            std::optional<SessionTurnSnapshot> snapshot;
+            core::Status turn_status = core::Status::Ok();
+            {
+                std::lock_guard lock(slot->mutex);
+                if (slot->state.status != SessionStatus::Active) {
+                    turn_status = core::Status::Error(
+                        core::ErrorCode::Cancelled,
+                        "session closed before queued turn started");
+                } else {
+                    slot->state.last_active = std::chrono::steady_clock::now();
+                    slot->state.last_trace_id = trace_id;
+                    snapshot.emplace(SessionTurnSnapshot{
+                        slot->next_turn_sequence++,
+                        slot->state});
+                }
+            }
+
+            SessionTurnCommit commit;
+            SessionTurnReceipt receipt;
+            if (snapshot) {
+                turn_status = task(*snapshot, commit, context);
+                if (turn_status.ok()) {
+                    std::lock_guard lock(slot->mutex);
+                    if (slot->state.status != SessionStatus::Active &&
+                        slot->state.status != SessionStatus::Closing) {
+                        turn_status = core::Status::Error(
+                            core::ErrorCode::Cancelled,
+                            "session turn commit was fenced");
+                    } else {
+                        slot->state.emotion_state = std::move(commit.emotion_state);
+                        slot->state.last_active = std::chrono::steady_clock::now();
+                        slot->state.last_trace_id = commit.trace_id.empty() ? trace_id : commit.trace_id;
+                        slot->state.recent_history.push_back(std::move(commit.turn));
+                        ++slot->state.metrics.turn_count;
+                        ++slot->state.metrics.request_count;
+                        slot->state.metrics.last_latency = commit.latency;
+                        slot->state.metrics.total_latency += commit.latency;
+                        while (slot->state.recent_history.size() > slot->state.max_recent_turns) {
+                            slot->state.recent_history.pop_front();
+                        }
+                        receipt.sequence = snapshot->sequence;
+                        receipt.turn_index = slot->state.metrics.turn_count;
+                    }
+                }
+            }
+
+            // Turn 状态已经完成 snapshot/commit 后释放 lane；callback/WS 背压不应阻塞下一 Turn。
+            turn_lock.unlock();
+
+            if (!turn_status.ok()) {
+                logger_.warn("[trace={}] [session] turn failed module={} op={} session={} reason={}",
+                             core::CurrentTraceId(), module, operation, session_id,
+                             turn_status.message());
+            }
+
+            if (turn_status.ok()) {
+                operation_state->Finish(receipt, true);
+            } else {
+                operation_state->Finish(turn_status, true);
+            }
+            return turn_status;
+        },
+        {},
+        "io:" + module + ":" + operation,
+        std::move(metadata));
+
+    if (!status.ok()) {
+        operation_state->Finish(status, true);
+    }
+    return status;
+}
+
+core::Status SessionManager::SubmitTurnAsync(DispatchOptions options,
+                                             SessionTurnAsyncTask task,
+                                             SessionTurnCompletion completion) {
+    if (!task || !completion) {
+        return core::Status::Error(core::ErrorCode::InvalidArgument,
+                                   "async session turn task and completion are required");
+    }
+    if (options.session_id.empty()) {
+        return core::Status::Error(core::ErrorCode::InvalidArgument, "session_id is required");
+    }
+    auto& execution_pool = turn_pool_ ? *turn_pool_ : io_pool_;
+    if (!execution_pool.serializes_concurrency_key_until_completion()) {
+        return core::Status::Error(
+            core::ErrorCode::FailedPrecondition,
+            "async session turns require a scheduler that serializes concurrency_key until completion");
+    }
+
+    auto slot_result = FindSlot(options.session_id);
+    if (!slot_result.ok()) {
+        return slot_result.status();
+    }
+    auto slot = std::move(slot_result).value();
+    std::string tenant_id;
+    std::string user_uuid;
+    {
+        std::lock_guard lock(slot->mutex);
+        if (slot->state.status != SessionStatus::Active) {
+            return core::Status::Error(core::ErrorCode::FailedPrecondition,
+                                       "session is not active");
+        }
+        tenant_id = slot->state.tenant_id;
+        user_uuid = slot->state.user_uuid;
+        ++slot->outstanding_turns;
+    }
+
+    const auto session_id = options.session_id;
+    const auto trace = MakeTrace(options);
+    const auto trace_id = trace.trace_id;
+    const auto module = options.module.empty() ? std::string("session") : options.module;
+    const auto operation = options.operation.empty() ? std::string("async_turn") : options.operation;
+    core::ThreadPoolTaskMetadata metadata;
+    metadata.concurrency_key = session_id;
+    metadata.tenant_key = tenant_id;
+    if (!user_uuid.empty()) {
+        metadata.fairness_key = tenant_id + ":" + user_uuid;
+    }
+    metadata.execution_id = options.span_id;
+
+    auto operation_state = std::make_shared<TurnOperation>(
+        slot,
+        std::move(completion),
+        session_closed_callback_,
+        resource_accounting_,
+        logger_);
+    auto status = execution_pool.Submit(
+        [this, slot, operation_state, session_id, trace_id, user_uuid, module, operation,
+         task = std::move(task)](core::ThreadPoolContext& context) mutable -> core::Status {
+            core::TraceContext task_trace;
+            task_trace.trace_id = trace_id;
+            task_trace.user_uuid = user_uuid;
+            core::TraceScope trace_scope(task_trace);
+
+            std::optional<SessionTurnSnapshot> snapshot;
+            {
+                std::lock_guard lock(slot->mutex);
+                if (slot->state.status == SessionStatus::Active) {
+                    slot->state.last_active = std::chrono::steady_clock::now();
+                    slot->state.last_trace_id = trace_id;
+                    snapshot.emplace(SessionTurnSnapshot{
+                        slot->next_turn_sequence++,
+                        slot->state});
+                }
+            }
+            if (!snapshot) {
+                auto failure = core::Status::Error(
+                    core::ErrorCode::Cancelled,
+                    "session closed before queued async turn started");
+                operation_state->Finish(failure, true);
+                return failure;
+            }
+
+            auto deferred_result = context.DeferCompletion();
+            if (!deferred_result.ok()) {
+                operation_state->Finish(deferred_result.status(), true);
+                return deferred_result.status();
+            }
+
+            struct AsyncCompletionState {
+                ~AsyncCompletionState() {
+                    if (!finished.exchange(true, std::memory_order_acq_rel)) {
+                        auto status = core::Status::Error(
+                            core::ErrorCode::Cancelled,
+                            "async session turn finish callback was released");
+                        deferred.Complete(status);
+                        operation->Finish(status, true);
+                    }
+                }
+
+                std::atomic<bool> finished{false};
+                core::DeferredTaskCompletion deferred;
+                std::shared_ptr<TurnOperation> operation;
+            };
+            auto completion_state = std::make_shared<AsyncCompletionState>();
+            completion_state->deferred = std::move(deferred_result).value();
+            completion_state->operation = operation_state;
+            const auto sequence = snapshot->sequence;
+
+            SessionTurnAsyncFinish finish =
+                [this, slot, operation_state, completion_state, sequence, trace_id,
+                 session_id, module, operation](core::Result<SessionTurnCommit> result) mutable {
+                    if (completion_state->finished.exchange(true, std::memory_order_acq_rel)) {
+                        return;
+                    }
+
+                    core::Status turn_status = result.ok()
+                        ? core::Status::Ok()
+                        : result.status();
+                    SessionTurnReceipt receipt;
+                    if (result.ok()) {
+                        auto commit = std::move(result).value();
+                        std::lock_guard lock(slot->mutex);
+                        if (slot->state.status != SessionStatus::Active &&
+                            slot->state.status != SessionStatus::Closing) {
+                            turn_status = core::Status::Error(
+                                core::ErrorCode::Cancelled,
+                                "async session turn commit was fenced");
+                        } else {
+                            slot->state.emotion_state = std::move(commit.emotion_state);
+                            slot->state.last_active = std::chrono::steady_clock::now();
+                            slot->state.last_trace_id = commit.trace_id.empty()
+                                ? trace_id
+                                : commit.trace_id;
+                            slot->state.recent_history.push_back(std::move(commit.turn));
+                            ++slot->state.metrics.turn_count;
+                            ++slot->state.metrics.request_count;
+                            slot->state.metrics.last_latency = commit.latency;
+                            slot->state.metrics.total_latency += commit.latency;
+                            while (slot->state.recent_history.size() > slot->state.max_recent_turns) {
+                                slot->state.recent_history.pop_front();
+                            }
+                            receipt.sequence = sequence;
+                            receipt.turn_index = slot->state.metrics.turn_count;
+                        }
+                    }
+
+                    if (!turn_status.ok()) {
+                        logger_.warn(
+                            "[trace={}] [session] async turn failed module={} op={} session={} reason={}",
+                            trace_id, module, operation, session_id, turn_status.message());
+                    }
+
+                    // 先释放 scheduler lane/quota，再执行可能带 WebSocket 背压的业务 callback。
+                    completion_state->deferred.Complete(turn_status);
+                    if (turn_status.ok()) {
+                        operation_state->Finish(receipt, true);
+                    } else {
+                        operation_state->Finish(turn_status, true);
+                    }
+                };
+
+            try {
+                auto start_status = task(*snapshot, context, finish);
+                if (!start_status.ok()) {
+                    finish(start_status);
+                }
+            } catch (const std::exception& exception) {
+                finish(core::Status::Error(core::ErrorCode::InternalError, exception.what()));
+            } catch (...) {
+                finish(core::Status::Error(core::ErrorCode::Unknown,
+                                           "async session turn task threw an unknown exception"));
+            }
+
+            // 最终状态由 finish 负责；worker 此刻立即返回池中处理其他 Session。
+            return core::Status::Ok();
+        },
+        {},
+        "llm:" + module + ":" + operation,
+        std::move(metadata));
+
+    if (!status.ok()) {
+        operation_state->Finish(status, true);
+    }
+    return status;
+}
+
 SessionThreadPoolStats SessionManager::PoolStats() const {
     SessionThreadPoolStats stats;
     stats.compute = compute_pool_.Stats();
     stats.io = io_pool_.Stats();
+    stats.llm = turn_pool_ ? turn_pool_->Stats() : stats.io;
     return stats;
 }
 
@@ -295,7 +751,8 @@ void SessionManager::SetSessionClosedCallback(SessionClosedCallback callback) {
 core::Status SessionManager::Submit(core::ThreadPool& pool,
                                     std::string_view pool_role,
                                     DispatchOptions options,
-                                    SessionTask task) {
+                                    SessionTask task,
+                                    std::optional<TrustedDispatchIdentity> trusted_identity) {
     if (!task) {
         return core::Status::Error(core::ErrorCode::InvalidArgument, "session task is empty");
     }
@@ -309,17 +766,23 @@ core::Status SessionManager::Submit(core::ThreadPool& pool,
     const std::string trace_id = trace.trace_id;
     std::string trusted_tenant_id;
     std::string trusted_user_uuid;
-    auto admission_slot = FindSlot(task_session_id);
-    if (!admission_slot.ok()) {
-        return admission_slot.status();
-    }
-    {
-        std::lock_guard slot_lock(admission_slot.value()->mutex);
-        if (admission_slot.value()->state.status != SessionStatus::Active) {
-            return core::Status::Error(core::ErrorCode::FailedPrecondition, "session is not active");
+    if (trusted_identity) {
+        trusted_tenant_id = std::move(trusted_identity->tenant_id);
+        trusted_user_uuid = std::move(trusted_identity->user_uuid);
+    } else {
+        auto admission_slot = FindSlot(task_session_id);
+        if (!admission_slot.ok()) {
+            return admission_slot.status();
         }
-        trusted_tenant_id = admission_slot.value()->state.tenant_id;
-        trusted_user_uuid = admission_slot.value()->state.user_uuid;
+        {
+            std::lock_guard slot_lock(admission_slot.value()->mutex);
+            if (admission_slot.value()->state.status != SessionStatus::Active) {
+                return core::Status::Error(core::ErrorCode::FailedPrecondition,
+                                           "session is not active");
+            }
+            trusted_tenant_id = admission_slot.value()->state.tenant_id;
+            trusted_user_uuid = admission_slot.value()->state.user_uuid;
+        }
     }
     const std::string user_uuid = trusted_user_uuid;
     const std::string module = options.module.empty() ? "session" : options.module;
@@ -425,7 +888,18 @@ core::Result<std::shared_ptr<SessionManager::SessionSlot>> SessionManager::FindS
     return it->second;
 }
 
-SessionSnapshot SessionManager::SnapshotLocked(const SessionState& state) const {
+void SessionManager::NotifySessionClosed(const SessionSnapshot& snapshot) const {
+    if (session_closed_callback_) {
+        session_closed_callback_(snapshot);
+    }
+    logger_.info("[trace={}] [session] closed session={} user={} persona={}",
+                 snapshot.last_trace_id.empty() ? "-" : snapshot.last_trace_id,
+                 snapshot.session_id,
+                 snapshot.user_uuid,
+                 snapshot.persona_id);
+}
+
+SessionSnapshot SessionManager::SnapshotLocked(const SessionState& state) {
     SessionSnapshot snapshot;
     snapshot.session_id = state.session_id;
     snapshot.tenant_id = state.tenant_id;

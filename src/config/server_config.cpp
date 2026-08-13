@@ -20,6 +20,12 @@ std::optional<std::filesystem::path> FindConfigPath(int argc, char** argv) {
 }
 
 void LoadConfigFile(const std::filesystem::path& path, MultimodalServerOptions& options) {
+    LoadConfigFile(path, options, ConfigSectionSelection::All());
+}
+
+void LoadConfigFile(const std::filesystem::path& path,
+                    MultimodalServerOptions& options,
+                    const ConfigSectionSelection& selection) {
     std::ifstream file(path, std::ios::binary);
     if (!file) {
         throw std::runtime_error("Failed to open config file: " + path.string());
@@ -38,13 +44,20 @@ void LoadConfigFile(const std::filesystem::path& path, MultimodalServerOptions& 
 
     options.config_file_path = std::filesystem::absolute(path);
 
-    for (const auto& section : BuildConfigSections()) {
+    for (const auto& section : BuildConfigSections(selection)) {
         section->LoadJson(root, options);
     }
 }
 
 void ApplyCliFallbackOptions(int argc, char** argv, MultimodalServerOptions& options) {
-    const auto sections = BuildConfigSections();
+    ApplyCliFallbackOptions(argc, argv, options, ConfigSectionSelection::All());
+}
+
+void ApplyCliFallbackOptions(int argc,
+                             char** argv,
+                             MultimodalServerOptions& options,
+                             const ConfigSectionSelection& selection) {
+    const auto sections = BuildConfigSections(selection);
     for (int i = 1; i < argc; ++i) {
         CliCursor cursor{argc, argv, i};
         for (const auto& section : sections) {

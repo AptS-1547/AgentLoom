@@ -15,6 +15,7 @@
 #include <optional>
 #include <shared_mutex>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -111,6 +112,8 @@ struct DispatchOptions {
 struct SessionThreadPoolStats {
     core::ThreadPoolStats compute;
     core::ThreadPoolStats io;
+    /// 完整 Persona Turn 的执行池；未注入专用池时与 io 指向同一组统计。
+    core::ThreadPoolStats llm;
 };
 
 struct SessionState {
@@ -126,9 +129,26 @@ struct SessionState {
     std::deque<ConversationTurn> recent_history;
     std::shared_ptr<const PersonalityConfig> personality;
     EmotionStateTracker emotion_state;
-    std::unique_ptr<PromptBuilder> prompt_builder;
+    std::shared_ptr<const PromptBuilder> prompt_builder;
     SessionMetrics metrics;
     std::size_t max_recent_turns = 20;
+};
+
+struct SessionTurnSnapshot {
+    std::uint64_t sequence = 0;
+    SessionState state;
+};
+
+struct SessionTurnCommit {
+    std::string trace_id;
+    ConversationTurn turn;
+    EmotionStateTracker emotion_state;
+    std::chrono::milliseconds latency{0};
+};
+
+struct SessionTurnReceipt {
+    std::uint64_t sequence = 0;
+    std::uint64_t turn_index = 0;
 };
 
 class ISessionManager {
@@ -150,15 +170,28 @@ public:
 class SessionManager final : public ISessionManager {
 public:
     using SessionTask = std::function<core::Status(SessionState&, core::ThreadPoolContext&)>;
+    using SessionTurnTask = std::function<core::Status(
+        const SessionTurnSnapshot&,
+        SessionTurnCommit&,
+        core::ThreadPoolContext&)>;
+    using SessionTurnCompletion = std::function<void(core::Result<SessionTurnReceipt>)>;
+    using SessionTurnAsyncFinish = std::function<void(core::Result<SessionTurnCommit>)>;
+    using SessionTurnAsyncTask = std::function<core::Status(
+        const SessionTurnSnapshot&,
+        core::ThreadPoolContext&,
+        SessionTurnAsyncFinish)>;
     using SessionClosedCallback = std::function<void(const SessionSnapshot&)>;
 
     /// @param compute_pool 借用的计算线程池，生命周期必须长于 SessionManager。
     /// @param io_pool 借用的 IO 线程池，生命周期必须长于 SessionManager。
+    /// @param turn_pool 可选的完整 Persona Turn 池，生命周期必须长于 SessionManager；为空时使用 io_pool。
     /// @param options 空闲超时和最近回合容量。
     SessionManager(core::ThreadPool& compute_pool,
                    core::ThreadPool& io_pool,
                    SessionOptions options = {},
-                   core::LoggerAdapter logger = core::LoggerAdapter::ForModule("service"));
+                   core::LoggerAdapter logger = core::LoggerAdapter::ForModule("service"),
+                   core::ThreadPool* turn_pool = nullptr);
+    ~SessionManager();
 
     core::Result<SessionSnapshot> CreateSession(CreateSessionRequest request) override;
     core::Result<SessionSnapshot> GetSessionSnapshot(std::string_view session_id) const override;
@@ -166,6 +199,8 @@ public:
     core::Status TouchSession(std::string_view session_id, std::string_view trace_id = {}) override;
     std::vector<SessionSnapshot> CleanupExpired() override;
     std::size_t SessionCount() const override;
+    /// 阻止新 admission，并将所有 Session 置为 Closing；已在途 Turn 完成后再通知关闭。
+    void Shutdown();
 
     core::Status AddTurn(std::string_view session_id,
                          ConversationTurn turn,
@@ -179,32 +214,66 @@ public:
     core::Status SubmitCompute(DispatchOptions options, SessionTask task);
     /// 向 IO pool 提交持有目标 session 锁的任务。
     core::Status SubmitIo(DispatchOptions options, SessionTask task);
+    /// 仅供 SessionTask 在已持有目标 SessionSlot 锁时转投 IO，避免 admission 重复加锁。
+    core::Status SubmitIoFromSessionTask(const SessionState& locked_session,
+                                         DispatchOptions options,
+                                         SessionTask task);
+    /// 以单 Session lane 串行执行完整 Turn；业务执行锁外运行，仅 snapshot/commit 持短锁。
+    core::Status SubmitTurn(DispatchOptions options,
+                            SessionTurnTask task,
+                            SessionTurnCompletion completion);
+    /// 真异步 Turn：task 发起操作后返回，finish 可在任意线程调用一次；
+    /// 仅支持能将 concurrency_key 串行保持到 deferred Complete 的 scheduler。
+    core::Status SubmitTurnAsync(DispatchOptions options,
+                                 SessionTurnAsyncTask task,
+                                 SessionTurnCompletion completion);
     SessionThreadPoolStats PoolStats() const;
     /// 设置 session 关闭通知；callback 在内部资源移除后调用，不应执行长时间阻塞操作。
     void SetSessionClosedCallback(SessionClosedCallback callback);
 
 private:
+    struct TrustedDispatchIdentity {
+        std::string tenant_id;
+        std::string user_uuid;
+    };
+
     struct SessionSlot {
         mutable std::mutex mutex;
+        // 仅用于同一 Session 的 Turn 顺序，不保护 SessionState；慢 IO 不会阻塞 Snapshot/Close。
+        mutable std::mutex turn_gate;
         SessionState state;
+        std::uint64_t next_turn_sequence = 1;
+        std::size_t outstanding_turns = 0;
+    };
+
+    class TurnOperation;
+    struct ResourceAccounting {
+        std::atomic<std::size_t> resident_sessions{0};
     };
 
     core::Status Submit(core::ThreadPool& pool,
                         std::string_view pool_role,
                         DispatchOptions options,
-                        SessionTask task);
+                        SessionTask task,
+                        std::optional<TrustedDispatchIdentity> trusted_identity = std::nullopt);
     core::Result<std::shared_ptr<SessionSlot>> FindSlot(std::string_view session_id) const;
-    SessionSnapshot SnapshotLocked(const SessionState& state) const;
+    void NotifySessionClosed(const SessionSnapshot& snapshot) const;
+    static SessionSnapshot SnapshotLocked(const SessionState& state);
     core::TraceContext MakeTrace(DispatchOptions options) const;
     std::string MakeSessionId();
 
     core::ThreadPool& compute_pool_;
     core::ThreadPool& io_pool_;
+    // 可选的完整 Turn 执行池；为空时兼容使用 IO pool。
+    core::ThreadPool* turn_pool_ = nullptr;
     SessionOptions options_;
     core::LoggerAdapter logger_;
     SessionClosedCallback session_closed_callback_;
     mutable std::shared_mutex sessions_mutex_;
     std::unordered_map<std::string, std::shared_ptr<SessionSlot>> sessions_;
+    std::size_t active_session_count_ = 0;
+    std::shared_ptr<ResourceAccounting> resource_accounting_ =
+        std::make_shared<ResourceAccounting>();
 };
 
 } // namespace agent::service::persona

@@ -1,6 +1,7 @@
 #include "persona_gateway_http_adapter.h"
 #include "persona_gateway_server.h"
 #include "persona_gateway_service.h"
+#include "persona_interaction.h"
 #include "http_server.h"
 #include "redis_connection_pool.h"
 #include "document_analysis_service.h"
@@ -65,6 +66,9 @@ using agent::document::DocumentFileStoreOptions;
 using agent::service::persona::NeutralEmotionAnalyzer;
 using agent::service::persona::PersonaRuntime;
 using agent::service::persona::PersonaRuntimeOptions;
+using agent::service::persona::PersonaInteraction;
+using agent::service::persona::PersonaSessionQuery;
+using agent::service::persona::ClosePersonaSessionRequest;
 using agent::service::persona::PersonalityConfig;
 using agent::service::persona::SemanticMemoryContextProvider;
 using agent::service::persona::SessionManager;
@@ -249,6 +253,44 @@ CreateSessionGatewayRequest MakeCreateRequest() {
     req.personality = std::move(personality);
     req.emotion_state_config.noise_sigma = 0.0;
     return req;
+}
+
+TEST(PersonaInteractionTest, EnsuresSessionAndEnforcesTrustedOwner) {
+    GatewayFixture fixture;
+    PersonaInteraction interaction(fixture.sessions, fixture.runtime);
+
+    auto request = MakeCreateRequest();
+    agent::service::persona::CreateSessionRequest create;
+    create.session_id = request.session_id;
+    create.user_uuid = request.user_uuid;
+    create.persona_id = request.persona_id;
+    create.trace_id = request.trace_id;
+    create.personality = request.personality;
+    create.emotion_state_config.noise_sigma = 0.0;
+
+    auto created = interaction.EnsureSession(create);
+    ASSERT_TRUE(created.ok()) << created.status().message();
+    auto ensured = interaction.EnsureSession(std::move(create));
+    ASSERT_TRUE(ensured.ok()) << ensured.status().message();
+    EXPECT_EQ(fixture.sessions.SessionCount(), 1u);
+
+    auto denied = interaction.GetSession(PersonaSessionQuery{
+        created.value().session_id,
+        "trace-denied",
+        "another-user",
+    });
+    EXPECT_EQ(denied.status().code(), core::ErrorCode::PermissionDenied);
+
+    auto closed = interaction.CloseSession(ClosePersonaSessionRequest{
+        created.value().session_id,
+        "trace-close",
+        request.user_uuid,
+        "consumer_close",
+    });
+    ASSERT_TRUE(closed.ok()) << closed.status().message();
+    EXPECT_EQ(closed.value().status, agent::service::persona::SessionStatus::Closed);
+    EXPECT_EQ(closed.value().close_reason, "consumer_close");
+    EXPECT_EQ(fixture.sessions.SessionCount(), 0u);
 }
 
 PersonaMetadataGatewayRequest MakePersonaMetadataRequest(std::string user_uuid = "user-gateway",
@@ -1730,7 +1772,8 @@ TEST(PersonaGatewayHttpAdapterTest, HealthRouteBypassesAuthenticatorAndReportsRe
     EXPECT_TRUE(body["data"].contains("sessionCount"));
     EXPECT_TRUE(body["data"]["pools"].contains("compute"));
     EXPECT_TRUE(body["data"]["pools"].contains("io"));
-    for (const auto* pool_name : {"compute", "io"}) {
+    EXPECT_TRUE(body["data"]["pools"].contains("llm"));
+    for (const auto* pool_name : {"compute", "io", "llm"}) {
         const auto& scheduler = body["data"]["pools"][pool_name]["scheduler"];
         EXPECT_TRUE(scheduler.contains("activeKeys"));
         EXPECT_TRUE(scheduler.contains("readyKeys"));

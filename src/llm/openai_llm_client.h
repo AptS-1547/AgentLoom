@@ -4,6 +4,7 @@
 #include "../net/http_client/retry_policy.h"
 #include <unordered_map>
 #include <chrono>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -83,6 +84,24 @@ public:
         const ChatCompletionRequest& req) = 0;
 };
 
+class IAsyncLlmOperation {
+public:
+    virtual ~IAsyncLlmOperation() = default;
+    /// 幂等取消；完成 callback 仍恰好调用一次并返回 Cancelled。
+    virtual void Cancel() noexcept = 0;
+};
+
+class IAsyncLlmClient {
+public:
+    using Callback = std::function<void(core::Result<ChatCompletionResponse>)>;
+
+    virtual ~IAsyncLlmClient() = default;
+    /// 异步执行 completion；返回句柄只用于取消，丢弃句柄不取消请求。
+    virtual core::Result<std::shared_ptr<IAsyncLlmOperation>> CompleteAsync(
+        ChatCompletionRequest request,
+        Callback callback) = 0;
+};
+
 /// OpenAI-compatible LLM client.
 ///
 /// Implements the OpenAI chat completions API format, compatible with
@@ -112,6 +131,28 @@ private:
 
     OpenAiLlmClientOptions options_;
     net::IHttpClient& http_client_;
+};
+
+/// OpenAI-compatible 真异步客户端；HTTP 等待和 retry backoff 均不占用业务线程池 worker。
+class OpenAiAsyncLlmClient final : public IAsyncLlmClient {
+public:
+    struct Impl;
+
+    static core::Result<std::unique_ptr<OpenAiAsyncLlmClient>> Create(
+        OpenAiLlmClientOptions options,
+        net::IAsyncHttpClient& http_client);
+    ~OpenAiAsyncLlmClient() override;
+
+    core::Result<std::shared_ptr<IAsyncLlmOperation>> CompleteAsync(
+        ChatCompletionRequest request,
+        Callback callback) override;
+
+    /// 幂等关闭：取消在途 completion，等待 retry runtime 收口。
+    void Shutdown() noexcept;
+
+private:
+    explicit OpenAiAsyncLlmClient(std::shared_ptr<Impl> impl);
+    std::shared_ptr<Impl> impl_;
 };
 
 struct FallbackLlmClientOptions {

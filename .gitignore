@@ -48,6 +48,7 @@ config/e2e_test.json
 dev_note/
 # Test output
 test_dumps/
+persona_gateway_static_test/
 # frontend build output
 dist/
 # test output

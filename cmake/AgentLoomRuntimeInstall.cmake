@@ -43,7 +43,10 @@ if(TARGET emotion_inference_server)
     list(APPEND BERT_INSTALL_TARGETS emotion_inference_server)
 endif()
 if(BERT_INSTALL_TARGETS)
-    install(TARGETS ${BERT_INSTALL_TARGETS} RUNTIME DESTINATION bin)
+    install(TARGETS ${BERT_INSTALL_TARGETS}
+        RUNTIME DESTINATION bin
+        COMPONENT Runtime
+        EXCLUDE_FROM_ALL)
 endif()
 
 # 复制 ONNX Runtime 运行时库

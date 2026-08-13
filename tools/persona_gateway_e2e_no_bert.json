@@ -34,6 +34,11 @@
       "worker_count": 32,
       "queue_capacity": 1024
     },
+    "llm_pool": {
+      "worker_count": 32,
+      "queue_capacity": 1024,
+      "scheduler": "session_affinity"
+    },
     "session_idle_timeout_minutes": 15,
     "session_max_recent_turns": 20,
     "runtime_recent_raw_turns": 10,

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "persona_gateway_http_adapter.h"
+#include "gateway_lifecycle.h"
 #include "persona_gateway_service.h"
 #include "persona_runtime.h"
 #include "runtime_maintenance_service.h"
@@ -49,13 +50,24 @@ struct GatewayThreadPoolConcurrencyOptions {
     std::size_t max_outstanding_per_tenant = 256;
 };
 
+struct GatewayLlmPoolOptions {
+    core::ThreadPoolOptions pool;
+    GatewayThreadPoolConcurrencyOptions concurrency{
+        .scheduler = "session_affinity",
+    };
+};
+
 struct PersonaGatewayServerOptions {
+    using LlmPoolOptions = GatewayLlmPoolOptions;
+
     ::net::HttpServerOptions http;
     GatewayAuthOptions auth;
     core::ThreadPoolOptions compute_pool;
     GatewayThreadPoolConcurrencyOptions compute_pool_concurrency;
     core::ThreadPoolOptions io_pool;
     GatewayThreadPoolConcurrencyOptions io_pool_concurrency;
+    /// 未配置时兼容沿用 IO pool 参数；显式配置后独立控制长时 Persona/LLM Turn 的并发与排队容量。
+    std::optional<GatewayLlmPoolOptions> llm_pool;
     persona::SessionOptions session;
     persona::PersonaRuntimeOptions runtime;
     std::optional<::net::StaticFileOptions> static_files;
@@ -71,6 +83,8 @@ struct PersonaGatewayServerDependencies {
     std::shared_ptr<persona::IToolMemoryProvider> tool_memory_provider;
     std::shared_ptr<persona::ISkillSessionManager> skill_session_manager;
     std::shared_ptr<llm::ILlmClient> llm_client;
+    /// 可选的真异步 Persona 主对话客户端；为空时保持同步 ILlmClient 兼容路径。
+    std::shared_ptr<llm::IAsyncLlmClient> async_llm_client;
     std::shared_ptr<document::IDocumentEmbeddingProvider> document_embedding_provider;
     std::shared_ptr<document::IDocumentLlmChunkCache> document_llm_chunk_cache;
     std::shared_ptr<semantic_cache::ISemanticCache> document_semantic_cache;
@@ -117,6 +131,7 @@ private:
     core::Status EnsureAuthSessionStore();
     core::Status EnsurePersonaMetadataStore();
     core::Status EnsureDocumentStore();
+    core::Status ConfigureLifecycle();
     void ShutdownDocumentStore();
 
     PersonaGatewayServerOptions options_;
@@ -124,6 +139,8 @@ private:
     core::LoggerAdapter logger_;
     core::ThreadPool compute_pool_;
     core::ThreadPool io_pool_;
+    // 与通用 IO pool 隔离的 Persona/LLM 等待池；其 scheduler 仍复用 Session affinity 配额语义。
+    core::ThreadPool llm_pool_;
     persona::SessionManager sessions_;
     persona::PersonaRuntime runtime_;
     ClassroomScheduler classroom_scheduler_;
@@ -138,8 +155,9 @@ private:
     PersonaGatewayHttpAdapter adapter_;
     ::net::HttpServer http_server_;
     RuntimeMaintenanceService maintenance_;
+    GatewayLifecycleCoordinator lifecycle_;
     std::shared_ptr<::net::StaticFileHandler> static_files_;
-    bool started_ = false;
+    core::Status lifecycle_configuration_status_ = core::Status::Ok();
 };
 
 } // namespace agent::service::gateway

@@ -7,6 +7,7 @@
 #include "trace_context.h"
 
 #include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <functional>
 #include <memory>
@@ -18,6 +19,42 @@
 #include <vector>
 
 namespace core {
+
+namespace detail {
+class DeferredTaskCompletionState;
+struct ThreadPoolCompletionCounters {
+    std::atomic<std::size_t> completed{0};
+    std::atomic<std::size_t> failed{0};
+    std::atomic<std::size_t> deferred_outstanding{0};
+    mutable std::mutex mutex;
+    std::condition_variable drained_cv;
+};
+}
+
+/// 将线程池任务的 scheduler 完成时刻延后到异步 continuation。
+/// token 可移动且恰好完成一次；未显式完成便析构时按 Cancelled 释放 lane。
+class DeferredTaskCompletion final {
+public:
+    DeferredTaskCompletion() = default;
+    ~DeferredTaskCompletion();
+
+    DeferredTaskCompletion(const DeferredTaskCompletion&) = delete;
+    DeferredTaskCompletion& operator=(const DeferredTaskCompletion&) = delete;
+    DeferredTaskCompletion(DeferredTaskCompletion&& other) noexcept;
+    DeferredTaskCompletion& operator=(DeferredTaskCompletion&& other) noexcept;
+
+    void Complete(Status status = Status::Ok()) noexcept;
+    bool valid() const noexcept;
+
+private:
+    explicit DeferredTaskCompletion(
+        std::shared_ptr<detail::DeferredTaskCompletionState> state) noexcept;
+
+    std::shared_ptr<detail::DeferredTaskCompletionState> state_;
+    bool active_ = false;
+
+    friend class ThreadPoolContext;
+};
 
 struct ThreadPoolOptions {
     std::size_t worker_count = 0;
@@ -91,6 +128,10 @@ public:
         return task_group_token_->AcquireChild();
     }
 
+    /// 延后当前 work item 的 scheduler 完成；worker 会立即返回池中继续处理其他任务。
+    /// 仅允许调用一次，返回 token 必须由异步 continuation 持有并最终完成。
+    Result<DeferredTaskCompletion> DeferCompletion();
+
 private:
     friend class ThreadPool;
 
@@ -111,11 +152,17 @@ private:
         task_group_token_ = token;
     }
 
+    void set_deferred_completion_state(
+        std::shared_ptr<detail::DeferredTaskCompletionState> state) noexcept {
+        deferred_completion_state_ = std::move(state);
+    }
+
     std::size_t worker_index_ = 0;
     std::string pool_name_;
     std::stop_token stop_token_;
     SharedMemoryBlock payload_;
     TaskGroupToken* task_group_token_ = nullptr;
+    std::shared_ptr<detail::DeferredTaskCompletionState> deferred_completion_state_;
 };
 
 class ThreadPool {
@@ -187,6 +234,7 @@ public:
     ThreadPoolStats Stats() const;
     std::vector<WorkerStatus> WorkerStatuses() const;
     bool running() const noexcept;
+    bool serializes_concurrency_key_until_completion() const noexcept;
 
 private:
     template <typename Fn>
@@ -236,8 +284,8 @@ private:
     std::atomic<bool> running_{false};
     std::atomic<std::size_t> active_workers_{0};
     std::atomic<std::size_t> submitted_tasks_{0};
-    std::atomic<std::size_t> completed_tasks_{0};
-    std::atomic<std::size_t> failed_tasks_{0};
+    std::shared_ptr<detail::ThreadPoolCompletionCounters> completion_counters_ =
+        std::make_shared<detail::ThreadPoolCompletionCounters>();
     std::atomic<std::size_t> rejected_tasks_{0};
 };
 

@@ -3,6 +3,7 @@
 #include "request_options.h"
 
 #include <string>
+#include <vector>
 
 #include <grpcpp/server_context.h>
 
@@ -20,6 +21,11 @@ ValidationResult Fail(std::string error);
 
 ValidationResult ValidateAuth(
     const grpc::ServerContext& context,
+    const AuthOptions& options);
+
+/// callback API 在请求离开 gRPC 线程后使用已复制的 metadata 完成认证校验。
+ValidationResult ValidateAuthMetadata(
+    const std::vector<std::pair<std::string, std::string>>& metadata,
     const AuthOptions& options);
 
 ValidationResult ValidateEmotionRequest(

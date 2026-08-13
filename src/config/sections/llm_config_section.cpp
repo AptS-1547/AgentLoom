@@ -35,12 +35,20 @@ void LlmConfigSection::LoadJson(const Json& root, MultimodalServerOptions& optio
     SetString(*section, Name(), "model", options.llm.model);
     SetInt(*section, Name(), "timeout_ms", options.llm.timeout_ms, 1000, 600000);
     SetInt(*section, Name(), "max_retries", options.llm.max_retries, 0, 10);
+    SetSize(*section, Name(), "async_http_io_threads", options.llm.async_http_io_threads, 1);
+    SetBool(*section, Name(), "http_keep_alive", options.llm.http_keep_alive);
+    SetSize(*section, Name(), "http_max_idle_connections",
+            options.llm.http_max_idle_connections, 1);
+    SetSize(*section, Name(), "http_max_idle_connections_per_origin",
+            options.llm.http_max_idle_connections_per_origin, 1);
+    SetInt(*section, Name(), "http_idle_timeout_ms",
+           options.llm.http_idle_timeout_ms, 1, 600000);
     SetBool(*section, Name(), "require_api_key", options.llm.require_api_key);
     SetBool(*section, Name(), "allow_placeholder", options.llm.allow_placeholder);
     SetBool(*section, Name(), "disable_tls_verify_on_windows", options.llm.disable_tls_verify_on_windows);
     SetString(*section, Name(), "ca_bundle_path", options.llm.ca_bundle_path);
 
-    // Paths are stored as-is (relative); resolution happens in LlmPromptStore::Load.
+    // Prompt 路径保持配置中的相对形式，由 LlmPromptStore::Load 统一解析。
     if (const Json* prompts_field = FindField(*section, Name(), "prompts")) {
         if (!prompts_field->is_object()) {
             throw std::runtime_error("llm.prompts must be an object");
@@ -71,8 +79,7 @@ bool LlmConfigSection::LoadCli(CliCursor& cursor, MultimodalServerOptions& optio
     return false;
 }
 
-// Resolve api_key: env var → file → error (if base_url is set).
-// Mirrors the auth section's token resolution pattern.
+// API key 按环境变量、文件、报错的顺序解析，与认证配置保持一致。
 namespace {
 
 std::optional<std::string> ReadKeyFromEnv(const std::string& name) {
@@ -89,7 +96,11 @@ std::string ReadKeyFromFile(const std::filesystem::path& path) {
     }
     std::string key((std::istreambuf_iterator<char>(f)),
                      std::istreambuf_iterator<char>());
-    // Trim whitespace / BOM
+    // 凭据文件按 UTF-8 读取，兼容可选 BOM，并去除首尾空白。
+    constexpr std::string_view utf8_bom = "\xEF\xBB\xBF";
+    if (key.starts_with(utf8_bom)) {
+        key.erase(0, utf8_bom.size());
+    }
     while (!key.empty() && (std::isspace(static_cast<unsigned char>(key.back())))) {
         key.pop_back();
     }
@@ -106,10 +117,10 @@ std::filesystem::path ResolveRelativeToConfig(const std::filesystem::path& p,
     return config_path.parent_path() / p;
 }
 
-}  // namespace
+}
 
 void LlmConfigSection::Validate(MultimodalServerOptions& options) const {
-    // LLM client is optional — skip validation if base_url is not configured.
+    // 未启用或未配置 base_url 时允许只使用本地 LLM。
     if (!options.llm.enabled || options.llm.base_url.empty()) {
         return;
     }
@@ -117,8 +128,16 @@ void LlmConfigSection::Validate(MultimodalServerOptions& options) const {
     if (options.llm.model.empty()) {
         throw std::runtime_error("llm.model must not be empty when base_url is set");
     }
+    if (options.llm.http_keep_alive &&
+        options.llm.http_max_idle_connections_per_origin >
+            options.llm.http_max_idle_connections) {
+        // 单 origin 空闲连接属于全局空闲连接集合，不能超过其全局上限。
+        throw std::runtime_error(
+            "llm.http_max_idle_connections_per_origin must not exceed "
+            "llm.http_max_idle_connections");
+    }
 
-    // api_key_env → api_key_file → error
+    // 环境变量优先于文件，避免配置文件覆盖部署时注入的凭据。
     if (auto key = ReadKeyFromEnv(options.llm.api_key_env)) {
         options.llm.api_key = *key;
         return;
@@ -141,8 +160,8 @@ void LlmConfigSection::Validate(MultimodalServerOptions& options) const {
     }
 }
 
-} // namespace
+}
 
 REGISTER_CONFIG_SECTION(LlmConfigSection)
 
-} // namespace server_config
+}

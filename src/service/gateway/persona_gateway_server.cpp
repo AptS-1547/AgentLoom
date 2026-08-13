@@ -37,6 +37,26 @@ core::ThreadPoolOptions ResolvePoolOptions(
     return options;
 }
 
+core::ThreadPoolOptions ResolveLlmPoolOptions(
+    const PersonaGatewayServerOptions& gateway) {
+    auto options = gateway.llm_pool
+        ? gateway.llm_pool->pool
+        : gateway.io_pool;
+    const auto& concurrency = gateway.llm_pool
+        ? gateway.llm_pool->concurrency
+        : gateway.io_pool_concurrency;
+    options.name = "gateway-llm-pool";
+    // LLM lane 必须在调度器内按 Session 排队，不能让后续同 Session Turn 占用 worker 等 mutex。
+    options.scheduler = std::make_shared<persona::GatewaySessionAffinityScheduler>(
+        persona::GatewaySessionAffinitySchedulerOptions{
+            .max_active_keys = concurrency.max_active_keys,
+            .max_outstanding_per_key = concurrency.max_outstanding_per_key,
+            .max_outstanding_per_fairness_key = concurrency.max_outstanding_per_fairness_key,
+            .max_outstanding_per_tenant = concurrency.max_outstanding_per_tenant,
+        });
+    return options;
+}
+
 ::net::HttpServerOptions ResolveHttpOptions(const PersonaGatewayServerOptions& options) {
     auto http = options.http;
     if (!http.request_filter.enabled) {
@@ -120,7 +140,8 @@ PersonaGatewayServer::PersonaGatewayServer(PersonaGatewayServerOptions options,
           options_.io_pool,
           options_.io_pool_concurrency,
           "gateway-io-pool")),
-      sessions_(compute_pool_, io_pool_, options_.session, logger_),
+      llm_pool_(ResolveLlmPoolOptions(options_)),
+      sessions_(compute_pool_, io_pool_, options_.session, logger_, &llm_pool_),
       runtime_(sessions_,
                dependencies_.memory_provider,
                dependencies_.emotion_analyzer,
@@ -129,7 +150,9 @@ PersonaGatewayServer::PersonaGatewayServer(PersonaGatewayServerOptions options,
                nullptr,
                dependencies_.tool_memory_provider,
                dependencies_.skill_session_manager,
-               logger_),
+               logger_,
+               nullptr,
+               dependencies_.async_llm_client),
       classroom_scheduler_({}, core::LoggerAdapter::ForModule("classroom")),
       auth_session_store_(MakeAuthSessionStore(options_.auth, auth_redis_)),
       persona_metadata_store_(MakePersonaMetadataStore(options_.auth, options_.default_personas, dependencies_, auth_redis_)),
@@ -161,7 +184,8 @@ PersonaGatewayServer::PersonaGatewayServer(PersonaGatewayServerOptions options,
                    .enable_path_analyze_test_endpoint =
                        options_.document_store.enable_path_analyze_test_endpoint}),
       http_server_(ResolveHttpOptions(options_)),
-      maintenance_(core::LoggerAdapter::ForModule("gateway")) {
+      maintenance_(core::LoggerAdapter::ForModule("gateway")),
+      lifecycle_(core::LoggerAdapter::ForModule("gateway")) {
     if (dependencies_.l0_memory_adapter) {
         auto l0 = dependencies_.l0_memory_adapter;
         sessions_.SetSessionClosedCallback([l0 = std::move(l0)](const persona::SessionSnapshot& snapshot) {
@@ -186,6 +210,11 @@ PersonaGatewayServer::PersonaGatewayServer(PersonaGatewayServerOptions options,
     for (const auto& task : dependencies_.maintenance_tasks) {
         static_cast<void>(maintenance_.RegisterTask(task));
     }
+    if (options_.document_store.enabled) {
+        static_cast<void>(maintenance_.RegisterTask(std::make_shared<DocumentRetentionMaintenanceTask>(
+            document_service_,
+            std::chrono::seconds(options_.document_store.cleanup_interval_seconds))));
+    }
 
     http_server_.SetHttpRequestHandler([this](std::shared_ptr<::net::IHttpRequest> request) {
         HandleHttp(std::move(request));
@@ -196,6 +225,7 @@ PersonaGatewayServer::PersonaGatewayServer(PersonaGatewayServerOptions options,
     http_server_.SetWebSocketCloseHandler([this](const ::net::ConnectionCloseInfo& close_info) {
         HandleWebSocketClose(close_info);
     });
+    lifecycle_configuration_status_ = ConfigureLifecycle();
 }
 
 PersonaGatewayServer::~PersonaGatewayServer() {
@@ -203,7 +233,7 @@ PersonaGatewayServer::~PersonaGatewayServer() {
 }
 
 core::Status PersonaGatewayServer::RegisterMaintenanceTask(std::shared_ptr<IRuntimeMaintenanceTask> task) {
-    if (started_ || maintenance_.running()) {
+    if (lifecycle_.state() != GatewayLifecycleState::Stopped || maintenance_.running()) {
         return core::Status::Error(core::ErrorCode::FailedPrecondition,
                                    "maintenance tasks must be registered before server start");
     }
@@ -211,71 +241,107 @@ core::Status PersonaGatewayServer::RegisterMaintenanceTask(std::shared_ptr<IRunt
 }
 
 core::Status PersonaGatewayServer::Start() {
-    if (started_) {
-        return core::Status::Ok();
+    if (!lifecycle_configuration_status_.ok()) {
+        return lifecycle_configuration_status_;
     }
-    auto dependency_status = ValidateDependencies();
-    if (!dependency_status.ok()) {
-        return dependency_status;
+    auto status = lifecycle_.Start();
+    if (!status.ok()) {
+        return status;
     }
-    auto auth_store_status = EnsureAuthSessionStore();
-    if (!auth_store_status.ok()) {
-        return auth_store_status;
-    }
-    auto persona_metadata_status = EnsurePersonaMetadataStore();
-    if (!persona_metadata_status.ok()) {
-        return persona_metadata_status;
-    }
-    auto document_store_status = EnsureDocumentStore();
-    if (!document_store_status.ok()) {
-        return document_store_status;
-    }
-
-    auto compute_status = compute_pool_.Start();
-    if (!compute_status.ok()) {
-        ShutdownDocumentStore();
-        return compute_status;
-    }
-
-    auto io_status = io_pool_.Start();
-    if (!io_status.ok()) {
-        ShutdownDocumentStore();
-        compute_pool_.Shutdown(false);
-        return io_status;
-    }
-
-    if (options_.document_store.enabled) {
-        auto document_task_status = maintenance_.RegisterTask(std::make_shared<DocumentRetentionMaintenanceTask>(
-            document_service_,
-            std::chrono::seconds(options_.document_store.cleanup_interval_seconds)));
-        if (!document_task_status.ok() && document_task_status.code() != core::ErrorCode::AlreadyExists) {
-            ShutdownDocumentStore();
-            io_pool_.Shutdown(false);
-            compute_pool_.Shutdown(false);
-            return document_task_status;
-        }
-    }
-
-    auto maintenance_status = maintenance_.Start();
-    if (!maintenance_status.ok()) {
-        ShutdownDocumentStore();
-        io_pool_.Shutdown(false);
-        compute_pool_.Shutdown(false);
-        return maintenance_status;
-    }
-
-    auto http_status = http_server_.Start();
-    if (!http_status.ok()) {
-        maintenance_.Stop();
-        ShutdownDocumentStore();
-        io_pool_.Shutdown(false);
-        compute_pool_.Shutdown(false);
-        return http_status;
-    }
-
-    started_ = true;
     logger_.info("[gateway] started http_port={} ws_path={}", http_server_.port(), options_.websocket_path);
     return core::Status::Ok();
+}
+
+core::Status PersonaGatewayServer::ConfigureLifecycle() {
+    auto register_component = [this](std::string name,
+                                     CallbackGatewayLifecycleComponent::StartCallback start,
+                                     CallbackGatewayLifecycleComponent::StopCallback stop) {
+        return lifecycle_.Register(std::make_shared<CallbackGatewayLifecycleComponent>(
+            std::move(name), std::move(start), std::move(stop)));
+    };
+
+    auto status = register_component(
+        "reference-storage",
+        [this]() {
+            if (auto value = ValidateDependencies(); !value.ok()) {
+                return value;
+            }
+            if (auto value = EnsureAuthSessionStore(); !value.ok()) {
+                return value;
+            }
+            if (auto value = EnsurePersonaMetadataStore(); !value.ok()) {
+                return value;
+            }
+            return EnsureDocumentStore();
+        },
+        [this](std::chrono::steady_clock::time_point) {
+            if (auth_redis_) {
+                auth_redis_->Shutdown();
+            }
+            ShutdownDocumentStore();
+            return core::Status::Ok();
+        });
+    if (!status.ok()) {
+        return status;
+    }
+    status = register_component(
+        "compute-pool",
+        [this]() { return compute_pool_.Start(); },
+        [this](std::chrono::steady_clock::time_point) {
+            compute_pool_.Shutdown(true);
+            return core::Status::Ok();
+        });
+    if (!status.ok()) {
+        return status;
+    }
+    status = register_component(
+        "io-pool",
+        [this]() { return io_pool_.Start(); },
+        [this](std::chrono::steady_clock::time_point) {
+            io_pool_.Shutdown(true);
+            return core::Status::Ok();
+        });
+    if (!status.ok()) {
+        return status;
+    }
+    status = register_component(
+        "llm-pool",
+        [this]() { return llm_pool_.Start(); },
+        [this](std::chrono::steady_clock::time_point) {
+            llm_pool_.Shutdown(true);
+            return core::Status::Ok();
+        });
+    if (!status.ok()) {
+        return status;
+    }
+    status = register_component(
+        "sessions",
+        []() { return core::Status::Ok(); },
+        [this](std::chrono::steady_clock::time_point) {
+            sessions_.Shutdown();
+            runtime_.Shutdown();
+            return core::Status::Ok();
+        });
+    if (!status.ok()) {
+        return status;
+    }
+    status = register_component(
+        "maintenance",
+        [this]() { return maintenance_.Start(); },
+        [this](std::chrono::steady_clock::time_point) {
+            maintenance_.Stop();
+            return core::Status::Ok();
+        });
+    if (!status.ok()) {
+        return status;
+    }
+    return register_component(
+        "http-ingress",
+        [this]() { return http_server_.Start(); },
+        [this](std::chrono::steady_clock::time_point) {
+            http_server_.Stop();
+            return core::Status::Ok();
+        });
 }
 
 core::Status PersonaGatewayServer::EnsureAuthSessionStore() {
@@ -356,19 +422,12 @@ void PersonaGatewayServer::ShutdownDocumentStore() {
 }
 
 void PersonaGatewayServer::Stop() {
-    if (!started_ && !http_server_.running()) {
-        return;
+    const auto status = lifecycle_.Stop();
+    if (!status.ok()) {
+        logger_.error("[gateway] stop failed: {}", status.message());
+    } else {
+        logger_.info("[gateway] stopped");
     }
-    http_server_.Stop();
-    maintenance_.Stop();
-    io_pool_.Shutdown(true);
-    compute_pool_.Shutdown(true);
-    if (auth_redis_) {
-        auth_redis_->Shutdown();
-    }
-    ShutdownDocumentStore();
-    started_ = false;
-    logger_.info("[gateway] stopped");
 }
 
 bool PersonaGatewayServer::running() const noexcept {

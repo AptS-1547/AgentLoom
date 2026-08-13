@@ -430,6 +430,19 @@ ValidationResult Fail(std::string error) {
 ValidationResult ValidateAuth(
     const grpc::ServerContext& context,
     const AuthOptions& options) {
+    std::vector<std::pair<std::string, std::string>> metadata;
+    metadata.reserve(context.client_metadata().size());
+    for (const auto& [key, value] : context.client_metadata()) {
+        metadata.emplace_back(
+            std::string(key.data(), key.length()),
+            std::string(value.data(), value.length()));
+    }
+    return ValidateAuthMetadata(metadata, options);
+}
+
+ValidationResult ValidateAuthMetadata(
+    const std::vector<std::pair<std::string, std::string>>& metadata,
+    const AuthOptions& options) {
     if (options.token.empty()) {
         return Ok();
     }
@@ -438,10 +451,8 @@ ValidationResult ValidateAuth(
     }
 
     const std::string key = ToLowerAscii(options.metadata_key);
-    const auto range = context.client_metadata().equal_range(key);
-    for (auto it = range.first; it != range.second; ++it) {
-        const std::string_view value(it->second.data(), it->second.length());
-        if (ConstantTimeEquals(value, options.token)) {
+    for (const auto& [metadata_key, value] : metadata) {
+        if (ToLowerAscii(metadata_key) == key && ConstantTimeEquals(value, options.token)) {
             return Ok();
         }
     }

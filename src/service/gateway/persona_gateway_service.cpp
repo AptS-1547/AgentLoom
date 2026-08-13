@@ -670,6 +670,7 @@ PersonaGatewayService::PersonaGatewayService(persona::SessionManager& sessions,
                                              core::LoggerAdapter logger)
     : sessions_(sessions),
       runtime_(runtime),
+      interaction_(sessions, runtime, logger),
       classroom_scheduler_(classroom_scheduler),
       report_evaluator_(std::move(report_evaluator)),
       persona_metadata_store_(std::move(persona_metadata_store)),
@@ -778,7 +779,7 @@ core::Result<SessionGatewayResponse> PersonaGatewayService::CreateSession(Create
     create.emotion_state_config = request.emotion_state_config;
     create.time_awareness = true;
 
-    auto snapshot = sessions_.CreateSession(std::move(create));
+    auto snapshot = interaction_.CreateSession(std::move(create));
     if (!snapshot.ok()) {
         return snapshot.status();
     }
@@ -855,12 +856,10 @@ core::Result<SessionGatewayResponse> PersonaGatewayService::GetSession(std::stri
                                                                        std::string_view authenticated_user_uuid) {
     const auto started = std::chrono::steady_clock::now();
     trace_id = EnsureTrace(std::move(trace_id));
-    auto snapshot = sessions_.GetSessionSnapshot(session_id);
+    auto snapshot = interaction_.GetSession(persona::PersonaSessionQuery{
+        std::string(session_id), trace_id, std::string(authenticated_user_uuid)});
     if (!snapshot.ok()) {
         return snapshot.status();
-    }
-    if (auto owner = EnsureSessionOwner(snapshot.value(), authenticated_user_uuid); !owner.ok()) {
-        return owner;
     }
     SessionGatewayResponse response;
     response.trace_id = trace_id;
@@ -873,18 +872,16 @@ core::Result<SessionGatewayResponse> PersonaGatewayService::GetSession(std::stri
 core::Result<SessionGatewayResponse> PersonaGatewayService::CloseSession(CloseSessionGatewayRequest request) {
     const auto started = std::chrono::steady_clock::now();
     request.trace_id = EnsureTrace(std::move(request.trace_id));
-    auto before = sessions_.GetSessionSnapshot(request.session_id);
-    if (!before.ok()) {
-        return before.status();
+    auto closed = interaction_.CloseSession(persona::ClosePersonaSessionRequest{
+        request.session_id,
+        request.trace_id,
+        request.authenticated_user_uuid,
+        request.reason,
+    });
+    if (!closed.ok()) {
+        return closed.status();
     }
-    if (auto owner = EnsureSessionOwner(before.value(), request.authenticated_user_uuid); !owner.ok()) {
-        return owner;
-    }
-    auto close = sessions_.CloseSession(request.session_id, request.trace_id);
-    if (!close.ok()) {
-        return close;
-    }
-    auto snapshot = std::move(before).value();
+    auto snapshot = std::move(closed).value();
     if (classroom_scheduler_) {
         auto unregister_status = classroom_scheduler_->UnregisterSession(request.session_id);
         if (!unregister_status.ok() && unregister_status.code() != core::ErrorCode::NotFound) {
@@ -894,9 +891,6 @@ core::Result<SessionGatewayResponse> PersonaGatewayService::CloseSession(CloseSe
                          unregister_status.message());
         }
     }
-    snapshot.status = persona::SessionStatus::Closed;
-    snapshot.close_reason = request.reason.empty() ? "client_close" : request.reason;
-
     SessionGatewayResponse response;
     response.trace_id = request.trace_id;
     response.session_id = snapshot.session_id;
@@ -1023,8 +1017,9 @@ core::Result<SystemStatsGatewayResponse> PersonaGatewayService::SystemStats(std:
     SystemStatsGatewayResponse response;
     response.trace_id = EnsureTrace(std::move(trace_id));
     response.latency = Since(started);
-    response.session_count = sessions_.SessionCount();
-    response.pools = sessions_.PoolStats();
+    const auto snapshot = interaction_.SystemSnapshot();
+    response.session_count = snapshot.session_count;
+    response.pools = snapshot.pools;
     return response;
 }
 
@@ -1058,8 +1053,8 @@ core::Status PersonaGatewayService::SubmitChat(ChatGatewayRequest request, ChatC
     chat.model = request.model;
     chat.context_id = request.mode;
 
-    auto status = runtime_.SubmitChat(
-        std::move(chat),
+    auto status = interaction_.SubmitTurn(
+        persona::PersonaTurnRequest{std::move(chat), request.authenticated_user_uuid},
         [this, request = std::move(request), callback = std::move(callback), started](
             core::Result<persona::ChatResponse> result) mutable {
             if (!result.ok()) {

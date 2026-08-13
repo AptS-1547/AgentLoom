@@ -23,6 +23,8 @@ add_library(agent_emotion_server STATIC
     src/server/grpc/grpc_error.h
     src/server/grpc/async_emotion_grpc_service.cpp
     src/server/grpc/async_emotion_grpc_service.h
+    src/server/grpc/async_emotion_inference_handler.cpp
+    src/server/grpc/async_emotion_inference_handler.h
     src/server/grpc/emotion_grpc_service.cpp
     src/server/grpc/emotion_grpc_service.h
     src/service/inference/emotion_inference_service.cpp

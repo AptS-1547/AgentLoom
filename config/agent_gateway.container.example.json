@@ -27,6 +27,11 @@
       "worker_count": 8,
       "queue_capacity": 1024
     },
+    "llm_pool": {
+      "worker_count": 8,
+      "queue_capacity": 1024,
+      "scheduler": "session_affinity"
+    },
     "request_filter": {
       "enabled": true,
       "reject_control_chars": true,
@@ -70,6 +75,11 @@
     "model": "deepseek-chat",
     "timeout_ms": 30000,
     "max_retries": 2,
+    "async_http_io_threads": 4,
+    "http_keep_alive": true,
+    "http_max_idle_connections": 128,
+    "http_max_idle_connections_per_origin": 64,
+    "http_idle_timeout_ms": 30000,
     "require_api_key": true,
     "allow_placeholder": false,
     "disable_tls_verify_on_windows": false

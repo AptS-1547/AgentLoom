@@ -81,12 +81,15 @@ add_subdirectory(path/to/AgentLoom)
 target_link_libraries(my_agent PRIVATE
     AgentLoom::core
     AgentLoom::runtime
-    AgentLoom::service
-    AgentLoom::gateway
+    AgentLoom::gateway_foundation
+    AgentLoom::persona_interaction
+    AgentLoom::gateway_routing
 )
 ```
 
-当前公开别名包括 `core`、`net`、`tls`、`http_client`、`config`、`storage`、`vector_storage`、`vector`、`semantic_cache`、`memory`、`document`、`conversation`、`llm`、`models`、`cache`、`ipc`、`media_inference`、`media`、`runtime`、`gateway` 和 `service`。
+`AgentLoom::gateway` 是上述三项通用 Gateway 组件的兼容聚合 target，不会引入 JWT/Cookie、Document、Classroom、参考 Route 或参考 Server。参考产品需要完整参考 Gateway 时，可在启用 `AGENTLOOM_BUILD_REFERENCE_GATEWAY` 后额外链接 `AgentLoom::reference_gateway`。
+
+当前公开别名包括 `core`、`net`、`tls`、`http_client`、`config`、`storage`、`vector_storage`、`vector`、`semantic_cache`、`memory`、`document`、`conversation`、`llm`、`models`、`cache`、`ipc`、`media_inference`、`media`、`runtime`、`gateway_foundation`、`persona_interaction`、`gateway_routing`、`gateway`、`reference_gateway`（仅启用参考 Gateway 时）和 `service`。
 
 也可以安装静态库、头文件和 CMake package 后通过 `find_package()` 复用：
 
@@ -100,12 +103,24 @@ find_package(AgentLoom CONFIG REQUIRED)
 
 target_link_libraries(my_agent PRIVATE
     AgentLoom::core
+    AgentLoom::config
     AgentLoom::runtime
-    AgentLoom::gateway
+    AgentLoom::gateway_foundation
+    AgentLoom::persona_interaction
+    AgentLoom::gateway_routing
 )
 ```
 
-消费端将安装前缀加入 `CMAKE_PREFIX_PATH`，公共头文件使用 `#include <AgentLoom/core/result.h>` 形式。静态库仍要求消费端使用兼容的编译器、C++ Runtime 和第三方依赖 ABI；完整依赖定位与覆盖变量见 [扩展 AgentLoom](docs/EXTENDING_AGENTLOOM.md)。
+消费端将安装前缀加入 `CMAKE_PREFIX_PATH`，公共头文件使用 `#include <AgentLoom/core/result.h>` 形式。安装包会从自身前缀定位 SQLite、ONNX Runtime、Faiss、Eigen 和 tokenizer 依赖，并通过标准 CMake package 查找 Boost、gRPC、Protobuf、OpenSSL 等依赖；消费端不需要引用 AgentLoom 的源码树或构建树。
+
+静态注册的 ConfigSection 需要保留整个静态库，可使用安装包提供的跨平台辅助函数：
+
+```cmake
+agentloom_link_whole_archive(my_agent AgentLoom::config)
+agentloom_link_whole_archive(my_agent my_config_sections)
+```
+
+只需要部分配置 section 的程序可用 `ConfigSectionSelection::Only({"llm", "gateway"})` 选择性加载和校验，未选中的服务器专用 section 不会施加参数约束。静态库仍要求消费端使用兼容的编译器、C++ Runtime 和第三方依赖 ABI；完整依赖定位与覆盖变量见 [扩展 AgentLoom](docs/EXTENDING_AGENTLOOM.md)。
 
 ## 构建
 
@@ -113,8 +128,8 @@ target_link_libraries(my_agent PRIVATE
 
 - Visual Studio 2026/v145（Windows），或 GCC 11+/Clang 14+（Linux）
 - CMake 3.20+
-- vcpkg manifest 依赖：gRPC、Protobuf、OpenSSL、spdlog、Redis clients、libzip、pugixml、nlohmann/json；测试另需 GTest
-- 预编译/外部依赖：ONNX Runtime、llama.cpp（含 mtmd）、OpenCV、Boost、SQLite、Faiss、Eigen、MKL 和 HuggingFace Tokenizers C API
+- vcpkg manifest 依赖：gRPC、Protobuf、OpenSSL、spdlog、Redis clients、Boost.Asio/Redis/Interprocess、libzip、pugixml、nlohmann/json；测试另需 GTest
+- 预编译/外部依赖：ONNX Runtime、llama.cpp（含 mtmd）、OpenCV、SQLite、Faiss、Eigen、MKL 和 HuggingFace Tokenizers C API
 - **工具链说明**：截至 2026-07-16，使用 VS2026/v145 构建启用 CUDA 的 llama.cpp 仍受 CUDA Toolkit 兼容性限制，因此当前 CUDA 基线由 VS2022/v143 构建。真实 Qwen2.5-VL E2E 已确认，VS2026/v145 Release 宿主加载 VS2022/v143 Debug llama.cpp 会在 token generation 的 `llama_decode()` 中触发 ABI 崩溃；将 llama.cpp 改为 Release 后，同一共享内存 E2E 完整通过。Debug/Release CRT 配置必须一致，工具集版本也应尽量一致。
 
 仓库的 `deps/` 与 `vcpkg_installed/` 是本地依赖目录，不随源码分发。Linux 脚本可以准备对应依赖；Windows 需要按本机路径准备依赖，并确保 CMake generator、MSVC 工具集和 vcpkg ABI 一致。

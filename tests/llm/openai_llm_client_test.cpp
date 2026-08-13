@@ -5,9 +5,10 @@
 #include <boost/beast.hpp>
 #include <gtest/gtest.h>
 #include <atomic>
+#include <deque>
 #include <filesystem>
 #include <fstream>
-#include <atomic>
+#include <future>
 #include <memory>
 #include <string>
 #include <thread>
@@ -26,6 +27,7 @@ using agent::llm::LocalLlmRequest;
 using agent::llm::LocalLlmResponse;
 using agent::llm::OpenAiLlmClient;
 using agent::llm::OpenAiLlmClientOptions;
+using agent::llm::OpenAiAsyncLlmClient;
 using agent::net::BeastHttpClient;
 using agent::net::BeastHttpClientOptions;
 
@@ -159,6 +161,63 @@ private:
     std::string name_;
     core::Status status_;
 };
+
+class ScriptedAsyncHttpOperation final : public agent::net::IAsyncHttpOperation {
+public:
+    explicit ScriptedAsyncHttpOperation(agent::net::IAsyncHttpClient::Callback callback = {})
+        : callback_(std::move(callback)) {}
+
+    void Cancel() noexcept override {
+        if (completed_.exchange(true, std::memory_order_acq_rel)) {
+            return;
+        }
+        if (callback_) {
+            callback_(core::Status::Error(core::ErrorCode::Cancelled,
+                                          "scripted HTTP operation cancelled"));
+        }
+    }
+
+private:
+    agent::net::IAsyncHttpClient::Callback callback_;
+    std::atomic<bool> completed_{false};
+};
+
+class ScriptedAsyncHttpClient final : public agent::net::IAsyncHttpClient {
+public:
+    core::Result<std::shared_ptr<agent::net::IAsyncHttpOperation>> ExecuteAsync(
+        agent::net::HttpClientRequest request,
+        Callback callback) override {
+        ++call_count;
+        last_request = std::move(request);
+        if (hold_response) {
+            auto operation = std::make_shared<ScriptedAsyncHttpOperation>(std::move(callback));
+            last_operation = operation;
+            return std::static_pointer_cast<agent::net::IAsyncHttpOperation>(operation);
+        }
+        if (responses.empty()) {
+            return core::Status::Error(core::ErrorCode::InternalError,
+                                       "scripted HTTP response is missing");
+        }
+        auto response = std::move(responses.front());
+        responses.pop_front();
+        callback(std::move(response));
+        return std::static_pointer_cast<agent::net::IAsyncHttpOperation>(
+            std::make_shared<ScriptedAsyncHttpOperation>());
+    }
+
+    std::deque<core::Result<agent::net::HttpClientResponse>> responses;
+    agent::net::HttpClientRequest last_request;
+    std::shared_ptr<ScriptedAsyncHttpOperation> last_operation;
+    int call_count = 0;
+    bool hold_response = false;
+};
+
+agent::net::HttpClientResponse MakeHttpResponse(int status, std::string body) {
+    agent::net::HttpClientResponse response;
+    response.status = status;
+    response.body = std::move(body);
+    return response;
+}
 
 class FakeLocalLlm final : public ILocalLlm {
 public:
@@ -390,6 +449,85 @@ TEST(OpenAiLlmClientRetryTest, FourXxIsNotRetried) {
     auto client = OpenAiLlmClient::Create(opts, *http).value();
     client->Complete({});
     EXPECT_EQ(behavior->call_count.load(), 1);
+}
+
+TEST(OpenAiAsyncLlmClientTest, ImmediateTransportCallbackCompletesExactlyOnce) {
+    ScriptedAsyncHttpClient http;
+    http.responses.emplace_back(MakeHttpResponse(200, kValidResponse));
+    OpenAiLlmClientOptions options;
+    options.base_url = "http://127.0.0.1:8080/v1";
+    options.api_key = "key";
+    options.retry_policy.max_retries = 0;
+    auto created = OpenAiAsyncLlmClient::Create(options, http);
+    ASSERT_TRUE(created.ok()) << created.status().message();
+    auto client = std::move(created).value();
+
+    std::promise<core::Result<ChatCompletionResponse>> completed;
+    auto future = completed.get_future();
+    std::atomic<int> callback_count = 0;
+    auto submitted = client->CompleteAsync({}, [&](auto result) {
+        ++callback_count;
+        completed.set_value(std::move(result));
+    });
+
+    ASSERT_TRUE(submitted.ok()) << submitted.status().message();
+    auto result = future.get();
+    ASSERT_TRUE(result.ok()) << result.status().message();
+    EXPECT_EQ(result.value().content, "42");
+    EXPECT_EQ(callback_count.load(), 1);
+    EXPECT_EQ(http.call_count, 1);
+    EXPECT_NE(http.last_request.body.find("deepseek-chat"), std::string::npos);
+}
+
+TEST(OpenAiAsyncLlmClientTest, FiveXxRetryUsesTimerAndDoesNotBlockSubmission) {
+    ScriptedAsyncHttpClient http;
+    http.responses.emplace_back(MakeHttpResponse(503, kServerErrorResponse));
+    http.responses.emplace_back(MakeHttpResponse(200, kValidResponse));
+    OpenAiLlmClientOptions options;
+    options.base_url = "http://127.0.0.1:8080/v1";
+    options.api_key = "key";
+    options.retry_policy.max_retries = 1;
+    options.retry_policy.initial_delay = std::chrono::milliseconds(100);
+    auto client = OpenAiAsyncLlmClient::Create(options, http).value();
+
+    std::promise<core::Result<ChatCompletionResponse>> completed;
+    auto future = completed.get_future();
+    const auto started = std::chrono::steady_clock::now();
+    auto submitted = client->CompleteAsync({}, [&completed](auto result) {
+        completed.set_value(std::move(result));
+    });
+    const auto submit_elapsed = std::chrono::steady_clock::now() - started;
+
+    ASSERT_TRUE(submitted.ok());
+    EXPECT_LT(std::chrono::duration_cast<std::chrono::milliseconds>(submit_elapsed).count(), 50);
+    EXPECT_EQ(future.wait_for(std::chrono::milliseconds(30)), std::future_status::timeout);
+    auto result = future.get();
+    ASSERT_TRUE(result.ok()) << result.status().message();
+    EXPECT_EQ(http.call_count, 2);
+}
+
+TEST(OpenAiAsyncLlmClientTest, CancelPropagatesAndCompletesExactlyOnce) {
+    ScriptedAsyncHttpClient http;
+    http.hold_response = true;
+    OpenAiLlmClientOptions options;
+    options.base_url = "http://127.0.0.1:8080/v1";
+    options.api_key = "key";
+    auto client = OpenAiAsyncLlmClient::Create(options, http).value();
+
+    std::promise<core::Status> completed;
+    auto future = completed.get_future();
+    std::atomic<int> callback_count = 0;
+    auto submitted = client->CompleteAsync({}, [&](auto result) {
+        ++callback_count;
+        completed.set_value(result.ok() ? core::Status::Ok() : result.status());
+    });
+    ASSERT_TRUE(submitted.ok());
+    auto operation = std::move(submitted).value();
+    operation->Cancel();
+    operation->Cancel();
+
+    EXPECT_EQ(future.get().code(), core::ErrorCode::Cancelled);
+    EXPECT_EQ(callback_count.load(), 1);
 }
 
 // ── unit: LlmPromptStore ─────────────────────────────────────────────────────

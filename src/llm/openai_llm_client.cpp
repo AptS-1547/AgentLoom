@@ -1,8 +1,13 @@
 #include "openai_llm_client.h"
+#include "logger_adapter.h"
+
+#include <boost/asio.hpp>
 #include <nlohmann/json.hpp>
+#include <atomic>
 #include <exception>
 #include <fstream>
 #include <thread>
+#include <unordered_map>
 
 namespace agent::llm {
 
@@ -283,6 +288,335 @@ core::Result<ChatCompletionResponse> OpenAiLlmClient::ExecuteWithRetry(
     }
 
     return last_result_status;
+}
+
+namespace {
+
+net::HttpClientRequest BuildHttpRequest(const OpenAiLlmClientOptions& options,
+                                        const ChatCompletionRequest& request) {
+    auto url = options.base_url;
+    if (url.back() != '/') {
+        url.push_back('/');
+    }
+    url += "chat/completions";
+
+    net::HttpClientRequest http_request;
+    http_request.method = "POST";
+    http_request.url = std::move(url);
+    http_request.headers.push_back({"Content-Type", "application/json"});
+    if (!options.api_key.empty()) {
+        http_request.headers.push_back({"Authorization", "Bearer " + options.api_key});
+    }
+    http_request.body = BuildRequestJson(request, options.default_model)
+        .dump(-1, ' ', false, Json::error_handler_t::replace);
+    http_request.timeout_ms = options.timeout_ms;
+    return http_request;
+}
+
+class AsyncOpenAiOperation;
+
+} // namespace
+
+struct OpenAiAsyncLlmClient::Impl final
+    : public std::enable_shared_from_this<OpenAiAsyncLlmClient::Impl> {
+    using WorkGuard = boost::asio::executor_work_guard<boost::asio::io_context::executor_type>;
+
+    Impl(OpenAiLlmClientOptions client_options, net::IAsyncHttpClient& client)
+        : options(std::move(client_options)),
+          http_client(client),
+          retry_guard(boost::asio::make_work_guard(retry_context)),
+          logger(core::LoggerAdapter::ForModule("async-llm-client")) {}
+
+    core::Status Start() {
+        try {
+            auto self = shared_from_this();
+            retry_thread = std::thread([self] {
+                try {
+                    self->retry_context.run();
+                } catch (const std::exception& error) {
+                    self->logger.error("异步 LLM retry runtime 异常退出: {}", error.what());
+                } catch (...) {
+                    self->logger.error("异步 LLM retry runtime 发生未知异常");
+                }
+            });
+            return core::Status::Ok();
+        } catch (const std::exception& error) {
+            retry_guard.reset();
+            retry_context.stop();
+            return core::Status::Error(
+                core::ErrorCode::InternalError,
+                std::string("failed to start async LLM retry runtime: ") + error.what());
+        }
+    }
+
+    core::Status Register(const std::shared_ptr<AsyncOpenAiOperation>& operation) {
+        std::lock_guard lock(mutex);
+        if (stopping) {
+            return core::Status::Error(core::ErrorCode::Cancelled,
+                                       "async LLM client is shutting down");
+        }
+        operations.emplace(operation.get(), operation);
+        return core::Status::Ok();
+    }
+
+    void Unregister(AsyncOpenAiOperation* operation) noexcept {
+        std::lock_guard lock(mutex);
+        operations.erase(operation);
+    }
+
+    void Shutdown() noexcept;
+
+    OpenAiLlmClientOptions options;
+    net::IAsyncHttpClient& http_client;
+    boost::asio::io_context retry_context;
+    WorkGuard retry_guard;
+    core::LoggerAdapter logger;
+    std::thread retry_thread;
+    std::mutex mutex;
+    bool stopping = false;
+    std::unordered_map<AsyncOpenAiOperation*, std::shared_ptr<AsyncOpenAiOperation>> operations;
+};
+
+namespace {
+
+class AsyncOpenAiOperation final : public IAsyncLlmOperation,
+                                   public std::enable_shared_from_this<AsyncOpenAiOperation> {
+public:
+    AsyncOpenAiOperation(std::shared_ptr<OpenAiAsyncLlmClient::Impl> owner,
+                         ChatCompletionRequest request,
+                         IAsyncLlmClient::Callback callback)
+        : owner_(std::move(owner)),
+          http_request_(BuildHttpRequest(owner_->options, request)),
+          retry_timer_(owner_->retry_context),
+          callback_(std::move(callback)) {}
+
+    void Start() noexcept {
+        BeginAttempt();
+    }
+
+    void Cancel() noexcept override {
+        if (cancel_requested_.exchange(true, std::memory_order_acq_rel)) {
+            return;
+        }
+        std::shared_ptr<net::IAsyncHttpOperation> http_operation;
+        {
+            std::lock_guard lock(mutex_);
+            http_operation = http_operation_;
+        }
+        if (http_operation) {
+            http_operation->Cancel();
+        }
+        auto self = shared_from_this();
+        boost::asio::post(owner_->retry_context, [self] {
+            boost::system::error_code ignored;
+            self->retry_timer_.cancel(ignored);
+        });
+        Finish(core::Status::Error(core::ErrorCode::Cancelled,
+                                   "async LLM completion cancelled"));
+    }
+
+private:
+    void BeginAttempt() noexcept {
+        if (completed_.load(std::memory_order_acquire)) {
+            return;
+        }
+        auto self = shared_from_this();
+        auto submitted = owner_->http_client.ExecuteAsync(
+            http_request_,
+            [self](core::Result<net::HttpClientResponse> response) {
+                self->OnHttpComplete(std::move(response));
+            });
+        if (!submitted.ok()) {
+            OnAttemptFailure(submitted.status());
+            return;
+        }
+        std::lock_guard lock(mutex_);
+        if (completed_.load(std::memory_order_acquire)) {
+            submitted.value()->Cancel();
+        } else {
+            http_operation_ = std::move(submitted).value();
+        }
+    }
+
+    void OnHttpComplete(core::Result<net::HttpClientResponse> result) noexcept {
+        {
+            std::lock_guard lock(mutex_);
+            http_operation_.reset();
+        }
+        if (completed_.load(std::memory_order_acquire)) {
+            return;
+        }
+        if (!result.ok()) {
+            OnAttemptFailure(result.status());
+            return;
+        }
+        auto response = std::move(result).value();
+        if (response.status >= 500 && response.status < 600 && CanRetry()) {
+            ScheduleRetry();
+            return;
+        }
+        Finish(ParseResponse(response.body, response.status));
+    }
+
+    void OnAttemptFailure(const core::Status& status) noexcept {
+        if (completed_.load(std::memory_order_acquire)) {
+            return;
+        }
+        if (cancel_requested_.load(std::memory_order_acquire)) {
+            Finish(core::Status::Error(core::ErrorCode::Cancelled,
+                                       "async LLM completion cancelled"));
+            return;
+        }
+        if (CanRetry()) {
+            ScheduleRetry();
+            return;
+        }
+        Finish(status);
+    }
+
+    bool CanRetry() const noexcept {
+        return attempt_ < owner_->options.retry_policy.max_retries;
+    }
+
+    void ScheduleRetry() noexcept {
+        const auto delay = owner_->options.retry_policy.BackoffFor(attempt_);
+        ++attempt_;
+        auto self = shared_from_this();
+        boost::asio::post(owner_->retry_context, [self, delay] {
+            if (self->completed_.load(std::memory_order_acquire)) {
+                return;
+            }
+            self->retry_timer_.expires_after(delay);
+            self->retry_timer_.async_wait([self](const boost::system::error_code& error) {
+                if (error == boost::asio::error::operation_aborted ||
+                    self->completed_.load(std::memory_order_acquire)) {
+                    return;
+                }
+                self->BeginAttempt();
+            });
+        });
+    }
+
+    void Finish(core::Result<ChatCompletionResponse> result) noexcept {
+        if (completed_.exchange(true, std::memory_order_acq_rel)) {
+            return;
+        }
+        boost::asio::post(owner_->retry_context, [self = shared_from_this()] {
+            boost::system::error_code ignored;
+            self->retry_timer_.cancel(ignored);
+        });
+        owner_->Unregister(this);
+        auto callback = std::move(callback_);
+        try {
+            callback(std::move(result));
+        } catch (const std::exception& error) {
+            owner_->logger.error("异步 LLM callback 抛出异常: {}", error.what());
+        } catch (...) {
+            owner_->logger.error("异步 LLM callback 抛出未知异常");
+        }
+    }
+
+    std::shared_ptr<OpenAiAsyncLlmClient::Impl> owner_;
+    net::HttpClientRequest http_request_;
+    boost::asio::steady_timer retry_timer_;
+    IAsyncLlmClient::Callback callback_;
+    std::mutex mutex_;
+    std::shared_ptr<net::IAsyncHttpOperation> http_operation_;
+    std::atomic<bool> cancel_requested_{false};
+    std::atomic<bool> completed_{false};
+    std::int32_t attempt_ = 0;
+};
+
+} // namespace
+
+void OpenAiAsyncLlmClient::Impl::Shutdown() noexcept {
+    std::vector<std::shared_ptr<AsyncOpenAiOperation>> pending;
+    {
+        std::lock_guard lock(mutex);
+        if (stopping) {
+            return;
+        }
+        stopping = true;
+        pending.reserve(operations.size());
+        for (const auto& [_, operation] : operations) {
+            pending.push_back(operation);
+        }
+    }
+    for (const auto& operation : pending) {
+        operation->Cancel();
+    }
+    pending.clear();
+    retry_guard.reset();
+    if (retry_thread.joinable()) {
+        if (retry_thread.get_id() == std::this_thread::get_id()) {
+            retry_thread.detach();
+        } else {
+            retry_thread.join();
+        }
+    }
+}
+
+core::Result<std::unique_ptr<OpenAiAsyncLlmClient>> OpenAiAsyncLlmClient::Create(
+    OpenAiLlmClientOptions options,
+    net::IAsyncHttpClient& http_client) {
+    if (options.base_url.empty()) {
+        return core::Status::Error(core::ErrorCode::InvalidArgument,
+                                   "OpenAI async LLM client requires base_url");
+    }
+    if (options.require_api_key && options.api_key.empty()) {
+        return core::Status::Error(core::ErrorCode::InvalidArgument,
+                                   "OpenAI async LLM client requires api_key");
+    }
+    if (options.timeout_ms <= 0 || options.retry_policy.max_retries < 0) {
+        return core::Status::Error(core::ErrorCode::InvalidArgument,
+                                   "OpenAI async LLM timeout and retry options are invalid");
+    }
+    try {
+        auto impl = std::make_shared<Impl>(std::move(options), http_client);
+        if (auto status = impl->Start(); !status.ok()) {
+            return status;
+        }
+        return std::unique_ptr<OpenAiAsyncLlmClient>(new OpenAiAsyncLlmClient(std::move(impl)));
+    } catch (const std::exception& error) {
+        return core::Status::Error(
+            core::ErrorCode::InternalError,
+            std::string("failed to create async LLM client: ") + error.what());
+    }
+}
+
+OpenAiAsyncLlmClient::OpenAiAsyncLlmClient(std::shared_ptr<Impl> impl)
+    : impl_(std::move(impl)) {}
+
+OpenAiAsyncLlmClient::~OpenAiAsyncLlmClient() {
+    Shutdown();
+}
+
+core::Result<std::shared_ptr<IAsyncLlmOperation>> OpenAiAsyncLlmClient::CompleteAsync(
+    ChatCompletionRequest request,
+    Callback callback) {
+    if (!callback) {
+        return core::Status::Error(core::ErrorCode::InvalidArgument,
+                                   "async LLM callback is required");
+    }
+    try {
+        auto operation = std::make_shared<AsyncOpenAiOperation>(
+            impl_, std::move(request), std::move(callback));
+        if (auto status = impl_->Register(operation); !status.ok()) {
+            return status;
+        }
+        operation->Start();
+        return std::static_pointer_cast<IAsyncLlmOperation>(std::move(operation));
+    } catch (const std::exception& error) {
+        return core::Status::Error(
+            core::ErrorCode::InternalError,
+            std::string("failed to submit async LLM completion: ") + error.what());
+    }
+}
+
+void OpenAiAsyncLlmClient::Shutdown() noexcept {
+    if (impl_) {
+        impl_->Shutdown();
+    }
 }
 
 FallbackLlmClient::FallbackLlmClient(std::shared_ptr<ILlmClient> primary,

@@ -7,6 +7,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace server_config {
 
@@ -62,12 +63,48 @@ std::vector<std::unique_ptr<IConfigSection>> ConfigSectionRegistry::CreateSectio
     return sections;
 }
 
+ConfigSectionSelection::ConfigSectionSelection(bool include_all, std::vector<std::string> names)
+    : include_all_(include_all), names_(std::move(names)) {}
+
+ConfigSectionSelection ConfigSectionSelection::All() {
+    return ConfigSectionSelection(true, {});
+}
+
+ConfigSectionSelection ConfigSectionSelection::Only(std::initializer_list<std::string_view> names) {
+    std::vector<std::string> owned_names;
+    owned_names.reserve(names.size());
+    for (const auto name : names) {
+        owned_names.emplace_back(name);
+    }
+    return Only(std::move(owned_names));
+}
+
+ConfigSectionSelection ConfigSectionSelection::Only(std::vector<std::string> names) {
+    return ConfigSectionSelection(false, std::move(names));
+}
+
+bool ConfigSectionSelection::Includes(std::string_view name) const noexcept {
+    return include_all_ || std::find(names_.begin(), names_.end(), name) != names_.end();
+}
+
 std::vector<std::unique_ptr<IConfigSection>> BuildConfigSections() {
-    return ConfigSectionRegistry::Instance().CreateSections();
+    return BuildConfigSections(ConfigSectionSelection::All());
+}
+
+std::vector<std::unique_ptr<IConfigSection>> BuildConfigSections(const ConfigSectionSelection& selection) {
+    auto sections = ConfigSectionRegistry::Instance().CreateSections();
+    std::erase_if(sections, [&selection](const auto& section) {
+        return !selection.Includes(section->Name());
+    });
+    return sections;
 }
 
 void ValidateOptions(MultimodalServerOptions& options) {
-    for (const auto& section : BuildConfigSections()) {
+    ValidateOptions(options, ConfigSectionSelection::All());
+}
+
+void ValidateOptions(MultimodalServerOptions& options, const ConfigSectionSelection& selection) {
+    for (const auto& section : BuildConfigSections(selection)) {
         section->Validate(options);
     }
 }

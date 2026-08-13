@@ -278,17 +278,23 @@ PersonaRuntime::PersonaRuntime(SessionManager& sessions,
                                std::shared_ptr<IToolMemoryProvider> tool_memory_provider,
                                std::shared_ptr<ISkillSessionManager> skill_session_manager,
                                core::LoggerAdapter logger,
-                               std::shared_ptr<IEmotionCalibrationSampleSink> emotion_calibration_sink)
+                               std::shared_ptr<IEmotionCalibrationSampleSink> emotion_calibration_sink,
+                               std::shared_ptr<llm::IAsyncLlmClient> async_llm_client)
     : sessions_(sessions),
       memory_provider_(std::move(memory_provider)),
       emotion_analyzer_(std::move(emotion_analyzer)),
       llm_client_(std::move(llm_client)),
+      async_llm_client_(std::move(async_llm_client)),
       answer_cache_provider_(std::move(answer_cache_provider)),
       tool_memory_provider_(std::move(tool_memory_provider)),
       skill_session_manager_(std::move(skill_session_manager)),
       emotion_calibration_sink_(std::move(emotion_calibration_sink)),
       options_(std::move(options)),
       logger_(std::move(logger)) {}
+
+PersonaRuntime::~PersonaRuntime() {
+    Shutdown();
+}
 
 core::Status PersonaRuntime::SubmitChat(ChatRequest request, ChatCallback callback) {
     if (!callback) {
@@ -303,49 +309,138 @@ core::Status PersonaRuntime::SubmitChat(ChatRequest request, ChatCallback callba
     if (request.trace_id.empty()) {
         request.trace_id = core::GenerateTraceId();
     }
+    if (async_llm_client_) {
+        std::lock_guard lock(async_operations_mutex_);
+        if (async_stopping_) {
+            return core::Status::Error(core::ErrorCode::Cancelled,
+                                       "persona runtime is shutting down");
+        }
+    }
 
     const auto trace_id = request.trace_id;
-    const auto compute_submitted_at = std::chrono::steady_clock::now();
-    DispatchOptions compute_dispatch;
-    compute_dispatch.session_id = request.session_id;
-    compute_dispatch.trace_id = request.trace_id;
-    compute_dispatch.module = "persona_runtime";
-    compute_dispatch.operation = "prepare_chat";
-    return sessions_.SubmitCompute(
-        std::move(compute_dispatch),
-        [this, request = std::move(request), callback = std::move(callback), trace_id, compute_submitted_at](
-            SessionState& session,
+    const auto submitted_at = std::chrono::steady_clock::now();
+    auto response_holder = std::make_shared<std::optional<ChatResponse>>();
+    DispatchOptions dispatch;
+    dispatch.session_id = request.session_id;
+    dispatch.trace_id = request.trace_id;
+    dispatch.module = "persona_runtime";
+    dispatch.operation = "chat_turn";
+    if (async_llm_client_) {
+        return sessions_.SubmitTurnAsync(
+            std::move(dispatch),
+            [this, request = std::move(request), submitted_at, response_holder](
+                const SessionTurnSnapshot& snapshot,
+                core::ThreadPoolContext&,
+                SessionManager::SessionTurnAsyncFinish finish) mutable -> core::Status {
+                auto session = snapshot.state;
+                const auto user_input = request.user_input;
+                const auto context_id = request.context_id;
+                const auto persona_id = session.persona_id;
+                const auto compute_started_at = std::chrono::steady_clock::now();
+                auto prepared = PrepareChat(session, std::move(request));
+                if (!prepared.ok()) {
+                    return prepared.status();
+                }
+                prepared.value().started_at = submitted_at;
+                prepared.value().latency.compute_queue_wait = Since(submitted_at);
+                prepared.value().latency.compute_stage = Since(compute_started_at);
+                prepared.value().io_submitted_at = std::chrono::steady_clock::now();
+
+                return CompleteWithLlmAsync(
+                    std::move(session),
+                    std::move(prepared).value(),
+                    [response_holder, user_input, context_id, persona_id, finish = std::move(finish)](
+                        core::Result<CompletedChat> completed) mutable {
+                        if (!completed.ok()) {
+                            finish(completed.status());
+                            return;
+                        }
+                        auto value = std::move(completed).value();
+                        SessionTurnCommit commit;
+                        commit.trace_id = value.response.trace_id;
+                        commit.turn.user_input = user_input;
+                        commit.turn.emotion = value.response.user_emotion.emotion.primary;
+                        commit.turn.intensity = value.response.user_emotion.emotion.intensity;
+                        commit.turn.behavior = value.response.user_emotion.behavior;
+                        commit.turn.tone = value.response.user_emotion.tone;
+                        commit.turn.response = value.response.response;
+                        commit.turn.context_id = context_id;
+                        commit.turn.persona_id = persona_id;
+                        commit.turn.valence = value.emotion_state.state().valence;
+                        commit.turn.arousal = value.emotion_state.state().arousal;
+                        commit.emotion_state = std::move(value.emotion_state);
+                        commit.latency = value.response.latency.total;
+                        *response_holder = std::move(value.response);
+                        finish(std::move(commit));
+                    });
+            },
+            [response_holder, callback = std::move(callback)](
+                core::Result<SessionTurnReceipt> receipt) mutable {
+                if (!receipt.ok()) {
+                    callback(receipt.status());
+                    return;
+                }
+                if (!response_holder->has_value()) {
+                    callback(core::Status::Error(core::ErrorCode::InternalError,
+                                                 "async session turn response is missing"));
+                    return;
+                }
+                response_holder->value().turn_index = receipt.value().turn_index;
+                callback(std::move(response_holder->value()));
+            });
+    }
+    return sessions_.SubmitTurn(
+        std::move(dispatch),
+        [this, request = std::move(request), submitted_at, response_holder](
+            const SessionTurnSnapshot& snapshot,
+            SessionTurnCommit& commit,
             core::ThreadPoolContext&) mutable -> core::Status {
+            auto session = snapshot.state;
+            const auto user_input = request.user_input;
+            const auto context_id = request.context_id;
             const auto compute_started_at = std::chrono::steady_clock::now();
             auto prepared = PrepareChat(session, std::move(request));
             if (!prepared.ok()) {
-                callback(prepared.status());
                 return prepared.status();
             }
-            prepared.value().started_at = compute_submitted_at;
-            prepared.value().latency.compute_queue_wait = Since(prepared.value().started_at);
-
-            DispatchOptions io_dispatch;
-            io_dispatch.session_id = prepared.value().request.session_id;
-            io_dispatch.trace_id = trace_id;
-            io_dispatch.user_uuid = session.user_uuid;
-            io_dispatch.module = "persona_runtime";
-            io_dispatch.operation = "llm_complete";
+            prepared.value().started_at = submitted_at;
+            prepared.value().latency.compute_queue_wait = Since(submitted_at);
             prepared.value().latency.compute_stage = Since(compute_started_at);
             prepared.value().io_submitted_at = std::chrono::steady_clock::now();
-            auto status = sessions_.SubmitIo(
-                std::move(io_dispatch),
-                [this, prepared = std::move(prepared).value(), callback = std::move(callback)](
-                    SessionState& session,
-                    core::ThreadPoolContext&) mutable -> core::Status {
-                    prepared.latency.io_queue_wait = Since(prepared.io_submitted_at);
-                    CompleteWithLlm(session, std::move(prepared), std::move(callback));
-                    return core::Status::Ok();
-                });
-            if (!status.ok()) {
-                callback(status);
+
+            auto completed = CompleteWithLlm(session, std::move(prepared).value());
+            if (!completed.ok()) {
+                return completed.status();
             }
-            return status;
+            commit.trace_id = completed.value().trace_id;
+            commit.turn.user_input = user_input;
+            commit.turn.emotion = completed.value().user_emotion.emotion.primary;
+            commit.turn.intensity = completed.value().user_emotion.emotion.intensity;
+            commit.turn.behavior = completed.value().user_emotion.behavior;
+            commit.turn.tone = completed.value().user_emotion.tone;
+            commit.turn.response = completed.value().response;
+            commit.turn.context_id = context_id;
+            commit.turn.persona_id = session.persona_id;
+            commit.turn.valence = session.emotion_state.state().valence;
+            commit.turn.arousal = session.emotion_state.state().arousal;
+            commit.emotion_state = session.emotion_state;
+            commit.latency = completed.value().latency.total;
+            *response_holder = std::move(completed).value();
+            return core::Status::Ok();
+        },
+        [response_holder, callback = std::move(callback)](
+            core::Result<SessionTurnReceipt> receipt) mutable {
+            if (!receipt.ok()) {
+                callback(receipt.status());
+                return;
+            }
+            if (!response_holder->has_value()) {
+                callback(core::Status::Error(core::ErrorCode::InternalError,
+                                             "session turn response is missing"));
+                return;
+            }
+            response_holder->value().turn_index = receipt.value().turn_index;
+            callback(std::move(response_holder->value()));
         });
 }
 
@@ -583,7 +678,8 @@ core::Status PersonaRuntime::MaybeRecordEmotionCalibrationSample(
     return emotion_calibration_sink_->Record(sample);
 }
 
-void PersonaRuntime::CompleteWithLlm(SessionState& session, PreparedChat prepared, ChatCallback callback) {
+core::Result<ChatResponse> PersonaRuntime::CompleteWithLlm(SessionState& session,
+                                                            PreparedChat prepared) {
     const auto io_stage_start = std::chrono::steady_clock::now();
     std::optional<AnswerCacheLookupRequest> answer_cache_lookup;
     std::optional<AnswerCacheLookupResult> answer_cache_hit;
@@ -603,8 +699,7 @@ void PersonaRuntime::CompleteWithLlm(SessionState& session, PreparedChat prepare
         auto cache_result = answer_cache_provider_->Lookup(lookup);
         prepared.latency.answer_cache = Since(cache_start);
         if (!cache_result.ok()) {
-            callback(cache_result.status());
-            return;
+            return cache_result.status();
         }
         if (cache_result.value().hit) {
             prepared.answer_cache.hit = true;
@@ -634,19 +729,175 @@ void PersonaRuntime::CompleteWithLlm(SessionState& session, PreparedChat prepare
         auto llm_result = llm_client_->Complete(llm_req);
         prepared.latency.llm_total = Since(llm_start);
         if (!llm_result.ok()) {
-            callback(llm_result.status());
-            return;
+            return llm_result.status();
         }
         completion = std::move(llm_result).value();
-        if (answer_cache_provider_ && answer_cache_lookup) {
-            AnswerCacheStoreRequest store;
-            store.lookup = std::move(*answer_cache_lookup);
-            store.response = completion.content;
-            auto store_status = answer_cache_provider_->Store(store);
-            if (!store_status.ok()) {
-                callback(store_status);
+    }
+    auto finalized = FinalizeLlmCompletion(
+        session,
+        std::move(prepared),
+        std::move(completion),
+        std::move(answer_cache_lookup),
+        io_stage_start);
+    if (!finalized.ok()) {
+        return finalized.status();
+    }
+    session.emotion_state = finalized.value().emotion_state;
+    return std::move(finalized).value().response;
+}
+
+core::Status PersonaRuntime::CompleteWithLlmAsync(
+    SessionState session,
+    PreparedChat prepared,
+    std::function<void(core::Result<CompletedChat>)> completion) {
+    if (!completion) {
+        return core::Status::Error(core::ErrorCode::InvalidArgument,
+                                   "async chat completion callback is required");
+    }
+    const auto io_stage_start = std::chrono::steady_clock::now();
+    std::optional<AnswerCacheLookupRequest> answer_cache_lookup;
+    if (answer_cache_provider_) {
+        const auto cache_start = std::chrono::steady_clock::now();
+        prepared.answer_cache.enabled = true;
+        AnswerCacheLookupRequest lookup;
+        lookup.session_id = prepared.request.session_id;
+        lookup.user_uuid = session.user_uuid;
+        lookup.persona_id = session.persona_id;
+        lookup.trace_id = prepared.request.trace_id;
+        lookup.query = prepared.request.user_input;
+        lookup.model = prepared.request.model.empty() ? options_.default_model : prepared.request.model;
+        lookup.generation = prepared.generation;
+        lookup.messages = prepared.messages;
+
+        auto cache_result = answer_cache_provider_->Lookup(lookup);
+        prepared.latency.answer_cache = Since(cache_start);
+        if (!cache_result.ok()) {
+            return cache_result.status();
+        }
+        if (cache_result.value().hit) {
+            prepared.answer_cache.hit = true;
+            prepared.answer_cache.source = cache_result.value().source;
+            prepared.answer_cache.cache_key = cache_result.value().cache_key;
+            prepared.answer_cache.similarity_score = cache_result.value().similarity_score;
+            llm::ChatCompletionResponse cached;
+            cached.content = cache_result.value().response;
+            cached.model = lookup.model;
+            prepared.latency.llm_total = std::chrono::milliseconds{0};
+            completion(FinalizeLlmCompletion(
+                session, std::move(prepared), std::move(cached), std::nullopt, io_stage_start));
+            return core::Status::Ok();
+        }
+        answer_cache_lookup = std::move(lookup);
+    }
+
+    llm::ChatCompletionRequest request;
+    request.model = prepared.request.model.empty() ? options_.default_model : prepared.request.model;
+    request.messages = prepared.messages;
+    request.temperature = static_cast<float>(prepared.generation.temperature);
+    request.max_tokens = prepared.generation.max_tokens;
+    request.top_p = static_cast<float>(prepared.generation.top_p);
+    const auto llm_started_at = std::chrono::steady_clock::now();
+    std::uint64_t operation_id = 0;
+    {
+        std::lock_guard lock(async_operations_mutex_);
+        if (async_stopping_) {
+            return core::Status::Error(core::ErrorCode::Cancelled,
+                                       "persona runtime is shutting down");
+        }
+        operation_id = next_async_operation_id_++;
+        async_operations_.emplace(operation_id, nullptr);
+    }
+    auto submitted = async_llm_client_->CompleteAsync(
+        std::move(request),
+        [this, session = std::move(session), prepared = std::move(prepared),
+         answer_cache_lookup = std::move(answer_cache_lookup), io_stage_start, llm_started_at,
+         operation_id,
+         completion = std::move(completion)](
+            core::Result<llm::ChatCompletionResponse> result) mutable {
+            struct OperationCleanup {
+                PersonaRuntime* runtime;
+                std::uint64_t id;
+                ~OperationCleanup() {
+                    {
+                        std::lock_guard lock(runtime->async_operations_mutex_);
+                        runtime->async_operations_.erase(id);
+                    }
+                    runtime->async_operations_drained_.notify_all();
+                }
+            } cleanup{this, operation_id};
+            prepared.latency.llm_total = Since(llm_started_at);
+            if (!result.ok()) {
+                completion(result.status());
                 return;
             }
+            completion(FinalizeLlmCompletion(
+                session,
+                std::move(prepared),
+                std::move(result).value(),
+                std::move(answer_cache_lookup),
+                io_stage_start));
+        });
+    if (!submitted.ok()) {
+        {
+            std::lock_guard lock(async_operations_mutex_);
+            async_operations_.erase(operation_id);
+        }
+        async_operations_drained_.notify_all();
+        return submitted.status();
+    }
+
+    bool cancel = false;
+    {
+        std::lock_guard lock(async_operations_mutex_);
+        auto operation = async_operations_.find(operation_id);
+        if (operation == async_operations_.end()) {
+            // callback 允许在 CompleteAsync 返回前同步完成，此时无需再保存句柄。
+            return core::Status::Ok();
+        }
+        operation->second = submitted.value();
+        cancel = async_stopping_;
+    }
+    if (cancel) {
+        submitted.value()->Cancel();
+    }
+    return core::Status::Ok();
+}
+
+void PersonaRuntime::Shutdown() noexcept {
+    std::vector<std::shared_ptr<llm::IAsyncLlmOperation>> operations;
+    {
+        std::lock_guard lock(async_operations_mutex_);
+        if (async_stopping_ && async_operations_.empty()) {
+            return;
+        }
+        async_stopping_ = true;
+        operations.reserve(async_operations_.size());
+        for (const auto& [_, operation] : async_operations_) {
+            if (operation) {
+                operations.push_back(operation);
+            }
+        }
+    }
+    for (const auto& operation : operations) {
+        operation->Cancel();
+    }
+    std::unique_lock lock(async_operations_mutex_);
+    async_operations_drained_.wait(lock, [this] { return async_operations_.empty(); });
+}
+
+core::Result<PersonaRuntime::CompletedChat> PersonaRuntime::FinalizeLlmCompletion(
+    SessionState& session,
+    PreparedChat prepared,
+    llm::ChatCompletionResponse completion,
+    std::optional<AnswerCacheLookupRequest> answer_cache_lookup,
+    std::chrono::steady_clock::time_point io_stage_start) {
+    if (answer_cache_provider_ && answer_cache_lookup) {
+        AnswerCacheStoreRequest store;
+        store.lookup = std::move(*answer_cache_lookup);
+        store.response = completion.content;
+        auto store_status = answer_cache_provider_->Store(store);
+        if (!store_status.ok()) {
+            return store_status;
         }
     }
     prepared.latency.total = Since(prepared.started_at);
@@ -656,8 +907,7 @@ void PersonaRuntime::CompleteWithLlm(SessionState& session, PreparedChat prepare
                                                  prepared.request.trace_id,
                                                  session.personality);
     if (!ai_emotion.ok()) {
-        callback(ai_emotion.status());
-        return;
+        return ai_emotion.status();
     }
 
     ConversationTurn turn;
@@ -676,8 +926,7 @@ void PersonaRuntime::CompleteWithLlm(SessionState& session, PreparedChat prepare
         ai_emotion.value().emotion.primary,
         ai_emotion.value().emotion.intensity);
     if (!state_update.ok()) {
-        callback(state_update.status());
-        return;
+        return state_update.status();
     }
     turn.valence = state_update.value().valence;
     turn.arousal = state_update.value().arousal;
@@ -688,19 +937,7 @@ void PersonaRuntime::CompleteWithLlm(SessionState& session, PreparedChat prepare
         turn,
         prepared.request.trace_id);
     if (!admit_status.ok()) {
-        callback(admit_status);
-        return;
-    }
-
-    session.last_active = std::chrono::steady_clock::now();
-    session.last_trace_id = prepared.request.trace_id;
-    session.recent_history.push_back(turn);
-    ++session.metrics.turn_count;
-    ++session.metrics.request_count;
-    session.metrics.last_latency = prepared.latency.total;
-    session.metrics.total_latency += prepared.latency.total;
-    while (session.recent_history.size() > session.max_recent_turns) {
-        session.recent_history.pop_front();
+        return admit_status;
     }
 
     ChatResponse response;
@@ -712,12 +949,15 @@ void PersonaRuntime::CompleteWithLlm(SessionState& session, PreparedChat prepare
     response.l0_hit = prepared.memory.l0_hit;
     response.l3_hit = prepared.memory.l3_hit;
     response.l4_hit = prepared.memory.l4_hit;
-    response.turn_index = session.metrics.turn_count;
+    response.turn_index = 0;
     response.answer_cache = std::move(prepared.answer_cache);
     response.latency = prepared.latency;
     response.messages = std::move(prepared.messages);
     response.latency.callback_to_response = Since(prepared.started_at) - response.latency.total;
-    callback(std::move(response));
+    CompletedChat completed;
+    completed.response = std::move(response);
+    completed.emotion_state = session.emotion_state;
+    return completed;
 }
 
 } // namespace agent::service::persona

@@ -7,7 +7,8 @@ set(_agentloom_public_targets
     agent_llm agent_semantic_cache agent_document agent_memory agent_storage
     agent_vector_storage agent_conversation agent_ipc agent_ipc_grpc agent_media_inference agent_media_vlm_grpc agent_media
     server_runtime agent_bert_models agent_models agent_cache agent_vector agent_config
-    agent_service_core agent_agent_runtime agent_gateway_auth agent_agent_gateway
+    agent_service_core agent_agent_runtime agent_persona_interaction agent_gateway_routing agent_gateway_foundation agent_gateway
+    agent_gateway_auth agent_agent_gateway
     agent_classroom_gateway agent_training_report_gateway agent_document_gateway
     agent_gateway_server_lib agent_service agent_skill_media agent_grpc_runtime agent_emotion_server agent_server
 )
@@ -15,8 +16,9 @@ set(_agentloom_public_targets
 set(_agentloom_public_target_names
     bert_proto multimodal_proto core net tls http_client llm semantic_cache document
     memory storage vector_storage conversation ipc ipc_grpc media_inference vlm_client media runtime bert_models
-    models cache vector config service_core agent_runtime gateway_auth agent_gateway
-    classroom_gateway training_report_gateway document_gateway gateway service skill_media grpc_runtime
+    models cache vector config service_core agent_runtime persona_interaction gateway_routing gateway_foundation gateway
+    gateway_auth reference_agent_routes
+    classroom_gateway training_report_gateway document_gateway reference_gateway service skill_media grpc_runtime
     emotion_server server
 )
 
@@ -94,7 +96,12 @@ set(_agentloom_install_include_dirs
     "${CMAKE_INSTALL_INCLUDEDIR}/AgentLoom/service/gateway"
     "${CMAKE_INSTALL_INCLUDEDIR}/AgentLoom/service/inference"
     "${CMAKE_INSTALL_INCLUDEDIR}/AgentLoom/server/runtime"
-    "${CMAKE_INSTALL_INCLUDEDIR}/AgentLoom/server/grpc")
+    "${CMAKE_INSTALL_INCLUDEDIR}/AgentLoom/server/grpc"
+    "${CMAKE_INSTALL_INCLUDEDIR}/AgentLoom/third_party/eigen"
+    "${CMAKE_INSTALL_INCLUDEDIR}/AgentLoom/third_party/faiss"
+    "${CMAKE_INSTALL_INCLUDEDIR}/AgentLoom/third_party/hf_tokenizers"
+    "${CMAKE_INSTALL_INCLUDEDIR}/AgentLoom/third_party/onnxruntime"
+    "${CMAKE_INSTALL_INCLUDEDIR}/AgentLoom/third_party/sqlite")
 
 function(_agentloom_make_include_interface_relocatable target)
     get_target_property(_build_include_dirs ${target} INTERFACE_INCLUDE_DIRECTORIES)
@@ -157,6 +164,55 @@ if(EXISTS "${GENERATED_DIR}")
         FILES_MATCHING PATTERN "*.h" PATTERN "*.hpp")
 endif()
 
+install(FILES
+    "${BERT_SQLITE_INCLUDE_DIR}/sqlite3.h"
+    "${BERT_SQLITE_INCLUDE_DIR}/sqlite3ext.h"
+    DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/AgentLoom/third_party/sqlite")
+
+install(DIRECTORY "${ONNXRUNTIME_ROOT}/include/"
+    DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/AgentLoom/third_party/onnxruntime")
+file(GLOB _agentloom_onnx_runtime_files "${ONNXRUNTIME_ROOT}/${BERT_ONNXRUNTIME_RUNTIME_GLOB}")
+
+install(DIRECTORY "${HF_TOKENIZERS_INCLUDE_DIR}/"
+    DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/AgentLoom/third_party/hf_tokenizers")
+install(FILES "${HF_TOKENIZERS_STATICLIB_PATH}" DESTINATION "${CMAKE_INSTALL_LIBDIR}")
+
+install(DIRECTORY "${BERT_FAISS_ROOT}/include/"
+    DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/AgentLoom/third_party/faiss")
+install(DIRECTORY "${BERT_EIGEN_ROOT}/"
+    DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/AgentLoom/third_party/eigen")
+if(WIN32)
+    install(FILES ${_agentloom_onnx_runtime_files} DESTINATION "${CMAKE_INSTALL_BINDIR}")
+    install(FILES "${BERT_SQLITE_IMPLIB}" DESTINATION "${CMAKE_INSTALL_LIBDIR}")
+    install(FILES "${BERT_SQLITE_DLL}" DESTINATION "${CMAKE_INSTALL_BINDIR}")
+    install(FILES "${ONNXRUNTIME_ROOT}/${BERT_ONNXRUNTIME_IMPORT_LIB_RELATIVE}"
+        DESTINATION "${CMAKE_INSTALL_LIBDIR}")
+    install(FILES
+        "${BERT_FAISS_ROOT}/lib/faiss.lib"
+        DESTINATION "${CMAKE_INSTALL_LIBDIR}")
+    install(FILES
+        "${BERT_FAISS_ROOT}/bin/faiss.dll"
+        "${BERT_MKL_RUNTIME_ROOT}/Library/bin/mkl_rt.2.dll"
+        DESTINATION "${CMAKE_INSTALL_BINDIR}")
+else()
+    install(FILES ${_agentloom_onnx_runtime_files} DESTINATION "${CMAKE_INSTALL_LIBDIR}")
+    install(FILES "${BERT_FAISS_ROOT}/lib/libfaiss.so"
+        DESTINATION "${CMAKE_INSTALL_LIBDIR}")
+endif()
+
+if(AGENTLOOM_BUILD_LOCAL_LLM)
+    foreach(_agentloom_llama_include_dir IN LISTS LLAMA_CPP_INCLUDE_DIRS)
+        get_filename_component(_agentloom_llama_include_name "${_agentloom_llama_include_dir}" NAME)
+        install(DIRECTORY "${_agentloom_llama_include_dir}/"
+            DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/AgentLoom/third_party/llama_cpp/${_agentloom_llama_include_name}")
+    endforeach()
+    install(FILES ${LLAMA_CPP_LIBS} DESTINATION "${CMAKE_INSTALL_LIBDIR}")
+    install(FILES ${LLAMA_CPP_RUNTIME_FILES} DESTINATION "${CMAKE_INSTALL_BINDIR}" OPTIONAL)
+endif()
+
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/cmake/AgentLoomWholeArchive.cmake"
+    DESTINATION "${AGENTLOOM_CMAKE_INSTALL_DIR}")
+
 install(EXPORT AgentLoomTargets
     FILE AgentLoomTargets.cmake
     NAMESPACE AgentLoom::
@@ -170,6 +226,19 @@ if(TARGET agent_media)
     set(AGENTLOOM_PACKAGE_HAS_MEDIA ON)
 else()
     set(AGENTLOOM_PACKAGE_HAS_MEDIA OFF)
+endif()
+if(TARGET agentloom_gstreamer_dependency)
+    set(AGENTLOOM_PACKAGE_HAS_GSTREAMER ON)
+else()
+    set(AGENTLOOM_PACKAGE_HAS_GSTREAMER OFF)
+endif()
+
+set(AGENTLOOM_LLAMA_LIBRARY_NAMES "")
+if(AGENTLOOM_BUILD_LOCAL_LLM)
+    foreach(_agentloom_llama_library IN LISTS LLAMA_CPP_LIBS)
+        get_filename_component(_agentloom_llama_library_name "${_agentloom_llama_library}" NAME)
+        list(APPEND AGENTLOOM_LLAMA_LIBRARY_NAMES "${_agentloom_llama_library_name}")
+    endforeach()
 endif()
 
 configure_package_config_file(

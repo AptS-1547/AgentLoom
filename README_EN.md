@@ -79,12 +79,46 @@ add_subdirectory(path/to/AgentLoom)
 target_link_libraries(my_agent PRIVATE
     AgentLoom::core
     AgentLoom::runtime
-    AgentLoom::service
-    AgentLoom::gateway
+    AgentLoom::gateway_foundation
+    AgentLoom::persona_interaction
+    AgentLoom::gateway_routing
 )
 ```
 
-Available aliases include `core`, `net`, `tls`, `http_client`, `config`, `storage`, `vector_storage`, `vector`, `semantic_cache`, `memory`, `document`, `llm`, `models`, `cache`, `ipc`, `media_inference`, `media`, `runtime`, `gateway`, and `service`. Installable `find_package(AgentLoom)` exports are not available yet.
+`AgentLoom::gateway` is a compatibility aggregate of the three common Gateway components above. It does not bring in JWT/cookies, Document, Classroom, reference routes, or the reference server. Reference-product consumers can additionally link `AgentLoom::reference_gateway` when `AGENTLOOM_BUILD_REFERENCE_GATEWAY` is enabled.
+
+Available aliases include `core`, `net`, `tls`, `http_client`, `config`, `storage`, `vector_storage`, `vector`, `semantic_cache`, `memory`, `document`, `conversation`, `llm`, `models`, `cache`, `ipc`, `media_inference`, `media`, `runtime`, `gateway_foundation`, `persona_interaction`, `gateway_routing`, `gateway`, `reference_gateway` (when the reference Gateway is enabled), `grpc_runtime`, and `service`.
+
+The static libraries, public and generated headers, runtime dependencies, and CMake config package can also be installed for independent downstream consumption:
+
+```powershell
+& "C:\Program Files\CMake\bin\cmake.exe" --install build/x64-Release `
+  --config Release --prefix build/agentloom-package
+```
+
+```cmake
+find_package(AgentLoom CONFIG REQUIRED)
+
+target_link_libraries(my_agent PRIVATE
+    AgentLoom::core
+    AgentLoom::config
+    AgentLoom::runtime
+    AgentLoom::gateway_foundation
+    AgentLoom::persona_interaction
+    AgentLoom::gateway_routing
+)
+```
+
+Add the installation prefix to `CMAKE_PREFIX_PATH`. SQLite, ONNX Runtime, Faiss, Eigen, and tokenizer artifacts are resolved inside the installation prefix; Boost, gRPC, Protobuf, OpenSSL, and other standard dependencies are discovered as CMake packages. Downstream projects do not need the AgentLoom source or build tree.
+
+For ConfigSection registrars stored in static libraries, retain the full archives with the installed cross-platform helper:
+
+```cmake
+agentloom_link_whole_archive(my_agent AgentLoom::config)
+agentloom_link_whole_archive(my_agent my_config_sections)
+```
+
+Consumers that only need selected configuration sections can load and validate `ConfigSectionSelection::Only({"llm", "gateway"})`; unselected server-specific sections do not impose validation requirements.
 
 ## Build
 
@@ -92,8 +126,8 @@ Requirements:
 
 - Visual Studio 2026/v145 on Windows, or GCC 11+/Clang 14+ on Linux
 - CMake 3.20+
-- vcpkg manifest dependencies: gRPC, Protobuf, OpenSSL, spdlog, Redis clients, libzip, pugixml, and nlohmann/json; GTest for tests
-- Prebuilt or external ONNX Runtime, llama.cpp with mtmd, OpenCV, Boost, SQLite, Faiss, Eigen, MKL, and HuggingFace Tokenizers C API packages
+- vcpkg manifest dependencies: gRPC, Protobuf, OpenSSL, spdlog, Redis clients, Boost.Asio/Redis/Interprocess, libzip, pugixml, and nlohmann/json; GTest for tests
+- Prebuilt or external ONNX Runtime, llama.cpp with mtmd, OpenCV, SQLite, Faiss, Eigen, MKL, and HuggingFace Tokenizers C API packages
 - **Toolchain note:** As of 2026-07-11, building the CUDA-enabled llama.cpp dependency with the latest VS2026/v145 generator fails during CUDA compilation, indicating that the installed CUDA Toolkit does not yet provide sufficient VS2026/v145 compatibility. The llama.cpp dependency used by this repository's current test baseline was therefore built with VS2022/v143. This theoretically introduces an ABI compatibility risk, but no related failure has appeared across the existing unit, stress, or integration test runs. Until official support is available, using VS2022/v143 consistently for the CUDA-enabled dependency is recommended.
 
 The local `deps/` and `vcpkg_installed/` directories are not distributed with the source. Linux scripts prepare the required packages. On Windows, keep the CMake generator, MSVC toolset, and vcpkg ABI aligned.

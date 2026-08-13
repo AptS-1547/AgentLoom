@@ -24,6 +24,8 @@ DECLARE_CONFIG_SECTION(PersonaGatewayConfigSection, "persona_gateway")
     CONFIG_CLI_STRING(kComputeQueue, "--gateway-compute-queue");
     CONFIG_CLI_STRING(kIoWorkers, "--gateway-io-workers");
     CONFIG_CLI_STRING(kIoQueue, "--gateway-io-queue");
+    CONFIG_CLI_STRING(kLlmWorkers, "--gateway-llm-workers");
+    CONFIG_CLI_STRING(kLlmQueue, "--gateway-llm-queue");
     CONFIG_CLI_STRING(kSessionIdle, "--gateway-session-idle-minutes");
     CONFIG_CLI_STRING(kSessionTurns, "--gateway-session-max-recent-turns");
     CONFIG_CLI_STRING(kSessionMaxActive, "--gateway-session-max-active");
@@ -68,6 +70,15 @@ void LoadThreadPoolJson(const Json& section,
             "max_outstanding_per_tenant",
             options.max_outstanding_per_tenant,
             1);
+}
+
+GatewayThreadPoolConfigOptions& EnsureLlmPool(PersonaGatewayConfigOptions& gateway) {
+    if (!gateway.llm_pool) {
+        GatewayThreadPoolConfigOptions options;
+        options.scheduler = "session_affinity";
+        gateway.llm_pool = std::move(options);
+    }
+    return *gateway.llm_pool;
 }
 
 void ValidateThreadPool(std::string_view field_name,
@@ -323,6 +334,9 @@ void PersonaGatewayConfigSection::LoadJson(const Json& root, MultimodalServerOpt
     }
     LoadThreadPoolJson(*section, Name(), "compute_pool", options.persona_gateway.compute_pool);
     LoadThreadPoolJson(*section, Name(), "io_pool", options.persona_gateway.io_pool);
+    if (FindField(*section, Name(), "llm_pool")) {
+        LoadThreadPoolJson(*section, Name(), "llm_pool", EnsureLlmPool(options.persona_gateway));
+    }
     SetInt(*section, Name(), "session_idle_timeout_minutes", options.persona_gateway.session_idle_timeout_minutes, 1, 1440);
     SetSize(*section, Name(), "session_max_recent_turns", options.persona_gateway.session_max_recent_turns, 1);
     SetSize(*section, Name(), "session_max_active_sessions", options.persona_gateway.session_max_active_sessions, 1);
@@ -381,6 +395,8 @@ bool PersonaGatewayConfigSection::LoadCli(CliCursor& cursor, MultimodalServerOpt
     CONFIG_VALUE_ARG(kComputeQueue, value, options.persona_gateway.compute_pool.queue_capacity = ParseNonNegativeOption(kComputeQueue, *value);)
     CONFIG_VALUE_ARG(kIoWorkers, value, options.persona_gateway.io_pool.worker_count = ParseNonNegativeOption(kIoWorkers, *value);)
     CONFIG_VALUE_ARG(kIoQueue, value, options.persona_gateway.io_pool.queue_capacity = ParseNonNegativeOption(kIoQueue, *value);)
+    CONFIG_VALUE_ARG(kLlmWorkers, value, EnsureLlmPool(options.persona_gateway).worker_count = ParseNonNegativeOption(kLlmWorkers, *value);)
+    CONFIG_VALUE_ARG(kLlmQueue, value, EnsureLlmPool(options.persona_gateway).queue_capacity = ParseNonNegativeOption(kLlmQueue, *value);)
     CONFIG_VALUE_ARG(kSessionIdle, value, options.persona_gateway.session_idle_timeout_minutes = ParsePositiveOption(kSessionIdle, *value);)
     CONFIG_VALUE_ARG(kSessionTurns, value, options.persona_gateway.session_max_recent_turns = ParsePositiveOption(kSessionTurns, *value);)
     CONFIG_VALUE_ARG(kSessionMaxActive, value, options.persona_gateway.session_max_active_sessions = ParsePositiveOption(kSessionMaxActive, *value);)
@@ -396,6 +412,13 @@ void PersonaGatewayConfigSection::Validate(MultimodalServerOptions& options) con
     auto& gateway = options.persona_gateway;
     ValidateThreadPool("compute_pool", gateway.compute_pool);
     ValidateThreadPool("io_pool", gateway.io_pool);
+    if (gateway.llm_pool) {
+        ValidateThreadPool("llm_pool", *gateway.llm_pool);
+        if (gateway.llm_pool->scheduler != "session_affinity") {
+            throw std::runtime_error(
+                "persona_gateway.llm_pool.scheduler must be session_affinity");
+        }
+    }
     if (gateway.websocket_path.empty() || gateway.websocket_path.front() != '/') {
         throw std::runtime_error("persona_gateway.websocket_path must start with '/'");
     }

@@ -381,3 +381,40 @@ jobs:
           ctest --test-dir "$BUILD_DIR" -C Release \
             -R "(Core|Net|HttpClient|Tls|Storage|SemanticCache|Document|Config|PersonaGateway|SessionManager|PersonaRuntime|PersonaAlgorithm|AsyncGrpcRuntime)" \
             --output-on-failure
+
+      - name: Configure minimal package
+        shell: bash
+        env:
+          CCACHE_BASEDIR: ${{ github.workspace }}
+          CCACHE_COMPILERCHECK: content
+          CCACHE_DIR: ~/.cache/ccache
+        run: |
+          cmake -S . -B build/gha-linux-package \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DBERT_BUILD_TESTS=OFF \
+            -DBERT_VCPKG_TRIPLET="$VCPKG_TRIPLET" \
+            -DBERT_USE_ONNXRUNTIME_GPU=OFF \
+            -DBERT_OPENBLAS_LIBRARY="$BERT_OPENBLAS_LIBRARY" \
+            -DONNXRUNTIME_CPU_ROOT="$GITHUB_WORKSPACE/$ONNXRUNTIME_ROOT" \
+            -DAGENTLOOM_BUILD_LOCAL_LLM=OFF \
+            -DAGENTLOOM_BUILD_MEDIA=OFF \
+            -DAGENTLOOM_BUILD_REFERENCE_GATEWAY=OFF \
+            -DAGENTLOOM_BUILD_TOOLS=OFF \
+            -DBERT_BUILD_MULTIMODAL_INFERENCE_SERVER=OFF
+
+      - name: Verify installed package consumer
+        shell: bash
+        run: |
+          cmake \
+            -DAGENTLOOM_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DAGENTLOOM_PACKAGE_BUILD_DIR="$GITHUB_WORKSPACE/build/gha-linux-package" \
+            -DAGENTLOOM_INSTALL_PREFIX="$GITHUB_WORKSPACE/build/gha-linux-package-install" \
+            -DAGENTLOOM_CONSUMER_BUILD_DIR="$GITHUB_WORKSPACE/build/gha-linux-package-consumer" \
+            -DAGENTLOOM_CONSUMER_GENERATOR=Ninja \
+            -DAGENTLOOM_CONSUMER_BUILD_TYPE=Release \
+            -DAGENTLOOM_CONSUMER_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/vcpkg/scripts/buildsystems/vcpkg.cmake" \
+            -DAGENTLOOM_CONSUMER_TRIPLET="$VCPKG_TRIPLET" \
+            -DAGENTLOOM_CONSUMER_VCPKG_INSTALLED_DIR="$GITHUB_WORKSPACE/$VCPKG_INSTALL_ROOT" \
+            -P cmake/AgentLoomPackageConsumerTest.cmake

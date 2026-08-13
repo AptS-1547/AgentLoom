@@ -12,6 +12,10 @@
 
 namespace core {
 
+namespace detail {
+class DeferredTaskCompletionState;
+}
+
 class ThreadPool;
 class ThreadPoolContext;
 
@@ -61,6 +65,7 @@ public:
 
 private:
     friend class ThreadPool;
+    friend class detail::DeferredTaskCompletionState;
 
     ThreadPoolWorkItem(TaskFunction task,
                        SharedMemoryBlock payload,
@@ -99,6 +104,8 @@ public:
     virtual bool closed() const noexcept = 0;
     virtual std::size_t QueuedTaskCount() const noexcept = 0;
     virtual ThreadPoolConcurrencySnapshot Snapshot() const = 0;
+    /// 当前 work item 未 Complete 前，是否保证相同 concurrency_key 不会再次出队。
+    virtual bool SerializesConcurrencyKeyUntilCompletion() const noexcept { return false; }
 };
 
 class DefaultFifoThreadPoolTaskScheduler final : public IThreadPoolTaskScheduler {

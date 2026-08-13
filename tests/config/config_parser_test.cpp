@@ -1,3 +1,4 @@
+#include "config_section.h"
 #include "option_parser.h"
 
 #include <gtest/gtest.h>
@@ -84,7 +85,7 @@ MultimodalServerOptions Parse(std::initializer_list<std::string_view> args) {
     return ParseMultimodalOptions(argv.argc(), argv.argv());
 }
 
-} // namespace
+}
 
 TEST(ConfigOptionParserTest, DetectsHelpFlag) {
     ArgvBuilder long_help({"server", "--help"});
@@ -95,6 +96,23 @@ TEST(ConfigOptionParserTest, DetectsHelpFlag) {
 
     ArgvBuilder no_help({"server", "--llm", "model.gguf"});
     EXPECT_FALSE(IsHelpRequested(no_help.argc(), no_help.argv()));
+}
+
+TEST(ConfigSectionSelectionTest, BuildsAndValidatesOnlySelectedSections) {
+    const auto selection = server_config::ConfigSectionSelection::Only({"llm", "grpc"});
+    const auto sections = server_config::BuildConfigSections(selection);
+
+    ASSERT_EQ(sections.size(), 2u);
+    std::vector<std::string_view> names;
+    for (const auto& section : sections) {
+        names.push_back(section->Name());
+    }
+    EXPECT_NE(std::find(names.begin(), names.end(), "grpc"), names.end());
+    EXPECT_NE(std::find(names.begin(), names.end(), "llm"), names.end());
+
+    MultimodalServerOptions options;
+    EXPECT_NO_THROW(server_config::ValidateOptions(options, selection));
+    EXPECT_THROW(server_config::ValidateOptions(options), std::runtime_error);
 }
 
 TEST(ConfigOptionParserTest, ParsesCliFallbackOptionsThroughSections) {
@@ -399,7 +417,7 @@ TEST(ConfigOptionParserTest, RejectsInvalidSectionValidation) {
         std::runtime_error);
 }
 
-// ── LLM section ──────────────────────────────────────────────────────────────
+// LLM 配置解析与凭据优先级。
 
 namespace {
 
@@ -421,7 +439,7 @@ void SetEnv(const char* name, const char* value) {
 #endif
 }
 
-}  // namespace
+}
 
 TEST(ConfigLlmSectionTest, DisabledWhenBaseUrlEmpty) {
     UnsetLlmEnv();
@@ -465,7 +483,7 @@ TEST(ConfigLlmSectionTest, ApiKeyResolvedFromFileWhenEnvMissing) {
     UnsetLlmEnv();
     ScopedTempDirectory tmp("llm_key");
     auto key_file = tmp.path() / "key.txt";
-    WriteFile(key_file, "sk-from-file\n");
+    WriteFile(key_file, "\xEF\xBB\xBF  sk-from-file\n");
 
     auto opts = Parse({
         "server",
@@ -530,6 +548,11 @@ TEST(ConfigLlmSectionTest, JsonConfigLoadsLlmSection) {
             "model": "deepseek-chat",
             "timeout_ms": 45000,
             "max_retries": 5,
+            "async_http_io_threads": 6,
+            "http_keep_alive": true,
+            "http_max_idle_connections": 96,
+            "http_max_idle_connections_per_origin": 48,
+            "http_idle_timeout_ms": 45000,
             "disable_tls_verify_on_windows": false,
             "ca_bundle_path": "certs/mozilla-ca-bundle.pem",
             "prompts": {
@@ -549,6 +572,11 @@ TEST(ConfigLlmSectionTest, JsonConfigLoadsLlmSection) {
     EXPECT_EQ(opts.llm.model, "deepseek-chat");
     EXPECT_EQ(opts.llm.timeout_ms, 45000);
     EXPECT_EQ(opts.llm.max_retries, 5);
+    EXPECT_EQ(opts.llm.async_http_io_threads, 6u);
+    EXPECT_TRUE(opts.llm.http_keep_alive);
+    EXPECT_EQ(opts.llm.http_max_idle_connections, 96u);
+    EXPECT_EQ(opts.llm.http_max_idle_connections_per_origin, 48u);
+    EXPECT_EQ(opts.llm.http_idle_timeout_ms, 45000);
     EXPECT_EQ(opts.llm.api_key, "sk-json-test");
     EXPECT_FALSE(opts.llm.disable_tls_verify_on_windows);
     EXPECT_EQ(opts.llm.ca_bundle_path, "certs/mozilla-ca-bundle.pem");
@@ -558,6 +586,30 @@ TEST(ConfigLlmSectionTest, JsonConfigLoadsLlmSection) {
     EXPECT_TRUE(opts.config_file_path.is_absolute());
 
     UnsetLlmEnv();
+}
+
+TEST(ConfigLlmSectionTest, RejectsPerOriginIdleLimitAboveGlobalLimit) {
+    UnsetLlmEnv();
+    ScopedTempDirectory tmp("llm_bad_keep_alive_pool");
+    auto config_file = tmp.path() / "config.json";
+    WriteFile(config_file, R"({
+        "llm": {
+            "base_url": "http://127.0.0.1:18081/v1",
+            "model": "mock-chat",
+            "require_api_key": false,
+            "http_keep_alive": true,
+            "http_max_idle_connections": 16,
+            "http_max_idle_connections_per_origin": 17
+        }
+    })");
+
+    EXPECT_THROW(
+        Parse({
+            "server",
+            "--llm", "llm.gguf",
+            "--config", config_file.string(),
+        }),
+        std::runtime_error);
 }
 
 TEST(ConfigLlmSectionTest, CliOverridesJson) {
@@ -752,6 +804,15 @@ TEST(ConfigPersonaGatewaySectionTest, JsonLoadsE2EGatewayOptionsAndResolvesStati
                 "worker_count": 2,
                 "queue_capacity": 128
             },
+            "llm_pool": {
+                "worker_count": 12,
+                "queue_capacity": 512,
+                "scheduler": "session_affinity",
+                "max_active_keys": 222,
+                "max_outstanding_per_key": 5,
+                "max_outstanding_per_fairness_key": 47,
+                "max_outstanding_per_tenant": 303
+            },
             "session_idle_timeout_minutes": 30,
             "session_max_recent_turns": 24,
             "session_max_active_sessions": 37,
@@ -818,6 +879,14 @@ TEST(ConfigPersonaGatewaySectionTest, JsonLoadsE2EGatewayOptionsAndResolvesStati
     EXPECT_EQ(opts.persona_gateway.compute_pool.max_outstanding_per_tenant, 101u);
     EXPECT_EQ(opts.persona_gateway.io_pool.worker_count, 2u);
     EXPECT_EQ(opts.persona_gateway.io_pool.queue_capacity, 128u);
+    ASSERT_TRUE(opts.persona_gateway.llm_pool.has_value());
+    EXPECT_EQ(opts.persona_gateway.llm_pool->worker_count, 12u);
+    EXPECT_EQ(opts.persona_gateway.llm_pool->queue_capacity, 512u);
+    EXPECT_EQ(opts.persona_gateway.llm_pool->scheduler, "session_affinity");
+    EXPECT_EQ(opts.persona_gateway.llm_pool->max_active_keys, 222u);
+    EXPECT_EQ(opts.persona_gateway.llm_pool->max_outstanding_per_key, 5u);
+    EXPECT_EQ(opts.persona_gateway.llm_pool->max_outstanding_per_fairness_key, 47u);
+    EXPECT_EQ(opts.persona_gateway.llm_pool->max_outstanding_per_tenant, 303u);
     EXPECT_EQ(opts.persona_gateway.session_idle_timeout_minutes, 30);
     EXPECT_EQ(opts.persona_gateway.session_max_recent_turns, 24u);
     EXPECT_EQ(opts.persona_gateway.session_max_active_sessions, 37u);
@@ -862,6 +931,8 @@ TEST(ConfigPersonaGatewaySectionTest, CliOverridesGatewayJson) {
         "--gateway-compute-queue", "300",
         "--gateway-io-workers", "2",
         "--gateway-io-queue", "200",
+        "--gateway-llm-workers", "9",
+        "--gateway-llm-queue", "900",
         "--gateway-session-idle-minutes", "45",
         "--gateway-session-max-recent-turns", "32",
         "--gateway-session-max-active", "41",
@@ -884,6 +955,10 @@ TEST(ConfigPersonaGatewaySectionTest, CliOverridesGatewayJson) {
     EXPECT_EQ(opts.persona_gateway.compute_pool.queue_capacity, 300u);
     EXPECT_EQ(opts.persona_gateway.io_pool.worker_count, 2u);
     EXPECT_EQ(opts.persona_gateway.io_pool.queue_capacity, 200u);
+    ASSERT_TRUE(opts.persona_gateway.llm_pool.has_value());
+    EXPECT_EQ(opts.persona_gateway.llm_pool->worker_count, 9u);
+    EXPECT_EQ(opts.persona_gateway.llm_pool->queue_capacity, 900u);
+    EXPECT_EQ(opts.persona_gateway.llm_pool->scheduler, "session_affinity");
     EXPECT_EQ(opts.persona_gateway.session_idle_timeout_minutes, 45);
     EXPECT_EQ(opts.persona_gateway.session_max_recent_turns, 32u);
     EXPECT_EQ(opts.persona_gateway.session_max_active_sessions, 41u);
@@ -917,6 +992,26 @@ TEST(ConfigPersonaGatewaySectionTest, RejectsUnknownThreadPoolScheduler) {
         "persona_gateway": {
             "compute_pool": {
                 "scheduler": "unknown"
+            }
+        }
+    })");
+
+    EXPECT_THROW(
+        Parse({
+            "server",
+            "--llm", "llm.gguf",
+            "--config", config_file.string(),
+        }),
+        std::runtime_error);
+}
+
+TEST(ConfigPersonaGatewaySectionTest, RejectsFifoLlmPoolScheduler) {
+    ScopedTempDirectory tmp("persona_gateway_bad_llm_scheduler");
+    auto config_file = tmp.path() / "config.json";
+    WriteFile(config_file, R"({
+        "persona_gateway": {
+            "llm_pool": {
+                "scheduler": "default_fifo"
             }
         }
     })");

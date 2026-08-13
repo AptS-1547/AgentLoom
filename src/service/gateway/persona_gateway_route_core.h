@@ -2,6 +2,7 @@
 
 #include "document_analysis_service.h"
 #include "gateway_auth.h"
+#include "gateway_routing.h"
 #include "isemantic_cache.h"
 #include "persona_gateway_service.h"
 #include "request_interfaces.h"
@@ -9,7 +10,6 @@
 
 #include <nlohmann/json.hpp>
 
-#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -70,142 +70,41 @@ struct WsRouteContext {
     std::unordered_map<std::string, DocumentUploadSession>& document_uploads;
 };
 
-class IHttpRoute {
-public:
-    virtual ~IHttpRoute() = default;
-    virtual ::net::http::verb Method() const noexcept = 0;
-    virtual std::vector<std::string_view> Pattern() const = 0;
-    virtual bool RequiresAuth() const noexcept { return true; }
-    virtual bool RequiresAuthenticatedIdentity() const noexcept { return false; }
-    virtual void Handle(HttpRouteContext& context) const = 0;
-
-    bool Matches(::net::http::verb method,
-                 const std::vector<std::string>& parts,
-                 std::unordered_map<std::string, std::string>& params) const {
-        if (method != Method()) {
-            return false;
-        }
-        const auto pattern = Pattern();
-        if (pattern.size() != parts.size()) {
-            return false;
-        }
-        params.clear();
-        for (std::size_t i = 0; i < pattern.size(); ++i) {
-            const auto token = pattern[i];
-            if (token.size() >= 2 && token.front() == '{' && token.back() == '}') {
-                params.emplace(std::string(token.substr(1, token.size() - 2)), parts[i]);
-                continue;
-            }
-            if (token != parts[i]) {
-                return false;
-            }
-        }
-        return true;
-    }
-};
+using IHttpRoute = ITypedHttpRoute<HttpRouteContext>;
 
 using HttpRouteFactory = std::unique_ptr<IHttpRoute> (*)();
 
-class IWsRoute {
-public:
-    virtual ~IWsRoute() = default;
-    virtual std::string_view Type() const noexcept = 0;
-    virtual bool RequiresAuth() const noexcept { return true; }
-    virtual bool RequiresAuthenticatedIdentity() const noexcept { return false; }
-    virtual void Handle(WsRouteContext& context) const = 0;
-
-    bool Matches(std::string_view type) const noexcept {
-        return Type() == type;
-    }
-};
+using IWsRoute = ITypedWsRoute<WsRouteContext>;
 
 using WsRouteFactory = std::unique_ptr<IWsRoute> (*)();
 
-class HttpRouteRegistry {
+class HttpRouteRegistry : public TypedRouteRegistry<IHttpRoute> {
 public:
     static HttpRouteRegistry& Instance() {
         static HttpRouteRegistry registry;
         return registry;
     }
 
-    bool Register(std::string_view name, HttpRouteFactory factory) {
-        auto duplicate = std::find_if(
-            entries_.begin(),
-            entries_.end(),
-            [name](const Entry& entry) {
-                return entry.name == name;
-            });
-        if (duplicate == entries_.end()) {
-            entries_.push_back({name, factory});
-        }
-        return true;
-    }
-
-    std::vector<std::unique_ptr<IHttpRoute>> CreateRoutes() const {
-        std::vector<std::unique_ptr<IHttpRoute>> routes;
-        routes.reserve(entries_.size());
-        for (const auto& entry : entries_) {
-            routes.push_back(entry.factory());
-        }
-        return routes;
-    }
-
-private:
-    struct Entry {
-        std::string_view name;
-        HttpRouteFactory factory = nullptr;
-    };
-
-    std::vector<Entry> entries_;
 };
 
-class WsRouteRegistry {
+class WsRouteRegistry : public TypedRouteRegistry<IWsRoute> {
 public:
     static WsRouteRegistry& Instance() {
         static WsRouteRegistry registry;
         return registry;
     }
 
-    bool Register(std::string_view name, WsRouteFactory factory) {
-        auto duplicate = std::find_if(
-            entries_.begin(),
-            entries_.end(),
-            [name](const Entry& entry) {
-                return entry.name == name;
-            });
-        if (duplicate == entries_.end()) {
-            entries_.push_back({name, factory});
-        }
-        return true;
-    }
-
-    std::vector<std::unique_ptr<IWsRoute>> CreateRoutes() const {
-        std::vector<std::unique_ptr<IWsRoute>> routes;
-        routes.reserve(entries_.size());
-        for (const auto& entry : entries_) {
-            routes.push_back(entry.factory());
-        }
-        return routes;
-    }
-
-private:
-    struct Entry {
-        std::string_view name;
-        WsRouteFactory factory = nullptr;
-    };
-
-    std::vector<Entry> entries_;
 };
 
 template <typename T>
 class HttpRouteRegistrar {
 public:
     HttpRouteRegistrar() {
-        HttpRouteRegistry::Instance().Register(
+        static_cast<void>(HttpRouteRegistry::Instance().Register(
             T::kRouteName,
             []() -> std::unique_ptr<IHttpRoute> {
                 return std::make_unique<T>();
-            });
+            }));
     }
 };
 
@@ -213,11 +112,11 @@ template <typename T>
 class WsRouteRegistrar {
 public:
     WsRouteRegistrar() {
-        WsRouteRegistry::Instance().Register(
+        static_cast<void>(WsRouteRegistry::Instance().Register(
             T::kRouteName,
             []() -> std::unique_ptr<IWsRoute> {
                 return std::make_unique<T>();
-            });
+            }));
     }
 };
 

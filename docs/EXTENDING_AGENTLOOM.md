@@ -11,8 +11,10 @@ add_subdirectory(path/to/AgentLoom)
 
 target_link_libraries(my_agent_backend PRIVATE
     AgentLoom::core
-    AgentLoom::service
-    AgentLoom::gateway
+    AgentLoom::runtime
+    AgentLoom::gateway_foundation
+    AgentLoom::persona_interaction
+    AgentLoom::gateway_routing
 )
 ```
 
@@ -37,9 +39,15 @@ AgentLoom::ipc
 AgentLoom::media
 AgentLoom::media_inference
 AgentLoom::runtime
+AgentLoom::gateway_foundation
+AgentLoom::persona_interaction
+AgentLoom::gateway_routing
 AgentLoom::gateway
+AgentLoom::reference_gateway
 AgentLoom::service
 ```
+
+`AgentLoom::gateway` 是 `gateway_foundation`、`persona_interaction` 和 `gateway_routing` 的兼容聚合，不依赖参考认证、Document、Classroom、参考 Route 或参考 Server。只有在启用 `AGENTLOOM_BUILD_REFERENCE_GATEWAY` 时才导出 `AgentLoom::reference_gateway`；该 target 适用于 AgentLoom 的参考产品组合，不是下游 Runtime 的默认依赖。
 
 这些 alias 不改变内部 `agent_*` target，方便现有工程逐步迁移。
 
@@ -63,7 +71,9 @@ target_compile_features(my_agent PRIVATE cxx_std_20)
 target_link_libraries(my_agent PRIVATE
     AgentLoom::core
     AgentLoom::runtime
-    AgentLoom::gateway
+    AgentLoom::gateway_foundation
+    AgentLoom::persona_interaction
+    AgentLoom::gateway_routing
 )
 ```
 
@@ -71,7 +81,9 @@ target_link_libraries(my_agent PRIVATE
 
 ```cpp
 #include <AgentLoom/core/result.h>
-#include <AgentLoom/service/persona/persona_runtime.h>
+#include <AgentLoom/service/persona/persona_interaction.h>
+#include <AgentLoom/service/gateway/gateway_lifecycle.h>
+#include <AgentLoom/service/gateway/gateway_routing.h>
 ```
 
 `AgentLoomConfig.cmake` 会查找 Protobuf、gRPC、spdlog、OpenSSL、Redis client、libzip、pugixml、Faiss、OpenCV 和 nlohmann-json。构建 AgentLoom 时使用的本地预编译依赖路径会作为消费端默认值写入 config；迁移安装包或使用另一套依赖时，可以在 `find_package()` 前覆盖：

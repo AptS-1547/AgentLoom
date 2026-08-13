@@ -9,8 +9,10 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 using agent::net::BeastHttpClient;
 using agent::net::BeastHttpClientOptions;
@@ -49,6 +51,14 @@ public:
         acceptor_.close();
         ioc_.stop();
         if (thread_.joinable()) thread_.join();
+        // 所有已接收会话均属于 mock server，析构时等待其退出，避免跨测试访问
+        // socket/runtime 资源。先停止 accept 线程，确保不会再添加新会话线程。
+        std::lock_guard lock(session_threads_mutex_);
+        for (auto& session_thread : session_threads_) {
+            if (session_thread.joinable()) {
+                session_thread.join();
+            }
+        }
     }
 
     std::uint16_t port() const { return port_; }
@@ -75,37 +85,44 @@ private:
 
     void HandleSession(tcp::socket sock) {
         // One request per connection — simple and matches what BeastHttpClient does.
-        std::thread([this, sock = std::move(sock)]() mutable {
+        // 会话线程可能在 server fixture 析构后才结束，因此只捕获共享行为对象，
+        // 不能通过 this 访问已经释放的 MockHttpServer。
+        auto behavior = behavior_;
+        std::thread session_thread([behavior = std::move(behavior), sock = std::move(sock)]() mutable {
             beast::error_code ec;
             beast::flat_buffer buf;
             http::request<http::string_body> req;
             http::read(sock, buf, req, ec);
             if (ec) return;
 
-            behavior_->last_method = std::string(req.method_string());
-            behavior_->last_target = std::string(req.target());
-            behavior_->last_body = req.body();
+            behavior->last_method = std::string(req.method_string());
+            behavior->last_target = std::string(req.target());
+            behavior->last_body = req.body();
 
-            if (behavior_->delay_before_response.count() > 0) {
-                std::this_thread::sleep_for(behavior_->delay_before_response);
+            if (behavior->delay_before_response.count() > 0) {
+                std::this_thread::sleep_for(behavior->delay_before_response);
             }
 
             http::response<http::string_body> res(
-                static_cast<http::status>(behavior_->status), req.version());
+                static_cast<http::status>(behavior->status), req.version());
             res.set(http::field::server, "mock-http-server");
-            res.set(http::field::content_type, behavior_->content_type);
+            res.set(http::field::content_type, behavior->content_type);
             res.keep_alive(false);
-            res.body() = behavior_->body;
+            res.body() = behavior->body;
             res.prepare_payload();
             http::write(sock, res, ec);
             sock.shutdown(tcp::socket::shutdown_both, ec);
-        }).detach();
+        });
+        std::lock_guard lock(session_threads_mutex_);
+        session_threads_.push_back(std::move(session_thread));
     }
 
     std::shared_ptr<MockBehavior> behavior_;
     asio::io_context ioc_;
     tcp::acceptor acceptor_;
     std::thread thread_;
+    std::mutex session_threads_mutex_;
+    std::vector<std::thread> session_threads_;
     std::uint16_t port_ = 0;
 };
 

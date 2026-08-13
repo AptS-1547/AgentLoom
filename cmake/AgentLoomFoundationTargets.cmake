@@ -100,6 +100,8 @@ add_library(agent_http_client STATIC
     src/net/http_client/retry_policy.cpp
     src/net/http_client/beast_http_client.h
     src/net/http_client/beast_http_client.cpp
+    src/net/http_client/async_beast_http_client.h
+    src/net/http_client/async_beast_http_client.cpp
     src/net/http_client/concurrent_http_client.h
 )
 
@@ -122,6 +124,7 @@ if(BERT_BUILD_TESTS)
         tests/net/http_client/url_parser_test.cpp
         tests/net/http_client/retry_policy_test.cpp
         tests/net/http_client/beast_http_client_test.cpp
+        tests/net/http_client/async_beast_http_client_test.cpp
     )
     target_link_libraries(http_client_tests PRIVATE
         agent_http_client
@@ -182,6 +185,14 @@ if(BERT_BUILD_TESTS)
 endif()
 
 if(AGENTLOOM_BUILD_TOOLS)
+# ──────────── OpenAI-compatible C++ quota mock (manual E2E benchmark peer) ────────────
+add_executable(openai_compatible_quota_mock_server
+    tools/openai_compatible_quota_mock_server.cpp
+)
+target_link_libraries(openai_compatible_quota_mock_server PRIVATE
+    agent_net
+)
+
 # ──────────── Manual smoke test against a real LLM API (not part of CTest) ────────────
 add_executable(llm_smoke_test
     tools/llm_smoke_test.cpp

@@ -8,6 +8,123 @@
 
 namespace core {
 
+namespace detail {
+
+class DeferredTaskCompletionState final {
+public:
+    DeferredTaskCompletionState(
+        std::shared_ptr<IThreadPoolTaskScheduler> scheduler,
+        std::shared_ptr<ThreadPoolWorkItem> item,
+        std::size_t worker_index,
+        std::shared_ptr<ThreadPoolCompletionCounters> counters)
+        : scheduler_(std::move(scheduler)),
+          item_(std::move(item)),
+          worker_index_(worker_index),
+          counters_(std::move(counters)) {}
+
+    bool TryDefer() noexcept {
+        bool expected = false;
+        if (!deferred_.compare_exchange_strong(
+                expected, true, std::memory_order_acq_rel)) {
+            return false;
+        }
+        counters_->deferred_outstanding.fetch_add(1, std::memory_order_acq_rel);
+        return true;
+    }
+
+    bool deferred() const noexcept {
+        return deferred_.load(std::memory_order_acquire);
+    }
+
+    void Complete(Status status) noexcept {
+        if (completed_.exchange(true, std::memory_order_acq_rel)) {
+            return;
+        }
+        scheduler_->Complete(*item_, worker_index_, status);
+        if (item_->task_group_token_) {
+            item_->task_group_token_->Complete(status);
+        }
+        if (status.ok()) {
+            counters_->completed.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            counters_->failed.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (deferred_.load(std::memory_order_acquire) &&
+            counters_->deferred_outstanding.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            std::lock_guard lock(counters_->mutex);
+            counters_->drained_cv.notify_all();
+        }
+        item_.reset();
+    }
+
+private:
+    std::shared_ptr<IThreadPoolTaskScheduler> scheduler_;
+    std::shared_ptr<ThreadPoolWorkItem> item_;
+    std::size_t worker_index_ = 0;
+    std::shared_ptr<ThreadPoolCompletionCounters> counters_;
+    std::atomic<bool> deferred_{false};
+    std::atomic<bool> completed_{false};
+};
+
+} // namespace detail
+
+DeferredTaskCompletion::DeferredTaskCompletion(
+    std::shared_ptr<detail::DeferredTaskCompletionState> state) noexcept
+    : state_(std::move(state)), active_(state_ != nullptr) {}
+
+DeferredTaskCompletion::~DeferredTaskCompletion() {
+    if (active_) {
+        Complete(Status::Error(
+            ErrorCode::Cancelled,
+            "deferred thread pool task released without completion"));
+    }
+}
+
+DeferredTaskCompletion::DeferredTaskCompletion(DeferredTaskCompletion&& other) noexcept
+    : state_(std::move(other.state_)),
+      active_(std::exchange(other.active_, false)) {}
+
+DeferredTaskCompletion& DeferredTaskCompletion::operator=(
+    DeferredTaskCompletion&& other) noexcept {
+    if (this != &other) {
+        if (active_) {
+            Complete(Status::Error(
+                ErrorCode::Cancelled,
+                "deferred thread pool task replaced without completion"));
+        }
+        state_ = std::move(other.state_);
+        active_ = std::exchange(other.active_, false);
+    }
+    return *this;
+}
+
+void DeferredTaskCompletion::Complete(Status status) noexcept {
+    if (!active_ || !state_) {
+        return;
+    }
+    active_ = false;
+    state_->Complete(std::move(status));
+    state_.reset();
+}
+
+bool DeferredTaskCompletion::valid() const noexcept {
+    return active_ && state_ != nullptr;
+}
+
+Result<DeferredTaskCompletion> ThreadPoolContext::DeferCompletion() {
+    if (!deferred_completion_state_) {
+        return Status::Error(
+            ErrorCode::FailedPrecondition,
+            "current task does not support deferred completion");
+    }
+    if (!deferred_completion_state_->TryDefer()) {
+        return Status::Error(
+            ErrorCode::AlreadyExists,
+            "current task completion is already deferred");
+    }
+    return DeferredTaskCompletion(deferred_completion_state_);
+}
+
 ThreadPool::ThreadPool(ThreadPoolOptions options)
     : options_(std::move(options)),
       scheduler_(options_.scheduler
@@ -86,6 +203,13 @@ void ThreadPool::Shutdown(bool drain) {
         if (worker.joinable()) {
             worker.join();
         }
+    }
+    if (drain) {
+        std::unique_lock lock(completion_counters_->mutex);
+        completion_counters_->drained_cv.wait(lock, [this] {
+            return completion_counters_->deferred_outstanding.load(
+                       std::memory_order_acquire) == 0;
+        });
     }
 }
 
@@ -194,8 +318,8 @@ ThreadPoolStats ThreadPool::Stats() const {
     stats.queued_tasks = scheduler_ ? scheduler_->QueuedTaskCount() : 0;
     stats.active_workers = active_workers_.load(std::memory_order_relaxed);
     stats.submitted_tasks = submitted_tasks_.load(std::memory_order_relaxed);
-    stats.completed_tasks = completed_tasks_.load(std::memory_order_relaxed);
-    stats.failed_tasks = failed_tasks_.load(std::memory_order_relaxed);
+    stats.completed_tasks = completion_counters_->completed.load(std::memory_order_relaxed);
+    stats.failed_tasks = completion_counters_->failed.load(std::memory_order_relaxed);
     stats.rejected_tasks = rejected_tasks_.load(std::memory_order_relaxed);
     if (scheduler_) {
         stats.scheduler = scheduler_->Snapshot();
@@ -218,6 +342,10 @@ bool ThreadPool::running() const noexcept {
     return running_.load(std::memory_order_acquire);
 }
 
+bool ThreadPool::serializes_concurrency_key_until_completion() const noexcept {
+    return scheduler_ && scheduler_->SerializesConcurrencyKeyUntilCompletion();
+}
+
 void ThreadPool::WorkerLoop(std::stop_token stop_token, std::size_t worker_index) {
     ThreadPoolContext context(worker_index, options_.name, stop_token);
     SetWorkerState(worker_index, WorkerState::Idle);
@@ -234,6 +362,9 @@ void ThreadPool::WorkerLoop(std::stop_token stop_token, std::size_t worker_index
         SetWorkerState(worker_index, WorkerState::Running, queued->name_);
         context.set_payload(std::move(queued->payload_));
         context.set_task_group_token(queued->task_group_token_.get());
+        auto completion = std::make_shared<detail::DeferredTaskCompletionState>(
+            scheduler_, queued, worker_index, completion_counters_);
+        context.set_deferred_completion_state(completion);
 
         TraceContext trace_ctx;
         trace_ctx.trace_id = queued->trace_id_;
@@ -252,19 +383,12 @@ void ThreadPool::WorkerLoop(std::stop_token stop_token, std::size_t worker_index
 
         context.clear_payload();
         context.set_task_group_token(nullptr);
+        context.set_deferred_completion_state(nullptr);
         active_workers_.fetch_sub(1, std::memory_order_relaxed);
-        const auto task_ok = status.ok();
-        scheduler_->Complete(*queued, worker_index, status);
-        if (queued->task_group_token_) {
-            queued->task_group_token_->Complete(status);
+        if (!completion->deferred() || !status.ok()) {
+            completion->Complete(status);
         }
         FinishWorkerTask(worker_index, std::move(status));
-
-        if (task_ok) {
-            completed_tasks_.fetch_add(1, std::memory_order_relaxed);
-        } else {
-            failed_tasks_.fetch_add(1, std::memory_order_relaxed);
-        }
     }
 
     SetWorkerState(worker_index, WorkerState::Stopped);

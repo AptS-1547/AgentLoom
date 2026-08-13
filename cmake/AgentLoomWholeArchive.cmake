@@ -1,0 +1,20 @@
+include_guard(GLOBAL)
+
+function(agentloom_link_whole_archive target library)
+    if(NOT TARGET "${target}")
+        message(FATAL_ERROR "agentloom_link_whole_archive target does not exist: ${target}")
+    endif()
+    if(NOT TARGET "${library}")
+        message(FATAL_ERROR "agentloom_link_whole_archive library does not exist: ${library}")
+    endif()
+
+    if(MSVC)
+        target_link_libraries("${target}" PRIVATE "${library}")
+        target_link_options("${target}" PRIVATE "/WHOLEARCHIVE:$<TARGET_FILE:${library}>")
+    elseif(APPLE)
+        target_link_libraries("${target}" PRIVATE "-Wl,-force_load,$<TARGET_FILE:${library}>")
+    else()
+        target_link_libraries("${target}" PRIVATE
+            "-Wl,--whole-archive" "${library}" "-Wl,--no-whole-archive")
+    endif()
+endfunction()

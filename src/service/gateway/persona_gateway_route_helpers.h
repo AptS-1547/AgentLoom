@@ -329,6 +329,7 @@ static Json SystemStatsEnvelope(const SystemStatsGatewayResponse& response) {
             {"pools", {
                 {"compute", ThreadPoolStatsToJson(response.pools.compute)},
                 {"io", ThreadPoolStatsToJson(response.pools.io)},
+                {"llm", ThreadPoolStatsToJson(response.pools.llm)},
             }},
         }},
     };

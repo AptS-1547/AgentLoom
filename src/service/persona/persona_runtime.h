@@ -8,10 +8,12 @@
 #include "tool_memory_provider.h"
 
 #include <chrono>
+#include <condition_variable>
 #include <functional>
 #include <memory>
 #include <optional>
 #include <span>
+#include <unordered_map>
 
 namespace agent::service::persona {
 
@@ -222,12 +224,16 @@ public:
                    std::shared_ptr<IToolMemoryProvider> tool_memory_provider = nullptr,
                    std::shared_ptr<ISkillSessionManager> skill_session_manager = nullptr,
                    core::LoggerAdapter logger = core::LoggerAdapter::ForModule("service"),
-                   std::shared_ptr<IEmotionCalibrationSampleSink> emotion_calibration_sink = nullptr);
+                   std::shared_ptr<IEmotionCalibrationSampleSink> emotion_calibration_sink = nullptr,
+                   std::shared_ptr<llm::IAsyncLlmClient> async_llm_client = nullptr);
+    ~PersonaRuntime();
 
     /// 异步提交对话；callback 恰好调用一次并携带最终 Result。
     /// @param request 本轮 session、输入、trace 和生成参数。
     /// @param callback 完成回调，不得为空；可能在线程池工作线程执行。
     core::Status SubmitChat(ChatRequest request, ChatCallback callback);
+    /// 停止异步 admission，取消在途 LLM 请求并等待其 callback/Session commit 收口。
+    void Shutdown() noexcept;
 
 private:
     struct PreparedChat {
@@ -242,6 +248,11 @@ private:
         ChatLatencyBreakdown latency;
     };
 
+    struct CompletedChat {
+        ChatResponse response;
+        EmotionStateTracker emotion_state;
+    };
+
     core::Result<PreparedChat> PrepareChat(SessionState& session, ChatRequest request);
     core::Result<std::vector<llm::ChatMessage>> BuildMessages(
         SessionState& session,
@@ -253,18 +264,34 @@ private:
                                                      const ChatRequest& request,
                                                      const EmotionAnalysis& emotion,
                                                      const std::vector<ConversationTurn>& recent_turns) const;
-    void CompleteWithLlm(SessionState& session, PreparedChat prepared, ChatCallback callback);
+    core::Result<ChatResponse> CompleteWithLlm(SessionState& session, PreparedChat prepared);
+    core::Status CompleteWithLlmAsync(
+        SessionState session,
+        PreparedChat prepared,
+        std::function<void(core::Result<CompletedChat>)> completion);
+    core::Result<CompletedChat> FinalizeLlmCompletion(
+        SessionState& session,
+        PreparedChat prepared,
+        llm::ChatCompletionResponse llm_completion,
+        std::optional<AnswerCacheLookupRequest> answer_cache_lookup,
+        std::chrono::steady_clock::time_point io_stage_start);
 
     SessionManager& sessions_;
     std::shared_ptr<IMemoryContextProvider> memory_provider_;
     std::shared_ptr<IEmotionAnalyzer> emotion_analyzer_;
     std::shared_ptr<llm::ILlmClient> llm_client_;
+    std::shared_ptr<llm::IAsyncLlmClient> async_llm_client_;
     std::shared_ptr<IAnswerCacheProvider> answer_cache_provider_;
     std::shared_ptr<IToolMemoryProvider> tool_memory_provider_;
     std::shared_ptr<ISkillSessionManager> skill_session_manager_;
     std::shared_ptr<IEmotionCalibrationSampleSink> emotion_calibration_sink_;
     PersonaRuntimeOptions options_;
     core::LoggerAdapter logger_;
+    mutable std::mutex async_operations_mutex_;
+    std::condition_variable async_operations_drained_;
+    std::unordered_map<std::uint64_t, std::shared_ptr<llm::IAsyncLlmOperation>> async_operations_;
+    std::uint64_t next_async_operation_id_ = 1;
+    bool async_stopping_ = false;
 };
 
 } // namespace agent::service::persona

@@ -534,6 +534,49 @@ TEST(ThreadPoolTest, RecordsFailedTaskStatus) {
     EXPECT_EQ(stats.failed_tasks, 1u);
 }
 
+TEST(ThreadPoolTest, DeferredCompletionReleasesWorkerAndDrainWaitsForContinuation) {
+    core::ThreadPool pool({1, 8, "deferred-completion-pool"});
+    ASSERT_TRUE(pool.Start().ok());
+
+    std::promise<core::DeferredTaskCompletion> deferred_ready;
+    auto deferred_future = deferred_ready.get_future();
+    std::promise<void> short_task_ran;
+    auto short_task_future = short_task_ran.get_future();
+
+    ASSERT_TRUE(pool.Submit(
+        [&](core::ThreadPoolContext& context) -> core::Status {
+            auto token = context.DeferCompletion();
+            if (!token.ok()) {
+                return token.status();
+            }
+            deferred_ready.set_value(std::move(token).value());
+            return core::Status::Ok();
+        },
+        {},
+        "start-async-operation").ok());
+    ASSERT_EQ(deferred_future.wait_for(2s), std::future_status::ready);
+    auto deferred = deferred_future.get();
+
+    // 单 worker 已经可继续执行，证明异步等待没有占住工作线程。
+    ASSERT_TRUE(pool.Submit([&] { short_task_ran.set_value(); }).ok());
+    ASSERT_EQ(short_task_future.wait_for(2s), std::future_status::ready);
+    EXPECT_EQ(pool.Stats().completed_tasks, 1u);
+
+    std::atomic<bool> shutdown_returned{false};
+    std::jthread shutdown([&] {
+        pool.Shutdown(true);
+        shutdown_returned.store(true, std::memory_order_release);
+    });
+    std::this_thread::sleep_for(20ms);
+    EXPECT_FALSE(shutdown_returned.load(std::memory_order_acquire));
+
+    deferred.Complete();
+    shutdown.join();
+    EXPECT_TRUE(shutdown_returned.load(std::memory_order_acquire));
+    EXPECT_EQ(pool.Stats().completed_tasks, 2u);
+    EXPECT_EQ(pool.Stats().failed_tasks, 0u);
+}
+
 TEST(TaskGroupTest, TracksNestedTasksAcrossPoolsAfterSeal) {
     core::ThreadPool compute({1, 8, "task-group-compute"});
     core::ThreadPool io({1, 8, "task-group-io"});

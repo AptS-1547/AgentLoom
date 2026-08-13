@@ -23,6 +23,8 @@ using agent::service::persona::GatewaySessionAffinitySchedulerOptions;
 using agent::service::persona::PersonalityConfig;
 using agent::service::persona::SessionManager;
 using agent::service::persona::SessionOptions;
+using agent::service::persona::SessionTurnCommit;
+using agent::service::persona::SessionTurnReceipt;
 using agent::service::gateway::IRuntimeMaintenanceTask;
 using agent::service::gateway::InferenceFrameIpcPeerMaintenanceTask;
 using agent::service::gateway::RuntimeMaintenanceService;
@@ -146,6 +148,43 @@ TEST(SessionManagerTest, CreatesTouchesAddsTurnsAndClosesSession) {
     EXPECT_TRUE(manager.CloseSession("session-a", "trace-close").ok());
     EXPECT_EQ(manager.SessionCount(), 0u);
 
+    compute.Shutdown(true);
+    io.Shutdown(true);
+}
+
+TEST(SessionManagerTest, TransfersFromLockedComputeTaskToIoWithoutRelockingAdmission) {
+    core::ThreadPool compute({1, 8, "test-compute"});
+    core::ThreadPool io({1, 8, "test-io"});
+    ASSERT_TRUE(compute.Start().ok());
+    ASSERT_TRUE(io.Start().ok());
+
+    SessionManager manager(compute, io);
+    ASSERT_TRUE(manager.CreateSession(MakeCreateRequest()).ok());
+
+    std::promise<core::Status> completed;
+    auto future = completed.get_future();
+    DispatchOptions compute_dispatch;
+    compute_dispatch.session_id = "session-a";
+    compute_dispatch.trace_id = "trace-compute-to-io";
+    ASSERT_TRUE(manager.SubmitCompute(
+        compute_dispatch,
+        [&manager, &completed](agent::service::persona::SessionState& session,
+                              core::ThreadPoolContext&) {
+            DispatchOptions io_dispatch;
+            io_dispatch.session_id = session.session_id;
+            io_dispatch.trace_id = "trace-io-stage";
+            return manager.SubmitIoFromSessionTask(
+                session,
+                std::move(io_dispatch),
+                [&completed](agent::service::persona::SessionState&,
+                             core::ThreadPoolContext&) {
+                    completed.set_value(core::Status::Ok());
+                    return core::Status::Ok();
+                });
+        }).ok());
+
+    ASSERT_EQ(future.wait_for(2s), std::future_status::ready);
+    EXPECT_TRUE(future.get().ok());
     compute.Shutdown(true);
     io.Shutdown(true);
 }
@@ -315,6 +354,341 @@ TEST(SessionManagerTest, DispatchUsesRegisteredIdentityForCrossSessionFairness) 
     compute.Shutdown(true);
     io.Shutdown(true);
     EXPECT_EQ(scheduler->Snapshot().active_keys, 0u);
+}
+
+TEST(SessionManagerTest, CloseAndSnapshotDoNotWaitForSlowTurn) {
+    core::ThreadPool compute({1, 8, "test-compute"});
+    core::ThreadPool io({2, 8, "test-io"});
+    ASSERT_TRUE(compute.Start().ok());
+    ASSERT_TRUE(io.Start().ok());
+
+    SessionOptions options;
+    options.max_active_sessions = 1;
+    SessionManager manager(compute, io, options);
+    ASSERT_TRUE(manager.CreateSession(MakeCreateRequest("session-slow-turn")).ok());
+    std::promise<void> entered;
+    std::promise<void> release;
+    std::promise<core::Result<SessionTurnReceipt>> completed;
+    auto entered_future = entered.get_future();
+    auto completed_future = completed.get_future();
+    auto release_future = release.get_future();
+    ASSERT_TRUE(manager.SubmitTurn(
+        DispatchOptions{.session_id = "session-slow-turn", .trace_id = "trace-slow"},
+        [&entered, &release_future](const auto& snapshot, auto& commit, auto&) {
+            entered.set_value();
+            release_future.wait();
+            commit.trace_id = "trace-slow";
+            commit.turn.user_input = "slow";
+            commit.turn.response = "done";
+            commit.emotion_state = snapshot.state.emotion_state;
+            return core::Status::Ok();
+        },
+        [&completed](auto result) { completed.set_value(std::move(result)); })
+        .ok());
+    ASSERT_EQ(entered_future.wait_for(2s), std::future_status::ready);
+
+    const auto close_started = std::chrono::steady_clock::now();
+    ASSERT_TRUE(manager.CloseSession("session-slow-turn", "trace-close").ok());
+    EXPECT_LT(std::chrono::steady_clock::now() - close_started, 100ms);
+    EXPECT_EQ(manager.SessionCount(), 0u);
+    auto rejected = manager.CreateSession(MakeCreateRequest("session-rejected"));
+    EXPECT_EQ(rejected.status().code(), core::ErrorCode::ResourceExhausted);
+
+    release.set_value();
+    ASSERT_EQ(completed_future.wait_for(2s), std::future_status::ready);
+    EXPECT_TRUE(completed_future.get().ok());
+    auto admitted = manager.CreateSession(MakeCreateRequest("session-admitted"));
+    ASSERT_TRUE(admitted.ok()) << admitted.status().message();
+    compute.Shutdown(true);
+    io.Shutdown(true);
+}
+
+TEST(SessionManagerTest, SerializesTurnsAcrossIoWorkersAndPreservesResidentQuota) {
+    core::ThreadPool compute({1, 8, "test-compute"});
+    core::ThreadPool io({2, 8, "test-io"});
+    ASSERT_TRUE(compute.Start().ok());
+    ASSERT_TRUE(io.Start().ok());
+
+    SessionOptions options;
+    options.max_active_sessions = 1;
+    SessionManager manager(compute, io, options);
+    ASSERT_TRUE(manager.CreateSession(MakeCreateRequest("session-ordered")).ok());
+
+    std::promise<void> first_entered;
+    std::promise<void> release_first;
+    std::promise<void> second_entered;
+    std::promise<core::Result<SessionTurnReceipt>> first_done;
+    std::promise<core::Result<SessionTurnReceipt>> second_done;
+    auto first_entered_future = first_entered.get_future();
+    auto second_entered_future = second_entered.get_future();
+    auto first_done_future = first_done.get_future();
+    auto second_done_future = second_done.get_future();
+    auto release_future = release_first.get_future();
+    std::atomic<int> entered{0};
+
+    auto submit = [&manager](std::string trace,
+                             auto task,
+                             auto completion) {
+        return manager.SubmitTurn(
+            DispatchOptions{.session_id = "session-ordered", .trace_id = std::move(trace)},
+            std::move(task), std::move(completion));
+    };
+    ASSERT_TRUE(submit(
+        "trace-first",
+        [&first_entered, &release_future, &entered](const auto& snapshot, auto& commit, auto&) {
+            entered.fetch_add(1);
+            first_entered.set_value();
+            release_future.wait();
+            commit.trace_id = "trace-first";
+            commit.turn.user_input = "first";
+            commit.turn.response = "1";
+            commit.emotion_state = snapshot.state.emotion_state;
+            return core::Status::Ok();
+        },
+        [&first_done](auto result) { first_done.set_value(std::move(result)); })
+        .ok());
+    ASSERT_EQ(first_entered_future.wait_for(2s), std::future_status::ready);
+
+    ASSERT_TRUE(submit(
+        "trace-second",
+        [&second_entered, &entered](const auto& snapshot, auto& commit, auto&) {
+            entered.fetch_add(1);
+            second_entered.set_value();
+            commit.trace_id = "trace-second";
+            commit.turn.user_input = "second";
+            commit.turn.response = "2";
+            commit.emotion_state = snapshot.state.emotion_state;
+            return core::Status::Ok();
+        },
+        [&second_done](auto result) { second_done.set_value(std::move(result)); })
+        .ok());
+    EXPECT_EQ(second_entered_future.wait_for(100ms), std::future_status::timeout);
+    EXPECT_EQ(entered.load(), 1);
+
+    release_first.set_value();
+    ASSERT_EQ(first_done_future.wait_for(2s), std::future_status::ready);
+    ASSERT_EQ(second_done_future.wait_for(2s), std::future_status::ready);
+    EXPECT_TRUE(first_done_future.get().ok());
+    EXPECT_TRUE(second_done_future.get().ok());
+    EXPECT_EQ(entered.load(), 2);
+
+    ASSERT_TRUE(manager.CloseSession("session-ordered").ok());
+
+    auto admitted = manager.CreateSession(MakeCreateRequest("session-admitted"));
+    ASSERT_TRUE(admitted.ok()) << admitted.status().message();
+    compute.Shutdown(true);
+    io.Shutdown(true);
+}
+
+TEST(SessionManagerTest, SubmitTurnOnDedicatedAffinityPoolKeepsOtherIoWorkAvailable) {
+    core::ThreadPool compute({1, 32, "session-dedicated-compute"});
+    core::ThreadPool io({1, 32, "session-dedicated-io"});
+    core::ThreadPool llm({2, 32, "session-dedicated-llm",
+                          std::make_shared<GatewaySessionAffinityScheduler>(
+                              GatewaySessionAffinitySchedulerOptions{
+                                  .max_active_keys = 16,
+                                  .max_outstanding_per_key = 8,
+                                  .max_outstanding_per_fairness_key = 16,
+                                  .max_outstanding_per_tenant = 32})});
+    ASSERT_TRUE(compute.Start().ok());
+    ASSERT_TRUE(io.Start().ok());
+    ASSERT_TRUE(llm.Start().ok());
+
+    SessionManager manager(compute, io, {}, core::LoggerAdapter::ForModule("service"), &llm);
+    EXPECT_EQ(manager.PoolStats().io.worker_count, 1u);
+    EXPECT_EQ(manager.PoolStats().llm.worker_count, 2u);
+    ASSERT_TRUE(manager.CreateSession(MakeCreateRequest("session-dedicated-a")).ok());
+    ASSERT_TRUE(manager.CreateSession(MakeCreateRequest("session-dedicated-b")).ok());
+
+    std::promise<void> slow_started;
+    auto slow_started_future = slow_started.get_future();
+    std::promise<core::Result<SessionTurnReceipt>> slow_done;
+    auto slow_done_future = slow_done.get_future();
+    ASSERT_TRUE(manager.SubmitTurn(
+        DispatchOptions{.session_id = "session-dedicated-a", .trace_id = "trace-slow"},
+        [&slow_started](const auto&, auto&, auto&) {
+            slow_started.set_value();
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            return core::Status::Ok();
+        },
+        [&slow_done](core::Result<SessionTurnReceipt> result) mutable {
+            slow_done.set_value(std::move(result));
+        }).ok());
+    ASSERT_EQ(slow_started_future.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+
+    std::promise<void> queued_same_session_started;
+    auto queued_same_session_future = queued_same_session_started.get_future();
+    std::promise<core::Result<SessionTurnReceipt>> queued_same_session_done;
+    auto queued_same_session_done_future = queued_same_session_done.get_future();
+    ASSERT_TRUE(manager.SubmitTurn(
+        DispatchOptions{.session_id = "session-dedicated-a", .trace_id = "trace-queued-same"},
+        [&queued_same_session_started](const auto&, auto&, auto&) {
+            queued_same_session_started.set_value();
+            return core::Status::Ok();
+        },
+        [&queued_same_session_done](core::Result<SessionTurnReceipt> result) mutable {
+            queued_same_session_done.set_value(std::move(result));
+        }).ok());
+    EXPECT_EQ(queued_same_session_future.wait_for(std::chrono::milliseconds(50)),
+              std::future_status::timeout);
+
+    std::promise<void> other_session_llm_ran;
+    auto other_session_llm_future = other_session_llm_ran.get_future();
+    std::promise<core::Result<SessionTurnReceipt>> other_session_llm_done;
+    auto other_session_llm_done_future = other_session_llm_done.get_future();
+    ASSERT_TRUE(manager.SubmitTurn(
+        DispatchOptions{.session_id = "session-dedicated-b", .trace_id = "trace-other-session"},
+        [&other_session_llm_ran](const auto&, auto&, auto&) {
+            other_session_llm_ran.set_value();
+            return core::Status::Ok();
+        },
+        [&other_session_llm_done](core::Result<SessionTurnReceipt> result) mutable {
+            other_session_llm_done.set_value(std::move(result));
+        }).ok());
+    EXPECT_EQ(other_session_llm_future.wait_for(std::chrono::milliseconds(500)),
+              std::future_status::ready);
+    ASSERT_EQ(other_session_llm_done_future.wait_for(std::chrono::seconds(1)),
+              std::future_status::ready);
+    EXPECT_TRUE(other_session_llm_done_future.get().ok());
+
+    std::promise<void> io_ran;
+    auto io_ran_future = io_ran.get_future();
+    ASSERT_TRUE(manager.SubmitIo(
+        DispatchOptions{.session_id = "session-dedicated-b", .trace_id = "trace-io"},
+        [&io_ran](auto&, auto&) {
+            io_ran.set_value();
+            return core::Status::Ok();
+        }).ok());
+    EXPECT_EQ(io_ran_future.wait_for(std::chrono::milliseconds(500)), std::future_status::ready);
+    ASSERT_EQ(slow_done_future.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+    EXPECT_TRUE(slow_done_future.get().ok());
+    ASSERT_EQ(queued_same_session_done_future.wait_for(std::chrono::seconds(1)),
+              std::future_status::ready);
+    EXPECT_TRUE(queued_same_session_done_future.get().ok());
+
+    manager.CloseSession("session-dedicated-a");
+    manager.CloseSession("session-dedicated-b");
+    llm.Shutdown(true);
+    io.Shutdown(true);
+    compute.Shutdown(true);
+}
+
+TEST(SessionManagerTest, AsyncTurnRejectsFifoSchedulerBecauseItCannotPreserveSessionOrder) {
+    core::ThreadPool compute({1, 8, "async-turn-fifo-compute"});
+    core::ThreadPool io({1, 8, "async-turn-fifo-io"});
+    ASSERT_TRUE(compute.Start().ok());
+    ASSERT_TRUE(io.Start().ok());
+    SessionManager manager(compute, io);
+    ASSERT_TRUE(manager.CreateSession(MakeCreateRequest("session-async-fifo")).ok());
+
+    auto status = manager.SubmitTurnAsync(
+        DispatchOptions{.session_id = "session-async-fifo"},
+        [](const auto&, auto&, auto) { return core::Status::Ok(); },
+        [](auto) {});
+
+    EXPECT_EQ(status.code(), core::ErrorCode::FailedPrecondition);
+    manager.CloseSession("session-async-fifo");
+    io.Shutdown(true);
+    compute.Shutdown(true);
+}
+
+TEST(SessionManagerTest, AsyncTurnReleasesWorkerButKeepsSameSessionLaneUntilFinish) {
+    core::ThreadPool compute({1, 32, "async-turn-compute"});
+    core::ThreadPool io({1, 32, "async-turn-io"});
+    core::ThreadPool llm({1, 32, "async-turn-llm",
+                          std::make_shared<GatewaySessionAffinityScheduler>(
+                              GatewaySessionAffinitySchedulerOptions{
+                                  .max_active_keys = 8,
+                                  .max_outstanding_per_key = 4,
+                                  .max_outstanding_per_fairness_key = 8,
+                                  .max_outstanding_per_tenant = 16})});
+    ASSERT_TRUE(compute.Start().ok());
+    ASSERT_TRUE(io.Start().ok());
+    ASSERT_TRUE(llm.Start().ok());
+    SessionManager manager(compute, io, {}, core::LoggerAdapter::ForModule("service"), &llm);
+    ASSERT_TRUE(manager.CreateSession(MakeCreateRequest("session-async-a")).ok());
+    ASSERT_TRUE(manager.CreateSession(MakeCreateRequest("session-async-b")).ok());
+
+    std::promise<SessionManager::SessionTurnAsyncFinish> first_finish_ready;
+    auto first_finish_future = first_finish_ready.get_future();
+    std::promise<core::Result<SessionTurnReceipt>> first_done;
+    auto first_done_future = first_done.get_future();
+    ASSERT_TRUE(manager.SubmitTurnAsync(
+        DispatchOptions{.session_id = "session-async-a", .trace_id = "trace-async-a1"},
+        [&first_finish_ready](const auto&, auto&, auto finish) {
+            first_finish_ready.set_value(std::move(finish));
+            return core::Status::Ok();
+        },
+        [&first_done](auto result) { first_done.set_value(std::move(result)); }).ok());
+    ASSERT_EQ(first_finish_future.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+    auto finish_first = first_finish_future.get();
+
+    std::promise<void> same_session_started;
+    auto same_session_started_future = same_session_started.get_future();
+    std::promise<core::Result<SessionTurnReceipt>> same_session_done;
+    auto same_session_done_future = same_session_done.get_future();
+    ASSERT_TRUE(manager.SubmitTurnAsync(
+        DispatchOptions{.session_id = "session-async-a", .trace_id = "trace-async-a2"},
+        [&same_session_started](const auto& snapshot, auto&, auto finish) {
+            same_session_started.set_value();
+            SessionTurnCommit commit;
+            commit.trace_id = "trace-async-a2";
+            commit.turn.user_input = "second";
+            commit.turn.response = "second-response";
+            commit.emotion_state = snapshot.state.emotion_state;
+            finish(std::move(commit));
+            return core::Status::Ok();
+        },
+        [&same_session_done](auto result) { same_session_done.set_value(std::move(result)); }).ok());
+    EXPECT_EQ(same_session_started_future.wait_for(std::chrono::milliseconds(100)),
+              std::future_status::timeout);
+
+    // 只有一个 LLM worker，但 A 的异步等待已经释放 worker，因此 B 能立即开始并完成。
+    std::promise<void> other_session_started;
+    auto other_session_started_future = other_session_started.get_future();
+    std::promise<core::Result<SessionTurnReceipt>> other_session_done;
+    auto other_session_done_future = other_session_done.get_future();
+    ASSERT_TRUE(manager.SubmitTurnAsync(
+        DispatchOptions{.session_id = "session-async-b", .trace_id = "trace-async-b1"},
+        [&other_session_started](const auto& snapshot, auto&, auto finish) {
+            other_session_started.set_value();
+            SessionTurnCommit commit;
+            commit.trace_id = "trace-async-b1";
+            commit.turn.user_input = "other";
+            commit.turn.response = "other-response";
+            commit.emotion_state = snapshot.state.emotion_state;
+            finish(std::move(commit));
+            return core::Status::Ok();
+        },
+        [&other_session_done](auto result) { other_session_done.set_value(std::move(result)); }).ok());
+    ASSERT_EQ(other_session_started_future.wait_for(std::chrono::seconds(1)),
+              std::future_status::ready);
+    ASSERT_EQ(other_session_done_future.wait_for(std::chrono::seconds(1)),
+              std::future_status::ready);
+    EXPECT_TRUE(other_session_done_future.get().ok());
+
+    SessionTurnCommit first_commit;
+    first_commit.trace_id = "trace-async-a1";
+    first_commit.turn.user_input = "first";
+    first_commit.turn.response = "first-response";
+    finish_first(std::move(first_commit));
+
+    ASSERT_EQ(first_done_future.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+    ASSERT_TRUE(first_done_future.get().ok());
+    ASSERT_EQ(same_session_started_future.wait_for(std::chrono::seconds(1)),
+              std::future_status::ready);
+    ASSERT_EQ(same_session_done_future.wait_for(std::chrono::seconds(1)),
+              std::future_status::ready);
+    ASSERT_TRUE(same_session_done_future.get().ok());
+
+    auto snapshot = manager.GetSessionSnapshot("session-async-a");
+    ASSERT_TRUE(snapshot.ok());
+    EXPECT_EQ(snapshot.value().metrics.turn_count, 2u);
+    manager.CloseSession("session-async-a");
+    manager.CloseSession("session-async-b");
+    llm.Shutdown(true);
+    io.Shutdown(true);
+    compute.Shutdown(true);
 }
 
 TEST(GatewaySessionAffinitySchedulerTest, SerializesSessionKeyAndRejectsExcessOutstandingWork) {

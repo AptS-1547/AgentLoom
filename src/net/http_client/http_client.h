@@ -3,6 +3,8 @@
 #include "result.h"
 
 #include <cstdint>
+#include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -15,9 +17,9 @@ struct HttpHeader {
 
 struct HttpClientRequest {
     std::string method = "POST";
-    /// Full URL including scheme, host, optional port and path.
-    /// Examples: "https://api.deepseek.com/v1/chat/completions",
-    ///           "http://127.0.0.1:8080/echo".
+    /// 完整 URL，包含 scheme、host、可选 port 与 path。
+    /// 例如："https://api.deepseek.com/v1/chat/completions"、
+    ///       "http://127.0.0.1:8080/echo"。
     std::string url;
     std::vector<HttpHeader> headers;
     std::string body;
@@ -30,22 +32,35 @@ struct HttpClientResponse {
     std::string body;
 };
 
-/// Outbound HTTP/HTTPS client interface.
+/// 出站 HTTP/HTTPS 客户端接口。
 ///
-/// Implementations execute one request per call: DNS resolve → connect →
-/// (TLS handshake) → write request → read full response → close.  No connection
-/// reuse, no auto-redirect.  Caller is responsible for retry / backoff (see
-/// retry_policy.h) and for picking a sensible `timeout_ms`.
+/// 每次调用执行一个请求；具体实现启用 HTTP keep-alive 后可以复用空闲连接。
+/// 不自动跟随重定向，调用方负责重试、退避和合理的 `timeout_ms`。
 class IHttpClient {
 public:
     virtual ~IHttpClient() = default;
 
-    /// Run a single request.  Returns a non-ok Status for transport-level
-    /// failures (DNS, connect, TLS handshake, timeout, malformed response);
-    /// returns `Ok` with `status` populated for any HTTP-level outcome,
-    /// including 4xx/5xx.
+    /// 执行单个请求。DNS、连接、TLS 握手、超时、响应格式错误等传输失败返回非 ok Status；
+    /// 任意 HTTP 响应（包括 4xx/5xx）返回 Ok，具体状态写入 `status`。
     virtual core::Result<HttpClientResponse> Execute(const HttpClientRequest& req) = 0;
 };
 
-}  // namespace agent::net
+class IAsyncHttpOperation {
+public:
+    virtual ~IAsyncHttpOperation() = default;
+    /// 幂等取消；最终回调仍恰好调用一次并返回 Cancelled。
+    virtual void Cancel() noexcept = 0;
+};
 
+class IAsyncHttpClient {
+public:
+    using Callback = std::function<void(core::Result<HttpClientResponse>)>;
+
+    virtual ~IAsyncHttpClient() = default;
+    /// 发起真正的异步出站请求；返回句柄只用于主动取消，丢弃句柄不会取消请求。
+    virtual core::Result<std::shared_ptr<IAsyncHttpOperation>> ExecuteAsync(
+        HttpClientRequest request,
+        Callback callback) = 0;
+};
+
+}

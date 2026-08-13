@@ -1,4 +1,5 @@
-#include "emotion_grpc_service.h"
+#include "async_emotion_grpc_service.h"
+#include "async_emotion_inference_handler.h"
 #include "emotion_inference_service.h"
 #include "logger.h"
 #include "option_parser.h"
@@ -11,6 +12,7 @@
 #include <grpcpp/server_builder.h>
 
 #include <exception>
+#include <algorithm>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -57,8 +59,44 @@ int main(int argc, char** argv) {
              options.limits.max_batch_size);
 
     server_common::RuntimeStats stats;
-    service::EmotionInferenceService emotion_service(options);
-    server::grpc_service::EmotionGrpcService grpc_service(options, stats, emotion_service);
+    auto emotion_service = std::make_shared<service::EmotionInferenceService>(options);
+
+    core::ThreadPoolOptions worker_options;
+    worker_options.worker_count = static_cast<std::size_t>(
+        std::max(1, options.grpc.grpc_max_pollers));
+    worker_options.queue_capacity = worker_options.worker_count * 32;
+    worker_options.name = "emotion-grpc-worker";
+    auto worker_pool = std::make_shared<core::ThreadPool>(std::move(worker_options));
+    if (const auto status = worker_pool->Start(); !status.ok()) {
+        LOG_ERROR("[EmotionServer] Failed to start async worker pool: {}", status.message());
+        logging::Shutdown();
+        return 1;
+    }
+
+    grpc_runtime::AsyncGrpcRuntimeOptions runtime_options;
+    runtime_options.max_inflight_calls = std::max<std::size_t>(
+        256, worker_pool->Stats().worker_count * 32);
+    runtime_options.task_name = "emotion-grpc";
+    auto runtime_result = grpc_runtime::AsyncGrpcRuntime::Create(
+        worker_pool, runtime_options, core::LoggerAdapter::ForModule("emotion-grpc"));
+    if (!runtime_result.ok()) {
+        LOG_ERROR("[EmotionServer] Failed to create async gRPC runtime: {}",
+                  runtime_result.status().message());
+        worker_pool->Shutdown(false);
+        logging::Shutdown();
+        return 1;
+    }
+    auto runtime = std::move(runtime_result).value();
+    auto handler = std::make_shared<server::grpc_service::AsyncEmotionInferenceHandler>(
+        options, stats, emotion_service);
+    std::shared_ptr<grpc_runtime::IAsyncUnaryRpcHandler<
+        multimodal_inference::EmotionRequest,
+        multimodal_inference::EmotionResponse>> emotion_handler = handler;
+    std::shared_ptr<grpc_runtime::IAsyncUnaryRpcHandler<
+        multimodal_inference::EmotionBatchRequest,
+        multimodal_inference::EmotionBatchResponse>> batch_handler = handler;
+    server::grpc_service::AsyncEmotionGrpcService grpc_service(
+        runtime, std::move(emotion_handler), std::move(batch_handler));
 
     grpc::EnableDefaultHealthCheckService(true);
     grpc::ServerBuilder builder;
@@ -66,13 +104,11 @@ int main(int argc, char** argv) {
     builder.RegisterService(&grpc_service);
     builder.SetMaxReceiveMessageSize(options.grpc.max_receive_message_mb * 1024 * 1024);
     builder.SetMaxSendMessageSize(options.grpc.max_send_message_mb * 1024 * 1024);
-    builder.SetSyncServerOption(grpc::ServerBuilder::SyncServerOption::NUM_CQS, options.grpc.grpc_num_cqs);
-    builder.SetSyncServerOption(grpc::ServerBuilder::SyncServerOption::MIN_POLLERS, options.grpc.grpc_min_pollers);
-    builder.SetSyncServerOption(grpc::ServerBuilder::SyncServerOption::MAX_POLLERS, options.grpc.grpc_max_pollers);
 
     std::unique_ptr<grpc::Server> server(builder.BuildAndStart());
     if (!server) {
         LOG_ERROR("[EmotionServer] Failed to start gRPC server");
+        worker_pool->Shutdown(false);
         logging::Shutdown();
         return 1;
     }
@@ -92,6 +128,8 @@ int main(int argc, char** argv) {
         });
 
     server->Wait();
+    // gRPC 已停止接收并等待 reactor 结束，随后排空业务任务，保证模型最后析构。
+    worker_pool->Shutdown(true);
     LOG_INFO("[EmotionServer] Shutdown complete");
     logging::Shutdown();
 

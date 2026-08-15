@@ -848,16 +848,22 @@ core::Result<L0MemoryCacheBundle> CreateL0MemoryCache(const ToolConfig& config) 
     }
 
     fs::create_directories(config.l0_sqlite_path.parent_path());
-    auto sqlite = storage::sqlite::SqliteConnection::Open(config.l0_sqlite_path.string());
-    if (!sqlite.ok()) {
+    storage::sqlite::SqliteConnectionPoolOptions sqlite_options;
+    sqlite_options.path = config.l0_sqlite_path.string();
+    sqlite_options.read_connection_count = 4;
+    sqlite_options.write_connection_count = 1;
+    sqlite_options.busy_timeout_ms = 5000;
+    sqlite_options.enable_wal = true;
+    auto sqlite_pool = std::make_shared<storage::sqlite::SqliteConnectionPool>(std::move(sqlite_options));
+    if (auto status = sqlite_pool->Start(); !status.ok()) {
         redis->Shutdown();
-        return sqlite.status();
+        return status;
     }
 
     auto index = std::make_shared<agent::semantic_cache::cache_vector::VectorIndexManager>(
         config.l0_user_uuid,
         redis,
-        std::move(sqlite).value(),
+        std::move(sqlite_pool),
         config.l0_max_cached_records);
 
     agent::semantic_cache::L0MemoryCacheAdapterOptions options;

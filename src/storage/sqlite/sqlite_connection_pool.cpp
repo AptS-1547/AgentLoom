@@ -38,14 +38,24 @@ struct SqliteConnectionPoolState {
         if (started) {
             return core::Status::Ok();
         }
+        if (closed) {
+            return core::Status::Error(
+                core::ErrorCode::FailedPrecondition,
+                "SQLite connection pool cannot be restarted after close");
+        }
         if (options.path.empty()) {
             return core::Status::Error(core::ErrorCode::InvalidArgument, "SQLite database path is required");
         }
         if (options.read_connection_count == 0 && options.write_connection_count == 0) {
             return core::Status::Error(core::ErrorCode::InvalidArgument, "at least one SQLite connection is required");
         }
+        if (options.write_connection_count > 1) {
+            return core::Status::Error(
+                core::ErrorCode::InvalidArgument,
+                "SQLite connection pool supports at most one write connection");
+        }
 
-        // Ensure database file exists by opening a write connection first
+        // 启动阶段先创建数据库文件并统一设置 busy timeout 与 WAL，避免业务连接配置不一致。
         auto init_result = SqliteConnection::Open(options.path, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE |
                                                    (options.full_mutex ? SQLITE_OPEN_FULLMUTEX : SQLITE_OPEN_NOMUTEX));
         if (!init_result.ok()) {
@@ -108,10 +118,21 @@ struct SqliteConnectionPoolState {
     core::Result<SqliteConnectionLease> WaitAcquire(SqliteConnectionKind kind) {
         std::unique_lock lock(mutex);
         auto& idle = kind == SqliteConnectionKind::Read ? read_idle : write_idle;
+        if (!started || closed || !idle.empty()) {
+            return TakeIdleLocked(kind, idle);
+        }
+
+        auto& waiting = kind == SqliteConnectionKind::Read
+            ? stats.waiting_read_acquires
+            : stats.waiting_write_acquires;
+        ++waiting;
+        const auto wait_started = std::chrono::steady_clock::now();
 
         available.wait(lock, [&] {
             return closed || !started || !idle.empty();
         });
+        --waiting;
+        RecordWaitLocked(kind, wait_started);
 
         return TakeIdleLocked(kind, idle);
     }
@@ -123,10 +144,21 @@ struct SqliteConnectionPoolState {
 
         std::unique_lock lock(mutex);
         auto& idle = kind == SqliteConnectionKind::Read ? read_idle : write_idle;
+        if (!started || closed || !idle.empty()) {
+            return TakeIdleLocked(kind, idle);
+        }
+
+        auto& waiting = kind == SqliteConnectionKind::Read
+            ? stats.waiting_read_acquires
+            : stats.waiting_write_acquires;
+        ++waiting;
+        const auto wait_started = std::chrono::steady_clock::now();
 
         const bool ready = available.wait_for(lock, timeout, [&] {
             return closed || !started || !idle.empty();
         });
+        --waiting;
+        RecordWaitLocked(kind, wait_started);
 
         if (!ready) {
             ++stats.rejected_acquires;
@@ -134,6 +166,20 @@ struct SqliteConnectionPoolState {
         }
 
         return TakeIdleLocked(kind, idle);
+    }
+
+    void RecordWaitLocked(SqliteConnectionKind kind,
+                          std::chrono::steady_clock::time_point started_at) {
+        const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - started_at);
+        const auto elapsed_ns = static_cast<std::uint64_t>(std::max<std::int64_t>(0, elapsed.count()));
+        if (kind == SqliteConnectionKind::Read) {
+            ++stats.read_wait_count;
+            stats.total_read_wait_ns += elapsed_ns;
+            return;
+        }
+        ++stats.write_wait_count;
+        stats.total_write_wait_ns += elapsed_ns;
     }
 
     core::Result<SqliteConnectionLease> TakeIdleLocked(SqliteConnectionKind,

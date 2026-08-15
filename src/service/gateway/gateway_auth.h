@@ -15,6 +15,10 @@ namespace agent::semantic_cache {
 class RedisConnectionPool;
 }
 
+namespace storage::sqlite {
+class SqliteConnectionPool;
+}
+
 namespace agent::service::gateway {
 
 struct AuthIdentity {
@@ -176,6 +180,7 @@ private:
 class SqliteAuthSessionStore final : public IAuthSessionStore {
 public:
     explicit SqliteAuthSessionStore(std::string database_path);
+    explicit SqliteAuthSessionStore(std::shared_ptr<storage::sqlite::SqliteConnectionPool> pool);
 
     core::Status EnsureSchema() override;
     core::Result<AuthSessionRecord> ResolveSession(std::string_view token_id) override;
@@ -188,7 +193,7 @@ public:
         std::size_t max_records) override;
 
 private:
-    std::string database_path_;
+    std::shared_ptr<storage::sqlite::SqliteConnectionPool> pool_;
 };
 
 class RedisAuthSessionStore final : public IAuthSessionStore {

@@ -128,6 +128,7 @@ private:
     void HandleWebSocket(std::shared_ptr<::net::IWebSocketStreamRequest> request);
     void HandleWebSocketClose(const ::net::ConnectionCloseInfo& close_info);
     core::Status ValidateDependencies() const;
+    core::Status EnsureGatewayMetadataPool();
     core::Status EnsureAuthSessionStore();
     core::Status EnsurePersonaMetadataStore();
     core::Status EnsureDocumentStore();
@@ -144,6 +145,8 @@ private:
     persona::SessionManager sessions_;
     persona::PersonaRuntime runtime_;
     ClassroomScheduler classroom_scheduler_;
+    /// Auth 与 Persona metadata 共享同一 SQLite pool，保证同一数据库内严格单写。
+    std::shared_ptr<storage::sqlite::SqliteConnectionPool> gateway_metadata_pool_;
     std::shared_ptr<agent::semantic_cache::RedisConnectionPool> auth_redis_;
     std::shared_ptr<IAuthSessionStore> auth_session_store_;
     std::shared_ptr<IPersonaMetadataStore> persona_metadata_store_;

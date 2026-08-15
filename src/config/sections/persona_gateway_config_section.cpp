@@ -438,6 +438,10 @@ void PersonaGatewayConfigSection::Validate(MultimodalServerOptions& options) con
         if (gateway.document_store.database_path.empty()) {
             throw std::runtime_error("persona_gateway.document_store.database_path is required when document store is enabled");
         }
+        if (gateway.document_store.write_connection_count != 1) {
+            throw std::runtime_error(
+                "persona_gateway.document_store.write_connection_count must be 1 for SQLite");
+        }
         gateway.document_store.root = ResolveRelativeToConfig(gateway.document_store.root, options.config_file_path);
         gateway.document_store.database_path = ResolveRelativeToConfig(gateway.document_store.database_path, options.config_file_path);
     }

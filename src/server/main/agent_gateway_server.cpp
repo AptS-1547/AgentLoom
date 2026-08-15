@@ -578,16 +578,22 @@ core::Result<std::shared_ptr<agent::semantic_cache::ISemanticCache>> CreateDocum
     }
 
     fs::create_directories(config.document_semantic_cache.sqlite_path.parent_path());
-    auto sqlite = storage::sqlite::SqliteConnection::Open(config.document_semantic_cache.sqlite_path.string());
-    if (!sqlite.ok()) {
+    storage::sqlite::SqliteConnectionPoolOptions sqlite_options;
+    sqlite_options.path = config.document_semantic_cache.sqlite_path.string();
+    sqlite_options.read_connection_count = 4;
+    sqlite_options.write_connection_count = 1;
+    sqlite_options.busy_timeout_ms = 5000;
+    sqlite_options.enable_wal = true;
+    auto sqlite_pool = std::make_shared<storage::sqlite::SqliteConnectionPool>(std::move(sqlite_options));
+    if (auto status = sqlite_pool->Start(); !status.ok()) {
         redis->Shutdown();
-        return sqlite.status();
+        return status;
     }
 
     auto index = std::make_shared<agent::semantic_cache::cache_vector::VectorIndexManager>(
         config.document_semantic_cache.user_uuid,
         redis,
-        std::move(sqlite).value(),
+        std::move(sqlite_pool),
         config.document_semantic_cache.max_cached_records);
 
     agent::semantic_cache::SemanticCachePipelineDeps deps;

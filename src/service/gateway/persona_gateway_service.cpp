@@ -3,6 +3,7 @@
 #include "redis_connection_pool.h"
 #include "result.h"
 #include "sqlite/sqlite_connection.h"
+#include "sqlite/sqlite_connection_pool.h"
 #include "sqlite/sqlite_statement.h"
 #include "trace_context.h"
 
@@ -20,8 +21,34 @@ namespace agent::service::gateway {
 namespace {
 
 using Json = nlohmann::json;
-using storage::sqlite::SqliteConnection;
+using storage::sqlite::SqliteConnectionLease;
+using storage::sqlite::SqliteConnectionPool;
+using storage::sqlite::SqliteConnectionPoolOptions;
 using storage::sqlite::SqliteStepResult;
+
+std::shared_ptr<SqliteConnectionPool> MakePersonaMetadataPool(std::string database_path) {
+    SqliteConnectionPoolOptions options;
+    options.path = std::move(database_path);
+    options.read_connection_count = 4;
+    options.write_connection_count = 1;
+    options.busy_timeout_ms = 5000;
+    options.enable_wal = true;
+    return std::make_shared<SqliteConnectionPool>(std::move(options));
+}
+
+core::Result<SqliteConnectionLease> AcquirePersonaMetadataConnection(
+    const std::shared_ptr<SqliteConnectionPool>& pool,
+    bool write) {
+    if (!pool) {
+        return core::Status::Error(
+            core::ErrorCode::FailedPrecondition,
+            "SQLite persona metadata pool is not configured");
+    }
+    if (auto status = pool->Start(); !status.ok()) {
+        return status;
+    }
+    return write ? pool->WaitAcquireWrite() : pool->WaitAcquireRead();
+}
 
 std::string NowIso8601Utc() {
     const auto now = std::chrono::system_clock::now();
@@ -382,21 +409,18 @@ core::Result<std::vector<PersonaMetadataRecord>> OverlayPersonaMetadataStore::Li
 }
 
 SqlitePersonaMetadataStore::SqlitePersonaMetadataStore(std::string database_path)
-    : database_path_(std::move(database_path)) {}
+    : pool_(MakePersonaMetadataPool(std::move(database_path))) {}
+
+SqlitePersonaMetadataStore::SqlitePersonaMetadataStore(std::shared_ptr<SqliteConnectionPool> pool)
+    : pool_(std::move(pool)) {}
 
 core::Status SqlitePersonaMetadataStore::EnsureSchema() {
-    if (database_path_.empty()) {
-        return core::Status::Error(core::ErrorCode::InvalidArgument, "persona metadata database path is required");
+    auto lease_result = AcquirePersonaMetadataConnection(pool_, true);
+    if (!lease_result.ok()) {
+        return lease_result.status();
     }
-    auto connection_result = SqliteConnection::Open(database_path_);
-    if (!connection_result.ok()) {
-        return connection_result.status();
-    }
-    auto connection = std::move(connection_result).value();
-    auto wal = connection.EnableWal();
-    if (!wal.ok()) {
-        return wal;
-    }
+    auto lease = std::move(lease_result).value();
+    auto& connection = lease.connection();
     return connection.Execute(
         "CREATE TABLE IF NOT EXISTS gateway_persona_metadata ("
         "tenant_id TEXT NOT NULL,"
@@ -413,11 +437,12 @@ core::Status SqlitePersonaMetadataStore::Upsert(PersonaMetadataRecord record) {
     if (auto status = ValidatePersonaMetadata(record); !status.ok()) {
         return status;
     }
-    auto connection_result = SqliteConnection::Open(database_path_);
-    if (!connection_result.ok()) {
-        return connection_result.status();
+    auto lease_result = AcquirePersonaMetadataConnection(pool_, true);
+    if (!lease_result.ok()) {
+        return lease_result.status();
     }
-    auto connection = std::move(connection_result).value();
+    auto lease = std::move(lease_result).value();
+    auto& connection = lease.connection();
     auto statement_result = connection.Prepare(
         "INSERT INTO gateway_persona_metadata(tenant_id,user_uuid,persona_id,record_json,created_at,updated_at) "
         "VALUES(?1,?2,?3,?4,?5,?5) "
@@ -445,11 +470,12 @@ core::Status SqlitePersonaMetadataStore::Upsert(PersonaMetadataRecord record) {
 core::Result<PersonaMetadataRecord> SqlitePersonaMetadataStore::Get(std::string_view tenant_id,
                                                                     std::string_view user_uuid,
                                                                     std::string_view persona_id) const {
-    auto connection_result = SqliteConnection::Open(database_path_);
-    if (!connection_result.ok()) {
-        return connection_result.status();
+    auto lease_result = AcquirePersonaMetadataConnection(pool_, false);
+    if (!lease_result.ok()) {
+        return lease_result.status();
     }
-    auto connection = std::move(connection_result).value();
+    auto lease = std::move(lease_result).value();
+    auto& connection = lease.connection();
     auto statement_result = connection.Prepare(
         "SELECT record_json FROM gateway_persona_metadata "
         "WHERE tenant_id=?1 AND user_uuid=?2 AND persona_id=?3");
@@ -473,11 +499,12 @@ core::Result<PersonaMetadataRecord> SqlitePersonaMetadataStore::Get(std::string_
 core::Result<std::vector<PersonaMetadataRecord>> SqlitePersonaMetadataStore::ListByAccount(
     std::string_view tenant_id,
     std::string_view user_uuid) const {
-    auto connection_result = SqliteConnection::Open(database_path_);
-    if (!connection_result.ok()) {
-        return connection_result.status();
+    auto lease_result = AcquirePersonaMetadataConnection(pool_, false);
+    if (!lease_result.ok()) {
+        return lease_result.status();
     }
-    auto connection = std::move(connection_result).value();
+    auto lease = std::move(lease_result).value();
+    auto& connection = lease.connection();
     auto statement_result = connection.Prepare(
         "SELECT record_json FROM gateway_persona_metadata "
         "WHERE tenant_id=?1 AND user_uuid=?2 ORDER BY persona_id");

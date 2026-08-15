@@ -905,6 +905,29 @@ TEST(ConfigPersonaGatewaySectionTest, JsonLoadsE2EGatewayOptionsAndResolvesStati
     EXPECT_TRUE(opts.persona_gateway.request_filter_enabled);
 }
 
+TEST(ConfigPersonaGatewaySectionTest, RejectsMultipleSqliteDocumentWriters) {
+    ScopedTempDirectory tmp("persona_gateway_sqlite_writers_cfg");
+    auto config_file = tmp.path() / "config.json";
+    WriteFile(config_file, R"({
+        "persona_gateway": {
+            "document_store": {
+                "enabled": true,
+                "root": "document",
+                "database_path": "document/document_store.sqlite",
+                "write_connection_count": 2
+            }
+        }
+    })");
+
+    EXPECT_THROW(
+        Parse({
+            "server",
+            "--llm", "llm.gguf",
+            "--config", config_file.string(),
+        }),
+        std::runtime_error);
+}
+
 TEST(ConfigPersonaGatewaySectionTest, CliOverridesGatewayJson) {
     ScopedTempDirectory tmp("persona_gateway_cli");
     auto config_file = tmp.path() / "config.json";

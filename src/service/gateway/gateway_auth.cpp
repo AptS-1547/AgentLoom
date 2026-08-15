@@ -9,6 +9,7 @@
 #include <openssl/rsa.h>
 
 #include "sqlite/sqlite_connection.h"
+#include "sqlite/sqlite_connection_pool.h"
 #include "sqlite/sqlite_statement.h"
 #include "redis_connection_pool.h"
 
@@ -28,11 +29,38 @@ namespace {
 
 using Json = nlohmann::json;
 using storage::sqlite::SqliteConnection;
+using storage::sqlite::SqliteConnectionLease;
+using storage::sqlite::SqliteConnectionPool;
+using storage::sqlite::SqliteConnectionPoolOptions;
 using storage::sqlite::SqliteStepResult;
 
 constexpr int kPasswordIterations = 120000;
 constexpr std::size_t kPasswordSaltBytes = 16;
 constexpr std::size_t kPasswordHashBytes = 32;
+
+std::shared_ptr<SqliteConnectionPool> MakeGatewayMetadataPool(std::string database_path) {
+    SqliteConnectionPoolOptions options;
+    options.path = std::move(database_path);
+    options.read_connection_count = 4;
+    options.write_connection_count = 1;
+    options.busy_timeout_ms = 5000;
+    options.enable_wal = true;
+    return std::make_shared<SqliteConnectionPool>(std::move(options));
+}
+
+core::Result<SqliteConnectionLease> AcquireStoreConnection(
+    const std::shared_ptr<SqliteConnectionPool>& pool,
+    bool write) {
+    if (!pool) {
+        return core::Status::Error(
+            core::ErrorCode::FailedPrecondition,
+            "SQLite auth session pool is not configured");
+    }
+    if (auto status = pool->Start(); !status.ok()) {
+        return status;
+    }
+    return write ? pool->WaitAcquireWrite() : pool->WaitAcquireRead();
+}
 
 struct BioDeleter {
     void operator()(BIO* bio) const noexcept {
@@ -851,18 +879,18 @@ std::string JwtAuthRegistrationService::BuildCookieHeader(
 }
 
 SqliteAuthSessionStore::SqliteAuthSessionStore(std::string database_path)
-    : database_path_(std::move(database_path)) {}
+    : pool_(MakeGatewayMetadataPool(std::move(database_path))) {}
+
+SqliteAuthSessionStore::SqliteAuthSessionStore(std::shared_ptr<SqliteConnectionPool> pool)
+    : pool_(std::move(pool)) {}
 
 core::Status SqliteAuthSessionStore::EnsureSchema() {
-    auto connection_result = SqliteConnection::Open(database_path_);
-    if (!connection_result.ok()) {
-        return connection_result.status();
+    auto lease_result = AcquireStoreConnection(pool_, true);
+    if (!lease_result.ok()) {
+        return lease_result.status();
     }
-    auto connection = std::move(connection_result).value();
-    auto wal = connection.EnableWal();
-    if (!wal.ok()) {
-        return wal;
-    }
+    auto lease = std::move(lease_result).value();
+    auto& connection = lease.connection();
     auto create = connection.Execute(
         "CREATE TABLE IF NOT EXISTS gateway_auth_sessions ("
         "token_id TEXT PRIMARY KEY,"
@@ -899,11 +927,12 @@ core::Status SqliteAuthSessionStore::EnsureSchema() {
 }
 
 core::Result<AuthSessionRecord> SqliteAuthSessionStore::ResolveSession(std::string_view token_id) {
-    auto connection_result = SqliteConnection::Open(database_path_);
-    if (!connection_result.ok()) {
-        return connection_result.status();
+    auto lease_result = AcquireStoreConnection(pool_, false);
+    if (!lease_result.ok()) {
+        return lease_result.status();
     }
-    auto connection = std::move(connection_result).value();
+    auto lease = std::move(lease_result).value();
+    auto& connection = lease.connection();
     auto statement_result = connection.Prepare(
         "SELECT token_id,user_uuid,tenant_id,subject,issued_at,expires_at,revoked,updated_at "
         "FROM gateway_auth_sessions WHERE token_id=?1");
@@ -935,11 +964,12 @@ core::Result<AuthSessionRecord> SqliteAuthSessionStore::ResolveSession(std::stri
 }
 
 core::Result<AuthUserRecord> SqliteAuthSessionStore::ResolveUserByUsername(std::string_view username) {
-    auto connection_result = SqliteConnection::Open(database_path_);
-    if (!connection_result.ok()) {
-        return connection_result.status();
+    auto lease_result = AcquireStoreConnection(pool_, false);
+    if (!lease_result.ok()) {
+        return lease_result.status();
     }
-    auto connection = std::move(connection_result).value();
+    auto lease = std::move(lease_result).value();
+    auto& connection = lease.connection();
     auto statement_result = connection.Prepare(
         "SELECT user_uuid,tenant_id,username,password_hash,password_salt,password_iterations,subject,created_at,updated_at,disabled "
         "FROM gateway_auth_users WHERE username=?1");
@@ -976,11 +1006,12 @@ core::Status SqliteAuthSessionStore::UpsertUser(const AuthUserRecord& record) {
         record.password_hash.empty() || record.password_salt.empty() || record.password_iterations <= 0) {
         return core::Status::Error(core::ErrorCode::InvalidArgument, "auth user record is incomplete");
     }
-    auto connection_result = SqliteConnection::Open(database_path_);
-    if (!connection_result.ok()) {
-        return connection_result.status();
+    auto lease_result = AcquireStoreConnection(pool_, true);
+    if (!lease_result.ok()) {
+        return lease_result.status();
     }
-    auto connection = std::move(connection_result).value();
+    auto lease = std::move(lease_result).value();
+    auto& connection = lease.connection();
     auto existing_result = connection.Prepare("SELECT user_uuid FROM gateway_auth_users WHERE username=?1");
     if (!existing_result.ok()) {
         return existing_result.status();
@@ -1026,11 +1057,12 @@ core::Status SqliteAuthSessionStore::UpsertSession(const AuthSessionRecord& reco
     if (record.token_id.empty() || record.user_uuid.empty()) {
         return core::Status::Error(core::ErrorCode::InvalidArgument, "token_id and user_uuid are required");
     }
-    auto connection_result = SqliteConnection::Open(database_path_);
-    if (!connection_result.ok()) {
-        return connection_result.status();
+    auto lease_result = AcquireStoreConnection(pool_, true);
+    if (!lease_result.ok()) {
+        return lease_result.status();
     }
-    auto connection = std::move(connection_result).value();
+    auto lease = std::move(lease_result).value();
+    auto& connection = lease.connection();
     auto statement_result = connection.Prepare(
         "INSERT INTO gateway_auth_sessions(token_id,user_uuid,tenant_id,subject,issued_at,expires_at,revoked,updated_at) "
         "VALUES(?1,?2,?3,?4,?5,?6,0,?7) "
@@ -1057,11 +1089,12 @@ core::Status SqliteAuthSessionStore::UpsertSession(const AuthSessionRecord& reco
 }
 
 core::Status SqliteAuthSessionStore::RevokeSession(std::string_view token_id, std::string_view reason) {
-    auto connection_result = SqliteConnection::Open(database_path_);
-    if (!connection_result.ok()) {
-        return connection_result.status();
+    auto lease_result = AcquireStoreConnection(pool_, true);
+    if (!lease_result.ok()) {
+        return lease_result.status();
     }
-    auto connection = std::move(connection_result).value();
+    auto lease = std::move(lease_result).value();
+    auto& connection = lease.connection();
     auto statement_result = connection.Prepare(
         "UPDATE gateway_auth_sessions SET revoked=1, revoked_reason=?2, updated_at=?3 WHERE token_id=?1");
     if (!statement_result.ok()) {
@@ -1087,11 +1120,12 @@ core::Result<std::size_t> SqliteAuthSessionStore::CleanupExpired(
         return core::Status::Error(core::ErrorCode::InvalidArgument,
                                    "auth session cleanup batch size must be positive");
     }
-    auto connection_result = SqliteConnection::Open(database_path_);
-    if (!connection_result.ok()) {
-        return connection_result.status();
+    auto lease_result = AcquireStoreConnection(pool_, true);
+    if (!lease_result.ok()) {
+        return lease_result.status();
     }
-    auto connection = std::move(connection_result).value();
+    auto lease = std::move(lease_result).value();
+    auto& connection = lease.connection();
     auto statement_result = connection.Prepare(
         "DELETE FROM gateway_auth_sessions "
         "WHERE token_id IN ("

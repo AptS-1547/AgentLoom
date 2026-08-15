@@ -72,7 +72,8 @@ core::ThreadPoolOptions ResolveLlmPoolOptions(
 
 std::shared_ptr<IAuthSessionStore> MakeAuthSessionStore(
     const GatewayAuthOptions& options,
-    std::shared_ptr<agent::semantic_cache::RedisConnectionPool>& auth_redis) {
+    std::shared_ptr<agent::semantic_cache::RedisConnectionPool>& auth_redis,
+    const std::shared_ptr<storage::sqlite::SqliteConnectionPool>& metadata_pool) {
     if (options.session_store_backend == "redis") {
         agent::semantic_cache::RedisPoolOptions redis_options;
         redis_options.host = options.redis_host;
@@ -83,17 +84,32 @@ std::shared_ptr<IAuthSessionStore> MakeAuthSessionStore(
         auth_redis = std::make_shared<agent::semantic_cache::RedisConnectionPool>(redis_options);
         return std::make_shared<RedisAuthSessionStore>(auth_redis, options.redis_key_prefix);
     }
+    if (!metadata_pool) {
+        return nullptr;
+    }
+    return std::make_shared<SqliteAuthSessionStore>(metadata_pool);
+}
+
+std::shared_ptr<storage::sqlite::SqliteConnectionPool> MakeGatewayMetadataPool(
+    const GatewayAuthOptions& options) {
     if (options.session_database_path.empty()) {
         return nullptr;
     }
-    return std::make_shared<SqliteAuthSessionStore>(options.session_database_path);
+    storage::sqlite::SqliteConnectionPoolOptions pool_options;
+    pool_options.path = options.session_database_path;
+    pool_options.read_connection_count = 4;
+    pool_options.write_connection_count = 1;
+    pool_options.busy_timeout_ms = 5000;
+    pool_options.enable_wal = true;
+    return std::make_shared<storage::sqlite::SqliteConnectionPool>(std::move(pool_options));
 }
 
 std::shared_ptr<IPersonaMetadataStore> MakePersonaMetadataStore(
     const GatewayAuthOptions& options,
     const std::vector<PersonaMetadataRecord>& default_personas,
     const PersonaGatewayServerDependencies& dependencies,
-    const std::shared_ptr<agent::semantic_cache::RedisConnectionPool>& auth_redis) {
+    const std::shared_ptr<agent::semantic_cache::RedisConnectionPool>& auth_redis,
+    const std::shared_ptr<storage::sqlite::SqliteConnectionPool>& metadata_pool) {
     if (dependencies.persona_metadata_store) {
         if (default_personas.empty()) {
             return dependencies.persona_metadata_store;
@@ -103,10 +119,10 @@ std::shared_ptr<IPersonaMetadataStore> MakePersonaMetadataStore(
             dependencies.persona_metadata_store);
     }
     std::shared_ptr<IPersonaMetadataStore> account_store;
-    if (options.session_database_path.empty()) {
+    if (!metadata_pool) {
         account_store = std::make_shared<InMemoryPersonaMetadataStore>();
     } else {
-        auto primary = std::make_shared<SqlitePersonaMetadataStore>(options.session_database_path);
+        auto primary = std::make_shared<SqlitePersonaMetadataStore>(metadata_pool);
         if (!auth_redis) {
             account_store = std::move(primary);
         } else {
@@ -154,8 +170,14 @@ PersonaGatewayServer::PersonaGatewayServer(PersonaGatewayServerOptions options,
                nullptr,
                dependencies_.async_llm_client),
       classroom_scheduler_({}, core::LoggerAdapter::ForModule("classroom")),
-      auth_session_store_(MakeAuthSessionStore(options_.auth, auth_redis_)),
-      persona_metadata_store_(MakePersonaMetadataStore(options_.auth, options_.default_personas, dependencies_, auth_redis_)),
+      gateway_metadata_pool_(MakeGatewayMetadataPool(options_.auth)),
+      auth_session_store_(MakeAuthSessionStore(options_.auth, auth_redis_, gateway_metadata_pool_)),
+      persona_metadata_store_(MakePersonaMetadataStore(
+          options_.auth,
+          options_.default_personas,
+          dependencies_,
+          auth_redis_,
+          gateway_metadata_pool_)),
       service_(sessions_,
                runtime_,
                &classroom_scheduler_,
@@ -266,6 +288,9 @@ core::Status PersonaGatewayServer::ConfigureLifecycle() {
             if (auto value = ValidateDependencies(); !value.ok()) {
                 return value;
             }
+            if (auto value = EnsureGatewayMetadataPool(); !value.ok()) {
+                return value;
+            }
             if (auto value = EnsureAuthSessionStore(); !value.ok()) {
                 return value;
             }
@@ -279,6 +304,9 @@ core::Status PersonaGatewayServer::ConfigureLifecycle() {
                 auth_redis_->Shutdown();
             }
             ShutdownDocumentStore();
+            if (gateway_metadata_pool_) {
+                gateway_metadata_pool_->Close();
+            }
             return core::Status::Ok();
         });
     if (!status.ok()) {
@@ -342,6 +370,13 @@ core::Status PersonaGatewayServer::ConfigureLifecycle() {
             http_server_.Stop();
             return core::Status::Ok();
         });
+}
+
+core::Status PersonaGatewayServer::EnsureGatewayMetadataPool() {
+    if (!gateway_metadata_pool_) {
+        return core::Status::Ok();
+    }
+    return gateway_metadata_pool_->Start();
 }
 
 core::Status PersonaGatewayServer::EnsureAuthSessionStore() {

@@ -20,6 +20,7 @@ enum class SqliteConnectionKind {
 struct SqliteConnectionPoolOptions {
     std::string path;
     std::size_t read_connection_count = 4;
+    /// SQLite/WAL 同一时刻只允许一个 writer；0 表示只读池，1 表示启用写入。
     std::size_t write_connection_count = 1;
     int busy_timeout_ms = 5000;
     bool enable_wal = true;
@@ -35,6 +36,12 @@ struct SqliteConnectionPoolStats {
     std::size_t leased_write_connections = 0;
     std::size_t acquired_connections = 0;
     std::size_t rejected_acquires = 0;
+    std::size_t waiting_read_acquires = 0;
+    std::size_t waiting_write_acquires = 0;
+    std::uint64_t read_wait_count = 0;
+    std::uint64_t write_wait_count = 0;
+    std::uint64_t total_read_wait_ns = 0;
+    std::uint64_t total_write_wait_ns = 0;
 };
 
 struct SqliteConnectionSnapshot {

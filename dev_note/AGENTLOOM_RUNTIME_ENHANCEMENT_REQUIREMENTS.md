@@ -1,8 +1,8 @@
 # AgentLoom Runtime 通用能力补充需求
 
-> 状态：分项实施中；通用 unary gRPC Server Runtime、Gateway 通用化首轮和 Persona Session 长锁第一阶段已完成，后续 transport/动态 quota 仍在推进
+> 状态：分项实施中；通用 unary gRPC Server Runtime、Gateway 通用化首轮、Persona Session 异步链路和 SQLite P0 已完成，下一阶段优先推进 Session 重建、粘性路由与 PostgreSQL Runtime 后端
 > 日期：2026-08-12
-> 进度更新：2026-08-13
+> 进度更新：2026-08-15
 > 来源：EnterpriseTrainingSystem Application Runtime Gateway 设计
 
 ## 1. 目的
@@ -10,7 +10,7 @@
 本文记录适合在 AgentLoom 通用运行时中补充的能力。异步流式、CloudTaskCoordinator 和观测增强可以与
 EnterpriseTrainingSystem Application 同步开发，不构成核心智能体交互闭环的统一前置条件；第 11.4
 至 11.7 节的 Gateway 解耦则是正式 Application 组合根落地的默认包边界门禁。若工期必须先形成纵向
-闭环，只能按 11.11 节的受控应急方案临时推进。
+闭环，只能按 11.12 节的受控应急方案临时推进。
 
 本文只定义通用 Runtime、并发、流式传输和云任务能力，不把 EnterpriseTrainingSystem 的产品业务下沉到 AgentLoom。
 
@@ -18,7 +18,7 @@ EnterpriseTrainingSystem Application 同步开发，不构成核心智能体交�
 
 - 企业 OA/SSO、用户、角色和权限事实；
 - 浏览器登录 Session、Cookie 和公网 API；
-- 训练业务 Session、PostgreSQL 事务、revision、业务幂等和审计；
+- Go 拥有的训练业务 Session 写模型、PostgreSQL 业务事务、revision、业务幂等和审计；
 - Go Front-Gateway 的 SSE bridge、浏览器事件重放和业务路由；
 - 企业租户预算、数据合规策略和 usage 账单事实。
 
@@ -73,6 +73,8 @@ AgentLoom::runtime
 | 11.8 Session 生命周期 observer | 未完成，P0 | 当前仍是可覆盖的单 callback，不能满足多个下游订阅和恰好一次关闭投影 |
 | 11.9 动态 quota/admission | 未完成，P0 | scheduler 有静态 process/key/tenant 限额，但缺少可信动态 policy/provider 和 ingress 前置 admission |
 | 11.10 Session 长锁与同步下游 IO | 第一阶段与 HTTP/1.1 连接复用已完成，后续优化进行中，P0 | Cloud LLM async HTTP、deferred completion、Session 短锁 snapshot/commit、保序/跨 Session 并发、主动关闭取消和 outbound keep-alive pool 已接入纯 cloud Gateway，并通过单元、生命周期、Fake/真实 API E2E 压测；async fallback、短后处理线程迁移、HTTP/2 和动态 admission 仍待完成 |
+| SQLite metadata P0 | 已完成，待提交 | pool 严格单 writer，Auth/Persona 共享 metadata pool，L0 全局锁拆为短映射锁与每 Session operation lock，正常 Search 使用 read lease，并补充真实 pool wait 指标和并发 HTTP E2E |
+| 11.11 Session 重建、粘性路由与 PostgreSQL Runtime 后端 | 架构文档已完成，P1 首位 | Go 保持业务 Session 写所有权；C++ 可直接只读版本化 business projection，并写入独立 Runtime Session snapshot/lease/fencing schema；正常 Turn 不经过数据库 |
 | CloudTaskCoordinator / LLM streaming / 统一 snapshot | 未开始本轮实现 | 保持原规划，优先级低于 11.4 至 11.10 的 Application 组合根门禁 |
 
 ### 3.2 下一阶段顺序
@@ -80,15 +82,18 @@ AgentLoom::runtime
 `gateway` 已成为通用兼容聚合，不能再以“存在一个 target”替代其边界与 consumer 验证。下一阶段建议按
 以下顺序推进：
 
-1. 补 11.8 的多 observer 生命周期通知，避免形成第二份 Session registry；
-2. 在 ingress 保留请求对象前实现 11.9 的动态 admission，再进入 scheduler；
-3. 继续完成 11.10 的剩余项：异步 fallback、后处理 continuation、HTTP/2 和真实 transport 分段测量；
-4. 最后扩展 async gRPC Client/server-streaming、CloudTaskCoordinator 和增量输出。
+1. 补 11.8 的多 observer 生命周期通知，为 checkpoint、lease release、L0 release 和下游投影提供同一生命周期事件源；
+2. 按 11.11 建立 Session 持久化 contract、PostgreSQL 最小 Runtime 后端、按需重建、lease/fencing 与粘性路由；
+3. 在 ingress 保留请求对象前实现 11.9 的动态 admission，再进入 scheduler；
+4. 继续完成 11.10 的剩余项：异步 fallback、后处理 continuation、HTTP/2 和真实 transport 分段测量；
+5. 最后扩展 async gRPC Client/server-streaming、CloudTaskCoordinator 和增量输出。
 
 | 优先级 | 能力 | 与 Application 主链路的关系 |
 |---|---|---|
 | P0 | Reference Gateway 解耦与通用组件安装导出 | 正式 Application 组合根的包边界；Route/Proto 可并行开发 |
 | P0 | gRPC Client/Server 异步运行时 | 所有层间和微服务调用的公共底座；新 Adapter 优先采用，现有情绪服务不强制重写 |
+| P0 | SQLite metadata 并发止血 | 保证保留的轻量后端安全运行；不是生产高并发数据库方案 |
+| P1 | Session 重建、粘性路由和 PostgreSQL Runtime 后端 | 下一个核心资源闭环；支持 C++ 直读业务投影、Runtime snapshot、lease 和 fencing |
 | P1 | TaskGroup、deadline、取消和统一 snapshot 集成 | 提升运行治理；可在 unary 主链路建立后逐步接入 |
 | P1 | CloudTaskCoordinator 增强 | 主要服务算法层管道，不阻塞普通 Persona Turn |
 | P2 | gRPC server-streaming、LLM 增量输出和浏览器 SSE 支撑 | 前端体验和过程可观测性优化，不阻塞完整结果交互 |
@@ -540,7 +545,9 @@ Runtime/System snapshot
 Emotion 和 LLM 交互闭环；Application 不再包装第二层队列或 Session registry。
 
 接口应允许 consumer 注入可信身份、Persona/Session 配置解析、`RuntimeBootstrap`、动态 entitlement
-和幂等/fencing 信息，但 AgentLoom 不保存 Go 业务 Session、PostgreSQL revision 或 OA 权限事实。
+和幂等/fencing 信息。AgentLoom 不写入或拥有 Go 业务 Session、PostgreSQL business revision 或 OA
+权限事实，但可以通过最小权限只读角色直接读取 Go 发布的版本化 business Session 投影，避免
+`RuntimeBootstrap` 和重建 metadata 每次穿越 gRPC。
 错误统一返回 `core::Status`/`core::Result<T>`，异步完成必须恰好一次并明确取消、deadline 和回调线程。
 
 当前 `PersonaTurnRequest` 将 `ChatRequest` 与 `trusted_user_uuid` 分离；可信身份仅用于 Session
@@ -698,7 +705,81 @@ SQLite metadata/auth 的单写者争用仍作为轻量后端的客观限制保�
 短事务、索引、隔离级别和可恢复错误重试展开；SQLite 的全局写串行化仅适用于保留该轻量后端时的
 局部兼容，不应推广为生产关系型后端架构。
 
-### 11.11 工期应急方案及退出条件
+### 11.11 Session 重建、粘性路由与生产关系型数据库后端
+
+> 设计状态（2026-08-15）：已完成独立目标设计，详见
+> `RELATIONAL_DATABASE_BACKEND_ARCHITECTURE.md`。下一阶段优先级高于 Auth、Document、Vector 等
+> Repository 的全面后端迁移。
+
+SQLite 已覆盖 Auth、Persona、Document、Semantic Cache、Long-term Memory 和 Vector metadata。
+P0 的单 writer、共享 pool 和 L0 短锁能够保证轻量后端的正确性，但不能提供跨节点 Session 恢复、
+高并发写入或可靠的 Runtime owner 裁决。生产 SQL 后端的首个纵向闭环必须以 Session 为中心。
+
+系统继续区分三类事实：
+
+```text
+Go business Session
+  业务状态、正式消息、business revision、idempotency、permission、audit
+
+AgentLoom Persona Session
+  热状态、Persona/Emotion/Memory、最近对话、调度和生命周期
+
+Runtime control plane
+  runtime_instance_id、runtime_revision、checkpoint、lease、fencing、owner node
+```
+
+Go 仍是 business Session 的唯一写入者。C++ 可以使用最小权限只读 PostgreSQL 角色直接读取 Go
+migration 发布的版本化 business projection，用于 `RuntimeBootstrap`、重建前校验、tenant/user/persona、
+minimum business revision 和可选 owner hint；该读取不需要每次穿越 gRPC，但不能绑定 Go 私有表或
+绕过 Go 的权限、业务 admission 和状态转换。
+
+C++ 可以读写独立的 AgentLoom Runtime schema，保存可恢复 snapshot、runtime instance、lease 和
+fencing token。该 schema 不保存正式业务消息，不执行 business revision CAS，也不成为第二个训练
+Session 事实源。建议新增以下纯领域接口：
+
+```cpp
+class IBusinessSessionMetadataReader;
+class IRuntimeSessionRepository;
+class IRuntimeSessionLeaseStore;
+```
+
+接口不得暴露 PostgreSQL/SQLite connection、transaction、driver result 或无类型 context。
+`SessionState` 也不能直接序列化，其中的 `steady_clock`、mutex、callback、worker/lane、in-flight
+operation、PromptBuilder 等进程内对象必须转换成稳定、版本化的持久化 DTO。
+
+Session Ensure/恢复的目标顺序为：
+
+```text
+读取或命中 business projection cache
+-> 校验 business status/minimum revision/tenant/user
+-> Resolve/Acquire Runtime lease
+-> 获得单调递增 fencing token
+-> 加载可恢复 checkpoint
+-> 生成新的 runtime_instance_id
+-> 构造并注册 SessionManager Session
+-> 返回 runtime snapshot 与 owner 信息
+```
+
+正常 Turn 不得每次访问 PostgreSQL。owner、fencing 和 bootstrap revision 在进程内缓存；checkpoint
+按 N-turn、时间窗口、idle/Finalize/Close/shutdown 策略通过有界 DB executor 合并写入；lease 使用
+批量 heartbeat。只有首次 Ensure、cache miss、恢复、owner 冲突、节点切换和 lease 临近过期才进入
+数据库路径。
+
+首版 PostgreSQL driver 可以使用 libpqxx 或封装后的 libpq 同步事务，但必须运行在独立、有界、
+可观测的 DB executor，不得阻塞 Network IO、通用 downstream IO 或 Session affinity lane。后续只有
+压测证明 DB executor 成为瓶颈时，才接入 libpq nonblocking/pipeline。MySQL 保留同一领域 contract，
+在明确 consumer 需要时实现，不与 PostgreSQL 首版同时扩大战线。
+
+其他 metadata 按冷热路径和共享性选择：Runtime Session lease/checkpoint 与 business projection 为
+P1；Auth、Persona、quota/usage 等热/温共享数据按需迁移；Document、Vector metadata、L3 可以继续
+使用 SQLite；L0 active batch/timestamp index 属于节点本地且可由 Redis 重建，默认保留 SQLite。
+
+首版必须验证：双节点 Acquire 只有一个成功；新 owner 获得更高 fencing token；旧 owner 的 checkpoint、
+Close 和迟到异步结果被拒绝；Application 重启后按需恢复；只读角色不能修改 business schema；正常
+Turn cache hit 时零数据库往返；DB queue wait、pool acquire wait、query、Session commit 和 E2E 可以
+分别观测。
+
+### 11.12 工期应急方案及退出条件
 
 若交付窗口明确不允许先完成上述 AgentLoom 拆分，可从一个固定、已测试的 AgentLoom commit 将参考
 Gateway 的必要组合代码复制到 Application 后进行产品化修改。该路径只作为应急方案，不是并行维护
@@ -744,6 +825,10 @@ Gateway 的必要组合代码复制到 Application 后进行产品化修改。�
 - 纯 cloud Persona Session 异步 LLM E2E：不同 Session 并发、同 Session 保序、主动取消和关闭收口；
 - 启动各阶段注入失败时完整回滚，HTTP/WS/RPC in-flight 关闭时按 deadline drain/cancel；
 - Session idle cleanup 同时通知 L0 release 和下游 runtime projection，且每个 observer 恰好一次。
+- C++ 使用只读 PostgreSQL role 直接读取版本化 business Session projection，并验证 minimum revision；
+- 两节点竞争 Runtime Session lease 时只有一个 owner，旧 fencing token 的 checkpoint/Close 被拒绝；
+- Application 重启后能够按需重建 Runtime Session，正常 Turn cache hit 时不访问数据库；
+- PostgreSQL 阻塞调用只运行在独立 DB executor，SessionSlot mutex 不跨 queue/acquire/query 等待。
 
 ### 12.3 压测
 
@@ -754,11 +839,14 @@ Gateway 的必要组合代码复制到 Application 后进行产品化修改。�
 - P50/P95/P99 queue wait、首 chunk 和完成延迟；
 - 取消风暴、Provider 429 风暴和慢消费者；
 - snapshot/metrics 开启与关闭时的性能差异。
+- SQLite、C++ 直连 PostgreSQL、只读副本和 `C++ -> gRPC -> Go -> PostgreSQL` 的 Session point lookup 对照；
+- Session restore、lease Acquire/Renew、checkpoint CAS 在 1/4/16/64/100/500 并发下的吞吐和尾延迟；
+- DB executor queue wait、connection acquire wait、query、Session commit 和 E2E 分段指标。
 
 ## 13. 各演进项完成定义
 
 以下条件是各模块独立完成后的总体目标。Application 的配置、Route、Proto 和 Go adapter 可以并行开发；
-正式 Runtime 组合默认以第 8 项及 11.4 至 11.7 节的目标拆分可用为门禁，或显式采用 11.11 节的应急路径：
+正式 Runtime 组合默认以第 8 项及 11.4 至 11.7 节的目标拆分可用为门禁，或显式采用 11.12 节的应急路径：
 
 1. CloudTaskCoordinator 支持有界多 batch、取消、deadline 和 ordered incremental sink；
 2. LLM client 具备真实增量 transport，retry/fallback 行为结构化且可观察；
@@ -770,4 +858,7 @@ Gateway 的必要组合代码复制到 Application 后进行产品化修改。�
 8. foundation、interaction、routing 等静态库、公共头文件和依赖通过安装包正确导出，reference
    Gateway 只依赖它们而不被它们反向依赖；
 9. 每个独立演进项均有对应的单元、集成、E2E 和性能测试；
-10. 企业 OA、PostgreSQL 业务事务、浏览器 SSE 和产品路由没有被耦合进 AgentLoom。
+10. 企业 OA、PostgreSQL 业务写事务、浏览器 SSE 和产品路由没有被耦合进 AgentLoom；
+11. C++ 可通过只读投影直接读取 business Session metadata，但不拥有或修改 Go business schema；
+12. Runtime Session snapshot、lease/fencing、按需重建和粘性路由通过 PostgreSQL 纵向 E2E；
+13. SQLite 继续作为可选轻量后端，PostgreSQL/MySQL 不成为 AgentLoom 默认构建的强制依赖。

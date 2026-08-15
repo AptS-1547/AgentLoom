@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 
@@ -48,17 +49,28 @@ public:
     void ReleaseSession(std::string_view session_id);
 
 private:
-    core::Result<std::shared_ptr<cache_vector::VectorIndexManager>> ResolveIndexLocked(
+    struct SessionIndexEntry {
+        explicit SessionIndexEntry(std::shared_ptr<cache_vector::VectorIndexManager> value)
+            : index(std::move(value)) {}
+
+        std::shared_ptr<cache_vector::VectorIndexManager> index;
+        // VectorIndexManager 仍包含批次游标等可变状态；同一 Session 暂时严格保序。
+        std::mutex operation_mutex;
+    };
+
+    core::Result<std::shared_ptr<SessionIndexEntry>> ResolveIndex(
         const CacheLookupRequest& req);
 
     std::shared_ptr<::vector::EmbeddingPipeline> embedding_;
     std::shared_ptr<cache_vector::VectorIndexManager> index_;
     std::shared_ptr<RedisConnectionPool> redis_pool_;
-    std::string sqlite_path_;
+    std::shared_ptr<storage::sqlite::SqliteConnectionPool> sqlite_pool_;
     std::size_t max_cached_records_ = 1000;
-    std::unordered_map<std::string, std::shared_ptr<cache_vector::VectorIndexManager>> per_session_indices_;
+    std::shared_ptr<SessionIndexEntry> fixed_index_entry_;
+    std::unordered_map<std::string, std::shared_ptr<SessionIndexEntry>> per_session_indices_;
     L0MemoryCacheAdapterOptions options_;
-    mutable std::mutex mutex_;
+    // 仅保护 Session 到索引的映射，严禁在持锁期间执行 Embedding、Redis 或 SQLite I/O。
+    mutable std::shared_mutex indices_mutex_;
 };
 
 } // namespace agent::semantic_cache

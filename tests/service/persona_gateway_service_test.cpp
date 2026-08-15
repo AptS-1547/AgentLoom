@@ -15,6 +15,7 @@
 #include <boost/asio.hpp>
 #include <boost/beast.hpp>
 
+#include <atomic>
 #include <future>
 #include <filesystem>
 #include <fstream>
@@ -60,6 +61,8 @@ using agent::service::gateway::TrainingReportGatewayRequest;
 using agent::service::gateway::GatewayAuthOptions;
 using agent::service::gateway::JwtAuthRegistrationService;
 using agent::service::gateway::GenerateDevelopmentRsaKeyPair;
+using storage::sqlite::SqliteConnectionPool;
+using storage::sqlite::SqliteConnectionPoolOptions;
 using agent::document::DocumentAnalysisService;
 using agent::document::DocumentFileStore;
 using agent::document::DocumentFileStoreOptions;
@@ -1980,6 +1983,97 @@ TEST(GatewayAuthSessionStoreTest, PersistsResolvesAndRevokesSessions) {
     std::filesystem::remove(path.string() + "-shm", ec);
 }
 
+TEST(GatewaySqliteMetadataStoreTest, SerializesConcurrentAuthAndPersonaWritesOnSharedPool) {
+    const auto path = std::filesystem::temp_directory_path() /
+        "agent_gateway_shared_metadata_concurrency_test.db";
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    std::filesystem::remove(path.string() + "-wal", ec);
+    std::filesystem::remove(path.string() + "-shm", ec);
+
+    SqliteConnectionPoolOptions pool_options;
+    pool_options.path = path.string();
+    pool_options.read_connection_count = 4;
+    pool_options.write_connection_count = 1;
+    pool_options.busy_timeout_ms = 1000;
+    pool_options.enable_wal = true;
+    auto pool = std::make_shared<SqliteConnectionPool>(std::move(pool_options));
+    ASSERT_TRUE(pool->Start().ok());
+
+    SqliteAuthSessionStore auth(pool);
+    SqlitePersonaMetadataStore personas(pool);
+    ASSERT_TRUE(auth.EnsureSchema().ok());
+    ASSERT_TRUE(personas.EnsureSchema().ok());
+
+    constexpr int kConcurrentWorkers = 16;
+    constexpr int kRecords = 64;
+    std::atomic<int> next_record{0};
+    std::promise<void> start_signal;
+    auto start_gate = start_signal.get_future().share();
+    std::vector<std::future<std::string>> writers;
+    writers.reserve(kConcurrentWorkers);
+    for (int worker = 0; worker < kConcurrentWorkers; ++worker) {
+        writers.push_back(std::async(std::launch::async, [&, start_gate] {
+            start_gate.wait();
+            while (true) {
+                const int i = next_record.fetch_add(1, std::memory_order_relaxed);
+                if (i >= kRecords) {
+                    return std::string{};
+                }
+
+                AuthSessionRecord session;
+                session.token_id = "token-" + std::to_string(i);
+                session.user_uuid = "user-" + std::to_string(i);
+                session.tenant_id = "default";
+                session.subject = "subject-" + std::to_string(i);
+                session.issued_at = std::chrono::system_clock::now();
+                session.expires_at = session.issued_at + std::chrono::hours(1);
+                if (auto status = auth.UpsertSession(session); !status.ok()) {
+                    return status.message();
+                }
+
+                auto request = MakePersonaMetadataRequest(
+                    session.user_uuid,
+                    "persona-" + std::to_string(i),
+                    "concurrent persona");
+                agent::service::gateway::PersonaMetadataRecord record{
+                    request.tenant_id,
+                    request.user_uuid,
+                    request.persona_id,
+                    request.personality,
+                    request.emotion_prompt_config,
+                    request.emotion_state_config,
+                };
+                if (auto status = personas.Upsert(std::move(record)); !status.ok()) {
+                    return status.message();
+                }
+            }
+        }));
+    }
+    start_signal.set_value();
+
+    for (auto& writer : writers) {
+        ASSERT_EQ(writer.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+        EXPECT_TRUE(writer.get().empty());
+    }
+
+    auto session = auth.ResolveSession("token-63");
+    ASSERT_TRUE(session.ok()) << session.status().message();
+    EXPECT_EQ(session.value().user_uuid, "user-63");
+    auto persona = personas.Get("default", "user-63", "persona-63");
+    ASSERT_TRUE(persona.ok()) << persona.status().message();
+    EXPECT_EQ(persona.value().personality.description, "concurrent persona");
+
+    const auto stats = pool->Stats();
+    EXPECT_EQ(stats.total_write_connections, 1u);
+    EXPECT_EQ(stats.leased_write_connections, 0u);
+    pool->Close();
+
+    std::filesystem::remove(path, ec);
+    std::filesystem::remove(path.string() + "-wal", ec);
+    std::filesystem::remove(path.string() + "-shm", ec);
+}
+
 TEST(GatewayAuthSessionStoreTest, CleansExpiredSessionsInLruOrder) {
     const auto path = std::filesystem::temp_directory_path() / "agent_gateway_auth_sessions_cleanup_test.db";
     std::error_code ec;
@@ -2347,6 +2441,105 @@ TEST(PersonaGatewayServerTest, HostsApiWebSocketAdapterAndStaticDistOnOneHttpSer
     server.Stop();
    }
     std::filesystem::remove_all(static_root, cleanup_error);
+    std::filesystem::remove(auth_db_path, cleanup_error);
+    std::filesystem::remove(auth_db_path.string() + "-wal", cleanup_error);
+    std::filesystem::remove(auth_db_path.string() + "-shm", cleanup_error);
+}
+
+TEST(PersonaGatewayServerTest, SerializesConcurrentAuthAndPersonaWritesOverHttp) {
+    const auto auth_db_path = TempPath("agent_gateway_concurrent_metadata.sqlite");
+    std::error_code cleanup_error;
+    std::filesystem::remove(auth_db_path, cleanup_error);
+    std::filesystem::remove(auth_db_path.string() + "-wal", cleanup_error);
+    std::filesystem::remove(auth_db_path.string() + "-shm", cleanup_error);
+
+    auto cache = std::make_shared<FakeSemanticCache>();
+    auto memory = std::make_shared<SemanticMemoryContextProvider>(cache);
+    auto emotion = std::make_shared<NeutralEmotionAnalyzer>();
+    auto llm = std::make_shared<FakeLlmClient>();
+
+    PersonaGatewayServerOptions options;
+    options.http.address = "127.0.0.1";
+    options.http.port = 0;
+    options.http.io_threads = 16;
+    options.compute_pool.worker_count = 4;
+    options.compute_pool.queue_capacity = 256;
+    options.io_pool.worker_count = 4;
+    options.io_pool.queue_capacity = 256;
+    options.runtime.default_model = "test-model";
+    EnableGatewayTestAuth(options, auth_db_path);
+
+    PersonaGatewayServerDependencies dependencies;
+    dependencies.memory_provider = std::move(memory);
+    dependencies.emotion_analyzer = std::move(emotion);
+    dependencies.llm_client = std::move(llm);
+
+    {
+        PersonaGatewayServer server(std::move(options), std::move(dependencies));
+        ASSERT_TRUE(server.Start().ok());
+
+        constexpr int kConcurrentClients = 16;
+        constexpr int kAccounts = 64;
+        std::atomic<int> next_account{0};
+        std::promise<void> start_signal;
+        auto start_gate = start_signal.get_future().share();
+        std::vector<std::future<std::string>> clients;
+        clients.reserve(kConcurrentClients);
+        for (int worker = 0; worker < kConcurrentClients; ++worker) {
+            clients.push_back(std::async(std::launch::async, [&, start_gate] {
+                start_gate.wait();
+                try {
+                    while (true) {
+                        const int i = next_account.fetch_add(1, std::memory_order_relaxed);
+                        if (i >= kAccounts) {
+                            return std::string{};
+                        }
+                        const auto user_uuid = "http-user-" + std::to_string(i);
+                        auto registered = SendJsonRequest(
+                            server.port(),
+                            ::net::http::verb::post,
+                            "/api/auth/register",
+                            Json{
+                                {"traceId", "trace-http-register-" + std::to_string(i)},
+                                {"userUuid", user_uuid},
+                                {"tenantId", "default"},
+                                {"ttlSeconds", 600},
+                            });
+                        if (registered.result() != ::net::http::status::ok) {
+                            return "register failed: " + registered.body();
+                        }
+
+                        auto persona = SendJsonRequest(
+                            server.port(),
+                            ::net::http::verb::post,
+                            "/api/persona",
+                            Json{
+                                {"traceId", "trace-http-persona-" + std::to_string(i)},
+                                {"personaId", "persona-" + std::to_string(i)},
+                                {"personality", {
+                                    {"name", "persona-" + std::to_string(i)},
+                                    {"description", "concurrent HTTP persona"},
+                                }},
+                            },
+                            {{"Cookie", std::string(registered[::net::http::field::set_cookie])}});
+                        if (persona.result() != ::net::http::status::ok) {
+                            return "persona upsert failed: " + persona.body();
+                        }
+                    }
+                } catch (const std::exception& error) {
+                    return std::string(error.what());
+                }
+            }));
+        }
+        start_signal.set_value();
+
+        for (auto& client : clients) {
+            ASSERT_EQ(client.wait_for(std::chrono::seconds(15)), std::future_status::ready);
+            EXPECT_TRUE(client.get().empty());
+        }
+        server.Stop();
+    }
+
     std::filesystem::remove(auth_db_path, cleanup_error);
     std::filesystem::remove(auth_db_path.string() + "-wal", cleanup_error);
     std::filesystem::remove(auth_db_path.string() + "-shm", cleanup_error);

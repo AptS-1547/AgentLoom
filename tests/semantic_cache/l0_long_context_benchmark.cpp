@@ -281,18 +281,23 @@ int main(int argc, char** argv) {
         std::filesystem::remove(options.sqlite_path, ec);
         std::filesystem::remove(options.sqlite_path.string() + "-wal", ec);
         std::filesystem::remove(options.sqlite_path.string() + "-shm", ec);
-        auto sqlite_result = storage::sqlite::SqliteConnection::Open(options.sqlite_path.string());
-        if (!sqlite_result.ok()) {
-            std::cerr << "[error] sqlite: " << sqlite_result.status().message() << "\n";
+        storage::sqlite::SqliteConnectionPoolOptions sqlite_options;
+        sqlite_options.path = options.sqlite_path.string();
+        sqlite_options.read_connection_count = 4;
+        sqlite_options.write_connection_count = 1;
+        sqlite_options.busy_timeout_ms = 5000;
+        sqlite_options.enable_wal = true;
+        auto sqlite_pool = std::make_shared<storage::sqlite::SqliteConnectionPool>(std::move(sqlite_options));
+        auto sqlite_status = sqlite_pool->Start();
+        if (!sqlite_status.ok()) {
+            std::cerr << "[error] sqlite: " << sqlite_status.message() << "\n";
             return 1;
         }
-        auto sqlite = std::move(sqlite_result.value());
-        sqlite.EnableWal();
 
         auto index = std::make_shared<agent::semantic_cache::cache_vector::VectorIndexManager>(
             options.user_uuid,
             redis,
-            std::move(sqlite),
+            std::move(sqlite_pool),
             options.max_cached_records);
         agent::semantic_cache::L0MemoryCacheAdapterOptions l0_options;
         l0_options.top_k = options.top_k;

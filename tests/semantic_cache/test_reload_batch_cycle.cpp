@@ -1,6 +1,6 @@
 #include "../../src/semantic_cache/semantic_cache_pipeline.h"
 #include "../../src/semantic_cache/redis_connection_pool.h"
-#include "../../src/storage/sqlite/sqlite_connection.h"
+#include "../../src/storage/sqlite/sqlite_connection_pool.h"
 #include <gtest/gtest.h>
 #include <filesystem>
 #include <chrono>
@@ -17,9 +17,14 @@ protected:
             ("test_reload_cycle_" + std::to_string(unique) + ".db")).string();
         std::filesystem::remove(test_db_path_);
 
-        auto conn_result = sqlite::SqliteConnection::Open(test_db_path_);
-        ASSERT_TRUE(conn_result.ok());
-        sqlite_conn_ = std::move(conn_result.value());
+        sqlite::SqliteConnectionPoolOptions sqlite_options;
+        sqlite_options.path = test_db_path_;
+        sqlite_options.read_connection_count = 2;
+        sqlite_options.write_connection_count = 1;
+        sqlite_options.busy_timeout_ms = 1000;
+        sqlite_options.enable_wal = true;
+        sqlite_pool_ = std::make_shared<sqlite::SqliteConnectionPool>(std::move(sqlite_options));
+        ASSERT_TRUE(sqlite_pool_->Start().ok());
 
         redis_pool_ = std::make_shared<RedisConnectionPool>(
             RedisPoolOptions{
@@ -40,7 +45,10 @@ protected:
             CleanupRedisKeys();
             redis_pool_->Shutdown();
         }
-        sqlite_conn_ = sqlite::SqliteConnection();
+        if (sqlite_pool_) {
+            sqlite_pool_->Close();
+            sqlite_pool_.reset();
+        }
         std::error_code ec;
         std::filesystem::remove(test_db_path_, ec);
     }
@@ -54,13 +62,13 @@ protected:
     }
 
     std::string test_db_path_;
-    sqlite::SqliteConnection sqlite_conn_;
+    std::shared_ptr<sqlite::SqliteConnectionPool> sqlite_pool_;
     std::shared_ptr<RedisConnectionPool> redis_pool_;
     std::string user_uuid_;
 };
 
 TEST_F(ReloadBatchCycleTest, CyclicReloadDoesNotEmptyIndex) {
-    cache_vector::VectorIndexManager manager(user_uuid_, redis_pool_, std::move(sqlite_conn_),MAX_CACHE_RECORDS);
+    cache_vector::VectorIndexManager manager(user_uuid_, redis_pool_, sqlite_pool_, MAX_CACHE_RECORDS);
 
     for (int batch = 0; batch < 3; ++batch) {
         for (int i = 0; i < MAX_CACHE_RECORDS; ++i) {
@@ -84,7 +92,7 @@ TEST_F(ReloadBatchCycleTest, CyclicReloadDoesNotEmptyIndex) {
 }
 
 TEST_F(ReloadBatchCycleTest, RebuildFromRedisWhenIndexEmpty) {
-    cache_vector::VectorIndexManager manager(user_uuid_, redis_pool_, std::move(sqlite_conn_));
+    cache_vector::VectorIndexManager manager(user_uuid_, redis_pool_, sqlite_pool_);
 
     for (int batch = 0; batch < 2; ++batch) {
         for (int i = 0; i < MAX_CACHE_RECORDS; ++i) {
@@ -99,18 +107,25 @@ TEST_F(ReloadBatchCycleTest, RebuildFromRedisWhenIndexEmpty) {
     std::string new_db = (std::filesystem::temp_directory_path() /
         ("test_rebuild_fresh_" + std::to_string(std::chrono::system_clock::now().time_since_epoch().count()) + ".db")).string();
     std::filesystem::remove(new_db);
-    auto new_conn_result = sqlite::SqliteConnection::Open(new_db);
-    ASSERT_TRUE(new_conn_result.ok());
+    sqlite::SqliteConnectionPoolOptions fresh_options;
+    fresh_options.path = new_db;
+    fresh_options.read_connection_count = 2;
+    fresh_options.write_connection_count = 1;
+    fresh_options.busy_timeout_ms = 1000;
+    fresh_options.enable_wal = true;
+    auto fresh_pool = std::make_shared<sqlite::SqliteConnectionPool>(std::move(fresh_options));
+    ASSERT_TRUE(fresh_pool->Start().ok());
 
     {
         cache_vector::VectorIndexManager fresh_manager(
-            user_uuid_, redis_pool_, std::move(new_conn_result.value()));
+            user_uuid_, redis_pool_, fresh_pool);
 
         std::vector<float> query(agent::semantic_cache::kExpectedEmbeddingDim, 0.3f);
         auto result = fresh_manager.Search(query, 3);
         ASSERT_TRUE(result.ok()) << result.status().message();
         ASSERT_FALSE(result.value().empty());
-    }  // fresh_manager 析构，释放数据库文件句柄
+    }
+    fresh_pool->Close();
 
     std::error_code ec;
     std::filesystem::remove(new_db, ec);

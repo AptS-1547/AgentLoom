@@ -128,8 +128,11 @@ jobs:
           )"
           git init vcpkg
           git -C vcpkg remote add origin https://github.com/microsoft/vcpkg.git
-          git -C vcpkg fetch --depth 1 origin "$vcpkg_baseline"
+          # vcpkg versioning resolves historical port git trees. A depth-1 clone
+          # lacks those objects and fails while loading versioned ports.
+          git -C vcpkg fetch --no-tags origin "$vcpkg_baseline"
           git -C vcpkg checkout --detach FETCH_HEAD
+          test "$(git -C vcpkg rev-parse --is-shallow-repository)" = "false"
           ./vcpkg/bootstrap-vcpkg.sh -disableMetrics
 
       - name: Install vcpkg dependencies

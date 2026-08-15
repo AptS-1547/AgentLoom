@@ -1,12 +1,14 @@
 #include "l0_memory_cache_adapter.h"
 
 #include "redis_connection_pool.h"
-#include "sqlite/sqlite_connection.h"
+#include "sqlite/sqlite_connection_pool.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <limits>
+#include <mutex>
+#include <shared_mutex>
 #include <sstream>
 #include <utility>
 #include <vector>
@@ -77,6 +79,20 @@ struct RankedL0Hit {
     float decay = 1.0f;
 };
 
+std::shared_ptr<storage::sqlite::SqliteConnectionPool> MakeL0SqlitePool(
+    std::string sqlite_path) {
+    if (sqlite_path.empty()) {
+        return nullptr;
+    }
+    storage::sqlite::SqliteConnectionPoolOptions options;
+    options.path = std::move(sqlite_path);
+    options.read_connection_count = 4;
+    options.write_connection_count = 1;
+    options.busy_timeout_ms = 5000;
+    options.enable_wal = true;
+    return std::make_shared<storage::sqlite::SqliteConnectionPool>(std::move(options));
+}
+
 } // namespace
 
 L0MemoryCacheAdapter::L0MemoryCacheAdapter(
@@ -85,7 +101,11 @@ L0MemoryCacheAdapter::L0MemoryCacheAdapter(
     L0MemoryCacheAdapterOptions options)
     : embedding_(std::move(embedding)),
       index_(std::move(index)),
-      options_(options) {}
+      options_(options) {
+    if (index_) {
+        fixed_index_entry_ = std::make_shared<SessionIndexEntry>(index_);
+    }
+}
 
 L0MemoryCacheAdapter::L0MemoryCacheAdapter(
     std::shared_ptr<::vector::EmbeddingPipeline> embedding,
@@ -95,14 +115,14 @@ L0MemoryCacheAdapter::L0MemoryCacheAdapter(
     L0MemoryCacheAdapterOptions options)
     : embedding_(std::move(embedding)),
       redis_pool_(std::move(redis_pool)),
-      sqlite_path_(std::move(sqlite_path)),
+      sqlite_pool_(MakeL0SqlitePool(std::move(sqlite_path))),
       max_cached_records_(max_cached_records),
       options_(options) {}
 
-core::Result<std::shared_ptr<cache_vector::VectorIndexManager>> L0MemoryCacheAdapter::ResolveIndexLocked(
+core::Result<std::shared_ptr<L0MemoryCacheAdapter::SessionIndexEntry>> L0MemoryCacheAdapter::ResolveIndex(
     const CacheLookupRequest& req) {
-    if (index_) {
-        return index_;
+    if (fixed_index_entry_) {
+        return fixed_index_entry_;
     }
     if (req.session_id.empty()) {
         return core::Status::Error(core::ErrorCode::InvalidArgument, "L0 memory session_id is required");
@@ -113,34 +133,41 @@ core::Result<std::shared_ptr<cache_vector::VectorIndexManager>> L0MemoryCacheAda
     if (!redis_pool_) {
         return core::Status::Error(core::ErrorCode::FailedPrecondition, "L0 memory redis pool is not initialized");
     }
-    if (sqlite_path_.empty()) {
+    if (!sqlite_pool_) {
         return core::Status::Error(core::ErrorCode::FailedPrecondition, "L0 memory sqlite path is not configured");
     }
 
     const std::string key(req.session_id);
-    auto found = per_session_indices_.find(key);
-    if (found != per_session_indices_.end()) {
-        return found->second;
+    {
+        std::shared_lock lock(indices_mutex_);
+        auto found = per_session_indices_.find(key);
+        if (found != per_session_indices_.end()) {
+            return found->second;
+        }
     }
 
-    auto sqlite = storage::sqlite::SqliteConnection::Open(sqlite_path_);
-    if (!sqlite.ok()) {
-        return sqlite.status();
+    if (auto status = sqlite_pool_->Start(); !status.ok()) {
+        return status;
     }
+    // 索引初始化可能访问 SQLite，放在映射锁之外，避免一个新 Session 阻塞全部热路径。
     auto index = std::make_shared<cache_vector::VectorIndexManager>(
         key,
         redis_pool_,
-        std::move(sqlite).value(),
+        sqlite_pool_,
         max_cached_records_);
-    per_session_indices_[key] = index;
-    return index;
+    auto candidate = std::make_shared<SessionIndexEntry>(std::move(index));
+
+    // 同 Session 并发首次访问允许构造候选对象，但最终只发布一个共享实例。
+    std::unique_lock lock(indices_mutex_);
+    auto found = per_session_indices_.try_emplace(key, candidate).first;
+    return found->second;
 }
 
 void L0MemoryCacheAdapter::ReleaseSession(std::string_view session_id) {
     if (session_id.empty()) {
         return;
     }
-    std::lock_guard lock(mutex_);
+    std::unique_lock lock(indices_mutex_);
     per_session_indices_.erase(std::string(session_id));
 }
 
@@ -152,14 +179,13 @@ core::Result<CacheLookupResult> L0MemoryCacheAdapter::Lookup(const CacheLookupRe
         return CacheLookupResult{};
     }
 
-    std::lock_guard lock(mutex_);
     auto query_embedding = embedding_->Encode(req.text);
     if (!query_embedding.ok()) {
         return query_embedding.status();
     }
-    auto index = ResolveIndexLocked(req);
-    if (!index.ok()) {
-        return index.status();
+    auto entry = ResolveIndex(req);
+    if (!entry.ok()) {
+        return entry.status();
     }
 
     const auto candidate_multiplier = std::max<std::size_t>(1, options_.candidate_multiplier);
@@ -167,7 +193,11 @@ core::Result<CacheLookupResult> L0MemoryCacheAdapter::Lookup(const CacheLookupRe
     const auto candidate_k = options_.top_k > max_top_k
         ? std::numeric_limits<std::size_t>::max()
         : options_.top_k * candidate_multiplier;
-    auto hits = index.value()->SearchWithContext(query_embedding.value(), candidate_k, options_.neighbors_per_hit);
+    core::Result<std::vector<cache_vector::SearchWithContextResult>> hits = [&] {
+        std::lock_guard lock(entry.value()->operation_mutex);
+        return entry.value()->index->SearchWithContext(
+            query_embedding.value(), candidate_k, options_.neighbors_per_hit);
+    }();
     if (!hits.ok()) {
         if (hits.status().code() == core::ErrorCode::NotFound) {
             return CacheLookupResult{};
@@ -237,14 +267,13 @@ core::Status L0MemoryCacheAdapter::Store(const CacheStoreRequest& req) {
         return core::Status::Ok();
     }
 
-    std::lock_guard lock(mutex_);
     auto text_embedding = embedding_->Encode(req.origin.text);
     if (!text_embedding.ok()) {
         return text_embedding.status();
     }
-    auto index = ResolveIndexLocked(req.origin);
-    if (!index.ok()) {
-        return index.status();
+    auto entry = ResolveIndex(req.origin);
+    if (!entry.ok()) {
+        return entry.status();
     }
 
     storage::CacheRecord record;
@@ -268,7 +297,8 @@ core::Status L0MemoryCacheAdapter::Store(const CacheStoreRequest& req) {
             std::chrono::duration_cast<std::chrono::milliseconds>(*req.ttl).count();
     }
     record.extra_metadata = req.origin.extra;
-    return index.value()->AddRecord(record);
+    std::lock_guard lock(entry.value()->operation_mutex);
+    return entry.value()->index->AddRecord(record);
 }
 
 } // namespace agent::semantic_cache

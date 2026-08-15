@@ -6,7 +6,7 @@
 #include "semantic_cache_types.h"
 #include "result.h"
 #include "../vector/hf_tokenizer.h"
-#include "../storage/sqlite/sqlite_connection.h"
+#include "../storage/sqlite/sqlite_connection_pool.h"
 #include "../vector/onnx_text_embedding_model.h"
 #include <cstdint>
 #include <deque>
@@ -197,7 +197,7 @@ namespace cache_vector {
         public:
             VectorIndexManager(std::string user_uuid,
                                std::shared_ptr<RedisConnectionPool> redis_pool,
-                               storage::sqlite::SqliteConnection sqlite_conn,
+                               std::shared_ptr<storage::sqlite::SqliteConnectionPool> sqlite_pool,
                                std::size_t max_cached_records = 1000);
             VectorIndexManager(const VectorIndexManager&) = delete;
             VectorIndexManager& operator=(const VectorIndexManager&) = delete;
@@ -221,6 +221,7 @@ namespace cache_vector {
             ~VectorIndexManager() = default;
 
         private:
+            core::Status EnsureSchema();
             core::Status ReloadNextBatch();
             core::Status RebuildTimestampIndexFromRedis();
             core::Status LoadActiveBatch();
@@ -230,7 +231,8 @@ namespace cache_vector {
             std::size_t max_cached_records_;
             std::string user_uuid_;
             std::shared_ptr<RedisConnectionPool> redis_pool_;
-            storage::sqlite::SqliteConnection sqlite_conn_;
+            std::shared_ptr<storage::sqlite::SqliteConnectionPool> sqlite_pool_;
+            core::Status initialization_status_;
             std::deque<std::int64_t> timestamp_index_;
             std::vector<std::int64_t> backpack_timestamps_;
             std::int64_t active_timestamp_;

@@ -14,6 +14,10 @@
 #include <mutex>
 #include <unordered_map>
 
+namespace storage::sqlite {
+class SqliteConnectionPool;
+}
+
 namespace agent::service::gateway {
 
 class IPersonaMetadataStore {
@@ -83,6 +87,7 @@ private:
 class SqlitePersonaMetadataStore final : public IPersonaMetadataStore {
 public:
     explicit SqlitePersonaMetadataStore(std::string database_path);
+    explicit SqlitePersonaMetadataStore(std::shared_ptr<storage::sqlite::SqliteConnectionPool> pool);
 
     core::Status EnsureSchema() override;
     core::Status Upsert(PersonaMetadataRecord record) override;
@@ -93,7 +98,7 @@ public:
                                                                    std::string_view user_uuid) const override;
 
 private:
-    std::string database_path_;
+    std::shared_ptr<storage::sqlite::SqliteConnectionPool> pool_;
 };
 
 class RedisPersonaMetadataCache final : public IPersonaMetadataStore {

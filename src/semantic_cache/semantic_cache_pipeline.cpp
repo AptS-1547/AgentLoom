@@ -19,6 +19,20 @@ thread_local std::mt19937 g_batch_rng{std::random_device{}()};
 constexpr std::uint32_t kCacheRecordExtensionMagic = 0x43524D45; // CRME
 constexpr std::uint32_t kCacheRecordExtensionVersion = 1;
 
+core::Result<storage::sqlite::SqliteConnectionLease> AcquireIndexConnection(
+    const std::shared_ptr<storage::sqlite::SqliteConnectionPool>& pool,
+    bool write) {
+    if (!pool) {
+        return core::Status::Error(
+            core::ErrorCode::FailedPrecondition,
+            "semantic cache SQLite pool is not configured");
+    }
+    if (auto status = pool->Start(); !status.ok()) {
+        return status;
+    }
+    return write ? pool->WaitAcquireWrite() : pool->WaitAcquireRead();
+}
+
 void AppendPod(std::string& buf, const auto& value) {
     const auto* raw = reinterpret_cast<const char*>(&value);
     buf.append(raw, sizeof(value));
@@ -467,16 +481,82 @@ core::Status SemanticCachePipeline::Store(const CacheStoreRequest& req) {
 cache_vector::VectorIndexManager::VectorIndexManager(
     std::string user_uuid,
     std::shared_ptr<RedisConnectionPool> redis_pool,
-    storage::sqlite::SqliteConnection sqlite_conn,
+    std::shared_ptr<storage::sqlite::SqliteConnectionPool> sqlite_pool,
     std::size_t max_cached_records)
-    : user_uuid_(std::move(user_uuid)),
+    : max_cached_records_(max_cached_records),
+      user_uuid_(std::move(user_uuid)),
       redis_pool_(std::move(redis_pool)),
-      sqlite_conn_(std::move(sqlite_conn)),
+      sqlite_pool_(std::move(sqlite_pool)),
       active_timestamp_(0),
-      active_count_(0),
-      max_cached_records_(max_cached_records) {
-    LoadActiveBatch();
-    LoadTimestampIndex();
+      active_count_(0) {
+    initialization_status_ = EnsureSchema();
+    if (initialization_status_.ok()) {
+        initialization_status_ = LoadActiveBatch();
+    }
+    if (initialization_status_.ok()) {
+        initialization_status_ = LoadTimestampIndex();
+    }
+}
+
+core::Status cache_vector::VectorIndexManager::EnsureSchema() {
+    {
+        auto read_lease_result = AcquireIndexConnection(sqlite_pool_, false);
+        if (!read_lease_result.ok()) {
+            return read_lease_result.status();
+        }
+        auto read_lease = std::move(read_lease_result).value();
+        auto& read_connection = read_lease.connection();
+        auto active_probe = read_connection.Prepare(
+            "SELECT user_uuid, timestamp, count FROM active_batch LIMIT 0");
+        auto timestamp_probe = read_connection.Prepare(
+            "SELECT user_uuid, timestamp FROM cache_timestamp_index LIMIT 0");
+        if (active_probe.ok() && timestamp_probe.ok()) {
+            // Schema 已就绪时只走 read lease，新 Session 初始化无需进入 SQLite 写队列。
+            return core::Status::Ok();
+        }
+    }
+
+    auto lease_result = AcquireIndexConnection(sqlite_pool_, true);
+    if (!lease_result.ok()) {
+        return lease_result.status();
+    }
+    auto lease = std::move(lease_result).value();
+    auto& connection = lease.connection();
+
+    auto status = connection.Execute(
+        "CREATE TABLE IF NOT EXISTS active_batch ("
+        "user_uuid TEXT PRIMARY KEY, "
+        "timestamp INTEGER NOT NULL, "
+        "count INTEGER NOT NULL)");
+    if (!status.ok()) {
+        return status;
+    }
+
+    status = connection.Execute(
+        "CREATE TABLE IF NOT EXISTS cache_timestamp_index ("
+        "user_uuid TEXT NOT NULL, "
+        "timestamp INTEGER NOT NULL, "
+        "PRIMARY KEY (user_uuid, timestamp))");
+    if (!status.ok()) {
+        return status;
+    }
+
+    auto schema_probe = connection.Prepare(
+        "SELECT user_uuid, timestamp FROM cache_timestamp_index LIMIT 0");
+    if (schema_probe.ok()) {
+        return core::Status::Ok();
+    }
+
+    // 旧表只有 timestamp 列；索引可由 Redis 批次重建，因此启动时一次性迁移，避免查询热路径执行 DDL。
+    status = connection.Execute("DROP TABLE IF EXISTS cache_timestamp_index");
+    if (!status.ok()) {
+        return status;
+    }
+    return connection.Execute(
+        "CREATE TABLE cache_timestamp_index ("
+        "user_uuid TEXT NOT NULL, "
+        "timestamp INTEGER NOT NULL, "
+        "PRIMARY KEY (user_uuid, timestamp))");
 }
 
 std::size_t cache_vector::VectorIndexManager::CurrentSize() const {
@@ -488,6 +568,9 @@ std::string cache_vector::VectorIndexManager::BuildBatchKey(std::int64_t timesta
 }
 
 core::Status cache_vector::VectorIndexManager::AddRecord(const storage::CacheRecord& record) {
+    if (!initialization_status_.ok()) {
+        return initialization_status_;
+    }
     if (active_timestamp_ == 0) {
         active_timestamp_ = std::chrono::system_clock::now().time_since_epoch().count();
     }
@@ -515,6 +598,9 @@ core::Status cache_vector::VectorIndexManager::AddRecord(const storage::CacheRec
 }
 
 core::Status cache_vector::VectorIndexManager::Store(const std::vector<storage::CacheRecord>& records) {
+    if (!initialization_status_.ok()) {
+        return initialization_status_;
+    }
     if (records.empty()) {
         return core::Status::Ok();
     }
@@ -641,6 +727,10 @@ core::Result<std::vector<storage::CacheRecord>> cache_vector::VectorIndexManager
     const std::vector<float>& embedding,
     std::size_t top_k) {
 
+    if (!initialization_status_.ok()) {
+        return initialization_status_;
+    }
+
     if (embedding.size() != kExpectedEmbeddingDim) {
         return core::Status::Error(core::ErrorCode::InvalidArgument,
             "embedding dimension mismatch: expected " + std::to_string(kExpectedEmbeddingDim)
@@ -737,6 +827,9 @@ core::Result<std::vector<storage::CacheRecord>> cache_vector::VectorIndexManager
 core::Result<std::vector<cache_vector::ScoredCacheRecord>> cache_vector::VectorIndexManager::SearchAllBatches(
     const std::vector<float>& embedding,
     std::size_t top_k) {
+    if (!initialization_status_.ok()) {
+        return initialization_status_;
+    }
     if (embedding.size() != kExpectedEmbeddingDim) {
         return core::Status::Error(core::ErrorCode::InvalidArgument,
             "embedding dimension mismatch: expected " + std::to_string(kExpectedEmbeddingDim)
@@ -823,6 +916,10 @@ core::Result<std::vector<cache_vector::SearchWithContextResult>> cache_vector::V
     const std::vector<float>& embedding,
     std::size_t top_k,
     std::size_t neighbors_per_hit) {
+
+    if (!initialization_status_.ok()) {
+        return initialization_status_;
+    }
 
     if (embedding.size() != kExpectedEmbeddingDim) {
         return core::Status::Error(core::ErrorCode::InvalidArgument,
@@ -949,27 +1046,21 @@ core::Result<std::vector<cache_vector::SearchWithContextResult>> cache_vector::V
 }
 
 core::Status cache_vector::VectorIndexManager::LoadActiveBatch() {
-    if (!sqlite_conn_.valid()) {
-        return core::Status::Error(core::ErrorCode::FailedPrecondition, "sqlite connection not available");
+    auto lease_result = AcquireIndexConnection(sqlite_pool_, false);
+    if (!lease_result.ok()) {
+        return lease_result.status();
     }
+    auto lease = std::move(lease_result).value();
+    auto& connection = lease.connection();
 
-    auto status = sqlite_conn_.Execute(
-        "CREATE TABLE IF NOT EXISTS active_batch ("
-        "user_uuid TEXT PRIMARY KEY, "
-        "timestamp INTEGER NOT NULL, "
-        "count INTEGER NOT NULL)");
-    if (!status.ok()) {
-        return status;
-    }
-
-    auto stmt_result = sqlite_conn_.Prepare(
+    auto stmt_result = connection.Prepare(
         "SELECT timestamp, count FROM active_batch WHERE user_uuid = ?");
     if (!stmt_result.ok()) {
         return stmt_result.status();
     }
     auto stmt = std::move(stmt_result.value());
 
-    status = stmt.BindText(1, user_uuid_);
+    auto status = stmt.BindText(1, user_uuid_);
     if (!status.ok()) {
         return status;
     }
@@ -991,11 +1082,14 @@ core::Status cache_vector::VectorIndexManager::LoadActiveBatch() {
 }
 
 core::Status cache_vector::VectorIndexManager::SaveActiveBatch() {
-    if (!sqlite_conn_.valid()) {
-        return core::Status::Error(core::ErrorCode::FailedPrecondition, "sqlite connection not available");
+    auto lease_result = AcquireIndexConnection(sqlite_pool_, true);
+    if (!lease_result.ok()) {
+        return lease_result.status();
     }
+    auto lease = std::move(lease_result).value();
+    auto& connection = lease.connection();
 
-    auto stmt_result = sqlite_conn_.Prepare(
+    auto stmt_result = connection.Prepare(
         "INSERT OR REPLACE INTO active_batch (user_uuid, timestamp, count) VALUES (?, ?, ?)");
     if (!stmt_result.ok()) {
         return stmt_result.status();
@@ -1037,7 +1131,13 @@ core::Status cache_vector::VectorIndexManager::PromoteBatchToIndex() {
         return status;
     }
 
-    auto stmt_result = sqlite_conn_.Prepare("DELETE FROM active_batch WHERE user_uuid = ?");
+    auto lease_result = AcquireIndexConnection(sqlite_pool_, true);
+    if (!lease_result.ok()) {
+        return lease_result.status();
+    }
+    auto lease = std::move(lease_result).value();
+    auto& connection = lease.connection();
+    auto stmt_result = connection.Prepare("DELETE FROM active_batch WHERE user_uuid = ?");
     if (!stmt_result.ok()) {
         return stmt_result.status();
     }
@@ -1060,15 +1160,18 @@ core::Status cache_vector::VectorIndexManager::PromoteBatchToIndex() {
 }
 
 core::Status cache_vector::VectorIndexManager::StoreTimestampIndex() {
-    if (!sqlite_conn_.valid()) {
-        return core::Status::Error(core::ErrorCode::FailedPrecondition, "sqlite connection not available");
+    auto lease_result = AcquireIndexConnection(sqlite_pool_, true);
+    if (!lease_result.ok()) {
+        return lease_result.status();
     }
+    auto lease = std::move(lease_result).value();
+    auto& connection = lease.connection();
 
-    storage::sqlite::SqliteTransaction txn(sqlite_conn_);
+    storage::sqlite::SqliteTransaction txn(connection);
     auto status = txn.Begin();
     if (!status.ok()) return status;
 
-    status = sqlite_conn_.Execute(
+    status = connection.Execute(
         "CREATE TABLE IF NOT EXISTS cache_timestamp_index ("
         "user_uuid TEXT NOT NULL, "
         "timestamp INTEGER NOT NULL, "
@@ -1078,15 +1181,16 @@ core::Status cache_vector::VectorIndexManager::StoreTimestampIndex() {
         return status;
     }
 
-    status = sqlite_conn_.Execute("DELETE FROM cache_timestamp_index WHERE user_uuid = ?");
-    if (!status.ok()) {
+    auto delete_result = connection.Prepare(
+        "DELETE FROM cache_timestamp_index WHERE user_uuid = ?");
+    if (!delete_result.ok()) {
         // Table might not have user_uuid column yet (old schema), recreate
-        status = sqlite_conn_.Execute("DROP TABLE IF EXISTS cache_timestamp_index");
+        status = connection.Execute("DROP TABLE IF EXISTS cache_timestamp_index");
         if (!status.ok()) {
             txn.Rollback();
             return status;
         }
-        status = sqlite_conn_.Execute(
+        status = connection.Execute(
             "CREATE TABLE cache_timestamp_index ("
             "user_uuid TEXT NOT NULL, "
             "timestamp INTEGER NOT NULL, "
@@ -1095,9 +1199,20 @@ core::Status cache_vector::VectorIndexManager::StoreTimestampIndex() {
             txn.Rollback();
             return status;
         }
+    } else {
+        auto delete_statement = std::move(delete_result).value();
+        if (auto bind = delete_statement.BindText(1, user_uuid_); !bind.ok()) {
+            txn.Rollback();
+            return bind;
+        }
+        auto deleted = delete_statement.Step();
+        if (!deleted.ok()) {
+            txn.Rollback();
+            return deleted.status();
+        }
     }
 
-    auto stmt_result = sqlite_conn_.Prepare("INSERT OR IGNORE INTO cache_timestamp_index (user_uuid, timestamp) VALUES (?, ?)");
+    auto stmt_result = connection.Prepare("INSERT OR IGNORE INTO cache_timestamp_index (user_uuid, timestamp) VALUES (?, ?)");
     if (!stmt_result.ok()) {
         txn.Rollback();
         return stmt_result.status();
@@ -1132,25 +1247,21 @@ core::Status cache_vector::VectorIndexManager::StoreTimestampIndex() {
 }
 
 core::Status cache_vector::VectorIndexManager::LoadTimestampIndex() {
-    if (!sqlite_conn_.valid()) {
-        return core::Status::Error(core::ErrorCode::FailedPrecondition, "sqlite connection not available");
+    auto lease_result = AcquireIndexConnection(sqlite_pool_, false);
+    if (!lease_result.ok()) {
+        return lease_result.status();
     }
+    auto lease = std::move(lease_result).value();
+    auto& connection = lease.connection();
 
-    auto status = sqlite_conn_.Execute(
-        "CREATE TABLE IF NOT EXISTS cache_timestamp_index ("
-        "user_uuid TEXT NOT NULL, "
-        "timestamp INTEGER NOT NULL, "
-        "PRIMARY KEY (user_uuid, timestamp))");
-    if (!status.ok()) return status;
-
-    auto stmt_result = sqlite_conn_.Prepare(
+    auto stmt_result = connection.Prepare(
         "SELECT timestamp FROM cache_timestamp_index WHERE user_uuid = ? ORDER BY timestamp");
     if (!stmt_result.ok()) {
         return stmt_result.status();
     }
     auto stmt = std::move(stmt_result.value());
 
-    status = stmt.BindText(1, user_uuid_);
+    auto status = stmt.BindText(1, user_uuid_);
     if (!status.ok()) {
         return status;
     }

@@ -1,6 +1,9 @@
 #include "../../src/semantic_cache/semantic_cache_pipeline.h"
 #include "../../src/core/result.h"
 #include <gtest/gtest.h>
+#include <chrono>
+#include <filesystem>
+#include <future>
 #include <memory>
 #include <vector>
 #include <string>
@@ -225,6 +228,43 @@ TEST(MockVectorRepositoryTest, StoreAndSearch) {
 
     const auto& hits = search_result.value();
     EXPECT_EQ(hits.size(), 3u);
+}
+
+TEST(VectorIndexManagerTest, SearchDoesNotWaitForSqliteWriterAfterSchemaInitialization) {
+    const auto unique = std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto database_path = std::filesystem::temp_directory_path() /
+        ("semantic_cache_read_lease_" + std::to_string(unique) + ".db");
+
+    sqlite::SqliteConnectionPoolOptions options;
+    options.path = database_path.string();
+    options.read_connection_count = 2;
+    options.write_connection_count = 1;
+    options.enable_wal = true;
+    auto pool = std::make_shared<sqlite::SqliteConnectionPool>(std::move(options));
+    ASSERT_TRUE(pool->Start().ok());
+
+    cache_vector::VectorIndexManager schema_initializer("schema-initializer", nullptr, pool);
+    EXPECT_EQ(schema_initializer.CurrentSize(), 0u);
+    auto writer_result = pool->WaitAcquireWrite();
+    ASSERT_TRUE(writer_result.ok()) << writer_result.status().message();
+    auto writer = std::move(writer_result).value();
+    const auto writes_before = pool->Stats().write_wait_count;
+
+    // 唯一 writer 被占用时，正常 Search 仍应通过 WAL read lease 完成元数据读取。
+    auto search = std::async(std::launch::async, [&pool] {
+        cache_vector::VectorIndexManager manager("read-lease-session", nullptr, pool);
+        return manager.Search(std::vector<float>(kExpectedEmbeddingDim, 0.1f), 1);
+    });
+    ASSERT_EQ(search.wait_for(std::chrono::seconds(3)), std::future_status::ready);
+    auto result = search.get();
+    EXPECT_FALSE(result.ok());
+    EXPECT_EQ(result.status().code(), core::ErrorCode::FailedPrecondition);
+    EXPECT_EQ(pool->Stats().write_wait_count, writes_before);
+
+    writer.Release();
+    pool->Close();
+    std::error_code error;
+    std::filesystem::remove(database_path, error);
 }
 
 TEST(MockVectorRepositoryTest, TopKOrdering) {

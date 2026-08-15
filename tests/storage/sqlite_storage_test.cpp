@@ -14,6 +14,7 @@
 #include <filesystem>
 #include <future>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -281,6 +282,23 @@ TEST(SqliteConnectionPoolTest, AcquiresAndReturnsReadWriteLeases) {
     EXPECT_EQ(stats.leased_write_connections, 0u);
 }
 
+TEST(SqliteConnectionPoolTest, RejectsMoreThanOneWriteConnection) {
+    const auto path = TestDatabasePath("agent_sqlite_pool_multiple_writers.db");
+
+    SqliteConnectionPool pool({
+        path.string(),
+        2,
+        2,
+        250,
+        true,
+        false});
+    auto status = pool.Start();
+
+    ASSERT_FALSE(status.ok());
+    EXPECT_EQ(status.code(), core::ErrorCode::InvalidArgument);
+    EXPECT_NE(status.message().find("at most one write connection"), std::string::npos);
+}
+
 TEST(SqliteConnectionPoolTest, ReportsResourceExhaustedWhenPoolIsEmpty) {
     const auto path = TestDatabasePath("agent_sqlite_pool_exhausted.db");
     InitializeFileDatabase(path);
@@ -336,6 +354,76 @@ TEST(SqliteConnectionPoolTest, WaitAcquireBlocksUntilLeaseIsReturned) {
     first.Release();
     EXPECT_TRUE(waiter.get());
     EXPECT_TRUE(acquired.load(std::memory_order_acquire));
+}
+
+TEST(SqliteConnectionPoolTest, ReportsWriteQueueWait) {
+    const auto path = TestDatabasePath("agent_sqlite_pool_write_wait.db");
+    InitializeFileDatabase(path);
+
+    SqliteConnectionPool pool({
+        path.string(),
+        1,
+        1,
+        250,
+        true,
+        false});
+    ASSERT_TRUE(pool.Start().ok());
+
+    auto first_result = pool.AcquireWrite();
+    ASSERT_TRUE(first_result.ok()) << first_result.status().message();
+    auto first = std::move(first_result).value();
+
+    auto waiter = std::async(std::launch::async, [&] {
+        return pool.WaitAcquireWrite();
+    });
+    for (int attempt = 0; attempt < 100; ++attempt) {
+        if (pool.Stats().waiting_write_acquires == 1) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_EQ(pool.Stats().waiting_write_acquires, 1u);
+
+    first.Release();
+    auto second_result = waiter.get();
+    ASSERT_TRUE(second_result.ok()) << second_result.status().message();
+    auto second = std::move(second_result).value();
+    second.Release();
+
+    const auto stats = pool.Stats();
+    EXPECT_EQ(stats.waiting_write_acquires, 0u);
+    EXPECT_EQ(stats.write_wait_count, 1u);
+    EXPECT_GT(stats.total_write_wait_ns, 0u);
+}
+
+TEST(SqliteConnectionPoolTest, ImmediateAcquireDoesNotReportQueueWait) {
+    const auto path = TestDatabasePath("agent_sqlite_pool_no_wait.db");
+    InitializeFileDatabase(path);
+
+    SqliteConnectionPool pool({
+        path.string(),
+        1,
+        1,
+        250,
+        true,
+        false});
+    ASSERT_TRUE(pool.Start().ok());
+
+    auto read_result = pool.WaitAcquireRead();
+    ASSERT_TRUE(read_result.ok()) << read_result.status().message();
+    auto read = std::move(read_result).value();
+    read.Release();
+
+    auto write_result = pool.WaitAcquireWrite();
+    ASSERT_TRUE(write_result.ok()) << write_result.status().message();
+    auto write = std::move(write_result).value();
+    write.Release();
+
+    const auto stats = pool.Stats();
+    EXPECT_EQ(stats.read_wait_count, 0u);
+    EXPECT_EQ(stats.write_wait_count, 0u);
+    EXPECT_EQ(stats.total_read_wait_ns, 0u);
+    EXPECT_EQ(stats.total_write_wait_ns, 0u);
 }
 
 TEST(SqliteConnectionPoolTest, TimedAcquireReturnsTimeoutWhenLeaseIsNotAvailable) {

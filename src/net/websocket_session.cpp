@@ -73,14 +73,62 @@ WebSocketSession::WebSocketSession(tcp::socket socket,
       callbacks_(std::move(callbacks)),
       outbound_queue_(MakeWebSocketOutboundQueue(options_.websocket)) {}
 
+std::size_t WebSocketSession::InitialReadCapacity() const noexcept {
+    const auto configured = options_.read_tuning.initial_read_bytes;
+    const auto bounded = configured == 0 ? std::size_t{1} : configured;
+    return std::min(bounded, MaxReadCapacity());
+}
+
+std::size_t WebSocketSession::MaxReadCapacity() const noexcept {
+    const auto configured = options_.read_tuning.max_read_bytes;
+    const auto bounded = configured == 0 ? options_.websocket.max_frame_bytes : configured;
+    return std::min(bounded, options_.websocket.max_frame_bytes);
+}
+
+void WebSocketSession::ObserveRead(std::size_t requested_capacity,
+                                   std::size_t bytes_transferred,
+                                   bool final_fragment) {
+    if (final_fragment) {
+        read_capacity_ = InitialReadCapacity();
+        full_read_streak_ = 0;
+        return;
+    }
+
+    if (bytes_transferred == 0 || bytes_transferred < requested_capacity) {
+        full_read_streak_ = 0;
+        return;
+    }
+
+    const auto threshold = std::max<std::size_t>(
+        1,
+        options_.read_tuning.growth_full_read_threshold);
+    if (++full_read_streak_ < threshold) {
+        return;
+    }
+
+    full_read_streak_ = 0;
+    const auto max_capacity = MaxReadCapacity();
+    if (read_capacity_ >= max_capacity) {
+        return;
+    }
+
+    const auto doubled = read_capacity_ > max_capacity / 2
+                             ? max_capacity
+                             : read_capacity_ * 2;
+    read_capacity_ = std::max(read_capacity_ + 1, std::min(doubled, max_capacity));
+}
+
 void WebSocketSession::Run() {
     auto compression = options_.websocket.CompressionOptions(true);
     stream_.set_option(compression);
     stream_.auto_fragment(true);
     stream_.read_message_max(options_.read_buffer_limit);
     stream_.write_buffer_bytes(16 * 1024);
-    stream_.control_callback([self = shared_from_this()](websocket::frame_type type, beast::string_view payload) {
-        self->OnControl(type, payload);
+    // Beast 在 stream 内保存控制回调，强捕获 Session 会形成所有权闭环。
+    stream_.control_callback([weak_self = weak_from_this()](websocket::frame_type type, beast::string_view payload) {
+        if (auto self = weak_self.lock()) {
+            self->OnControl(type, payload);
+        }
     });
     stream_.next_layer().expires_after(options_.request_timeout);
     stream_.async_accept(
@@ -155,9 +203,12 @@ void WebSocketSession::DoReadSome() {
 
     const auto remaining_message_capacity =
         current_message_bytes_ < max_message_bytes ? max_message_bytes - current_message_bytes_ : std::size_t{0};
+    if (read_capacity_ == 0) {
+        read_capacity_ = InitialReadCapacity();
+    }
     const auto read_capacity = discarding_oversized_message_
-                                   ? max_frame_bytes
-                                   : std::min(max_frame_bytes, std::max<std::size_t>(1, remaining_message_capacity));
+                                   ? MaxReadCapacity()
+                                   : std::min(read_capacity_, std::max<std::size_t>(1, remaining_message_capacity));
     auto buffer_result = SharedBuffer::AllocateCapacity(memory_pool_, read_capacity);
     if (!buffer_result.ok()) {
         DoClose({ConnectionCloseReason::InternalError, buffer_result.status(), buffer_result.status().message()});
@@ -192,6 +243,7 @@ void WebSocketSession::OnReadSome(beast::error_code ec, std::size_t bytes_transf
 
     lease_.Touch();
 
+    const auto requested_capacity = read_buffer_.capacity();
     auto resize_status = read_buffer_.resize(bytes_transferred);
     if (!resize_status.ok()) {
         DoClose({ConnectionCloseReason::InternalError, resize_status, resize_status.message()});
@@ -200,6 +252,7 @@ void WebSocketSession::OnReadSome(beast::error_code ec, std::size_t bytes_transf
 
     const auto max_message_bytes = options_.websocket.max_message_bytes;
     const auto final_fragment = stream_.is_message_done();
+    ObserveRead(requested_capacity, bytes_transferred, final_fragment);
     const auto next_message_bytes = current_message_bytes_ + bytes_transferred;
 
     if (discarding_oversized_message_) {

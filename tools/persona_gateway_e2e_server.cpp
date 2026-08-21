@@ -283,6 +283,7 @@ struct ToolConfig {
 struct L0MemoryCacheBundle {
     std::shared_ptr<agent::semantic_cache::ISemanticCache> cache;
     std::shared_ptr<agent::semantic_cache::RedisConnectionPool> redis_pool;
+    std::shared_ptr<agent::semantic_cache::L0MemoryCacheAdapter> adapter;
 };
 
 std::string ResolveApiKey(const fs::path& config_path, const Json& llm) {
@@ -430,6 +431,18 @@ ToolConfig LoadConfig(const fs::path& config_path) {
     config.gateway.session.max_recent_turns = GetSize(gateway, "session_max_recent_turns", 20);
     config.gateway.runtime.recent_raw_turns = GetSize(gateway, "runtime_recent_raw_turns", 10);
     config.gateway.runtime.default_model = GetString(gateway, "runtime_default_model");
+
+    // E2E 仅暴露生产 Gateway 已有的合批开关，保证 A/B 测试只改变调度策略。
+    const auto embedding_batch = config.root.value("embedding_batch", Json::object());
+    config.gateway.embedding_batch.enabled = GetBool(embedding_batch, "enabled", true);
+    config.gateway.embedding_batch.max_pending_requests = GetSize(
+        embedding_batch, "max_pending_requests", 1024);
+    config.gateway.embedding_batch.max_batch_size = GetSize(
+        embedding_batch, "max_batch_size", 16);
+    config.gateway.embedding_batch.max_batch_wait = std::chrono::milliseconds(
+        GetInt(embedding_batch, "max_batch_wait_ms", 2));
+    config.gateway.embedding_batch.max_inflight_batches = GetSize(
+        embedding_batch, "max_inflight_batches", 1);
 
     // 压测与手工 E2E 可从配置提供只读默认人格，避免每个 Session 重复写入元数据后端。
     const auto personas = gateway.value("personas", Json::array());
@@ -848,34 +861,19 @@ core::Result<L0MemoryCacheBundle> CreateL0MemoryCache(const ToolConfig& config) 
     }
 
     fs::create_directories(config.l0_sqlite_path.parent_path());
-    storage::sqlite::SqliteConnectionPoolOptions sqlite_options;
-    sqlite_options.path = config.l0_sqlite_path.string();
-    sqlite_options.read_connection_count = 4;
-    sqlite_options.write_connection_count = 1;
-    sqlite_options.busy_timeout_ms = 5000;
-    sqlite_options.enable_wal = true;
-    auto sqlite_pool = std::make_shared<storage::sqlite::SqliteConnectionPool>(std::move(sqlite_options));
-    if (auto status = sqlite_pool->Start(); !status.ok()) {
-        redis->Shutdown();
-        return status;
-    }
-
-    auto index = std::make_shared<agent::semantic_cache::cache_vector::VectorIndexManager>(
-        config.l0_user_uuid,
-        redis,
-        std::move(sqlite_pool),
-        config.l0_max_cached_records);
-
     agent::semantic_cache::L0MemoryCacheAdapterOptions options;
     options.top_k = config.l0_top_k;
     options.neighbors_per_hit = config.l0_neighbors_per_hit;
     options.similarity_floor = config.l0_similarity_floor;
     L0MemoryCacheBundle bundle;
     bundle.redis_pool = redis;
-    bundle.cache = std::make_shared<agent::semantic_cache::L0MemoryCacheAdapter>(
-            std::move(embedding),
-            std::move(index),
-            options);
+    bundle.adapter = std::make_shared<agent::semantic_cache::L0MemoryCacheAdapter>(
+        std::move(embedding),
+        redis,
+        config.l0_sqlite_path.string(),
+        config.l0_max_cached_records,
+        options);
+    bundle.cache = bundle.adapter;
     return bundle;
 }
 
@@ -1002,6 +1000,7 @@ int main(int argc, char** argv) {
 
         agent::service::gateway::PersonaGatewayServerDependencies dependencies;
         dependencies.memory_provider = std::move(memory);
+        dependencies.l0_memory_adapter = l0_bundle.adapter;
         dependencies.emotion_analyzer = std::move(emotion).value();
         auto llm_bundle = std::move(llm).value();
         dependencies.llm_client = std::move(llm_bundle.sync);

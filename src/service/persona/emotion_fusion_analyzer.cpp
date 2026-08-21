@@ -344,6 +344,52 @@ core::Result<EmotionAnalysis> FusedEmotionAnalyzer::Analyze(std::string_view tex
         return primary;
     }
 
+    return FusePrimary(text, trace_id, std::move(personality), std::move(primary).value());
+}
+
+core::Status FusedEmotionAnalyzer::AnalyzeAsync(
+    std::string text,
+    std::string trace_id,
+    std::shared_ptr<const PersonalityConfig> personality,
+    AnalyzeCompletion completion) {
+    if (!completion) {
+        return core::Status::Error(core::ErrorCode::InvalidArgument,
+                                   "emotion completion is required");
+    }
+    if (!primary_) {
+        return core::Status::Error(core::ErrorCode::FailedPrecondition,
+                                   "primary emotion analyzer is required");
+    }
+    auto async_primary = std::dynamic_pointer_cast<IAsyncEmotionAnalyzer>(primary_);
+    if (!async_primary) {
+        completion(Analyze(text, trace_id, std::move(personality)));
+        return core::Status::Ok();
+    }
+    return async_primary->AnalyzeAsync(
+        text,
+        trace_id,
+        personality,
+        [this, text, trace_id, personality,
+         completion = std::move(completion)](
+            core::Result<EmotionAnalysis> primary) mutable {
+            if (!primary.ok() || !options_.enabled) {
+                completion(std::move(primary));
+                return;
+            }
+            completion(FusePrimary(
+                text,
+                trace_id,
+                std::move(personality),
+                std::move(primary).value()));
+        });
+}
+
+core::Result<EmotionAnalysis> FusedEmotionAnalyzer::FusePrimary(
+    std::string_view text,
+    std::string_view trace_id,
+    std::shared_ptr<const PersonalityConfig> personality,
+    EmotionAnalysis primary) const {
+
     std::vector<EmotionEvidence> evidence;
     for (const auto& provider : providers_) {
         if (!provider) {
@@ -358,7 +404,7 @@ core::Result<EmotionAnalysis> FusedEmotionAnalyzer::Analyze(std::string_view tex
                         std::make_move_iterator(collected.value().end()));
     }
 
-    auto fused = FuseForTesting(primary.value(), evidence);
+    auto fused = FuseForTesting(primary, evidence);
     if (!fused.ok()) {
         return fused.status();
     }

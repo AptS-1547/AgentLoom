@@ -1,0 +1,4 @@
+interface:
+  display_name: "AgentLoom E2E Benchmark"
+  short_description: "Run AgentLoom E2E load tests and reports"
+  default_prompt: "Use $agentloom-e2e-benchmark to run and document an AgentLoom Gateway E2E capacity benchmark."

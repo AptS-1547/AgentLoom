@@ -1,6 +1,6 @@
 # Visual Tool Session Protocol
 
-本文档定义视觉工具接入主链路时的信令、状态机、Prompt 注入、资源回收和记忆写入边界。`vision.observe` 是通用 Skill Session Protocol 的第一个复杂 profile；通用协议见 `docs/SKILL_SESSION_PROTOCOL.md`。
+本文档定义视觉工具接入主链路时的信令、状态机、Prompt 注入、资源回收和记忆写入边界。`vision.observe` 是通用 Skill Session Protocol 的第一个复杂 profile；通用协议见 `docs/architecture/SKILL_SESSION_PROTOCOL.md`。
 
 目标是在复用现有 WebRTC / OpenCV / VLM / L4 Tool Memory 基础设施的同时，避免不成熟的多模态结果污染主对话链路。
 

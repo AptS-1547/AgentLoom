@@ -753,6 +753,14 @@ int main(int argc, char** argv) {
 
         auto config = ParseMultimodalOptions(argc, argv);
         auto gateway_options = ToPersonaGatewayServerOptions<agent::service::gateway::PersonaGatewayServerOptions, net::StaticFileOptions>(config);
+        gateway_options.embedding_batch.enabled = config.embedding.batch_enabled;
+        gateway_options.embedding_batch.max_pending_requests =
+            config.embedding.batch_max_pending_requests;
+        gateway_options.embedding_batch.max_batch_size = config.embedding.batch_max_size;
+        gateway_options.embedding_batch.max_batch_wait =
+            std::chrono::milliseconds(config.embedding.batch_max_wait_ms);
+        gateway_options.embedding_batch.max_inflight_batches =
+            config.embedding.batch_max_inflight;
         gateway_options.default_personas = BuildDefaultPersonas(config.persona_gateway.personas);
         if (gateway_options.auth.enabled &&
             config.gateway_auth.generate_dev_keys &&

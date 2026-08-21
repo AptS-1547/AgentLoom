@@ -268,6 +268,35 @@ endif()
 copy_runtime_files(document_analysis_e2e_test "${BERT_SQLITE_DLL}")
 copy_runtime_files(document_analysis_e2e_test ${VCPKG_RUNTIME_DLLS})
 
+function(agentloom_copy_gateway_runtime_files target)
+    # Gateway 需支持单独构建，不能依赖其他测试目标顺带复制运行时库。
+    copy_runtime_files(${target} "${BERT_SQLITE_DLL}")
+    copy_runtime_files(${target} ${BERT_FAISS_RUNTIME_FILES})
+    copy_runtime_files(${target} ${VCPKG_RUNTIME_DLLS})
+
+    file(GLOB _gateway_onnxruntime_files
+        "${ONNXRUNTIME_ROOT}/${BERT_ONNXRUNTIME_RUNTIME_GLOB}")
+    copy_runtime_files(${target} ${_gateway_onnxruntime_files})
+
+    if(ONNXRUNTIME_ROOT STREQUAL ONNXRUNTIME_GPU_ROOT AND
+            EXISTS "${CUDA_RUNTIME_DLL_ROOT}")
+        if(WIN32)
+            file(GLOB _gateway_cuda_runtime_files
+                "${CUDA_RUNTIME_DLL_ROOT}/*.dll")
+        elseif(UNIX AND NOT APPLE)
+            file(GLOB _gateway_cuda_runtime_files
+                "${CUDA_RUNTIME_DLL_ROOT}/*.so*")
+        endif()
+        copy_runtime_files(${target} ${_gateway_cuda_runtime_files})
+    endif()
+
+    if(UNIX AND NOT APPLE)
+        set_target_properties(${target} PROPERTIES
+            BUILD_RPATH "$ORIGIN"
+            INSTALL_RPATH "$ORIGIN")
+    endif()
+endfunction()
+
 add_executable(persona_gateway_e2e_server
     tools/persona_gateway_e2e_server.cpp
 )
@@ -287,7 +316,7 @@ target_link_libraries(persona_gateway_e2e_server PRIVATE
 if(WIN32)
     link_whole_archive(persona_gateway_e2e_server agent_config)
 endif()
-copy_runtime_files(persona_gateway_e2e_server "${BERT_SQLITE_DLL}")
+agentloom_copy_gateway_runtime_files(persona_gateway_e2e_server)
 
 add_executable(agent_gateway_server
     src/server/main/agent_gateway_server.cpp
@@ -318,8 +347,7 @@ target_link_libraries(agent_gateway_server PRIVATE
 if(WIN32)
     link_whole_archive(agent_gateway_server agent_config)
 endif()
-copy_runtime_files(agent_gateway_server "${BERT_SQLITE_DLL}")
-copy_runtime_files(agent_gateway_server ${VCPKG_RUNTIME_DLLS})
+agentloom_copy_gateway_runtime_files(agent_gateway_server)
 
 add_executable(persona_config_migration
     tools/persona_config_migration.cpp

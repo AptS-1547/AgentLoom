@@ -1,12 +1,12 @@
 # Frontend Refactor and E2E Plan
 
-> Document status: historical migration plan. Current routes and payloads are documented in `FRONTEND_BACKEND_API_PROTOCOL.md`.
+> Document status: historical migration plan. Current routes and payloads are documented in `../gateway/FRONTEND_BACKEND_API_PROTOCOL.md`.
 
 ## 1. Purpose
 
 This document defines the frontend refactor direction for the competition E2E phase.
 
-The frontend should be rebuilt from the old `D:\front_end\Train` project as a functional reference, not as a protocol or architecture contract. The new frontend must exercise the C++ Gateway directly, collect latency data for the full maximum-latency path, and build to a static `dist` directory served by the C++ `HttpServer`.
+The frontend should be rebuilt from the old `<legacy-frontend-root>` project as a functional reference, not as a protocol or architecture contract. The new frontend must exercise the C++ Gateway directly, collect latency data for the full maximum-latency path, and build to a static `dist` directory served by the C++ `HttpServer`.
 
 The backend-side target path is:
 
@@ -1025,12 +1025,12 @@ This keeps security failures debuggable from Nginx/ModSecurity logs rather than 
 Old Python config files:
 
 ```text
-D:\Users\21405\source\repos\EducationalAgentProject\agent\config\config_lidazhi.json
-D:\Users\21405\source\repos\EducationalAgentProject\agent\config\config_lidazhi_no_emotion.json
-D:\Users\21405\source\repos\EducationalAgentProject\agent\config\config_linnuan.json
-D:\Users\21405\source\repos\EducationalAgentProject\agent\config\config_test_deepseek.json
-D:\Users\21405\source\repos\EducationalAgentProject\agent\config\config_zhangyiming.json
-D:\Users\21405\source\repos\EducationalAgentProject\agent\config\evaluation_indicators.json
+<legacy-backend-root>/agent/config/config_lidazhi.json
+<legacy-backend-root>/agent/config/config_lidazhi_no_emotion.json
+<legacy-backend-root>/agent/config/config_linnuan.json
+<legacy-backend-root>/agent/config/config_test_deepseek.json
+<legacy-backend-root>/agent/config/config_zhangyiming.json
+<legacy-backend-root>/agent/config/evaluation_indicators.json
 ```
 
 Competition C++ approach:

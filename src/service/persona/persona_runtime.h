@@ -9,6 +9,7 @@
 
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -27,11 +28,23 @@ struct RecalledContext {
 
 struct MemoryContextRequest {
     std::string session_id;
+    std::string tenant_id = "default";
     std::string user_uuid;
     std::string persona_id;
     std::string query;
     std::string trace_id;
     std::span<const ConversationTurn> current_session_recent;
+    std::size_t max_recent_turns = 10;
+};
+
+struct AsyncMemoryContextRequest {
+    std::string session_id;
+    std::string tenant_id = "default";
+    std::string user_uuid;
+    std::string persona_id;
+    std::string query;
+    std::string trace_id;
+    std::vector<ConversationTurn> current_session_recent;
     std::size_t max_recent_turns = 10;
 };
 
@@ -45,9 +58,35 @@ public:
     /// 在回复成功后接纳一个完整回合。
     /// @param turn 已完成的用户输入、回复和情绪元数据。
     virtual core::Status AdmitTurn(std::string_view session_id,
+                                   std::string_view tenant_id,
                                    std::string_view user_uuid,
                                    const ConversationTurn& turn,
                                    std::string_view trace_id) = 0;
+};
+
+class IAsyncMemoryContextProvider {
+public:
+    using BuildCompletion = std::function<void(core::Result<RecalledContext>)>;
+
+    virtual ~IAsyncMemoryContextProvider() = default;
+    /// 返回非 OK 表示请求未被接纳，之后不得调用 completion；返回 OK 后必须恰好完成一次。
+    virtual core::Status BuildContextAsync(AsyncMemoryContextRequest request,
+                                           BuildCompletion completion) = 0;
+};
+
+class IAsyncMemoryAdmissionProvider {
+public:
+    using AdmissionCompletion = std::function<void(core::Status)>;
+
+    virtual ~IAsyncMemoryAdmissionProvider() = default;
+    /// 返回 OK 后必须恰好调用一次 completion；失败表示未接纳请求。
+    virtual core::Status AdmitTurnAsync(
+        std::string session_id,
+        std::string tenant_id,
+        std::string user_uuid,
+        ConversationTurn turn,
+        std::string trace_id,
+        AdmissionCompletion completion) = 0;
 };
 
 struct SemanticMemoryContextProviderOptions {
@@ -55,7 +94,9 @@ struct SemanticMemoryContextProviderOptions {
     int l3_top_k = 5;
 };
 
-class SemanticMemoryContextProvider final : public IMemoryContextProvider {
+class SemanticMemoryContextProvider final : public IMemoryContextProvider,
+                                            public IAsyncMemoryContextProvider,
+                                            public IAsyncMemoryAdmissionProvider {
 public:
     SemanticMemoryContextProvider(
         std::shared_ptr<semantic_cache::ISemanticCache> l0_cache,
@@ -63,7 +104,17 @@ public:
         SemanticMemoryContextProviderOptions options = {});
 
     core::Result<RecalledContext> BuildContext(const MemoryContextRequest& request) override;
+    core::Status BuildContextAsync(AsyncMemoryContextRequest request,
+                                   BuildCompletion completion) override;
+    core::Status AdmitTurnAsync(
+        std::string session_id,
+        std::string tenant_id,
+        std::string user_uuid,
+        ConversationTurn turn,
+        std::string trace_id,
+        AdmissionCompletion completion) override;
     core::Status AdmitTurn(std::string_view session_id,
+                           std::string_view tenant_id,
                            std::string_view user_uuid,
                            const ConversationTurn& turn,
                            std::string_view trace_id) override;
@@ -83,6 +134,19 @@ public:
     virtual core::Result<EmotionAnalysis> Analyze(std::string_view text,
                                                   std::string_view trace_id,
                                                   std::shared_ptr<const PersonalityConfig> personality = nullptr) = 0;
+};
+
+class IAsyncEmotionAnalyzer {
+public:
+    using AnalyzeCompletion = std::function<void(core::Result<EmotionAnalysis>)>;
+
+    virtual ~IAsyncEmotionAnalyzer() = default;
+    /// 返回 OK 后必须恰好完成一次；实现不得在等待远端推理时占用业务 worker。
+    virtual core::Status AnalyzeAsync(
+        std::string text,
+        std::string trace_id,
+        std::shared_ptr<const PersonalityConfig> personality,
+        AnalyzeCompletion completion) = 0;
 };
 
 class NeutralEmotionAnalyzer final : public IEmotionAnalyzer {
@@ -225,17 +289,32 @@ public:
                    std::shared_ptr<ISkillSessionManager> skill_session_manager = nullptr,
                    core::LoggerAdapter logger = core::LoggerAdapter::ForModule("service"),
                    std::shared_ptr<IEmotionCalibrationSampleSink> emotion_calibration_sink = nullptr,
-                   std::shared_ptr<llm::IAsyncLlmClient> async_llm_client = nullptr);
+                   std::shared_ptr<llm::IAsyncLlmClient> async_llm_client = nullptr,
+                   core::ThreadPool* continuation_pool = nullptr);
     ~PersonaRuntime();
 
     /// 异步提交对话；callback 恰好调用一次并携带最终 Result。
     /// @param request 本轮 session、输入、trace 和生成参数。
     /// @param callback 完成回调，不得为空；可能在线程池工作线程执行。
     core::Status SubmitChat(ChatRequest request, ChatCallback callback);
-    /// 停止异步 admission，取消在途 LLM 请求并等待其 callback/Session commit 收口。
+    /// 停止异步 admission，等待 memory continuation，并取消在途 LLM 后收口 Session commit。
     void Shutdown() noexcept;
 
 private:
+    enum class AsyncTurnPhase : std::uint8_t {
+        Admitted,
+        MemoryLookupPending,
+        Preparing,
+        UserEmotionPending,
+        LlmPending,
+        MemoryAdmissionPending,
+        SessionCommitPending,
+        Completed,
+        Failed,
+    };
+
+    struct AsyncTurnOperation;
+
     struct PreparedChat {
         ChatRequest request;
         RecalledContext memory;
@@ -254,6 +333,16 @@ private:
     };
 
     core::Result<PreparedChat> PrepareChat(SessionState& session, ChatRequest request);
+    core::Result<PreparedChat> PrepareChatBeforeEmotion(
+        SessionState& session,
+        ChatRequest request,
+        RecalledContext memory,
+        std::chrono::steady_clock::time_point memory_start);
+    core::Result<PreparedChat> PrepareChatAfterEmotion(
+        SessionState& session,
+        PreparedChat prepared,
+        std::vector<ConversationTurn> recent_copy,
+        EmotionAnalysis emotion);
     core::Result<std::vector<llm::ChatMessage>> BuildMessages(
         SessionState& session,
         const RecalledContext& memory,
@@ -275,12 +364,58 @@ private:
         llm::ChatCompletionResponse llm_completion,
         std::optional<AnswerCacheLookupRequest> answer_cache_lookup,
         std::chrono::steady_clock::time_point io_stage_start);
+    core::Status FinalizeLlmCompletionAsync(
+        SessionState session,
+        PreparedChat prepared,
+        llm::ChatCompletionResponse llm_completion,
+        std::optional<AnswerCacheLookupRequest> answer_cache_lookup,
+        std::chrono::steady_clock::time_point io_stage_start,
+        std::function<void(core::Result<CompletedChat>)> completion);
+    core::Result<CompletedChat> FinalizeLlmCompletionAfterEmotion(
+        SessionState& session,
+        PreparedChat prepared,
+        llm::ChatCompletionResponse llm_completion,
+        EmotionAnalysis ai_emotion,
+        std::chrono::steady_clock::time_point io_stage_start);
+    core::Result<std::shared_ptr<AsyncTurnOperation>> BeginAsyncTurnOperation(
+        SessionState session,
+        ChatRequest request,
+        std::shared_ptr<std::optional<ChatResponse>> response_holder,
+        SessionManager::SessionTurnAsyncFinish finish,
+        std::chrono::steady_clock::time_point submitted_at);
+    core::Status StartAsyncTurn(const std::shared_ptr<AsyncTurnOperation>& operation);
+    core::Status StartAsyncMemoryLookup(
+        const std::shared_ptr<AsyncTurnOperation>& operation);
+    void OnAsyncMemoryCompleted(
+        const std::shared_ptr<AsyncTurnOperation>& operation,
+        std::chrono::steady_clock::time_point memory_start,
+        core::Result<RecalledContext> memory) noexcept;
+    void OnAsyncUserEmotionCompleted(
+        const std::shared_ptr<AsyncTurnOperation>& operation,
+        core::Result<EmotionAnalysis> emotion) noexcept;
+    void ContinueAsyncTurn(
+        const std::shared_ptr<AsyncTurnOperation>& operation,
+        core::Result<PreparedChat> prepared) noexcept;
+    void OnAsyncLlmCompleted(
+        const std::shared_ptr<AsyncTurnOperation>& operation,
+        core::Result<CompletedChat> completed) noexcept;
+    void OnAsyncMemoryAdmissionCompleted(
+        const std::shared_ptr<AsyncTurnOperation>& operation,
+        CompletedChat completed,
+        core::Status status) noexcept;
+    void FinishAsyncCompletedChat(
+        const std::shared_ptr<AsyncTurnOperation>& operation,
+        CompletedChat completed) noexcept;
+    void FinishAsyncTurnOperation() noexcept;
 
     SessionManager& sessions_;
     std::shared_ptr<IMemoryContextProvider> memory_provider_;
+    std::shared_ptr<IAsyncMemoryContextProvider> async_memory_provider_;
     std::shared_ptr<IEmotionAnalyzer> emotion_analyzer_;
+    std::shared_ptr<IAsyncEmotionAnalyzer> async_emotion_analyzer_;
     std::shared_ptr<llm::ILlmClient> llm_client_;
     std::shared_ptr<llm::IAsyncLlmClient> async_llm_client_;
+    core::ThreadPool* continuation_pool_ = nullptr;
     std::shared_ptr<IAnswerCacheProvider> answer_cache_provider_;
     std::shared_ptr<IToolMemoryProvider> tool_memory_provider_;
     std::shared_ptr<ISkillSessionManager> skill_session_manager_;
@@ -290,6 +425,7 @@ private:
     mutable std::mutex async_operations_mutex_;
     std::condition_variable async_operations_drained_;
     std::unordered_map<std::uint64_t, std::shared_ptr<llm::IAsyncLlmOperation>> async_operations_;
+    std::size_t async_turn_operation_count_ = 0;
     std::uint64_t next_async_operation_id_ = 1;
     bool async_stopping_ = false;
 };

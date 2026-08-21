@@ -57,6 +57,14 @@ struct GatewayLlmPoolOptions {
     };
 };
 
+struct GatewayEmbeddingBatchOptions {
+    bool enabled = true;
+    std::size_t max_pending_requests = 1024;
+    std::size_t max_batch_size = 16;
+    std::chrono::milliseconds max_batch_wait{2};
+    std::size_t max_inflight_batches = 1;
+};
+
 struct PersonaGatewayServerOptions {
     using LlmPoolOptions = GatewayLlmPoolOptions;
 
@@ -68,6 +76,7 @@ struct PersonaGatewayServerOptions {
     GatewayThreadPoolConcurrencyOptions io_pool_concurrency;
     /// 未配置时兼容沿用 IO pool 参数；显式配置后独立控制长时 Persona/LLM Turn 的并发与排队容量。
     std::optional<GatewayLlmPoolOptions> llm_pool;
+    GatewayEmbeddingBatchOptions embedding_batch;
     persona::SessionOptions session;
     persona::PersonaRuntimeOptions runtime;
     std::optional<::net::StaticFileOptions> static_files;

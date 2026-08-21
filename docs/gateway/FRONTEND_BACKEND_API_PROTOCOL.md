@@ -925,7 +925,7 @@ Request:
 
 ```json
 {
-  "path": "D:/tmp/demo.pptx",
+  "path": "tmp/demo.pptx",
   "fileName": "demo.pptx",
   "sessionId": "session-001"
 }
@@ -1407,9 +1407,9 @@ WS skill.session.start/status/stop
 相关设计文档：
 
 ```text
-docs/SKILL_SESSION_PROTOCOL.md
-docs/VISUAL_TOOL_SESSION_PROTOCOL.md
-docs/VISION_SYSTEM_DESIGN.md
+docs/architecture/SKILL_SESSION_PROTOCOL.md
+docs/archive/VISUAL_TOOL_SESSION_PROTOCOL.md
+docs/architecture/VISION_SYSTEM_DESIGN.md
 ```
 
 ### 11.1 当前验证状态

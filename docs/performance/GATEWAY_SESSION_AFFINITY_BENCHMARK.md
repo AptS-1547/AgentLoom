@@ -61,7 +61,7 @@ worker 等待同一 session mutex，正常 session 的平均 queue wait 下降�
 ## 6. 复现
 
 ```powershell
-& "C:\Program Files\CMake\bin\cmake.exe" --build `
+cmake --build `
   build\x64-Release-Tests-v145-refactor `
   --config Release --target gateway_session_affinity_bench --parallel
 

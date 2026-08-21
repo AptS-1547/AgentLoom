@@ -43,6 +43,7 @@ onnx_models/
 tools/llm_smoke_test.json
 tools/llm_smoke_test.key
 tools/llm_smoke_prompt.txt
+tools/persona_gateway_e2e_real_benchmark_*.json
 config/e2e_test.json
 # dev_notes
 dev_note/
@@ -53,6 +54,9 @@ persona_gateway_static_test/
 dist/
 # test output
 data/
+# Public documentation is source, not runtime test output.
+!docs/data/
+!docs/data/**
 # document test
 test_document/
 /document/

@@ -37,6 +37,13 @@ struct HttpServerOptions {
     std::size_t websocket_read_buffer_limit = 16 * 1024 * 1024;
     ConnectionPoolOptions connection_pool;
     WebSocketOptions websocket;
+    // 普通 WebSocket 路由的接收 fragment 调优策略。
+    WebSocketReadTuning websocket_read_tuning;
+    // 流式 WebSocket 路由的接收 fragment 调优策略。
+    WebSocketReadTuning websocket_stream_read_tuning{
+        256 * 1024,
+        1024 * 1024,
+        2};
     // Optional early HTTP filter. It runs after Beast parses the request and
     // before access control, route handlers, static files, or WebSocket upgrade.
     HttpRequestFilterOptions request_filter;

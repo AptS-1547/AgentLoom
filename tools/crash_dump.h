@@ -36,7 +36,6 @@
 
 namespace crash_dump {
 
-//这他妈是我蝶，没这玩意今天已经被一万个bug弄死了还找不着原因
 
 inline std::atomic<int>& WriterGate() {
     static std::atomic<int> gate{0};

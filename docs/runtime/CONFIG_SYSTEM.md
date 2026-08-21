@@ -145,10 +145,17 @@ AgentLoom 使用 JSON 配置、CLI override 和 section registry 组合加载 Se
     "onnx_model_path": "models/minilm-l12-v2.onnx",
     "pooling_strategy": "mean",
     "normalize": true,
-    "expected_dimension": 384
+    "expected_dimension": 384,
+    "batch_enabled": true,
+    "batch_max_pending_requests": 1024,
+    "batch_max_size": 16,
+    "batch_max_wait_ms": 2,
+    "batch_max_inflight": 1
   },
   "grpc": {
-    "port": 50051
+    "host": "127.0.0.1",
+    "port": "50051",
+    "max_pollers": 0
   }
 }
 ```
@@ -157,10 +164,10 @@ AgentLoom 使用 JSON 配置、CLI override 和 section registry 组合加载 Se
 
 ```bash
 # 使用配置文件
-./agent_backend --config config.json
+./multimodal_inference_server --config config.json
 
 # CLI 覆盖配置
-./agent_backend --config config.json \
+./multimodal_inference_server --config config.json \
   --http-port 9090 \
   --embedding-model models/custom-embedding.onnx
 ```

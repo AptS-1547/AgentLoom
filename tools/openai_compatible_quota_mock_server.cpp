@@ -9,13 +9,16 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cctype>
 #include <csignal>
 #include <cstdlib>
 #include <deque>
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -40,6 +43,35 @@ struct MockSnapshot {
     std::size_t peak_queued = 0;
     std::size_t completed = 0;
 };
+
+std::string ExtractMemoryMarkers(std::string_view body) {
+    constexpr std::string_view prefix = "MEMORY_SECRET_";
+    std::set<std::string> markers;
+    std::size_t offset = 0;
+    while ((offset = body.find(prefix, offset)) != std::string_view::npos) {
+        std::size_t end = offset + prefix.size();
+        while (end < body.size()) {
+            const unsigned char ch = static_cast<unsigned char>(body[end]);
+            if (!std::isalnum(ch) && ch != '_' && ch != '-') {
+                break;
+            }
+            ++end;
+        }
+        markers.emplace(body.substr(offset, end - offset));
+        offset = end;
+    }
+    if (markers.empty()) {
+        return "NO_MEMORY_SECRET";
+    }
+    std::string joined;
+    for (const auto& marker : markers) {
+        if (!joined.empty()) {
+            joined += ',';
+        }
+        joined += marker;
+    }
+    return joined;
+}
 
 class QuotaMockState final : public std::enable_shared_from_this<QuotaMockState> {
 public:
@@ -133,8 +165,11 @@ private:
             http::response<http::string_body> response{http::status::ok, 11};
             response.set(http::field::content_type, "application/json; charset=utf-8");
             response.keep_alive(operation->request->message().keep_alive());
+            const auto content = ExtractMemoryMarkers(operation->request->message().body());
             response.body() =
-                R"({"id":"cpp-quota-mock","object":"chat.completion","created":0,"model":"mock-enterprise-chat","choices":[{"index":0,"message":{"role":"assistant","content":"C++ quota mock response."},"finish_reason":"stop"}],"usage":{"prompt_tokens":16,"completion_tokens":8,"total_tokens":24}})";
+                R"({"id":"cpp-quota-mock","object":"chat.completion","created":0,"model":"mock-enterprise-chat","choices":[{"index":0,"message":{"role":"assistant","content":")" +
+                content +
+                R"("},"finish_reason":"stop"}],"usage":{"prompt_tokens":16,"completion_tokens":8,"total_tokens":24}})";
             response.prepare_payload();
             static_cast<void>(operation->request->Respond(http::message_generator(std::move(response))));
         } else {

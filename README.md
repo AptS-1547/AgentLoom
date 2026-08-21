@@ -6,7 +6,7 @@
 
 [![C++20](https://img.shields.io/badge/C%2B%2B-20-blue.svg)](https://isocpp.org/)
 [![CMake](https://img.shields.io/badge/CMake-3.20+-green.svg)](https://cmake.org/)
-[![Tests](https://img.shields.io/badge/CTest-420_passing-brightgreen.svg)](#测试)
+[![Tests](https://img.shields.io/badge/CTest-E2E%20%2B%20unit-brightgreen.svg)](#测试)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 ## 项目定位
@@ -20,19 +20,19 @@ AgentLoom 是一个面向服务端智能体的 C++20 Runtime。它把 HTTP/WebSo
 ## 核心特性
 
 - **可组合架构**：核心能力以 CMake target 形式暴露，既可作为库集成到下游源码工程，也可以作为独立 Server 部署。
-- **完整的对话热路径**：从 WebSocket 连接、会话管理、记忆召回、情绪感知到 LLM 生成的端到端 C++ 实现，避免跨语言边界开销。
+- **全链路异步对话热路径**：同一 Session 严格保序，用户/AI Emotion、L0 Lookup、Cloud LLM 和 Memory Store 通过 continuation 推进；外部等待不占用业务 worker，不同 Session 可并行执行。
 - **实时多模态感知**：从浏览器摄像头 WebRTC 输入、GStreamer 解码、OpenCV 动态抽帧到 VLM 推理的完整链路。
 - **推理成本优化**：语义缓存、Prompt KV Cache 与 VLM 结果缓存协同，降低重复推理开销；VRAM guard 支持低显存与 OOM 降级。
 - **进程边界清晰**：BERT 与 VLM 推理作为独立 gRPC 进程，支持容器化与独立扩缩容；Gateway 通过 gRPC 或共享内存 IPC 对接。
-- **生产工程质量**：420+ 单元测试与跨进程 E2E 测试，覆盖并发路径、错误恢复与资源释放；`core::Status`/`Result` 统一错误模型。
+- **生产工程质量**：持续维护的单元、跨进程 E2E 和容量压测覆盖并发路径、错误恢复、资源释放与结构化拒绝；`core::Status`/`Result` 统一错误模型。
 
 ## 已实现能力
 
 - **Gateway Runtime**：统一 HTTP/WebSocket 入口、JWT/cookie 认证、静态文件托管、请求过滤、背压和运行时维护任务。
-- **Agent Runtime**：Persona、Session、Skill Session、多人格调度、主动发言状态机、trace 和情绪状态持久化。
+- **Agent Runtime**：Persona、Session、Skill Session、多人格调度、主动发言状态机、deferred Session lane、异步 Emotion/LLM/Memory continuation、trace 和情绪状态持久化。
 - **模型服务**：ONNX Runtime BERT 情绪推理，以及基于 llama.cpp/mtmd 的流式与同步 VLM 推理。
 - **情感融合**：BERT 主干结合关键词等证据，通过可配置 fusion head、置信度和 margin gate 更新 V-A 状态。
-- **记忆与缓存**：Redis/SQLite L0 记忆、L3 压缩记忆、Exact/Faiss 向量检索、VLM 结果缓存，以及基于 llama.cpp sequence state 的 image-prefix Prompt KV Cache（memory/Redis 双后端）。
+- **记忆与缓存**：Redis/SQLite L0 记忆、L3 压缩记忆、Exact/Faiss 向量检索、L0 embedding micro-batch、异步 Lookup/Store，以及基于 llama.cpp sequence state 的 image-prefix Prompt KV Cache（memory/Redis 双后端）。
 - **文档链路**：DOCX/PPTX OOXML 提取、受管文件存储、分块分析、元数据和 LLM/语义缓存。
 - **连续对话分块**：复用批量 embedding 与 SIMD 内积，以滚动块向量、时间代价和有界动态规划生成互不重叠的 DialogueBlock；上下文化 embedding 模式显式版本化。
 - **云任务并行执行**：可分解任务通过有界 worker pool 并发调用 OpenAI-compatible/本地 LLM，使用 ordered bitmap window 对乱序完成和失败终态进行保序归并。
@@ -61,6 +61,22 @@ Browser / Downstream Application
 ```
 
 模型推理默认以独立进程和 protobuf/gRPC 协议作为复用边界。关键帧传输采用共享内存数据面 + gRPC 控制面分离：大体积帧走共享内存零拷贝，grant/revoke/epoch 生命周期与故障恢复走 gRPC 控制信令。Gateway、Persona、Session、Memory、Media 与 IPC 也可以通过 CMake target 直接组合到下游源码工程。
+
+### 异步 Turn 时序
+
+```text
+Session admission / deferred lane
+  -> User Emotion async
+  -> L0/L3 Memory Lookup async
+  -> Prompt Building
+  -> LLM async
+  -> AI Emotion async
+  -> Memory Admission async
+  -> Session commit
+  -> HTTP/WebSocket completion
+```
+
+Deferred lane 从 admission 持有到 commit，保证同一 Session 不乱序；Emotion、Memory、LLM 等待期间 worker 会返回池中处理其他 Session。CUDA 服务的 health check 只证明进程存活，生产 readiness 还必须完成真实推理 warm-up。
 
 ### 基础 Server
 
@@ -94,7 +110,7 @@ target_link_libraries(my_agent PRIVATE
 也可以安装静态库、头文件和 CMake package 后通过 `find_package()` 复用：
 
 ```powershell
-& "C:\Program Files\CMake\bin\cmake.exe" --install build/x64-Release `
+cmake --install build/x64-Release `
   --config Release --prefix build/agentloom-package
 ```
 
@@ -120,7 +136,7 @@ agentloom_link_whole_archive(my_agent AgentLoom::config)
 agentloom_link_whole_archive(my_agent my_config_sections)
 ```
 
-只需要部分配置 section 的程序可用 `ConfigSectionSelection::Only({"llm", "gateway"})` 选择性加载和校验，未选中的服务器专用 section 不会施加参数约束。静态库仍要求消费端使用兼容的编译器、C++ Runtime 和第三方依赖 ABI；完整依赖定位与覆盖变量见 [扩展 AgentLoom](docs/EXTENDING_AGENTLOOM.md)。
+只需要部分配置 section 的程序可用 `ConfigSectionSelection::Only({"llm", "gateway"})` 选择性加载和校验，未选中的服务器专用 section 不会施加参数约束。静态库仍要求消费端使用兼容的编译器、C++ Runtime 和第三方依赖 ABI；完整依赖定位与覆盖变量见 [扩展 AgentLoom](docs/runtime/EXTENDING_AGENTLOOM.md)。
 
 ## 构建
 
@@ -130,16 +146,16 @@ agentloom_link_whole_archive(my_agent my_config_sections)
 - CMake 3.20+
 - vcpkg manifest 依赖：gRPC、Protobuf、OpenSSL、spdlog、Redis clients、Boost.Asio/Redis/Interprocess、libzip、pugixml、nlohmann/json；测试另需 GTest
 - 预编译/外部依赖：ONNX Runtime、llama.cpp（含 mtmd）、OpenCV、SQLite、Faiss、Eigen、MKL 和 HuggingFace Tokenizers C API
-- **工具链说明**：截至 2026-07-16，使用 VS2026/v145 构建启用 CUDA 的 llama.cpp 仍受 CUDA Toolkit 兼容性限制，因此当前 CUDA 基线由 VS2022/v143 构建。真实 Qwen2.5-VL E2E 已确认，VS2026/v145 Release 宿主加载 VS2022/v143 Debug llama.cpp 会在 token generation 的 `llama_decode()` 中触发 ABI 崩溃；将 llama.cpp 改为 Release 后，同一共享内存 E2E 完整通过。Debug/Release CRT 配置必须一致，工具集版本也应尽量一致。
+- **工具链说明**：Windows 本地构建必须保持 CMake generator、MSVC 工具集、CRT 配置和 vcpkg/预编译依赖 ABI 一致。若依赖由 v145 构建，宿主也必须使用 VS2026/v145；ABI guard 会拒绝已知的 Debug/Release CRT 冲突，正式构建可用 `AGENT_LLAMA_STRICT_TOOLSET_ABI=ON` 强制工具集一致。
 
 仓库的 `deps/` 与 `vcpkg_installed/` 是本地依赖目录，不随源码分发。Linux 脚本可以准备对应依赖；Windows 需要按本机路径准备依赖，并确保 CMake generator、MSVC 工具集和 vcpkg ABI 一致。
 
 ### Windows
 
-VS2026/v145 必须使用支持 `Visual Studio 18 2026` generator 的 CMake，例如 `C:\Program Files\CMake\bin\cmake.exe`：
+VS2026/v145 必须使用支持 `Visual Studio 18 2026` generator 的 CMake。配置前先用 `cmake --version` 和 `cmake --help` 核对 PATH：
 
 ```powershell
-& "C:\Program Files\CMake\bin\cmake.exe" -B build/x64-Release `
+cmake -B build/x64-Release `
   -G "Visual Studio 18 2026" -A x64 `
   -DCMAKE_CONFIGURATION_TYPES=Release `
   -DBERT_VCPKG_TRIPLET=x64-windows `
@@ -147,7 +163,7 @@ VS2026/v145 必须使用支持 `Visual Studio 18 2026` generator 的 CMake，例
   -DLLAMA_CPP_ROOT="<path-to-llama.cpp>" `
   -DLLAMA_CPP_BUILD="<path-to-llama.cpp-build>"
 
-& "C:\Program Files\CMake\bin\cmake.exe" --build build/x64-Release `
+cmake --build build/x64-Release `
   --config Release --parallel
 ```
 
@@ -212,6 +228,7 @@ Linux 使用独立的 `build/linux-vcpkg-installed`，不会复用或写入 Wind
 
 | 进程 | 配置样例 |
 | --- | --- |
+| 通用 ConfigSection 字段参考 | [`config.example.json`](config.example.json) |
 | Gateway | [`config/agent_gateway.example.json`](config/agent_gateway.example.json) |
 | Multimodal inference | [`config/server.example.json`](config/server.example.json) |
 | Container emotion inference | [`config/emotion.container.example.json`](config/emotion.container.example.json) |
@@ -295,12 +312,10 @@ build\x64-Release\Release\multimodal_inference_server.exe `
 
 ## 测试
 
-当前 CMake 注册 **420 个 CTest**，覆盖 core、TLS/HTTP、LLM、配置、SQLite、向量检索、语义缓存、文档、记忆、Media/IPC、Persona/Gateway 和 gRPC 边界，并包含跨进程 E2E 与独立 benchmark target。
-
-截至 2026-07-11，Windows VS2026/v145 Release 全量构建与 **420 项 CTest 均已通过**，并经过多轮重复验证，未观察到代码回归。
+当前 CMake 测试覆盖 core、TLS/HTTP、异步 LLM/Emotion、配置、SQLite、向量检索与 batch coordinator、语义缓存、文档、记忆、Media/IPC、Persona/Gateway 和 gRPC 边界，并包含跨进程 E2E 与独立 benchmark target。测试数量随功能演进，不在 README 固定硬编码。
 
 ```powershell
-& "C:\Program Files\CMake\bin\cmake.exe" -B build/x64-Release-Tests-v145 `
+cmake -B build/x64-Release-Tests-v145 `
   -G "Visual Studio 18 2026" -A x64 `
   -DBERT_BUILD_TESTS=ON `
   -DBERT_VCPKG_TRIPLET=x64-windows `
@@ -308,7 +323,7 @@ build\x64-Release\Release\multimodal_inference_server.exe `
   -DLLAMA_CPP_ROOT="<path-to-llama.cpp>" `
   -DLLAMA_CPP_BUILD="<path-to-llama.cpp-build>"
 
-& "C:\Program Files\CMake\bin\cmake.exe" --build `
+cmake --build `
   build/x64-Release-Tests-v145 --config Release --parallel
 
 ctest --test-dir build/x64-Release-Tests-v145 `
@@ -330,13 +345,13 @@ ctest --test-dir build/x64-Release-Tests-v145 `
 
 完整文档目录见 [docs/README.md](docs/README.md)。建议从以下内容开始：
 
-- [架构总览](docs/ARCHITECTURE_VISUAL.md)
-- [对话缓存与推理策略](docs/CONVERSATION_CACHE_AND_INFERENCE_STRATEGY.md)
-- [配置系统](docs/CONFIG_SYSTEM.md)
-- [部署指南](docs/DEPLOYMENT.md)
-- [Frontend/Backend API 协议](docs/FRONTEND_BACKEND_API_PROTOCOL.md)
-- [扩展 AgentLoom](docs/EXTENDING_AGENTLOOM.md)
-- [安全工程规范](docs/SECURITY_ENGINEERING_STANDARD.md)
+- [架构总览](docs/architecture/ARCHITECTURE_VISUAL.md)
+- [对话缓存与推理策略](docs/data/CONVERSATION_CACHE_AND_INFERENCE_STRATEGY.md)
+- [配置系统](docs/runtime/CONFIG_SYSTEM.md)
+- [部署指南](docs/runtime/DEPLOYMENT.md)
+- [Frontend/Backend API 协议](docs/gateway/FRONTEND_BACKEND_API_PROTOCOL.md)
+- [扩展 AgentLoom](docs/runtime/EXTENDING_AGENTLOOM.md)
+- [安全工程规范](docs/security/SECURITY_ENGINEERING_STANDARD.md)
 
 ## 贡献与许可
 

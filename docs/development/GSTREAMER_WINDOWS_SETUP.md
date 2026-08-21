@@ -6,7 +6,7 @@ pipeline probes and future WebRTC experiments.
 Current local package path:
 
 ```text
-D:\Program Files\gstreamer\1.0\msvc_x86_64
+<gstreamer-root>
 ```
 
 The CMake cache variable is:
@@ -24,8 +24,8 @@ cmake --build build/x64-Release-Tests --target media_gstreamer_probe --config Re
 Run the probe from PowerShell:
 
 ```powershell
-$env:PATH = "D:\Program Files\gstreamer\1.0\msvc_x86_64\bin;$env:PATH"
-$env:GST_PLUGIN_PATH = "D:\Program Files\gstreamer\1.0\msvc_x86_64\lib\gstreamer-1.0"
+$env:PATH = "<gstreamer-root>\bin;$env:PATH"
+$env:GST_PLUGIN_PATH = "<gstreamer-root>\lib\gstreamer-1.0"
 build\x64-Release-Tests\Release\media_gstreamer_probe.exe
 ```
 

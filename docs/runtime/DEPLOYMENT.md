@@ -20,13 +20,13 @@
 
 ```powershell
 # Windows
-& "C:\Program Files\CMake\bin\cmake.exe" -B build/x64-Release -G "Visual Studio 18 2026" -A x64 `
+cmake -B build/x64-Release -G "Visual Studio 18 2026" -A x64 `
   -DCMAKE_CONFIGURATION_TYPES=Release `
   -DBERT_VCPKG_TRIPLET=x64-windows `
   -DBERT_USE_ONNXRUNTIME_GPU=OFF `
   -DLLAMA_CPP_ROOT="<path-to-llama.cpp>"
 
-& "C:\Program Files\CMake\bin\cmake.exe" --build build/x64-Release `
+cmake --build build/x64-Release `
   --config Release --parallel
 ```
 
@@ -49,9 +49,9 @@ cd build/x64-Release/Release
 
 # 完整启动（BERT + VLM）
 ./multimodal_inference_server.exe `
-  --llm "D:/path/to/qwen2-vl-7b.gguf" `
-  --mmproj "D:/path/to/mmproj.gguf" `
-  --bert "D:/path/to/joint_model.onnx" `
+  --llm "models/qwen2-vl-7b.gguf" `
+  --mmproj "models/mmproj.gguf" `
+  --bert "models/joint_model.onnx" `
   --ngl 99 `
   --host 0.0.0.0 --port 50051
 ```

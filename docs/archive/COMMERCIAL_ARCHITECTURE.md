@@ -1277,10 +1277,10 @@ Month 5–6: Phase 3 交付准备
 ### 8.3 参考资料
 
 - [AgentBackendPredict README](../README.md)
-- [旧架构问题分析与重构方向](./LEGACY_ARCHITECTURE_ANALYSIS.md)
-- [EducationalAgentProject README](../../EducationalAgentProject/README.md)
-- [E2E 测试与情绪管线文档](./E2E_TEST_AND_EMOTION_PIPELINE.md)
-- [团队实施方案（内部参考）](./TEAM_IMPLEMENTATION_PLAN.md)
+- 旧架构问题分析已归档为内部开发记录，不作为当前开放架构文档。
+- EducationalAgentProject README（旧项目取证来源，不属于当前公开文档）
+- [E2E 测试与情绪管线文档](../performance/E2E_TEST_AND_EMOTION_PIPELINE.md)
+- [团队实施方案（内部参考）](TEAM_IMPLEMENTATION_PLAN.md)
 - [gRPC C++ Quick Start](https://grpc.io/docs/languages/cpp/quickstart/)
 - [Boost.Beast Documentation](https://www.boost.org/doc/libs/release/libs/beast/)
 - [ONNX Runtime C++ API](https://onnxruntime.ai/docs/api/c/)

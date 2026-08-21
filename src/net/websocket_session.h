@@ -25,6 +25,7 @@ struct WebSocketSessionOptions {
     std::chrono::seconds request_timeout{30};
     std::size_t read_buffer_limit = 16 * 1024 * 1024;
     WebSocketOptions websocket;
+    WebSocketReadTuning read_tuning;
 };
 
 struct WebSocketSessionCallbacks {
@@ -61,6 +62,11 @@ private:
     void OnControl(websocket::frame_type type, beast::string_view payload);
     void DispatchMessage(WebSocketMessage message);
     void DispatchReadError(core::Status status, std::size_t bytes_transferred, bool final_fragment);
+    std::size_t InitialReadCapacity() const noexcept;
+    std::size_t MaxReadCapacity() const noexcept;
+    void ObserveRead(std::size_t requested_capacity,
+                     std::size_t bytes_transferred,
+                     bool final_fragment);
 
     websocket::stream<beast::tcp_stream> stream_;
     asio::steady_timer response_timer_;
@@ -71,6 +77,8 @@ private:
     WebSocketOutboundQueue outbound_queue_;
     core::BucketMemoryPool memory_pool_;
     SharedBuffer read_buffer_;
+    std::size_t read_capacity_ = 0;
+    std::size_t full_read_streak_ = 0;
     std::size_t current_message_bytes_ = 0;
     WebSocketMessageKind current_message_kind_ = WebSocketMessageKind::Binary;
     WebSocketFrame current_write_;

@@ -26,6 +26,39 @@ private:
     EmotionAnalysis analysis_;
 };
 
+class RecordingAsyncEmotionAnalyzer final
+    : public agent::service::persona::IEmotionAnalyzer,
+      public agent::service::persona::IAsyncEmotionAnalyzer {
+public:
+    explicit RecordingAsyncEmotionAnalyzer(EmotionAnalysis analysis)
+        : analysis_(std::move(analysis)) {}
+
+    core::Result<EmotionAnalysis> Analyze(
+        std::string_view,
+        std::string_view,
+        std::shared_ptr<const agent::service::persona::PersonalityConfig> = nullptr) override {
+        return core::Status::Error(core::ErrorCode::InternalError,
+                                   "unexpected synchronous analysis");
+    }
+
+    core::Status AnalyzeAsync(
+        std::string text,
+        std::string trace_id,
+        std::shared_ptr<const agent::service::persona::PersonalityConfig>,
+        AnalyzeCompletion completion) override {
+        observed_text = std::move(text);
+        observed_trace_id = std::move(trace_id);
+        completion(analysis_);
+        return core::Status::Ok();
+    }
+
+    std::string observed_text;
+    std::string observed_trace_id;
+
+private:
+    EmotionAnalysis analysis_;
+};
+
 EmotionAnalysis MakeEmotion(std::string primary,
                             double primary_prob,
                             std::map<std::string, double> probabilities) {
@@ -112,6 +145,30 @@ TEST(FusedEmotionAnalyzerTest, LlmFallbackGateCanInterceptWithoutSoftmaxEvidence
     ASSERT_TRUE(fused.ok()) << fused.status().message();
     EXPECT_EQ(fused.value().emotion.primary, "anger");
     EXPECT_NEAR(ProbSum(fused.value()), 1.0, 1e-9);
+}
+
+TEST(FusedEmotionAnalyzerTest, AsyncPathPreservesOwnedTextAndTrace) {
+    EmotionFusionAnalyzerOptions options;
+    options.enabled = false;
+    auto primary = std::make_shared<RecordingAsyncEmotionAnalyzer>(
+        MakeEmotion("curiosity", 0.9, {{"curiosity", 0.9}, {"neutral", 0.1}}));
+    FusedEmotionAnalyzer fusion(primary, options);
+    std::optional<core::Result<EmotionAnalysis>> completed;
+
+    auto status = fusion.AnalyzeAsync(
+        "为什么天空是蓝色的？",
+        "trace-async-fusion",
+        nullptr,
+        [&completed](core::Result<EmotionAnalysis> result) mutable {
+            completed.emplace(std::move(result));
+        });
+
+    ASSERT_TRUE(status.ok()) << status.message();
+    EXPECT_EQ(primary->observed_text, "为什么天空是蓝色的？");
+    EXPECT_EQ(primary->observed_trace_id, "trace-async-fusion");
+    ASSERT_TRUE(completed.has_value());
+    ASSERT_TRUE(completed->ok()) << completed->status().message();
+    EXPECT_EQ(completed->value().emotion.primary, "curiosity");
 }
 
 TEST(KeywordEmotionEvidenceProviderTest, MatchesDefaultChineseRules) {

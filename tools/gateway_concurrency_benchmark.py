@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import re
 import statistics
 import time
 from pathlib import Path
@@ -16,6 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_BASE_URL = "http://127.0.0.1:18080"
 PERSONA_REGISTRY = ROOT / "data" / "persona_gateway_e2e" / "persona_registry.json"
 REPORT_DIR = ROOT / "data" / "persona_gateway_e2e" / "reports"
+MEMORY_MARKER_PATTERN = re.compile(r"MEMORY_SECRET_[A-Za-z0-9_-]+")
 
 
 def percentile(values: list[float], p: float) -> float:
@@ -115,13 +117,20 @@ async def run_virtual_user(
     setup_lock: "asyncio.Lock | None" = None,
     chat_window: "ChatMeasurementWindow | None" = None,
     upsert_persona: bool = False,
+    tenant_count: int = 1,
+    shared_user_across_tenants: bool = False,
+    isolation_probe: bool = False,
 ) -> list[dict[str, Any]]:
     if start_delay_s > 0:
         await asyncio.sleep(start_delay_s)
 
     now = int(time.time() * 1000)
-    user_uuid = f"bench-user-{now}-{user_index}"
-    session_id = f"bench-session-{now}-{user_index}"
+    tenant_index = user_index % max(1, tenant_count)
+    user_slot = user_index // max(1, tenant_count) if shared_user_across_tenants else user_index
+    tenant_id = f"bench-tenant-{tenant_index}"
+    user_uuid = f"bench-user-{now}-{user_slot}"
+    session_id = f"bench-session-{now}-{tenant_index}-{user_index}"
+    expected_marker = f"MEMORY_SECRET_T{tenant_index}_U{user_index}_{now}"
 
     records: list[dict[str, Any]] = []
 
@@ -143,7 +152,7 @@ async def run_virtual_user(
             "/api/auth/register",
             {
                 "userUuid": user_uuid,
-                "tenantId": "default",
+                "tenantId": tenant_id,
                 "subject": user_uuid,
                 "ttlSeconds": 3600,
             },
@@ -200,12 +209,20 @@ async def run_virtual_user(
     if chat_start_gate:
         await chat_start_gate.wait()
 
-    prompts = [
-        "李大志，老师刚讲完一元二次方程配方法，你现在听懂了吗？",
-        "刚才你说后面没跟上，那你能说说卡在哪一步吗？",
-        "那我们再看一次配方法，你觉得第一步应该先做什么？",
-        "如果我把题目拆成更小的步骤，你愿意试着回答吗？",
-    ]
+    prompts = (
+        [
+            f"请记住：我今天的课程暗号是 {expected_marker}。这是只属于当前账户的私密学习事实。",
+            "请只根据属于当前账户的对话和记忆，复述我的课程暗号。",
+            "再次检查你的长期上下文，只输出你能确认属于当前账户的课程暗号。",
+        ]
+        if isolation_probe
+        else [
+            "李大志，老师刚讲完一元二次方程配方法，你现在听懂了吗？",
+            "刚才你说后面没跟上，那你能说说卡在哪一步吗？",
+            "那我们再看一次配方法，你觉得第一步应该先做什么？",
+            "如果我把题目拆成更小的步骤，你愿意试着回答吗？",
+        ]
+    )
 
     for turn in range(turns):
         if turn > 0 and chat_turn_gates:
@@ -235,6 +252,17 @@ async def run_virtual_user(
         data = body.get("data", {})
         pipeline = data.get("pipelineLatency", {})
         memory = data.get("memory", {})
+        reply_content = str(data.get("reply", {}).get("content", ""))
+        observed_markers = sorted(set(MEMORY_MARKER_PATTERN.findall(reply_content)))
+        if not isolation_probe:
+            isolation_passed = True
+        elif turn == 0:
+            # 首轮是写入事实；真实 LLM 通常只确认“已记住”，不保证回显暗号。
+            # 回显当前请求自己的暗号也属于合法行为；只要不出现其他租户/用户的暗号即可。
+            isolation_passed = not observed_markers or observed_markers == [expected_marker]
+        else:
+            # 后续轮次才是记忆召回断言，必须只返回当前租户/用户自己的暗号。
+            isolation_passed = observed_markers == [expected_marker]
         records.append(
             {
                 "kind": "chat",
@@ -254,7 +282,12 @@ async def run_virtual_user(
                 "callbackToResponseMs": pipeline.get("callbackToResponseMs", 0),
                 "l0Hit": memory.get("l0Hit", False),
                 "l3Hit": memory.get("l3Hit", False),
-                "replyPreview": str(data.get("reply", {}).get("content", ""))[:100],
+                "replyPreview": reply_content[:200],
+                "tenantId": tenant_id,
+                "userUuid": user_uuid,
+                "expectedMemoryMarker": expected_marker if isolation_probe else "",
+                "observedMemoryMarkers": observed_markers,
+                "memoryIsolationPassed": isolation_passed,
             }
         )
         if chat_window:
@@ -408,6 +441,9 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
                 setup_lock,
                 chat_window,
                 args.upsert_persona,
+                args.tenant_count,
+                args.shared_user_across_tenants,
+                args.isolation_probe,
             ))
         nested = await asyncio.gather(*tasks)
 
@@ -418,6 +454,8 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
     ok_records = [record for record in records if record.get("ok", True)]
     error_records = [record for record in records if not record.get("ok", True)]
     chat_records = [record for record in ok_records if record["kind"] == "chat"]
+    isolation_records = [record for record in chat_records if args.isolation_probe]
+    isolation_failures = [record for record in isolation_records if not record.get("memoryIsolationPassed", False)]
 
     chat_latency = [float(record["latencyMs"]) for record in chat_records]
     backend_latency = [float(record.get("backendTotalMs", 0)) for record in chat_records]
@@ -443,7 +481,7 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         }
 
     report = {
-        "ok": not error_records,
+        "ok": not error_records and not isolation_failures,
         "scenario": args.scenario,
         "baseUrl": base_url,
         "personaId": args.persona,
@@ -453,6 +491,9 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         "chatTurnBarrier": args.chat_turn_barrier,
         "setupMode": "serial" if args.serial_setup else "concurrent",
         "personaSource": "account_upsert" if args.upsert_persona else "server_default",
+        "tenantCount": args.tenant_count,
+        "sharedUserAcrossTenants": args.shared_user_across_tenants,
+        "isolationProbe": args.isolation_probe,
         "plannedConcurrentChatRequests": args.concurrency if args.turns > 0 else 0,
         "rampUpSeconds": args.ramp_up_seconds,
         "totalRequests": len(records),
@@ -490,6 +531,16 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
             "hits": sum(1 for record in chat_records if record.get("l0Hit")),
             "misses": sum(1 for record in chat_records if not record.get("l0Hit")),
         },
+        "memoryIsolation": {
+            "checkedReplies": len(isolation_records),
+            "passedReplies": len(isolation_records) - len(isolation_failures),
+            "failedReplies": len(isolation_failures),
+            "passRate": (
+                (len(isolation_records) - len(isolation_failures)) / len(isolation_records)
+                if isolation_records else 1.0
+            ),
+            "failures": isolation_failures[:20],
+        },
         "errors": error_records,
         "records": records if args.include_records else [],
     }
@@ -511,9 +562,18 @@ def main() -> int:
     parser.add_argument("--chat-turn-barrier", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--serial-setup", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--upsert-persona", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--tenant-count", type=int, default=1)
+    parser.add_argument("--shared-user-across-tenants", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--isolation-probe", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--include-records", action="store_true")
     parser.add_argument("--output", default="")
     args = parser.parse_args()
+    if args.concurrency <= 0 or args.turns <= 0:
+        parser.error("--concurrency and --turns must be positive")
+    if args.tenant_count <= 0:
+        parser.error("--tenant-count must be positive")
+    if args.isolation_probe and args.turns < 2:
+        parser.error("--isolation-probe requires at least two turns")
 
     report = asyncio.run(run(args))
     REPORT_DIR.mkdir(parents=True, exist_ok=True)

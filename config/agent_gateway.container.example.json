@@ -95,7 +95,12 @@
     "tokenizer_path": "/app/onnx_models/minilm/tokenizer.json",
     "model_path": "/app/onnx_models/minilm/model.onnx",
     "dimension": 384,
-    "execution_provider": "auto"
+    "execution_provider": "auto",
+    "batch_enabled": true,
+    "batch_max_pending_requests": 1024,
+    "batch_max_size": 16,
+    "batch_max_wait_ms": 2,
+    "batch_max_inflight": 1
   },
   "emotion_analyzer": {
     "enabled": true,

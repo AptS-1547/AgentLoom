@@ -4,14 +4,17 @@
 #include "semantic_cache_pipeline.h"
 
 #include "embedding_pipeline.h"
+#include "embedding_batch_coordinator.h"
 
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
+#include <functional>
 
 namespace agent::semantic_cache {
 
@@ -33,7 +36,9 @@ struct L0MemoryCacheAdapterOptions {
 /// adapter for SemanticMemoryContextProvider. It is not the answer semantic
 /// cache: Store() admits conversation turns into L0, while Lookup() retrieves
 /// related short-term dialogue context through cache_vector::VectorIndexManager.
-class L0MemoryCacheAdapter final : public ISemanticCache {
+class L0MemoryCacheAdapter final : public ISemanticCache,
+                                   public IAsyncSemanticCache,
+                                   public std::enable_shared_from_this<L0MemoryCacheAdapter> {
 public:
     L0MemoryCacheAdapter(std::shared_ptr<::vector::EmbeddingPipeline> embedding,
                          std::shared_ptr<cache_vector::VectorIndexManager> index,
@@ -43,10 +48,23 @@ public:
                          std::string sqlite_path,
                          std::size_t max_cached_records,
                          L0MemoryCacheAdapterOptions options = {});
+    ~L0MemoryCacheAdapter() override;
 
     core::Result<CacheLookupResult> Lookup(const CacheLookupRequest& req) override;
+    core::Status LookupAsync(CacheLookupRequest request,
+                             LookupCompletion completion) override;
+    core::Status StoreAsync(CacheStoreRequest request,
+                            StoreCompletion completion) override;
     core::Status Store(const CacheStoreRequest& req) override;
     void ReleaseSession(std::string_view session_id);
+
+    /// 在 Gateway 线程池启动前装配；StartBatching/ShutdownBatching 由生命周期负责。
+    core::Status ConfigureBatching(
+        core::ThreadPool& compute_pool,
+        core::ThreadPool& completion_pool,
+        ::vector::EmbeddingBatchCoordinatorOptions options = {});
+    core::Status StartBatching();
+    void ShutdownBatching() noexcept;
 
 private:
     struct SessionIndexEntry {
@@ -60,6 +78,12 @@ private:
 
     core::Result<std::shared_ptr<SessionIndexEntry>> ResolveIndex(
         const CacheLookupRequest& req);
+    core::Result<CacheLookupResult> LookupWithEmbedding(
+        const CacheLookupRequest& req,
+        const std::vector<float>& query_embedding);
+    core::Status StoreWithEmbedding(
+        const CacheStoreRequest& req,
+        std::vector<float> text_embedding);
 
     std::shared_ptr<::vector::EmbeddingPipeline> embedding_;
     std::shared_ptr<cache_vector::VectorIndexManager> index_;
@@ -69,6 +93,7 @@ private:
     std::shared_ptr<SessionIndexEntry> fixed_index_entry_;
     std::unordered_map<std::string, std::shared_ptr<SessionIndexEntry>> per_session_indices_;
     L0MemoryCacheAdapterOptions options_;
+    std::shared_ptr<::vector::EmbeddingBatchCoordinator> batch_coordinator_;
     // 仅保护 Session 到索引的映射，严禁在持锁期间执行 Embedding、Redis 或 SQLite I/O。
     mutable std::shared_mutex indices_mutex_;
 };

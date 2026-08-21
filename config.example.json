@@ -1,10 +1,14 @@
 {
+  "_comment": "Unified section reference. Copy the process-specific example under config/ for deployment and keep local model paths or secrets in an ignored config.",
   "models": {
-    "llm": "path/to/llama-model.gguf",
-    "mmproj": "path/to/mmproj.gguf",
-    "bert": "path/to/bert-model.onnx",
-    "vit": "path/to/vit-model.onnx",
+    "llm": "models/llama-model.gguf",
+    "mmproj": "models/mmproj.gguf",
+    "bert": "models/bert-model.onnx",
+    "vit": "models/vit-model.onnx",
     "n_gpu_layers": -1,
+    "runner_pool_size": 1,
+    "llama_threads": 8,
+    "mmproj_threads": 8,
     "provider": "auto",
     "cuda_device": 0
   },
@@ -28,24 +32,48 @@
     "pooling_strategy": "mean",
     "normalize": true,
     "expected_dimension": 384,
-    "require_token_type_ids": false
+    "require_token_type_ids": false,
+    "batch_enabled": true,
+    "batch_max_pending_requests": 1024,
+    "batch_max_size": 16,
+    "batch_max_wait_ms": 2,
+    "batch_max_inflight": 1
   },
   "grpc": {
-    "address": "0.0.0.0",
-    "port": 50051,
-    "max_workers": 4
+    "host": "0.0.0.0",
+    "port": "50051",
+    "log_dir": "logs",
+    "num_cqs": 0,
+    "min_pollers": 0,
+    "max_pollers": 0,
+    "max_receive_message_mb": 100,
+    "max_send_message_mb": 10,
+    "stats_log_interval_seconds": 30,
+    "slow_request_ms": 250
   },
   "auth": {
-    "enabled": false,
+    "metadata_key": "x-agent-auth",
+    "token": "",
     "token_file": "",
     "token_env": "AGENT_BACKEND_AUTH_TOKEN"
   },
   "limits": {
-    "max_concurrent_requests": 100,
-    "max_request_size_mb": 10,
-    "rate_limit_per_minute": 60
+    "max_image_mb": 20,
+    "max_image_pixels": 16777216,
+    "max_image_width": 8192,
+    "max_image_height": 8192,
+    "max_prompt_bytes": 8192,
+    "min_context_size": 128,
+    "max_context_size": 8192,
+    "max_vlm_tokens": 2048,
+    "max_temperature": 2.0,
+    "max_top_k": 1000,
+    "max_sequence_length": 512,
+    "max_batch_size": 64,
+    "max_token_id": 10000000,
+    "max_abs_personality": 100.0
   },
-  "vram": {
+  "vram_guard": {
     "monitor_interval_seconds": 10,
     "warning_free_mb": 1024,
     "unload_free_mb": 512,
@@ -54,8 +82,46 @@
     "unload_on_oom_error": true
   },
   "vlm_cache": {
-    "enabled": true,
-    "max_entries": 1000,
-    "ttl_seconds": 3600
+    "enabled": false,
+    "reuse_policy": "result_vector",
+    "persist": false,
+    "dir": "cache/vlm",
+    "max_entries": 512,
+    "max_mb": 1024,
+    "ttl_seconds": 3600,
+    "store_images": true,
+    "store_prompts": true,
+    "stale_on_failure": true,
+    "default_allow_cache": true,
+    "vector": {
+      "enabled": false,
+      "sim_threshold_high": 0.97,
+      "sim_threshold_mid": 0.93,
+      "max_saliency_for_mid": 0.15,
+      "max_entries_per_bucket": 256,
+      "ttl_seconds": 3600,
+      "dir": "cache/vlm/vectors"
+    },
+    "prompt_kv": {
+      "enabled": false,
+      "backend": "memory",
+      "redis_host": "127.0.0.1",
+      "redis_port": 5000,
+      "redis_password": "",
+      "redis_pool_size": 4,
+      "redis_command_timeout_ms": 5000,
+      "key_prefix": "agent:vlm:prompt_kv",
+      "ttl_seconds": 3600,
+      "max_mb": 512,
+      "near_embedding_enabled": false,
+      "near_same_session_min_cosine": 0.99,
+      "near_cross_session_min_cosine": 0.995,
+      "near_same_session_min_mean_token_cosine": 0.99,
+      "near_cross_session_min_mean_token_cosine": 0.995,
+      "near_same_session_min_p05_token_cosine": 0.95,
+      "near_cross_session_min_p05_token_cosine": 0.98,
+      "near_same_session_max_relative_l2": 0.15,
+      "near_cross_session_max_relative_l2": 0.10
+    }
   }
 }

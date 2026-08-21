@@ -341,6 +341,7 @@ if(BERT_BUILD_TESTS)
         tests/service/persona_algorithm_test.cpp
         tests/service/session_manager_test.cpp
         tests/service/persona_runtime_test.cpp
+        tests/service/semantic_memory_context_provider_test.cpp
         tests/service/media_inference_execution_test.cpp
         tests/service/emotion_fusion_analyzer_test.cpp
         tests/service/gateway_foundation_test.cpp

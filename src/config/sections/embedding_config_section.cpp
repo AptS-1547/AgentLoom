@@ -38,6 +38,11 @@ void EmbeddingConfigSection::LoadJson(const Json& root, MultimodalServerOptions&
     SetBool(*section, Name(), "normalize", options.embedding.normalize);
     SetInt(*section, Name(), "expected_dimension", options.embedding.expected_dimension, 0);
     SetBool(*section, Name(), "require_token_type_ids", options.embedding.require_token_type_ids);
+    SetBool(*section, Name(), "batch_enabled", options.embedding.batch_enabled);
+    SetSize(*section, Name(), "batch_max_pending_requests", options.embedding.batch_max_pending_requests, 1);
+    SetSize(*section, Name(), "batch_max_size", options.embedding.batch_max_size, 1);
+    SetInt(*section, Name(), "batch_max_wait_ms", options.embedding.batch_max_wait_ms, 1);
+    SetSize(*section, Name(), "batch_max_inflight", options.embedding.batch_max_inflight, 1);
 }
 
 bool EmbeddingConfigSection::LoadCli(CliCursor& cursor, MultimodalServerOptions& options) const {

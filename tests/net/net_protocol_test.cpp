@@ -4,12 +4,14 @@
 #include "http_types.h"
 #include "request_interfaces.h"
 #include "static_file_handler.h"
+#include "websocket_session.h"
 #include "websocket_types.h"
 
 #include "memory_pool.h"
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdlib>
 #include <string>
@@ -734,6 +736,95 @@ TEST(HttpServerRuntimeTest, DispatchesTypedWebSocketStreamRequestAndTracksConnec
     server.Stop();
 }
 
+TEST(HttpServerRuntimeTest, TunesWebSocketReadCapacityByRouteAndObservedBytes) {
+    net::HttpServerOptions options;
+    options.address = "127.0.0.1";
+    options.port = 0;
+    options.io_threads = 1;
+    options.websocket.max_frame_bytes = 32;
+    options.websocket.max_message_bytes = 8 * 1024;
+    options.websocket_read_buffer_limit = 8 * 1024;
+    options.websocket_read_tuning = net::WebSocketReadTuning{
+        4,
+        16,
+        1};
+    options.websocket_stream_read_tuning = net::WebSocketReadTuning{
+        8,
+        32,
+        1};
+
+    net::HttpServer server(options);
+    std::mutex capacities_mutex;
+    std::vector<std::size_t> message_capacities;
+    std::vector<std::size_t> stream_capacities;
+    std::promise<void> message_done;
+    std::promise<void> stream_done;
+    auto message_done_future = message_done.get_future();
+    auto stream_done_future = stream_done.get_future();
+
+    server.SetWebSocketHandler("/message", [&](net::WebSocketSessionHandle&, net::WebSocketMessage message) {
+        ASSERT_EQ(message.fragments.size(), 1u);
+        {
+            std::lock_guard lock(capacities_mutex);
+            message_capacities.push_back(message.fragments.front().capacity());
+        }
+        if (message.final_fragment) {
+            message_done.set_value();
+        }
+    });
+    server.SetWebSocketStreamHandler("/stream", [&](std::shared_ptr<net::IWebSocketStreamRequest> request) {
+        ASSERT_EQ(request->message().fragments.size(), 1u);
+        {
+            std::lock_guard lock(capacities_mutex);
+            stream_capacities.push_back(request->message().fragments.front().capacity());
+        }
+        if (request->message().final_fragment) {
+            stream_done.set_value();
+        }
+    });
+
+    ASSERT_TRUE(server.Start().ok());
+
+    auto send_message = [&](std::string_view target, std::future<void>& done) {
+        asio::io_context io;
+        tcp::resolver resolver(io);
+        beast::websocket::stream<tcp::socket> ws(io);
+        asio::connect(ws.next_layer(), resolver.resolve("127.0.0.1", std::to_string(server.port())));
+        ws.handshake("127.0.0.1", std::string(target));
+        const std::string payload(4 * 1024, 'x');
+        ws.binary(true);
+        ws.write(asio::buffer(payload));
+        EXPECT_EQ(done.wait_for(2s), std::future_status::ready);
+        beast::error_code ec;
+        ws.close(beast::websocket::close_code::normal, ec);
+        EXPECT_FALSE(ec) << ec.message();
+    };
+
+    send_message("/message", message_done_future);
+    send_message("/stream", stream_done_future);
+
+    {
+        std::lock_guard lock(capacities_mutex);
+        ASSERT_FALSE(message_capacities.empty());
+        EXPECT_EQ(message_capacities.front(), 4u);
+        EXPECT_NE(std::find(message_capacities.begin(), message_capacities.end(), 16u),
+                  message_capacities.end());
+        EXPECT_TRUE(std::all_of(message_capacities.begin(), message_capacities.end(), [](std::size_t capacity) {
+            return capacity <= 16;
+        }));
+
+        ASSERT_FALSE(stream_capacities.empty());
+        EXPECT_EQ(stream_capacities.front(), 8u);
+        EXPECT_NE(std::find(stream_capacities.begin(), stream_capacities.end(), 32u),
+                  stream_capacities.end());
+        EXPECT_TRUE(std::all_of(stream_capacities.begin(), stream_capacities.end(), [](std::size_t capacity) {
+            return capacity <= 32;
+        }));
+    }
+
+    server.Stop();
+}
+
 TEST(HttpServerRuntimeTest, ClosesIdleWebSocketAfterConfiguredTimeout) {
     net::HttpServerOptions options;
     options.address = "127.0.0.1";
@@ -764,6 +855,39 @@ TEST(HttpServerRuntimeTest, ClosesIdleWebSocketAfterConfiguredTimeout) {
 
     beast::error_code ec;
     ws.next_layer().close(ec);
+    server.Stop();
+}
+
+TEST(HttpServerRuntimeTest, ReleasesWebSocketSessionAfterPeerClose) {
+    net::HttpServer server({.address = "127.0.0.1", .port = 0, .io_threads = 1});
+    std::promise<std::weak_ptr<net::WebSocketSession>> session_accepted;
+    auto session_accepted_future = session_accepted.get_future();
+    server.SetWebSocketHandler("/ws", [](net::WebSocketSessionHandle&, net::WebSocketMessage) {});
+    server.SetWebSocketAcceptHandler([&](net::WebSocketSessionHandle& session) {
+        auto& websocket_session = dynamic_cast<net::WebSocketSession&>(session);
+        session_accepted.set_value(websocket_session.weak_from_this());
+    });
+    ASSERT_TRUE(server.Start().ok());
+
+    asio::io_context io;
+    tcp::resolver resolver(io);
+    beast::websocket::stream<tcp::socket> ws(io);
+    asio::connect(ws.next_layer(), resolver.resolve("127.0.0.1", std::to_string(server.port())));
+    ws.handshake("127.0.0.1", "/ws");
+
+    ASSERT_EQ(session_accepted_future.wait_for(2s), std::future_status::ready);
+    auto session = session_accepted_future.get();
+    ASSERT_FALSE(session.expired());
+
+    beast::error_code ec;
+    ws.close(beast::websocket::close_code::normal, ec);
+    ASSERT_FALSE(ec) << ec.message();
+
+    for (int i = 0; i < 200 && !session.expired(); ++i) {
+        std::this_thread::sleep_for(10ms);
+    }
+    EXPECT_TRUE(session.expired());
+
     server.Stop();
 }
 

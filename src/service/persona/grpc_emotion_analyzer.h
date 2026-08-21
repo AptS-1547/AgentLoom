@@ -22,7 +22,8 @@ struct GrpcEmotionAnalyzerOptions {
     ::vector::EncodeOptions tokenizer_options{128, true, true, false, true};
 };
 
-class GrpcEmotionAnalyzer final : public IEmotionAnalyzer {
+class GrpcEmotionAnalyzer final : public IEmotionAnalyzer,
+                                  public IAsyncEmotionAnalyzer {
 public:
     GrpcEmotionAnalyzer(GrpcEmotionAnalyzerOptions options,
                         std::shared_ptr<::vector::HfTokenizer> tokenizer);
@@ -34,6 +35,11 @@ public:
         std::string_view text,
         std::string_view trace_id,
         std::shared_ptr<const PersonalityConfig> personality = nullptr) override;
+    core::Status AnalyzeAsync(
+        std::string text,
+        std::string trace_id,
+        std::shared_ptr<const PersonalityConfig> personality,
+        AnalyzeCompletion completion) override;
 
     core::Result<std::vector<EmotionAnalysis>> AnalyzeBatch(
         std::span<const std::string_view> texts,

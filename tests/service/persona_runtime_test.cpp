@@ -43,6 +43,86 @@ using agent::service::persona::SkillVisionEventSinkOptions;
 using agent::service::persona::ToolMemoryContext;
 using agent::service::persona::ToolMemoryQuery;
 
+class ManualMemoryContextProvider final
+    : public agent::service::persona::IMemoryContextProvider,
+      public agent::service::persona::IAsyncMemoryContextProvider {
+public:
+    core::Result<agent::service::persona::RecalledContext> BuildContext(
+        const agent::service::persona::MemoryContextRequest&) override {
+        return core::Status::Error(core::ErrorCode::InternalError,
+                                   "unexpected synchronous memory lookup");
+    }
+
+    core::Status BuildContextAsync(
+        agent::service::persona::AsyncMemoryContextRequest request,
+        BuildCompletion completion) override {
+        {
+            std::lock_guard lock(mutex_);
+            request_ = std::move(request);
+            completion_ = std::move(completion);
+        }
+        condition_.notify_all();
+        return core::Status::Ok();
+    }
+
+    core::Status AdmitTurn(std::string_view,
+                           std::string_view,
+                           std::string_view,
+                           const agent::service::persona::ConversationTurn&,
+                           std::string_view) override {
+        return core::Status::Ok();
+    }
+
+    bool WaitUntilPending() {
+        std::unique_lock lock(mutex_);
+        return condition_.wait_for(lock, std::chrono::seconds(2), [&] {
+            return static_cast<bool>(completion_);
+        });
+    }
+
+    void Complete(core::Result<agent::service::persona::RecalledContext> result) {
+        BuildCompletion completion;
+        {
+            std::lock_guard lock(mutex_);
+            completion = std::move(completion_);
+        }
+        completion(std::move(result));
+    }
+
+private:
+    std::mutex mutex_;
+    std::condition_variable condition_;
+    agent::service::persona::AsyncMemoryContextRequest request_;
+    BuildCompletion completion_;
+};
+
+class DuplicateCompletionMemoryContextProvider final
+    : public agent::service::persona::IMemoryContextProvider,
+      public agent::service::persona::IAsyncMemoryContextProvider {
+public:
+    core::Result<agent::service::persona::RecalledContext> BuildContext(
+        const agent::service::persona::MemoryContextRequest&) override {
+        return core::Status::Error(core::ErrorCode::InternalError,
+                                   "unexpected synchronous memory lookup");
+    }
+
+    core::Status BuildContextAsync(
+        agent::service::persona::AsyncMemoryContextRequest,
+        BuildCompletion completion) override {
+        completion(agent::service::persona::RecalledContext{});
+        completion(agent::service::persona::RecalledContext{});
+        return core::Status::Ok();
+    }
+
+    core::Status AdmitTurn(std::string_view,
+                           std::string_view,
+                           std::string_view,
+                           const agent::service::persona::ConversationTurn&,
+                           std::string_view) override {
+        return core::Status::Ok();
+    }
+};
+
 class FakeSemanticCache final : public agent::semantic_cache::ISemanticCache {
 public:
     core::Result<CacheLookupResult> Lookup(const CacheLookupRequest& req) override {
@@ -176,6 +256,57 @@ public:
 
 private:
     EmotionAnalysis analysis_;
+};
+
+class ManualAsyncEmotionAnalyzer final
+    : public agent::service::persona::IEmotionAnalyzer,
+      public agent::service::persona::IAsyncEmotionAnalyzer {
+public:
+    core::Result<EmotionAnalysis> Analyze(
+        std::string_view,
+        std::string_view,
+        std::shared_ptr<const PersonalityConfig> = nullptr) override {
+        return core::Status::Error(core::ErrorCode::InternalError,
+                                   "unexpected synchronous emotion analysis");
+    }
+
+    core::Status AnalyzeAsync(
+        std::string text,
+        std::string trace_id,
+        std::shared_ptr<const PersonalityConfig>,
+        AnalyzeCompletion completion) override {
+        {
+            std::lock_guard lock(mutex_);
+            texts_.push_back(std::move(text));
+            trace_ids_.push_back(std::move(trace_id));
+            completions_.push_back(std::move(completion));
+        }
+        condition_.notify_all();
+        return core::Status::Ok();
+    }
+
+    bool WaitForCount(std::size_t count) {
+        std::unique_lock lock(mutex_);
+        return condition_.wait_for(lock, std::chrono::seconds(2), [&] {
+            return completions_.size() >= count;
+        });
+    }
+
+    void Complete(std::size_t index, EmotionAnalysis emotion) {
+        AnalyzeCompletion completion;
+        {
+            std::lock_guard lock(mutex_);
+            completion = std::move(completions_.at(index));
+        }
+        completion(std::move(emotion));
+    }
+
+private:
+    std::mutex mutex_;
+    std::condition_variable condition_;
+    std::vector<std::string> texts_;
+    std::vector<std::string> trace_ids_;
+    std::vector<AnalyzeCompletion> completions_;
 };
 
 class RecordingEmotionCalibrationSink final : public agent::service::persona::IEmotionCalibrationSampleSink {
@@ -356,6 +487,152 @@ TEST(PersonaRuntimeTest, AsyncLlmReleasesWorkerAndPreservesPerSessionOrder) {
     compute.Shutdown(true);
 }
 
+TEST(PersonaRuntimeTest, AsyncEmotionPrecedesMemoryAndReleasesTurnWorker) {
+    core::ThreadPool compute({1, 32, "runtime-order-compute"});
+    core::ThreadPool io({1, 32, "runtime-order-io"});
+    core::ThreadPool turn_pool({1, 32, "runtime-order-turn",
+                                std::make_shared<GatewaySessionAffinityScheduler>()});
+    ASSERT_TRUE(compute.Start().ok());
+    ASSERT_TRUE(io.Start().ok());
+    ASSERT_TRUE(turn_pool.Start().ok());
+
+    SessionManager sessions(
+        compute, io, {}, core::LoggerAdapter::ForModule("service"), &turn_pool);
+    ASSERT_TRUE(sessions.CreateSession(MakeSessionRequest()).ok());
+
+    auto memory = std::make_shared<ManualMemoryContextProvider>();
+    auto emotion = std::make_shared<ManualAsyncEmotionAnalyzer>();
+    auto async_llm = std::make_shared<ManualAsyncLlmClient>();
+    PersonaRuntime runtime(
+        sessions,
+        memory,
+        emotion,
+        std::make_shared<FakeLlmClient>(),
+        PersonaRuntimeOptions{.default_model = "test-model"},
+        nullptr,
+        nullptr,
+        nullptr,
+        core::LoggerAdapter::ForModule("service"),
+        nullptr,
+        async_llm,
+        &turn_pool);
+
+    std::promise<core::Result<ChatResponse>> completed;
+    auto completed_future = completed.get_future();
+    ChatRequest request;
+    request.session_id = "session-runtime";
+    request.user_input = "先分析情绪，再查询记忆";
+    request.trace_id = "trace-runtime-order";
+    ASSERT_TRUE(runtime.SubmitChat(
+        std::move(request),
+        [&completed](core::Result<ChatResponse> result) mutable {
+            completed.set_value(std::move(result));
+        }).ok());
+    ASSERT_TRUE(emotion->WaitForCount(1));
+    EXPECT_EQ(async_llm->Count(), 0u);
+
+    // 当前 Session 在等待 Emotion，但唯一 turn worker 应可处理其他 key。
+    std::promise<void> worker_reused;
+    auto worker_future = worker_reused.get_future();
+    core::ThreadPoolTaskMetadata metadata;
+    metadata.concurrency_key = "other-session";
+    ASSERT_TRUE(turn_pool.Submit(
+        [&worker_reused](core::ThreadPoolContext&) {
+            worker_reused.set_value();
+            return core::Status::Ok();
+        },
+        {},
+        "emotion-wait-worker-probe",
+        std::move(metadata)).ok());
+    EXPECT_EQ(worker_future.wait_for(std::chrono::seconds(1)),
+              std::future_status::ready);
+
+    emotion->Complete(0, MakeEmotion("curiosity", 0.8));
+    ASSERT_TRUE(memory->WaitUntilPending());
+    EXPECT_EQ(async_llm->Count(), 0u);
+
+    memory->Complete(agent::service::persona::RecalledContext{});
+    ASSERT_TRUE(async_llm->WaitForCount(1, std::chrono::seconds(1)));
+    async_llm->Complete(0, "按严格阶段顺序生成的回复");
+
+    // 回复侧情绪分析同样异步，完成前不得提交 Turn。
+    ASSERT_TRUE(emotion->WaitForCount(2));
+    EXPECT_EQ(completed_future.wait_for(std::chrono::milliseconds(50)),
+              std::future_status::timeout);
+    emotion->Complete(1, MakeEmotion("neutral", 0.5));
+    ASSERT_EQ(completed_future.wait_for(std::chrono::seconds(1)),
+              std::future_status::ready);
+    auto result = completed_future.get();
+    ASSERT_TRUE(result.ok()) << result.status().message();
+    EXPECT_EQ(result.value().response, "按严格阶段顺序生成的回复");
+
+    runtime.Shutdown();
+    sessions.Shutdown();
+    turn_pool.Shutdown(true);
+    io.Shutdown(true);
+    compute.Shutdown(true);
+}
+
+TEST(PersonaRuntimeTest, AsyncTurnIgnoresDuplicateMemoryCompletion) {
+    core::ThreadPool compute({1, 32, "runtime-duplicate-memory-compute"});
+    core::ThreadPool io({1, 32, "runtime-duplicate-memory-io"});
+    core::ThreadPool llm_pool({1, 32, "runtime-duplicate-memory-llm",
+                               std::make_shared<GatewaySessionAffinityScheduler>(
+                                   GatewaySessionAffinitySchedulerOptions{
+                                       .max_active_keys = 8,
+                                       .max_outstanding_per_key = 4,
+                                       .max_outstanding_per_fairness_key = 8,
+                                       .max_outstanding_per_tenant = 16})});
+    ASSERT_TRUE(compute.Start().ok());
+    ASSERT_TRUE(io.Start().ok());
+    ASSERT_TRUE(llm_pool.Start().ok());
+
+    SessionManager sessions(
+        compute, io, {}, core::LoggerAdapter::ForModule("service"), &llm_pool);
+    ASSERT_TRUE(sessions.CreateSession(MakeSessionRequest()).ok());
+
+    auto async_llm = std::make_shared<ManualAsyncLlmClient>();
+    PersonaRuntime runtime(
+        sessions,
+        std::make_shared<DuplicateCompletionMemoryContextProvider>(),
+        std::make_shared<NeutralEmotionAnalyzer>(),
+        std::make_shared<FakeLlmClient>(),
+        PersonaRuntimeOptions{.default_model = "test-model"},
+        nullptr,
+        nullptr,
+        nullptr,
+        core::LoggerAdapter::ForModule("service"),
+        nullptr,
+        async_llm);
+
+    std::promise<core::Result<ChatResponse>> completed;
+    auto future = completed.get_future();
+    ChatRequest request;
+    request.session_id = "session-runtime";
+    request.user_input = "duplicate memory callback";
+    request.trace_id = "trace-duplicate-memory";
+    ASSERT_TRUE(runtime.SubmitChat(
+        std::move(request),
+        [&completed](core::Result<ChatResponse> result) mutable {
+            completed.set_value(std::move(result));
+        }).ok());
+    ASSERT_TRUE(async_llm->WaitForCount(1, std::chrono::seconds(1)));
+    EXPECT_EQ(async_llm->Count(), 1u);
+
+    async_llm->Complete(0, "single response");
+    ASSERT_EQ(future.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+    auto result = future.get();
+    ASSERT_TRUE(result.ok()) << result.status().message();
+    EXPECT_EQ(result.value().response, "single response");
+    EXPECT_EQ(result.value().turn_index, 1u);
+
+    runtime.Shutdown();
+    sessions.Shutdown();
+    llm_pool.Shutdown(true);
+    io.Shutdown(true);
+    compute.Shutdown(true);
+}
+
 TEST(PersonaRuntimeTest, ShutdownCancelsInflightAsyncLlmAndReleasesTurnLane) {
     core::ThreadPool compute({1, 16, "runtime-shutdown-compute"});
     core::ThreadPool io({1, 16, "runtime-shutdown-io"});
@@ -404,6 +681,75 @@ TEST(PersonaRuntimeTest, ShutdownCancelsInflightAsyncLlmAndReleasesTurnLane) {
     sessions.Shutdown();
     llm_pool.Shutdown(true);
     EXPECT_EQ(llm_pool.Stats().scheduler.running_tasks, 0u);
+    io.Shutdown(true);
+    compute.Shutdown(true);
+}
+
+TEST(PersonaRuntimeTest, ShutdownWaitsForAcceptedAsyncMemoryContinuation) {
+    core::ThreadPool compute({1, 32, "runtime-memory-shutdown-compute"});
+    core::ThreadPool io({1, 32, "runtime-memory-shutdown-io"});
+    core::ThreadPool llm_pool({1, 32, "runtime-memory-shutdown-llm",
+                               std::make_shared<GatewaySessionAffinityScheduler>(
+                                   GatewaySessionAffinitySchedulerOptions{
+                                       .max_active_keys = 8,
+                                       .max_outstanding_per_key = 4,
+                                       .max_outstanding_per_fairness_key = 8,
+                                       .max_outstanding_per_tenant = 16})});
+    ASSERT_TRUE(compute.Start().ok());
+    ASSERT_TRUE(io.Start().ok());
+    ASSERT_TRUE(llm_pool.Start().ok());
+
+    SessionManager sessions(
+        compute, io, {}, core::LoggerAdapter::ForModule("service"), &llm_pool);
+    ASSERT_TRUE(sessions.CreateSession(MakeSessionRequest()).ok());
+
+    auto memory = std::make_shared<ManualMemoryContextProvider>();
+    auto async_llm = std::make_shared<ManualAsyncLlmClient>();
+    PersonaRuntime runtime(
+        sessions,
+        memory,
+        std::make_shared<NeutralEmotionAnalyzer>(),
+        std::make_shared<FakeLlmClient>(),
+        PersonaRuntimeOptions{.recent_raw_turns = 10, .default_model = "test-model"},
+        nullptr,
+        nullptr,
+        nullptr,
+        core::LoggerAdapter::ForModule("service"),
+        nullptr,
+        async_llm);
+
+    std::promise<core::Result<ChatResponse>> completed;
+    auto completed_future = completed.get_future();
+    ChatRequest request;
+    request.session_id = "session-runtime";
+    request.user_input = "等待异步记忆";
+    request.trace_id = "trace-memory-shutdown";
+    ASSERT_TRUE(runtime.SubmitChat(
+        std::move(request),
+        [&completed](core::Result<ChatResponse> result) mutable {
+            completed.set_value(std::move(result));
+        }).ok());
+    ASSERT_TRUE(memory->WaitUntilPending());
+
+    auto shutdown = std::async(std::launch::async, [&runtime] {
+        runtime.Shutdown();
+    });
+    EXPECT_EQ(shutdown.wait_for(std::chrono::milliseconds(100)),
+              std::future_status::timeout);
+
+    memory->Complete(core::Status::Error(
+        core::ErrorCode::Cancelled,
+        "memory cancelled during shutdown"));
+    ASSERT_EQ(completed_future.wait_for(std::chrono::seconds(2)),
+              std::future_status::ready);
+    auto result = completed_future.get();
+    ASSERT_FALSE(result.ok());
+    EXPECT_EQ(result.status().code(), core::ErrorCode::Cancelled);
+    EXPECT_EQ(shutdown.wait_for(std::chrono::seconds(2)),
+              std::future_status::ready);
+
+    sessions.Shutdown();
+    llm_pool.Shutdown(true);
     io.Shutdown(true);
     compute.Shutdown(true);
 }
@@ -469,9 +815,11 @@ TEST(PersonaRuntimeTest, BuildsMessagesFromL0AndLastTenRawTurns) {
     }
     {
         std::lock_guard lock(cache->mutex_);
+        EXPECT_EQ(cache->last_lookup.tenant_id, "default");
         EXPECT_EQ(cache->last_lookup.user_id, "user-runtime");
         EXPECT_EQ(cache->last_lookup.session_id, "session-runtime");
         EXPECT_EQ(cache->stores.size(), 1u);
+        EXPECT_EQ(cache->stores[0].origin.tenant_id, "default");
         EXPECT_EQ(cache->stores[0].origin.user_id, "user-runtime");
         EXPECT_EQ(cache->stores[0].response_payload, "这是回复");
     }

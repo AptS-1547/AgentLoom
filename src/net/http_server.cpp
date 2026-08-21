@@ -346,6 +346,9 @@ bool HttpServer::HttpSession::TryUpgradeWebSocket() {
     options.request_timeout = server_.options_.request_timeout;
     options.read_buffer_limit = server_.options_.websocket_read_buffer_limit;
     options.websocket = server_.options_.websocket;
+    options.read_tuning = stream_handler
+                              ? server_.options_.websocket_stream_read_tuning
+                              : server_.options_.websocket_read_tuning;
     options.websocket.idle_timeout =
         std::chrono::duration_cast<std::chrono::milliseconds>(server_.options_.websocket_idle_timeout);
 

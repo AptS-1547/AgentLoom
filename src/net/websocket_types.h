@@ -22,6 +22,13 @@ enum class WebSocketMessageKind {
     Binary
 };
 
+// 控制接收 fragment 的初始大小和有界增长策略，不改变消息总大小上限。
+struct WebSocketReadTuning {
+    std::size_t initial_read_bytes = 64 * 1024;
+    std::size_t max_read_bytes = 256 * 1024;
+    std::size_t growth_full_read_threshold = 2;
+};
+
 struct WebSocketOptions {
     std::size_t max_frame_bytes = 1024 * 1024;
     std::size_t max_message_bytes = 16 * 1024 * 1024;

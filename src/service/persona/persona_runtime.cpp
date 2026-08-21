@@ -1,10 +1,13 @@
 #include "persona_runtime.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <exception>
 #include <map>
 #include <sstream>
 #include <string_view>
+#include <tuple>
 #include <utility>
 
 namespace agent::service::persona {
@@ -70,6 +73,36 @@ std::vector<ConversationTurn> TakeRecent(std::span<const ConversationTurn> turns
     }
     return out;
 }
+
+/// 将 provider 的同步完成、异步完成和异常实现统一收敛为一次外部结果。
+class MemoryBuildCompletionState final {
+public:
+    explicit MemoryBuildCompletionState(
+        IAsyncMemoryContextProvider::BuildCompletion completion)
+        : completion_(std::move(completion)) {}
+
+    bool TryComplete(core::Result<RecalledContext> result) {
+        bool expected = false;
+        if (!completed_.compare_exchange_strong(
+                expected, true, std::memory_order_acq_rel)) {
+            return false;
+        }
+        // 状态可能被下游缓存持有；先移出回调，确保完成后及时释放 Runtime/session 捕获。
+        auto completion = std::move(completion_);
+        completion(std::move(result));
+        return true;
+    }
+
+    bool CancelWithoutCompletion() noexcept {
+        bool expected = false;
+        return completed_.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel);
+    }
+
+private:
+    std::atomic<bool> completed_{false};
+    IAsyncMemoryContextProvider::BuildCompletion completion_;
+};
 
 bool IsProactiveInput(std::string_view input) {
     return input.rfind("[proactive]", 0) == 0 ||
@@ -185,9 +218,11 @@ core::Result<RecalledContext> SemanticMemoryContextProvider::BuildContext(
         lookup.text = request.query;
         lookup.scope = semantic_cache::CacheScope::User;
         lookup.answer_type = semantic_cache::AnswerType::Personalized;
+        lookup.tenant_id = request.tenant_id;
         lookup.user_id = request.user_uuid;
         lookup.session_id = request.session_id;
         lookup.persona_id = request.persona_id;
+        lookup.extra["trace_id"] = request.trace_id;
         lookup.recent_turns.reserve(context.recent_turns.size());
         for (const auto& turn : context.recent_turns) {
             lookup.recent_turns.push_back(FormatRecentTurn(turn));
@@ -224,7 +259,193 @@ core::Result<RecalledContext> SemanticMemoryContextProvider::BuildContext(
     return context;
 }
 
+core::Status SemanticMemoryContextProvider::BuildContextAsync(
+    AsyncMemoryContextRequest request,
+    BuildCompletion completion) {
+    if (!completion) {
+        return core::Status::Error(core::ErrorCode::InvalidArgument,
+                                   "memory context completion is required");
+    }
+    RecalledContext context;
+    const auto recent_limit = request.max_recent_turns == 0
+        ? options_.max_recent_turns
+        : request.max_recent_turns;
+    context.recent_turns = TakeRecent(request.current_session_recent, recent_limit);
+    auto completion_state = std::make_shared<MemoryBuildCompletionState>(
+        std::move(completion));
+    const auto l3_memory = l3_memory_;
+    const auto l3_top_k = options_.l3_top_k;
+    const auto user_uuid = request.user_uuid;
+    const auto query = request.query;
+
+    auto complete_remaining =
+        [l3_memory, l3_top_k, user_uuid, query, completion_state](
+            RecalledContext value) mutable {
+            std::vector<std::string> sections;
+            if (!value.system_context.empty()) {
+                sections.push_back(std::move(value.system_context));
+            }
+            if (l3_memory) {
+                auto facts = l3_memory->SearchFacts(user_uuid, query, l3_top_k);
+                if (!facts.ok()) {
+                    completion_state->TryComplete(facts.status());
+                    return;
+                }
+                auto formatted = FormatL3Facts(facts.value());
+                if (!formatted.empty()) {
+                    value.l3_hit = true;
+                    sections.push_back(std::move(formatted));
+                }
+            }
+            value.system_context.clear();
+            for (std::size_t index = 0; index < sections.size(); ++index) {
+                if (index != 0) {
+                    value.system_context += "\n";
+                }
+                value.system_context += sections[index];
+            }
+            completion_state->TryComplete(std::move(value));
+        };
+
+    if (!l0_cache_) {
+        complete_remaining(std::move(context));
+        return core::Status::Ok();
+    }
+    auto async_l0 = std::dynamic_pointer_cast<semantic_cache::IAsyncSemanticCache>(l0_cache_);
+    if (!async_l0) {
+        MemoryContextRequest sync_request;
+        sync_request.session_id = request.session_id;
+        sync_request.tenant_id = request.tenant_id;
+        sync_request.user_uuid = request.user_uuid;
+        sync_request.persona_id = request.persona_id;
+        sync_request.query = request.query;
+        sync_request.trace_id = request.trace_id;
+        sync_request.current_session_recent = request.current_session_recent;
+        sync_request.max_recent_turns = request.max_recent_turns;
+        completion_state->TryComplete(BuildContext(sync_request));
+        return core::Status::Ok();
+    }
+
+    semantic_cache::CacheLookupRequest lookup;
+    lookup.text = request.query;
+    lookup.scope = semantic_cache::CacheScope::User;
+    lookup.answer_type = semantic_cache::AnswerType::Personalized;
+    lookup.tenant_id = request.tenant_id;
+    lookup.user_id = request.user_uuid;
+    lookup.session_id = request.session_id;
+    lookup.persona_id = request.persona_id;
+    lookup.extra["trace_id"] = request.trace_id;
+    lookup.recent_turns.reserve(context.recent_turns.size());
+    for (const auto& turn : context.recent_turns) {
+        lookup.recent_turns.push_back(FormatRecentTurn(turn));
+    }
+
+    core::Status start_status;
+    try {
+        start_status = async_l0->LookupAsync(
+            std::move(lookup),
+            [context = std::move(context),
+             complete_remaining = std::move(complete_remaining),
+             completion_state](
+                core::Result<semantic_cache::CacheLookupResult> l0) mutable {
+                if (!l0.ok()) {
+                    completion_state->TryComplete(l0.status());
+                    return;
+                }
+                if (l0.value().hit && !l0.value().payload.empty()) {
+                    context.l0_hit = true;
+                    context.system_context =
+                        "<memory_l0>\n" + l0.value().payload + "\n</memory_l0>";
+                }
+                complete_remaining(std::move(context));
+            });
+    } catch (const std::exception& exception) {
+        start_status = core::Status::Error(core::ErrorCode::InternalError, exception.what());
+    } catch (...) {
+        start_status = core::Status::Error(
+            core::ErrorCode::Unknown,
+            "async semantic cache threw an unknown exception");
+    }
+    if (!start_status.ok()) {
+        // 若下游违反契约并在返回失败前同步回调，以已完成结果为准，避免上层二次 finish。
+        if (!completion_state->CancelWithoutCompletion()) {
+            return core::Status::Ok();
+        }
+    }
+    return start_status;
+}
+
+core::Status SemanticMemoryContextProvider::AdmitTurnAsync(
+    std::string session_id,
+    std::string tenant_id,
+    std::string user_uuid,
+    ConversationTurn turn,
+    std::string trace_id,
+    AdmissionCompletion completion) {
+    if (!completion) {
+        return core::Status::Error(core::ErrorCode::InvalidArgument,
+                                   "memory admission completion is required");
+    }
+    if (!l0_cache_) {
+        return core::Status::Error(core::ErrorCode::FailedPrecondition,
+                                   "L0 memory cache is not initialized");
+    }
+    auto async_l0 = std::dynamic_pointer_cast<semantic_cache::IAsyncSemanticCache>(l0_cache_);
+    if (!async_l0) {
+        return core::Status::Error(
+            core::ErrorCode::FailedPrecondition,
+            "asynchronous L0 memory admission is not supported");
+    }
+
+    semantic_cache::CacheStoreRequest store;
+    store.origin.text = turn.user_input;
+    store.origin.scope = semantic_cache::CacheScope::User;
+    store.origin.answer_type = semantic_cache::AnswerType::Personalized;
+    store.origin.tenant_id = std::move(tenant_id);
+    store.origin.user_id = std::move(user_uuid);
+    store.origin.session_id = std::move(session_id);
+    store.origin.persona_id = turn.persona_id;
+    store.origin.extra["trace_id"] = std::move(trace_id);
+    store.response_payload = turn.response;
+    store.answer_type = semantic_cache::AnswerType::Personalized;
+
+    auto completion_state = std::make_shared<std::atomic<bool>>(false);
+    auto guarded_completion = [completion = std::move(completion), completion_state](
+                                  core::Status status) mutable {
+        bool expected = false;
+        if (!completion_state->compare_exchange_strong(
+                expected, true, std::memory_order_acq_rel)) {
+            return;
+        }
+        try {
+            completion(std::move(status));
+        } catch (...) {
+            // Provider 回调不应将业务异常传播回存储 executor。
+        }
+    };
+    core::Status status;
+    try {
+        status = async_l0->StoreAsync(std::move(store), std::move(guarded_completion));
+    } catch (const std::exception& exception) {
+        status = core::Status::Error(core::ErrorCode::InternalError, exception.what());
+    } catch (...) {
+        status = core::Status::Error(
+            core::ErrorCode::Unknown,
+            "asynchronous semantic cache store threw an unknown exception");
+    }
+    if (!status.ok()) {
+        bool expected = false;
+        // 违反“失败不回调”契约时，以已交付完成为准，避免二次 admission 收口。
+        if (!completion_state->compare_exchange_strong(
+                expected, true, std::memory_order_acq_rel)) {
+            return core::Status::Ok();
+        }
+    }
+    return status;
+}
+
 core::Status SemanticMemoryContextProvider::AdmitTurn(std::string_view session_id,
+                                                      std::string_view tenant_id,
                                                       std::string_view user_uuid,
                                                       const ConversationTurn& turn,
                                                       std::string_view) {
@@ -236,6 +457,7 @@ core::Status SemanticMemoryContextProvider::AdmitTurn(std::string_view session_i
     store.origin.text = turn.user_input;
     store.origin.scope = semantic_cache::CacheScope::User;
     store.origin.answer_type = semantic_cache::AnswerType::Personalized;
+    store.origin.tenant_id = std::string(tenant_id);
     store.origin.user_id = std::string(user_uuid);
     store.origin.session_id = std::string(session_id);
     store.origin.persona_id = turn.persona_id;
@@ -269,6 +491,84 @@ core::Result<EmotionAnalysis> NeutralEmotionAnalyzer::Analyze(std::string_view,
     return analysis;
 }
 
+struct PersonaRuntime::AsyncTurnOperation final {
+    AsyncTurnOperation(
+        PersonaRuntime* owner_value,
+        SessionState session_value,
+        ChatRequest request_value,
+        std::shared_ptr<std::optional<ChatResponse>> response_holder_value,
+        SessionManager::SessionTurnAsyncFinish finish_value,
+        std::chrono::steady_clock::time_point submitted_at_value)
+        : owner(owner_value),
+          session(std::move(session_value)),
+          request(std::move(request_value)),
+          response_holder(std::move(response_holder_value)),
+          finish(std::move(finish_value)),
+          user_input(request.user_input),
+          context_id(request.context_id),
+          persona_id(session.persona_id),
+          submitted_at(submitted_at_value),
+          compute_started_at(std::chrono::steady_clock::now()),
+          compute_queue_wait(std::chrono::duration_cast<std::chrono::milliseconds>(
+              compute_started_at - submitted_at)),
+          logger(owner_value->logger_) {}
+
+    ~AsyncTurnOperation() {
+        ReleaseRuntimeLease();
+    }
+
+    bool Transition(AsyncTurnPhase expected, AsyncTurnPhase next) noexcept {
+        return phase.compare_exchange_strong(
+            expected, next, std::memory_order_acq_rel);
+    }
+
+    void Finish(core::Result<SessionTurnCommit> result) noexcept {
+        if (finished.exchange(true, std::memory_order_acq_rel)) {
+            return;
+        }
+        phase.store(result.ok() ? AsyncTurnPhase::Completed : AsyncTurnPhase::Failed,
+                    std::memory_order_release);
+        auto callback = std::move(finish);
+        // Provider 允许在完成后继续持有 callback；Runtime drain 不能依赖
+        // operation 对象析构，否则已完成 Turn 会被误判为仍在途。
+        ReleaseRuntimeLease();
+        try {
+            callback(std::move(result));
+        } catch (const std::exception& exception) {
+            logger.error(
+                "[trace={}] [persona_runtime] async turn finish exception: {}",
+                request.trace_id, exception.what());
+        } catch (...) {
+            logger.error(
+                "[trace={}] [persona_runtime] async turn finish exception: unknown",
+                request.trace_id);
+        }
+    }
+
+    void ReleaseRuntimeLease() noexcept {
+        if (owner && armed.exchange(false, std::memory_order_acq_rel)) {
+            owner->FinishAsyncTurnOperation();
+        }
+    }
+
+    PersonaRuntime* owner = nullptr;
+    SessionState session;
+    ChatRequest request;
+    std::shared_ptr<std::optional<ChatResponse>> response_holder;
+    SessionManager::SessionTurnAsyncFinish finish;
+    std::string user_input;
+    std::string context_id;
+    std::string persona_id;
+    std::chrono::steady_clock::time_point submitted_at;
+    std::chrono::steady_clock::time_point compute_started_at;
+    std::chrono::milliseconds compute_queue_wait{0};
+    std::optional<EmotionAnalysis> user_emotion;
+    std::atomic<AsyncTurnPhase> phase{AsyncTurnPhase::Admitted};
+    std::atomic<bool> finished{false};
+    std::atomic<bool> armed{false};
+    core::LoggerAdapter logger;
+};
+
 PersonaRuntime::PersonaRuntime(SessionManager& sessions,
                                std::shared_ptr<IMemoryContextProvider> memory_provider,
                                std::shared_ptr<IEmotionAnalyzer> emotion_analyzer,
@@ -279,12 +579,18 @@ PersonaRuntime::PersonaRuntime(SessionManager& sessions,
                                std::shared_ptr<ISkillSessionManager> skill_session_manager,
                                core::LoggerAdapter logger,
                                std::shared_ptr<IEmotionCalibrationSampleSink> emotion_calibration_sink,
-                               std::shared_ptr<llm::IAsyncLlmClient> async_llm_client)
+                               std::shared_ptr<llm::IAsyncLlmClient> async_llm_client,
+                               core::ThreadPool* continuation_pool)
     : sessions_(sessions),
       memory_provider_(std::move(memory_provider)),
+      async_memory_provider_(
+          std::dynamic_pointer_cast<IAsyncMemoryContextProvider>(memory_provider_)),
       emotion_analyzer_(std::move(emotion_analyzer)),
+      async_emotion_analyzer_(
+          std::dynamic_pointer_cast<IAsyncEmotionAnalyzer>(emotion_analyzer_)),
       llm_client_(std::move(llm_client)),
       async_llm_client_(std::move(async_llm_client)),
+      continuation_pool_(continuation_pool),
       answer_cache_provider_(std::move(answer_cache_provider)),
       tool_memory_provider_(std::move(tool_memory_provider)),
       skill_session_manager_(std::move(skill_session_manager)),
@@ -332,47 +638,16 @@ core::Status PersonaRuntime::SubmitChat(ChatRequest request, ChatCallback callba
                 const SessionTurnSnapshot& snapshot,
                 core::ThreadPoolContext&,
                 SessionManager::SessionTurnAsyncFinish finish) mutable -> core::Status {
-                auto session = snapshot.state;
-                const auto user_input = request.user_input;
-                const auto context_id = request.context_id;
-                const auto persona_id = session.persona_id;
-                const auto compute_started_at = std::chrono::steady_clock::now();
-                auto prepared = PrepareChat(session, std::move(request));
-                if (!prepared.ok()) {
-                    return prepared.status();
+                auto operation = BeginAsyncTurnOperation(
+                    snapshot.state,
+                    std::move(request),
+                    response_holder,
+                    std::move(finish),
+                    submitted_at);
+                if (!operation.ok()) {
+                    return operation.status();
                 }
-                prepared.value().started_at = submitted_at;
-                prepared.value().latency.compute_queue_wait = Since(submitted_at);
-                prepared.value().latency.compute_stage = Since(compute_started_at);
-                prepared.value().io_submitted_at = std::chrono::steady_clock::now();
-
-                return CompleteWithLlmAsync(
-                    std::move(session),
-                    std::move(prepared).value(),
-                    [response_holder, user_input, context_id, persona_id, finish = std::move(finish)](
-                        core::Result<CompletedChat> completed) mutable {
-                        if (!completed.ok()) {
-                            finish(completed.status());
-                            return;
-                        }
-                        auto value = std::move(completed).value();
-                        SessionTurnCommit commit;
-                        commit.trace_id = value.response.trace_id;
-                        commit.turn.user_input = user_input;
-                        commit.turn.emotion = value.response.user_emotion.emotion.primary;
-                        commit.turn.intensity = value.response.user_emotion.emotion.intensity;
-                        commit.turn.behavior = value.response.user_emotion.behavior;
-                        commit.turn.tone = value.response.user_emotion.tone;
-                        commit.turn.response = value.response.response;
-                        commit.turn.context_id = context_id;
-                        commit.turn.persona_id = persona_id;
-                        commit.turn.valence = value.emotion_state.state().valence;
-                        commit.turn.arousal = value.emotion_state.state().arousal;
-                        commit.emotion_state = std::move(value.emotion_state);
-                        commit.latency = value.response.latency.total;
-                        *response_holder = std::move(value.response);
-                        finish(std::move(commit));
-                    });
+                return StartAsyncTurn(operation.value());
             },
             [response_holder, callback = std::move(callback)](
                 core::Result<SessionTurnReceipt> receipt) mutable {
@@ -451,10 +726,27 @@ core::Result<PersonaRuntime::PreparedChat> PersonaRuntime::PrepareChat(SessionSt
     prepared.started_at = started;
     prepared.request = std::move(request);
 
+    auto emotion = emotion_analyzer_->Analyze(
+        prepared.request.user_input,
+        prepared.request.trace_id,
+        session.personality);
+    if (!emotion.ok()) {
+        logger_.warn("[trace={}] [persona_runtime] user emotion failed session={} code={} reason={}",
+                     prepared.request.trace_id,
+                     session.session_id,
+                     static_cast<int>(emotion.status().code()),
+                     emotion.status().message());
+        return emotion.status();
+    }
+    logger_.info("[trace={}] [persona_runtime] user emotion done session={}",
+                 prepared.request.trace_id,
+                 session.session_id);
+
     const auto memory_start = std::chrono::steady_clock::now();
     std::vector<ConversationTurn> recent_copy(session.recent_history.begin(), session.recent_history.end());
     MemoryContextRequest memory_req;
     memory_req.session_id = session.session_id;
+    memory_req.tenant_id = session.tenant_id;
     memory_req.user_uuid = session.user_uuid;
     memory_req.persona_id = session.persona_id;
     memory_req.query = prepared.request.user_input;
@@ -475,7 +767,30 @@ core::Result<PersonaRuntime::PreparedChat> PersonaRuntime::PrepareChat(SessionSt
                      memory.status().message());
         return memory.status();
     }
-    prepared.memory = std::move(memory).value();
+    auto after_memory = PrepareChatBeforeEmotion(
+        session,
+        std::move(prepared.request),
+        std::move(memory).value(),
+        memory_start);
+    if (!after_memory.ok()) {
+        return after_memory.status();
+    }
+    return PrepareChatAfterEmotion(
+        session,
+        std::move(after_memory).value(),
+        std::move(recent_copy),
+        std::move(emotion).value());
+}
+
+core::Result<PersonaRuntime::PreparedChat> PersonaRuntime::PrepareChatBeforeEmotion(
+    SessionState& session,
+    ChatRequest request,
+    RecalledContext memory,
+    std::chrono::steady_clock::time_point memory_start) {
+    PreparedChat prepared;
+    prepared.started_at = memory_start;
+    prepared.request = std::move(request);
+    prepared.memory = std::move(memory);
     bool vision_tool_triggered = false;
     if (tool_memory_provider_) {
         ToolMemoryQuery tool_query;
@@ -539,21 +854,15 @@ core::Result<PersonaRuntime::PreparedChat> PersonaRuntime::PrepareChat(SessionSt
                  prepared.memory.l3_hit,
                  prepared.memory.l4_hit);
 
-    auto emotion = emotion_analyzer_->Analyze(prepared.request.user_input,
-                                              prepared.request.trace_id,
-                                              session.personality);
-    if (!emotion.ok()) {
-        logger_.warn("[trace={}] [persona_runtime] user emotion failed session={} code={} reason={}",
-                     prepared.request.trace_id,
-                     session.session_id,
-                     static_cast<int>(emotion.status().code()),
-                     emotion.status().message());
-        return emotion.status();
-    }
-    prepared.user_emotion = std::move(emotion).value();
-    logger_.info("[trace={}] [persona_runtime] user emotion done session={}",
-                 prepared.request.trace_id,
-                 session.session_id);
+    return prepared;
+}
+
+core::Result<PersonaRuntime::PreparedChat> PersonaRuntime::PrepareChatAfterEmotion(
+    SessionState& session,
+    PreparedChat prepared,
+    std::vector<ConversationTurn> recent_copy,
+    EmotionAnalysis emotion) {
+    prepared.user_emotion = std::move(emotion);
 
     auto calibration_status = MaybeRecordEmotionCalibrationSample(
         session,
@@ -680,6 +989,8 @@ core::Status PersonaRuntime::MaybeRecordEmotionCalibrationSample(
 
 core::Result<ChatResponse> PersonaRuntime::CompleteWithLlm(SessionState& session,
                                                             PreparedChat prepared) {
+    const auto turn_user_input = prepared.request.user_input;
+    const auto turn_context_id = prepared.request.context_id;
     const auto io_stage_start = std::chrono::steady_clock::now();
     std::optional<AnswerCacheLookupRequest> answer_cache_lookup;
     std::optional<AnswerCacheLookupResult> answer_cache_hit;
@@ -742,8 +1053,29 @@ core::Result<ChatResponse> PersonaRuntime::CompleteWithLlm(SessionState& session
     if (!finalized.ok()) {
         return finalized.status();
     }
-    session.emotion_state = finalized.value().emotion_state;
-    return std::move(finalized).value().response;
+    auto value = std::move(finalized).value();
+    ConversationTurn turn;
+    turn.user_input = turn_user_input;
+    turn.emotion = value.response.user_emotion.emotion.primary;
+    turn.intensity = value.response.user_emotion.emotion.intensity;
+    turn.behavior = value.response.user_emotion.behavior;
+    turn.tone = value.response.user_emotion.tone;
+    turn.response = value.response.response;
+    turn.context_id = turn_context_id;
+    turn.persona_id = session.persona_id;
+    turn.valence = value.emotion_state.state().valence;
+    turn.arousal = value.emotion_state.state().arousal;
+    auto admit_status = memory_provider_->AdmitTurn(
+        value.response.session_id,
+        session.tenant_id,
+        session.user_uuid,
+        turn,
+        value.response.trace_id);
+    if (!admit_status.ok()) {
+        return admit_status;
+    }
+    session.emotion_state = value.emotion_state;
+    return std::move(value.response);
 }
 
 core::Status PersonaRuntime::CompleteWithLlmAsync(
@@ -825,17 +1157,52 @@ core::Status PersonaRuntime::CompleteWithLlmAsync(
                     runtime->async_operations_drained_.notify_all();
                 }
             } cleanup{this, operation_id};
-            prepared.latency.llm_total = Since(llm_started_at);
-            if (!result.ok()) {
-                completion(result.status());
+            auto result_holder = std::make_shared<core::Result<llm::ChatCompletionResponse>>(
+                std::move(result));
+            auto finalize = [this,
+                             session = std::move(session),
+                             prepared = std::move(prepared),
+                             answer_cache_lookup = std::move(answer_cache_lookup),
+                             io_stage_start,
+                             llm_started_at,
+                             result_holder,
+                             completion = std::move(completion)]() mutable {
+                auto prepared_value = std::move(prepared);
+                prepared_value.latency.llm_total = Since(llm_started_at);
+                if (!result_holder->ok()) {
+                    completion(result_holder->status());
+                    return;
+                }
+                auto completion_holder =
+                    std::make_shared<std::function<void(core::Result<CompletedChat>)>>(
+                        std::move(completion));
+                auto status = FinalizeLlmCompletionAsync(
+                    std::move(session),
+                    std::move(prepared_value),
+                    std::move(*result_holder).value(),
+                    std::move(answer_cache_lookup),
+                    io_stage_start,
+                    *completion_holder);
+                if (!status.ok()) {
+                    (*completion_holder)(status);
+                }
+            };
+            if (!continuation_pool_) {
+                finalize();
                 return;
             }
-            completion(FinalizeLlmCompletion(
-                session,
-                std::move(prepared),
-                std::move(result).value(),
-                std::move(answer_cache_lookup),
-                io_stage_start));
+            auto finalize_holder = std::make_shared<std::function<void()>>(
+                std::move(finalize));
+            auto dispatch_status = continuation_pool_->Submit(
+                [finalize_holder](core::ThreadPoolContext&) mutable {
+                    (*finalize_holder)();
+                    return core::Status::Ok();
+                },
+                {},
+                "persona-llm-continuation");
+            if (!dispatch_status.ok()) {
+                (*finalize_holder)();
+            }
         });
     if (!submitted.ok()) {
         {
@@ -863,11 +1230,385 @@ core::Status PersonaRuntime::CompleteWithLlmAsync(
     return core::Status::Ok();
 }
 
+core::Result<std::shared_ptr<PersonaRuntime::AsyncTurnOperation>>
+PersonaRuntime::BeginAsyncTurnOperation(
+    SessionState session,
+    ChatRequest request,
+    std::shared_ptr<std::optional<ChatResponse>> response_holder,
+    SessionManager::SessionTurnAsyncFinish finish,
+    std::chrono::steady_clock::time_point submitted_at) {
+    auto operation = std::make_shared<AsyncTurnOperation>(
+        this,
+        std::move(session),
+        std::move(request),
+        std::move(response_holder),
+        std::move(finish),
+        submitted_at);
+    std::lock_guard lock(async_operations_mutex_);
+    if (async_stopping_) {
+        return core::Status::Error(core::ErrorCode::Cancelled,
+                                   "persona runtime is shutting down");
+    }
+    ++async_turn_operation_count_;
+    operation->armed.store(true, std::memory_order_release);
+    return operation;
+}
+
+core::Status PersonaRuntime::StartAsyncTurn(
+    const std::shared_ptr<AsyncTurnOperation>& operation) {
+    if (!operation->Transition(
+            AsyncTurnPhase::Admitted,
+            AsyncTurnPhase::UserEmotionPending)) {
+        return core::Status::Error(core::ErrorCode::FailedPrecondition,
+                                   "async turn entered an invalid emotion phase");
+    }
+
+    if (!async_emotion_analyzer_) {
+        auto emotion = emotion_analyzer_->Analyze(
+            operation->request.user_input,
+            operation->request.trace_id,
+            operation->session.personality);
+        OnAsyncUserEmotionCompleted(operation, std::move(emotion));
+        return core::Status::Ok();
+    }
+    return async_emotion_analyzer_->AnalyzeAsync(
+        operation->request.user_input,
+        operation->request.trace_id,
+        operation->session.personality,
+        [this, operation](core::Result<EmotionAnalysis> emotion) mutable {
+            OnAsyncUserEmotionCompleted(operation, std::move(emotion));
+        });
+}
+
+core::Status PersonaRuntime::StartAsyncMemoryLookup(
+    const std::shared_ptr<AsyncTurnOperation>& operation) {
+    if (!async_memory_provider_) {
+        auto recent_copy = std::vector<ConversationTurn>(
+            operation->session.recent_history.begin(),
+            operation->session.recent_history.end());
+        MemoryContextRequest request;
+        request.session_id = operation->session.session_id;
+        request.tenant_id = operation->session.tenant_id;
+        request.user_uuid = operation->session.user_uuid;
+        request.persona_id = operation->session.persona_id;
+        request.query = operation->request.user_input;
+        request.trace_id = operation->request.trace_id;
+        request.current_session_recent = recent_copy;
+        request.max_recent_turns = options_.recent_raw_turns;
+        const auto memory_start = std::chrono::steady_clock::now();
+        OnAsyncMemoryCompleted(
+            operation,
+            memory_start,
+            memory_provider_->BuildContext(request));
+        return core::Status::Ok();
+    }
+
+    AsyncMemoryContextRequest memory_request;
+    memory_request.session_id = operation->session.session_id;
+    memory_request.tenant_id = operation->session.tenant_id;
+    memory_request.user_uuid = operation->session.user_uuid;
+    memory_request.persona_id = operation->session.persona_id;
+    memory_request.query = operation->request.user_input;
+    memory_request.trace_id = operation->request.trace_id;
+    memory_request.current_session_recent.assign(
+        operation->session.recent_history.begin(),
+        operation->session.recent_history.end());
+    memory_request.max_recent_turns = options_.recent_raw_turns;
+    const auto memory_start = std::chrono::steady_clock::now();
+    logger_.info(
+        "[trace={}] [persona_runtime] async memory context start session={} user={} recent={}",
+        operation->request.trace_id,
+        operation->session.session_id,
+        operation->session.user_uuid,
+        memory_request.current_session_recent.size());
+
+    return async_memory_provider_->BuildContextAsync(
+        std::move(memory_request),
+        [this, operation, memory_start](core::Result<RecalledContext> memory) mutable {
+            OnAsyncMemoryCompleted(operation, memory_start, std::move(memory));
+        });
+}
+
+void PersonaRuntime::OnAsyncMemoryCompleted(
+    const std::shared_ptr<AsyncTurnOperation>& operation,
+    std::chrono::steady_clock::time_point memory_start,
+    core::Result<RecalledContext> memory) noexcept {
+    if (!operation->Transition(
+            AsyncTurnPhase::MemoryLookupPending,
+            AsyncTurnPhase::Preparing)) {
+        return;
+    }
+    try {
+        if (!memory.ok()) {
+            logger_.warn(
+                "[trace={}] [persona_runtime] async memory context failed session={} code={} reason={}",
+                operation->request.trace_id,
+                operation->session.session_id,
+                static_cast<int>(memory.status().code()),
+                memory.status().message());
+            operation->Finish(memory.status());
+            return;
+        }
+        std::vector<ConversationTurn> recent_copy(
+            operation->session.recent_history.begin(),
+            operation->session.recent_history.end());
+        if (!operation->user_emotion) {
+            operation->Finish(core::Status::Error(
+                core::ErrorCode::FailedPrecondition,
+                "user emotion is missing before memory continuation"));
+            return;
+        }
+        auto prepared = PrepareChatBeforeEmotion(
+            operation->session,
+            operation->request,
+            std::move(memory).value(),
+            memory_start);
+        if (!prepared.ok()) {
+            operation->Finish(prepared.status());
+            return;
+        }
+        ContinueAsyncTurn(
+            operation,
+            PrepareChatAfterEmotion(
+                operation->session,
+                std::move(prepared).value(),
+                std::move(recent_copy),
+                std::move(*operation->user_emotion)));
+    } catch (const std::exception& exception) {
+        operation->Finish(core::Status::Error(
+            core::ErrorCode::InternalError, exception.what()));
+    } catch (...) {
+        operation->Finish(core::Status::Error(
+            core::ErrorCode::Unknown,
+            "async memory continuation threw an unknown exception"));
+    }
+}
+
+void PersonaRuntime::OnAsyncUserEmotionCompleted(
+    const std::shared_ptr<AsyncTurnOperation>& operation,
+    core::Result<EmotionAnalysis> emotion) noexcept {
+    if (!operation->Transition(
+            AsyncTurnPhase::UserEmotionPending,
+            AsyncTurnPhase::MemoryLookupPending)) {
+        return;
+    }
+    try {
+        if (!emotion.ok()) {
+            logger_.warn(
+                "[trace={}] [persona_runtime] async user emotion failed session={} code={} reason={}",
+                operation->request.trace_id,
+                operation->session.session_id,
+                static_cast<int>(emotion.status().code()),
+                emotion.status().message());
+            operation->Finish(emotion.status());
+            return;
+        }
+        operation->user_emotion = std::move(emotion).value();
+        logger_.info(
+            "[trace={}] [persona_runtime] async user emotion done session={}",
+            operation->request.trace_id,
+            operation->session.session_id);
+        auto status = StartAsyncMemoryLookup(operation);
+        if (!status.ok()) {
+            operation->Finish(status);
+        }
+    } catch (const std::exception& exception) {
+        operation->Finish(core::Status::Error(
+            core::ErrorCode::InternalError, exception.what()));
+    } catch (...) {
+        operation->Finish(core::Status::Error(
+            core::ErrorCode::Unknown,
+            "async emotion continuation threw an unknown exception"));
+    }
+}
+
+void PersonaRuntime::ContinueAsyncTurn(
+    const std::shared_ptr<AsyncTurnOperation>& operation,
+    core::Result<PreparedChat> prepared) noexcept {
+    try {
+        if (!prepared.ok()) {
+            operation->Finish(prepared.status());
+            return;
+        }
+        if (!operation->Transition(
+                AsyncTurnPhase::Preparing,
+                AsyncTurnPhase::LlmPending)) {
+            return;
+        }
+        prepared.value().started_at = operation->submitted_at;
+        prepared.value().latency.compute_queue_wait = operation->compute_queue_wait;
+        prepared.value().latency.compute_stage = Since(operation->compute_started_at);
+        prepared.value().io_submitted_at = std::chrono::steady_clock::now();
+        auto status = CompleteWithLlmAsync(
+            operation->session,
+            std::move(prepared).value(),
+            [this, operation](core::Result<CompletedChat> completed) mutable {
+                OnAsyncLlmCompleted(operation, std::move(completed));
+            });
+        if (!status.ok()) {
+            operation->Finish(status);
+        }
+    } catch (const std::exception& exception) {
+        operation->Finish(core::Status::Error(
+            core::ErrorCode::InternalError, exception.what()));
+    } catch (...) {
+        operation->Finish(core::Status::Error(
+            core::ErrorCode::Unknown,
+            "async turn continuation threw an unknown exception"));
+    }
+}
+
+void PersonaRuntime::OnAsyncLlmCompleted(
+    const std::shared_ptr<AsyncTurnOperation>& operation,
+    core::Result<CompletedChat> completed) noexcept {
+    if (!operation->Transition(
+            AsyncTurnPhase::LlmPending,
+            AsyncTurnPhase::MemoryAdmissionPending)) {
+        return;
+    }
+    try {
+        if (!completed.ok()) {
+            operation->Finish(completed.status());
+            return;
+        }
+        auto value = std::move(completed).value();
+        auto completed_holder = std::make_shared<CompletedChat>(std::move(value));
+        auto async_admission =
+            std::dynamic_pointer_cast<IAsyncMemoryAdmissionProvider>(memory_provider_);
+        if (async_admission) {
+            auto status = async_admission->AdmitTurnAsync(
+                operation->session.session_id,
+                operation->session.tenant_id,
+                operation->session.user_uuid,
+                ConversationTurn{
+                    .user_input = operation->user_input,
+                    .emotion = completed_holder->response.user_emotion.emotion.primary,
+                    .intensity = completed_holder->response.user_emotion.emotion.intensity,
+                    .behavior = completed_holder->response.user_emotion.behavior,
+                    .tone = completed_holder->response.user_emotion.tone,
+                    .response = completed_holder->response.response,
+                    .context_id = operation->context_id,
+                    .persona_id = operation->persona_id,
+                    .valence = completed_holder->emotion_state.state().valence,
+                    .arousal = completed_holder->emotion_state.state().arousal},
+                completed_holder->response.trace_id,
+                [this, operation, completed_holder](core::Status status) mutable {
+                    OnAsyncMemoryAdmissionCompleted(
+                        operation, std::move(*completed_holder), std::move(status));
+                });
+            if (status.ok()) {
+                return;
+            }
+            if (operation->finished.load(std::memory_order_acquire)) {
+                return;
+            }
+            logger_.warn(
+                "[trace={}] [persona_runtime] async memory admission unavailable: {}",
+                operation->request.trace_id,
+                status.message());
+        }
+        if (memory_provider_) {
+            const ConversationTurn turn{
+                .user_input = operation->user_input,
+                .emotion = completed_holder->response.user_emotion.emotion.primary,
+                .intensity = completed_holder->response.user_emotion.emotion.intensity,
+                .behavior = completed_holder->response.user_emotion.behavior,
+                .tone = completed_holder->response.user_emotion.tone,
+                .response = completed_holder->response.response,
+                .context_id = operation->context_id,
+                .persona_id = operation->persona_id,
+                .valence = completed_holder->emotion_state.state().valence,
+                .arousal = completed_holder->emotion_state.state().arousal};
+            auto status = memory_provider_->AdmitTurn(
+                operation->session.session_id,
+                operation->session.tenant_id,
+                operation->session.user_uuid,
+                turn,
+                completed_holder->response.trace_id);
+            if (!status.ok()) {
+                logger_.warn(
+                    "[trace={}] [persona_runtime] memory admission failed after response: {}",
+                    operation->request.trace_id,
+                    status.message());
+            }
+        }
+        operation->phase.store(
+            AsyncTurnPhase::SessionCommitPending, std::memory_order_release);
+        FinishAsyncCompletedChat(operation, std::move(*completed_holder));
+    } catch (const std::exception& exception) {
+        operation->Finish(core::Status::Error(
+            core::ErrorCode::InternalError, exception.what()));
+    } catch (...) {
+        operation->Finish(core::Status::Error(
+            core::ErrorCode::Unknown,
+            "async LLM continuation threw an unknown exception"));
+    }
+}
+
+void PersonaRuntime::OnAsyncMemoryAdmissionCompleted(
+    const std::shared_ptr<AsyncTurnOperation>& operation,
+    CompletedChat completed,
+    core::Status status) noexcept {
+    if (!operation->Transition(
+            AsyncTurnPhase::MemoryAdmissionPending,
+            AsyncTurnPhase::SessionCommitPending)) {
+        return;
+    }
+    if (!status.ok()) {
+        logger_.warn(
+            "[trace={}] [persona_runtime] memory admission failed after response: {}",
+            operation->request.trace_id,
+            status.message());
+    }
+    FinishAsyncCompletedChat(operation, std::move(completed));
+}
+
+void PersonaRuntime::FinishAsyncCompletedChat(
+    const std::shared_ptr<AsyncTurnOperation>& operation,
+    CompletedChat value) noexcept {
+    try {
+        SessionTurnCommit commit;
+        commit.trace_id = value.response.trace_id;
+        commit.turn.user_input = operation->user_input;
+        commit.turn.emotion = value.response.user_emotion.emotion.primary;
+        commit.turn.intensity = value.response.user_emotion.emotion.intensity;
+        commit.turn.behavior = value.response.user_emotion.behavior;
+        commit.turn.tone = value.response.user_emotion.tone;
+        commit.turn.response = value.response.response;
+        commit.turn.context_id = operation->context_id;
+        commit.turn.persona_id = operation->persona_id;
+        commit.turn.valence = value.emotion_state.state().valence;
+        commit.turn.arousal = value.emotion_state.state().arousal;
+        commit.emotion_state = std::move(value.emotion_state);
+        commit.latency = value.response.latency.total;
+        *operation->response_holder = std::move(value.response);
+        operation->Finish(std::move(commit));
+    } catch (const std::exception& exception) {
+        operation->Finish(core::Status::Error(
+            core::ErrorCode::InternalError, exception.what()));
+    } catch (...) {
+        operation->Finish(core::Status::Error(
+            core::ErrorCode::Unknown,
+            "async LLM continuation threw an unknown exception"));
+    }
+}
+
+void PersonaRuntime::FinishAsyncTurnOperation() noexcept {
+    {
+        std::lock_guard lock(async_operations_mutex_);
+        if (async_turn_operation_count_ > 0) {
+            --async_turn_operation_count_;
+        }
+    }
+    async_operations_drained_.notify_all();
+}
+
 void PersonaRuntime::Shutdown() noexcept {
     std::vector<std::shared_ptr<llm::IAsyncLlmOperation>> operations;
     {
         std::lock_guard lock(async_operations_mutex_);
-        if (async_stopping_ && async_operations_.empty()) {
+        if (async_stopping_ && async_operations_.empty() &&
+            async_turn_operation_count_ == 0) {
             return;
         }
         async_stopping_ = true;
@@ -882,7 +1623,9 @@ void PersonaRuntime::Shutdown() noexcept {
         operation->Cancel();
     }
     std::unique_lock lock(async_operations_mutex_);
-    async_operations_drained_.wait(lock, [this] { return async_operations_.empty(); });
+    async_operations_drained_.wait(lock, [this] {
+        return async_operations_.empty() && async_turn_operation_count_ == 0;
+    });
 }
 
 core::Result<PersonaRuntime::CompletedChat> PersonaRuntime::FinalizeLlmCompletion(
@@ -910,42 +1653,127 @@ core::Result<PersonaRuntime::CompletedChat> PersonaRuntime::FinalizeLlmCompletio
         return ai_emotion.status();
     }
 
-    ConversationTurn turn;
-    turn.user_input = prepared.request.user_input;
-    turn.emotion = prepared.user_emotion.emotion.primary;
-    turn.intensity = prepared.user_emotion.emotion.intensity;
-    turn.behavior = prepared.user_emotion.behavior;
-    turn.tone = prepared.user_emotion.tone;
-    turn.response = completion.content;
-    turn.context_id = prepared.request.context_id;
-    turn.persona_id = session.persona_id;
+    return FinalizeLlmCompletionAfterEmotion(
+        session,
+        std::move(prepared),
+        std::move(completion),
+        std::move(ai_emotion).value(),
+        io_stage_start);
+}
+
+core::Status PersonaRuntime::FinalizeLlmCompletionAsync(
+    SessionState session,
+    PreparedChat prepared,
+    llm::ChatCompletionResponse llm_completion,
+    std::optional<AnswerCacheLookupRequest> answer_cache_lookup,
+    std::chrono::steady_clock::time_point io_stage_start,
+    std::function<void(core::Result<CompletedChat>)> completion) {
+    if (!completion) {
+        return core::Status::Error(core::ErrorCode::InvalidArgument,
+                                   "LLM finalization completion is required");
+    }
+    if (answer_cache_provider_ && answer_cache_lookup) {
+        AnswerCacheStoreRequest store;
+        store.lookup = std::move(*answer_cache_lookup);
+        store.response = llm_completion.content;
+        auto store_status = answer_cache_provider_->Store(store);
+        if (!store_status.ok()) {
+            return store_status;
+        }
+    }
+    prepared.latency.total = Since(prepared.started_at);
+    prepared.latency.io_stage = Since(io_stage_start);
+
+    if (!async_emotion_analyzer_) {
+        auto emotion = emotion_analyzer_->Analyze(
+            llm_completion.content,
+            prepared.request.trace_id,
+            session.personality);
+        if (!emotion.ok()) {
+            completion(emotion.status());
+        } else {
+            completion(FinalizeLlmCompletionAfterEmotion(
+                session,
+                std::move(prepared),
+                std::move(llm_completion),
+                std::move(emotion).value(),
+                io_stage_start));
+        }
+        return core::Status::Ok();
+    }
+
+    auto state = std::make_shared<std::tuple<
+        SessionState,
+        PreparedChat,
+        llm::ChatCompletionResponse,
+        std::function<void(core::Result<CompletedChat>)>>>(
+            std::move(session),
+            std::move(prepared),
+            std::move(llm_completion),
+            std::move(completion));
+    const auto text = std::get<2>(*state).content;
+    const auto trace_id = std::get<1>(*state).request.trace_id;
+    const auto personality = std::get<0>(*state).personality;
+    return async_emotion_analyzer_->AnalyzeAsync(
+        text,
+        trace_id,
+        personality,
+        [this, state, io_stage_start](core::Result<EmotionAnalysis> emotion) mutable {
+            auto finish = [this, state, io_stage_start,
+                           emotion_holder = std::make_shared<core::Result<EmotionAnalysis>>(
+                               std::move(emotion))]() mutable {
+                auto completion = std::move(std::get<3>(*state));
+                if (!emotion_holder->ok()) {
+                    completion(emotion_holder->status());
+                    return;
+                }
+                completion(FinalizeLlmCompletionAfterEmotion(
+                    std::get<0>(*state),
+                    std::move(std::get<1>(*state)),
+                    std::move(std::get<2>(*state)),
+                    std::move(*emotion_holder).value(),
+                    io_stage_start));
+            };
+            if (!continuation_pool_) {
+                finish();
+                return;
+            }
+            auto holder = std::make_shared<std::function<void()>>(std::move(finish));
+            auto status = continuation_pool_->Submit(
+                [holder](core::ThreadPoolContext&) mutable {
+                    (*holder)();
+                    return core::Status::Ok();
+                },
+                {},
+                "persona-ai-emotion-continuation");
+            if (!status.ok()) {
+                (*holder)();
+            }
+        });
+}
+
+core::Result<PersonaRuntime::CompletedChat>
+PersonaRuntime::FinalizeLlmCompletionAfterEmotion(
+    SessionState& session,
+    PreparedChat prepared,
+    llm::ChatCompletionResponse completion,
+    EmotionAnalysis ai_emotion,
+    std::chrono::steady_clock::time_point) {
 
     auto state_update = session.emotion_state.Update(
         prepared.user_emotion.emotion.primary,
         prepared.user_emotion.emotion.intensity,
-        ai_emotion.value().emotion.primary,
-        ai_emotion.value().emotion.intensity);
+        ai_emotion.emotion.primary,
+        ai_emotion.emotion.intensity);
     if (!state_update.ok()) {
         return state_update.status();
     }
-    turn.valence = state_update.value().valence;
-    turn.arousal = state_update.value().arousal;
-
-    auto admit_status = memory_provider_->AdmitTurn(
-        prepared.request.session_id,
-        session.user_uuid,
-        turn,
-        prepared.request.trace_id);
-    if (!admit_status.ok()) {
-        return admit_status;
-    }
-
     ChatResponse response;
     response.session_id = prepared.request.session_id;
     response.trace_id = prepared.request.trace_id;
     response.response = completion.content;
     response.user_emotion = prepared.user_emotion;
-    response.ai_emotion = std::move(ai_emotion).value();
+    response.ai_emotion = std::move(ai_emotion);
     response.l0_hit = prepared.memory.l0_hit;
     response.l3_hit = prepared.memory.l3_hit;
     response.l4_hit = prepared.memory.l4_hit;

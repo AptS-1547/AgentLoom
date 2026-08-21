@@ -188,8 +188,8 @@ Value: 序列化的 CacheRecord
 11. `tools/redis_stress_test.cpp` ✅ - 压测工具
 
 **文档**:
-11. `docs/REDIS_PLUSPLUS_MIGRATION.md` - 迁移指南 ✅
-12. `docs/REDIS_COMPATIBILITY.md` - 保留历史记录
+11. `docs/archive/REDIS_PLUSPLUS_MIGRATION.md` - 迁移指南 ✅
+12. `docs/data/REDIS_COMPATIBILITY.md` - 保留历史记录
 
 ---
 

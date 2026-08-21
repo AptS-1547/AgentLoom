@@ -129,5 +129,5 @@
 10. `tools/l3_compression_e2e_test.cpp` - E2E 测试
 
 **文档（未修改）：**
-- `docs/REDIS_COMPATIBILITY.md` - 保留历史记录
-- `docs/INFRASTRUCTURE_PLAN.md` - 保留参考
+- `docs/data/REDIS_COMPATIBILITY.md` - 保留历史记录
+- `docs/archive/INFRASTRUCTURE_PLAN.md` - 保留参考

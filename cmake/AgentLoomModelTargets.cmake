@@ -82,6 +82,8 @@ add_library(agent_vector STATIC
     src/vector/onnx_text_embedding_model.h
     src/vector/embedding_pipeline.cpp
     src/vector/embedding_pipeline.h
+    src/vector/embedding_batch_coordinator.cpp
+    src/vector/embedding_batch_coordinator.h
     src/vector/vector_index.h
     src/vector/exact_vector_index.cpp
     src/vector/exact_vector_index.h
@@ -113,6 +115,7 @@ if(BERT_BUILD_TESTS)
         tests/vector/hf_tokenizer_test.cpp
         tests/vector/tokenizer_pool_test.cpp
         tests/vector/text_embedding_test.cpp
+        tests/vector/embedding_batch_coordinator_test.cpp
         tests/vector/vlm_vector_cache_test.cpp
         tests/vector/vector_index_test.cpp
         tests/vector/vector_index_manager_test.cpp
@@ -133,6 +136,16 @@ if(BERT_BUILD_TESTS)
     endforeach()
 
     gtest_discover_tests(vector_tests DISCOVERY_MODE PRE_TEST)
+endif()
+
+if(AGENTLOOM_BUILD_TOOLS)
+    add_executable(embedding_batch_coordinator_bench
+        tests/vector/embedding_batch_coordinator_bench.cpp
+    )
+    target_link_libraries(embedding_batch_coordinator_bench PRIVATE
+        agent_vector
+        agent_core
+    )
 endif()
 
 add_library(agent_config STATIC

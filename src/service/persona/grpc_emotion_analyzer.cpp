@@ -107,7 +107,7 @@ std::size_t ArgMax(const std::vector<double>& values) {
 GrpcEmotionAnalyzer::GrpcEmotionAnalyzer(GrpcEmotionAnalyzerOptions options,
                                          std::shared_ptr<::vector::HfTokenizer> tokenizer)
     : GrpcEmotionAnalyzer(
-          std::move(options),
+          options,
           std::move(tokenizer),
           grpc::CreateChannel(options.target, grpc::InsecureChannelCredentials())) {}
 
@@ -163,6 +163,78 @@ core::Result<EmotionAnalysis> GrpcEmotionAnalyzer::Analyze(
         return core::Status::Error(core::ErrorCode::InternalError, response.error());
     }
     return BuildAnalysis(response);
+}
+
+core::Status GrpcEmotionAnalyzer::AnalyzeAsync(
+    std::string text,
+    std::string trace_id,
+    std::shared_ptr<const PersonalityConfig> personality,
+    AnalyzeCompletion completion) {
+    if (!completion) {
+        return core::Status::Error(core::ErrorCode::InvalidArgument,
+                                   "emotion completion is required");
+    }
+    if (!stub_) {
+        return core::Status::Error(core::ErrorCode::FailedPrecondition,
+                                   "emotion grpc stub is not initialized");
+    }
+    if (!tokenizer_ || !tokenizer_->valid()) {
+        return core::Status::Error(core::ErrorCode::FailedPrecondition,
+                                   "emotion tokenizer is not initialized");
+    }
+    if (text.empty()) {
+        return core::Status::Error(core::ErrorCode::InvalidArgument,
+                                   "emotion text is required");
+    }
+
+    std::unique_lock lock(tokenizer_mutex_);
+    auto tokenized = tokenizer_->Encode(text, options_.tokenizer_options);
+    lock.unlock();
+    if (!tokenized.ok()) {
+        return tokenized.status();
+    }
+
+    struct AsyncCall final {
+        grpc::ClientContext context;
+        multimodal_inference::EmotionRequest request;
+        multimodal_inference::EmotionResponse response;
+        AnalyzeCompletion completion;
+    };
+    auto call = std::make_shared<AsyncCall>();
+    call->request.mutable_input_ids()->Add(
+        tokenized.value().input_ids.begin(), tokenized.value().input_ids.end());
+    call->request.mutable_attention_mask()->Add(
+        tokenized.value().attention_mask.begin(), tokenized.value().attention_mask.end());
+    const auto personality_vector = BuildPersonalityVector(std::move(personality));
+    call->request.mutable_personality()->Add(
+        personality_vector.begin(), personality_vector.end());
+    call->context.set_deadline(std::chrono::system_clock::now() + options_.deadline);
+    if (!options_.auth_token.empty()) {
+        call->context.AddMetadata(options_.auth_metadata_key, options_.auth_token);
+    }
+    if (!trace_id.empty()) {
+        call->context.AddMetadata("x-trace-id", std::move(trace_id));
+    }
+    call->completion = std::move(completion);
+
+    stub_->async()->PredictEmotion(
+        &call->context,
+        &call->request,
+        &call->response,
+        [call](grpc::Status status) mutable {
+            auto completion = std::move(call->completion);
+            if (!status.ok()) {
+                completion(FromGrpcStatus(status));
+                return;
+            }
+            if (!call->response.error().empty()) {
+                completion(core::Status::Error(
+                    core::ErrorCode::InternalError, call->response.error()));
+                return;
+            }
+            completion(BuildAnalysis(call->response));
+        });
+    return core::Status::Ok();
 }
 
 core::Result<std::vector<EmotionAnalysis>> GrpcEmotionAnalyzer::AnalyzeBatch(

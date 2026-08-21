@@ -648,7 +648,7 @@ RTC 关键帧编码和 Gateway producer adapter 已完成。`GStreamerVideoFrame
 
 首轮准 E2E 数据显示，4 session x 15 FPS、4 worker x 20 ms 时 selected 帧零丢失且事件覆盖 100%；8 session x 30 FPS、2 worker x 100 ms 时 selected 帧已有 77.4% 在 receiver -> private backlog admission 被拒绝，但 16/16 事件仍至少保留一帧；VLM 延迟增加到 250-300 ms 后 selected 帧丢失达到 89.9%-91.8%，高 saliency 丢失达到 97.4%-98.7%，事件覆盖下降到 37.5%-50%。compute queue、编码、IO queue 和 IPC publish 在四组场景中均未丢帧，说明当前首要结构性瓶颈是 VLM 服务率与 `RejectNewest` backlog admission，而不是共享内存数据面吞吐。
 
-因此 sampler 后的帧不能继续沿用普通原始视频帧的无差别丢弃语义。项目媒体管线绑定有限 `SkillSession`，目标生产路径调整为推理端 private file-backed mapped spool：selected frame 正常路径无静默丢失，流结束后通过 Seal expected-count fence 完成 VLM drain 和事件 finalize，再结束 Skill。任何策略都不得覆盖 shared-memory claimed/in-flight slot；普通丢弃策略只作为异常资源耗尽兜底。完整生命周期与当前 Skill 实现校准见 `docs/SKILL_MEDIA_DRAIN_SPOOL_DESIGN.md`。
+因此 sampler 后的帧不能继续沿用普通原始视频帧的无差别丢弃语义。项目媒体管线绑定有限 `SkillSession`，目标生产路径调整为推理端 private file-backed mapped spool：selected frame 正常路径无静默丢失，流结束后通过 Seal expected-count fence 完成 VLM drain 和事件 finalize，再结束 Skill。任何策略都不得覆盖 shared-memory claimed/in-flight slot；普通丢弃策略只作为异常资源耗尽兜底。完整生命周期与当前 Skill 实现校准见 `docs/architecture/SKILL_MEDIA_DRAIN_SPOOL_DESIGN.md`。
 
 ## 6. 实施路线图
 

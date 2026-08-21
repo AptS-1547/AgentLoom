@@ -17,7 +17,7 @@ The current C++ work is not a simple language port. It is a system-level upgrade
 - A static frontend deployment model without Vite dev server or ADP-specific runtime dependencies.
 - A codebase that can be migrated into the enterprise project after additional security hardening.
 
-The old frontend under `D:\front_end\Train` is treated as a functional reference, not as a protocol contract. Its ADP/qbot/Vite-dev-server integration should not define the new production API.
+The old frontend under `<legacy-frontend-root>` is treated as a functional reference, not as a protocol contract. Its ADP/qbot/Vite-dev-server integration should not define the new production API.
 
 ## 2. Fixed Deployment Boundary
 
@@ -560,7 +560,7 @@ C++ service modules define the enterprise migration boundary.
 
 ## 13. Infrastructure Reuse and Library Packaging
 
-The current infrastructure is considered a reusable asset, not a temporary competition-only implementation. The performance report in `docs/PERFORMANCE_REPORT.md` shows that the core C++ infrastructure already has strong hot-path behavior:
+The current infrastructure is considered a reusable asset, not a temporary competition-only implementation. The performance report in `docs/performance/PERFORMANCE_REPORT.md` shows that the core C++ infrastructure already has strong hot-path behavior:
 
 - CPU embedding E2E latency is approximately 4 ms in single-item mode.
 - CPU batch embedding reaches hundreds of QPS.

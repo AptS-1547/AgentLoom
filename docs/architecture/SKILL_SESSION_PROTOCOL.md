@@ -47,7 +47,7 @@ Skill Session 是一次有生命周期的 Skill 执行实例。它不同于一�
 仓库当前所有媒体 Skill 都必须是有限流，并受 `max_duration` 约束；不支持无限媒体监控，也不允许通过异常大的 duration 等价构造无限流。媒体 Skill 的 selected-frame 映射缓存、Seal、drain 和关闭屏障设计见：
 
 ```text
-docs/SKILL_MEDIA_DRAIN_SPOOL_DESIGN.md
+docs/architecture/SKILL_MEDIA_DRAIN_SPOOL_DESIGN.md
 ```
 
 ### 2.3 L4 Tool Memory
@@ -540,7 +540,7 @@ closing_timeout:
 视觉 profile 的详细协议见：
 
 ```text
-docs/VISUAL_TOOL_SESSION_PROTOCOL.md
+docs/archive/VISUAL_TOOL_SESSION_PROTOCOL.md
 ```
 
 ## 14. 当前实现状态

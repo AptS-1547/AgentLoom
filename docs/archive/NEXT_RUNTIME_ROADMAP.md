@@ -787,8 +787,8 @@ public:
 - Adaptive quality scaling (reduce resolution under CPU pressure)
 
 **References**:
-- Detailed algorithm specifications: `docs/STREAMING_ARCHITECTURE.md`
-- Integration with business logic: `dev_note/FUTURE_PLAN.md` (Section 11-12)
+- Detailed algorithm specifications: `docs/architecture/STREAMING_ARCHITECTURE.md`
+- Integration with business logic: see the internal future-planning record; it is not part of the public documentation contract.
 
 ## 6. Discussion Anchors for Next Session
 

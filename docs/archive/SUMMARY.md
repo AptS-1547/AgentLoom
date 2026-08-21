@@ -221,9 +221,9 @@
 
 ## 📚 相关文档
 
-- [完整架构方案](./COMMERCIAL_ARCHITECTURE.md)
-- [架构图](./ARCHITECTURE_DIAGRAM.md)
-- [端到端测试报告](./E2E_TEST_AND_EMOTION_PIPELINE.md)
+- [完整架构方案](COMMERCIAL_ARCHITECTURE.md)
+- [架构图](ARCHITECTURE_DIAGRAM.md)
+- [端到端测试报告](../performance/E2E_TEST_AND_EMOTION_PIPELINE.md)
 - [AgentBackendPredict README](../README.md)
 
 ---

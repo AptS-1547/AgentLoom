@@ -119,6 +119,39 @@ L0MemoryCacheAdapter::L0MemoryCacheAdapter(
       max_cached_records_(max_cached_records),
       options_(options) {}
 
+L0MemoryCacheAdapter::~L0MemoryCacheAdapter() {
+    ShutdownBatching();
+}
+
+core::Status L0MemoryCacheAdapter::ConfigureBatching(
+    core::ThreadPool& compute_pool,
+    core::ThreadPool& completion_pool,
+    ::vector::EmbeddingBatchCoordinatorOptions options) {
+    if (!embedding_) {
+        return core::Status::Error(core::ErrorCode::FailedPrecondition,
+                                   "L0 embedding pipeline is not initialized");
+    }
+    options.completion_pool = &completion_pool;
+    auto provider = std::make_shared<::vector::EmbeddingPipelineBatchProvider>(embedding_);
+    batch_coordinator_ = std::make_shared<::vector::EmbeddingBatchCoordinator>(
+        compute_pool, std::move(provider), options,
+        core::LoggerAdapter::ForModule("l0-embedding-batch"));
+    return core::Status::Ok();
+}
+
+core::Status L0MemoryCacheAdapter::StartBatching() {
+    if (!batch_coordinator_) {
+        return core::Status::Ok();
+    }
+    return batch_coordinator_->Start();
+}
+
+void L0MemoryCacheAdapter::ShutdownBatching() noexcept {
+    if (batch_coordinator_) {
+        batch_coordinator_->Shutdown();
+    }
+}
+
 core::Result<std::shared_ptr<L0MemoryCacheAdapter::SessionIndexEntry>> L0MemoryCacheAdapter::ResolveIndex(
     const CacheLookupRequest& req) {
     if (fixed_index_entry_) {
@@ -171,7 +204,9 @@ void L0MemoryCacheAdapter::ReleaseSession(std::string_view session_id) {
     per_session_indices_.erase(std::string(session_id));
 }
 
-core::Result<CacheLookupResult> L0MemoryCacheAdapter::Lookup(const CacheLookupRequest& req) {
+core::Result<CacheLookupResult> L0MemoryCacheAdapter::LookupWithEmbedding(
+    const CacheLookupRequest& req,
+    const std::vector<float>& query_embedding) {
     if (!embedding_ || (!index_ && !redis_pool_)) {
         return core::Status::Error(core::ErrorCode::FailedPrecondition, "L0 memory adapter is not initialized");
     }
@@ -179,10 +214,6 @@ core::Result<CacheLookupResult> L0MemoryCacheAdapter::Lookup(const CacheLookupRe
         return CacheLookupResult{};
     }
 
-    auto query_embedding = embedding_->Encode(req.text);
-    if (!query_embedding.ok()) {
-        return query_embedding.status();
-    }
     auto entry = ResolveIndex(req);
     if (!entry.ok()) {
         return entry.status();
@@ -196,7 +227,7 @@ core::Result<CacheLookupResult> L0MemoryCacheAdapter::Lookup(const CacheLookupRe
     core::Result<std::vector<cache_vector::SearchWithContextResult>> hits = [&] {
         std::lock_guard lock(entry.value()->operation_mutex);
         return entry.value()->index->SearchWithContext(
-            query_embedding.value(), candidate_k, options_.neighbors_per_hit);
+            query_embedding, candidate_k, options_.neighbors_per_hit);
     }();
     if (!hits.ok()) {
         if (hits.status().code() == core::ErrorCode::NotFound) {
@@ -259,6 +290,74 @@ core::Result<CacheLookupResult> L0MemoryCacheAdapter::Lookup(const CacheLookupRe
     return result;
 }
 
+core::Result<CacheLookupResult> L0MemoryCacheAdapter::Lookup(const CacheLookupRequest& req) {
+    if (!embedding_) {
+        return core::Status::Error(core::ErrorCode::FailedPrecondition,
+                                   "L0 memory adapter is not initialized");
+    }
+    if (req.text.empty()) {
+        return CacheLookupResult{};
+    }
+    auto query_embedding = embedding_->Encode(req.text);
+    if (!query_embedding.ok()) {
+        return query_embedding.status();
+    }
+    return LookupWithEmbedding(req, query_embedding.value());
+}
+
+core::Status L0MemoryCacheAdapter::LookupAsync(
+    CacheLookupRequest request,
+    LookupCompletion completion) {
+    if (!completion) {
+        return core::Status::Error(core::ErrorCode::InvalidArgument,
+                                   "L0 lookup completion is required");
+    }
+    if (!batch_coordinator_) {
+        try {
+            completion(Lookup(request));
+        } catch (...) {
+            return core::Status::Error(core::ErrorCode::InternalError,
+                                       "L0 lookup completion threw an exception");
+        }
+        return core::Status::Ok();
+    }
+    if (request.text.empty()) {
+        try {
+            completion(CacheLookupResult{});
+        } catch (...) {
+            return core::Status::Error(core::ErrorCode::InternalError,
+                                       "L0 lookup completion threw an exception");
+        }
+        return core::Status::Ok();
+    }
+
+    auto self = weak_from_this().lock();
+    if (!self) {
+        return core::Status::Error(
+            core::ErrorCode::FailedPrecondition,
+            "asynchronous L0 lookup requires shared adapter ownership");
+    }
+    auto request_holder = std::make_shared<CacheLookupRequest>(std::move(request));
+    return batch_coordinator_->Submit({
+        .session_id = request_holder->session_id,
+        .tenant_id = request_holder->tenant_id,
+        .user_uuid = request_holder->user_id,
+        .trace_id = request_holder->extra.contains("trace_id")
+            ? request_holder->extra.at("trace_id")
+            : std::string{},
+        .text = request_holder->text,
+        .completion = [self = std::move(self), request_holder,
+                       completion = std::move(completion)](
+            core::Result<std::vector<float>> embedding) mutable {
+            if (!embedding.ok()) {
+                completion(embedding.status());
+                return;
+            }
+            completion(self->LookupWithEmbedding(*request_holder, embedding.value()));
+        },
+    });
+}
+
 core::Status L0MemoryCacheAdapter::Store(const CacheStoreRequest& req) {
     if (!embedding_ || (!index_ && !redis_pool_)) {
         return core::Status::Error(core::ErrorCode::FailedPrecondition, "L0 memory adapter is not initialized");
@@ -271,13 +370,72 @@ core::Status L0MemoryCacheAdapter::Store(const CacheStoreRequest& req) {
     if (!text_embedding.ok()) {
         return text_embedding.status();
     }
+    return StoreWithEmbedding(req, std::move(text_embedding).value());
+}
+
+core::Status L0MemoryCacheAdapter::StoreAsync(
+    CacheStoreRequest request,
+    StoreCompletion completion) {
+    if (!completion) {
+        return core::Status::Error(core::ErrorCode::InvalidArgument,
+                                   "L0 store completion is required");
+    }
+    if (!batch_coordinator_) {
+        try {
+            completion(Store(request));
+        } catch (...) {
+            return core::Status::Error(core::ErrorCode::InternalError,
+                                       "L0 store completion threw an exception");
+        }
+        return core::Status::Ok();
+    }
+    if (request.origin.text.empty() || request.response_payload.empty()) {
+        try {
+            completion(core::Status::Ok());
+        } catch (...) {
+            return core::Status::Error(core::ErrorCode::InternalError,
+                                       "L0 store completion threw an exception");
+        }
+        return core::Status::Ok();
+    }
+    auto self = weak_from_this().lock();
+    if (!self) {
+        return core::Status::Error(
+            core::ErrorCode::FailedPrecondition,
+            "asynchronous L0 store requires shared adapter ownership");
+    }
+    auto request_holder = std::make_shared<CacheStoreRequest>(std::move(request));
+    return batch_coordinator_->Submit({
+        .session_id = request_holder->origin.session_id,
+        .tenant_id = request_holder->origin.tenant_id,
+        .user_uuid = request_holder->origin.user_id,
+        .trace_id = request_holder->origin.extra.contains("trace_id")
+            ? request_holder->origin.extra.at("trace_id")
+            : std::string{},
+        .text = request_holder->origin.text,
+        .completion = [self = std::move(self), request_holder,
+                       completion = std::move(completion)](
+            core::Result<std::vector<float>> embedding) mutable {
+            if (!embedding.ok()) {
+                completion(embedding.status());
+                return;
+            }
+            completion(self->StoreWithEmbedding(
+                *request_holder, std::move(embedding).value()));
+        },
+    });
+}
+
+core::Status L0MemoryCacheAdapter::StoreWithEmbedding(
+    const CacheStoreRequest& req,
+    std::vector<float> text_embedding) {
     auto entry = ResolveIndex(req.origin);
     if (!entry.ok()) {
         return entry.status();
     }
 
     storage::CacheRecord record;
-    record.embedding = std::move(text_embedding).value();
+    record.embedding = std::move(text_embedding);
     record.input = req.origin.text;
     record.response = req.response_payload;
     record.metadata.scope = req.origin.scope;

@@ -168,7 +168,8 @@ PersonaGatewayServer::PersonaGatewayServer(PersonaGatewayServerOptions options,
                dependencies_.skill_session_manager,
                logger_,
                nullptr,
-               dependencies_.async_llm_client),
+               dependencies_.async_llm_client,
+               &llm_pool_),
       classroom_scheduler_({}, core::LoggerAdapter::ForModule("classroom")),
       gateway_metadata_pool_(MakeGatewayMetadataPool(options_.auth)),
       auth_session_store_(MakeAuthSessionStore(options_.auth, auth_redis_, gateway_metadata_pool_)),
@@ -213,6 +214,17 @@ PersonaGatewayServer::PersonaGatewayServer(PersonaGatewayServerOptions options,
         sessions_.SetSessionClosedCallback([l0 = std::move(l0)](const persona::SessionSnapshot& snapshot) {
             l0->ReleaseSession(snapshot.session_id);
         });
+        if (options_.embedding_batch.enabled) {
+            ::vector::EmbeddingBatchCoordinatorOptions batch_options;
+            batch_options.max_pending_requests =
+                options_.embedding_batch.max_pending_requests;
+            batch_options.max_batch_size = options_.embedding_batch.max_batch_size;
+            batch_options.max_batch_wait = options_.embedding_batch.max_batch_wait;
+            batch_options.max_inflight_batches =
+                options_.embedding_batch.max_inflight_batches;
+            lifecycle_configuration_status_ = dependencies_.l0_memory_adapter->ConfigureBatching(
+                compute_pool_, io_pool_, batch_options);
+        }
     }
     if (options_.static_files) {
         static_files_ = std::make_shared<::net::StaticFileHandler>(*options_.static_files);
@@ -247,7 +259,9 @@ PersonaGatewayServer::PersonaGatewayServer(PersonaGatewayServerOptions options,
     http_server_.SetWebSocketCloseHandler([this](const ::net::ConnectionCloseInfo& close_info) {
         HandleWebSocketClose(close_info);
     });
-    lifecycle_configuration_status_ = ConfigureLifecycle();
+    if (lifecycle_configuration_status_.ok()) {
+        lifecycle_configuration_status_ = ConfigureLifecycle();
+    }
 }
 
 PersonaGatewayServer::~PersonaGatewayServer() {
@@ -331,6 +345,18 @@ core::Status PersonaGatewayServer::ConfigureLifecycle() {
         });
     if (!status.ok()) {
         return status;
+    }
+    if (dependencies_.l0_memory_adapter && options_.embedding_batch.enabled) {
+        status = register_component(
+            "embedding-batch",
+            [this]() { return dependencies_.l0_memory_adapter->StartBatching(); },
+            [this](std::chrono::steady_clock::time_point) {
+                dependencies_.l0_memory_adapter->ShutdownBatching();
+                return core::Status::Ok();
+            });
+        if (!status.ok()) {
+            return status;
+        }
     }
     status = register_component(
         "llm-pool",

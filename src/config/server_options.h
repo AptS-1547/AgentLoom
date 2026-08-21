@@ -34,6 +34,11 @@ struct EmbeddingModelOptions {
     bool normalize = true;
     int expected_dimension = 0;
     bool require_token_type_ids = false;
+    bool batch_enabled = true;
+    std::size_t batch_max_pending_requests = 1024;
+    std::size_t batch_max_size = 16;
+    int batch_max_wait_ms = 2;
+    std::size_t batch_max_inflight = 1;
 };
 
 struct BertRuntimeConfigOptions {

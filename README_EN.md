@@ -6,7 +6,7 @@
 
 [![C++20](https://img.shields.io/badge/C%2B%2B-20-blue.svg)](https://isocpp.org/)
 [![CMake](https://img.shields.io/badge/CMake-3.20+-green.svg)](https://cmake.org/)
-[![Tests](https://img.shields.io/badge/CTest-420_passing-brightgreen.svg)](#tests)
+[![Tests](https://img.shields.io/badge/CTest-E2E%20%2B%20unit-brightgreen.svg)](#tests)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 ## Overview
@@ -20,19 +20,19 @@ The current version is `0.1.0` and remains under active development. It is suita
 ## Core Features
 
 - **Composable architecture**: Core capabilities exposed as CMake targets—integrate as libraries or deploy as standalone servers.
-- **Complete hot path**: End-to-end C++ implementation from WebSocket connection through session management, memory recall, emotion sensing, to LLM generation—avoiding cross-language boundary overhead.
+- **Fully asynchronous chat hot path**: Strict same-session ordering with continuation-based user/AI emotion, L0 lookup, cloud LLM, and memory store; external waits release business workers while different sessions progress concurrently.
 - **Real-time multimodal sensing**: Complete pipeline from browser camera WebRTC input, GStreamer decoding, OpenCV dynamic frame sampling, to VLM inference.
 - **Inference cost optimization**: Semantic cache, prompt KV cache, and VLM result cache coordinate to reduce redundant inference overhead; VRAM guard supports low-memory scenarios and OOM degradation.
 - **Clear process boundaries**: BERT and VLM inference as independent gRPC processes supporting containerization and independent scaling; gateway connects via gRPC or shared-memory IPC.
-- **Production-grade engineering**: 420+ unit and cross-process E2E tests covering concurrency paths, error recovery, and resource cleanup; unified error model via `core::Status`/`Result`.
+- **Production-grade engineering**: Maintained unit, cross-process E2E, and capacity tests cover concurrency, error recovery, resource cleanup, and structured overload rejection; unified error model via `core::Status`/`Result`.
 
 ## Implemented Capabilities
 
 - **Gateway runtime**: Unified HTTP/WebSocket entry, JWT/cookie authentication, static file hosting, request filtering, backpressure, and runtime maintenance tasks.
-- **Agent runtime**: Persona, session, skill session, multi-persona scheduling, proactive speech state machine, trace and emotion state persistence.
+- **Agent runtime**: Persona, session, skill session, multi-persona scheduling, deferred session lanes, asynchronous emotion/LLM/memory continuations, proactive speech, trace, and emotion state persistence.
 - **Model services**: ONNX Runtime BERT emotion inference, and llama.cpp/mtmd-based streaming and synchronous VLM inference.
 - **Emotion fusion**: BERT backbone combined with keyword evidence, updating V-A state through configurable fusion head, confidence, and margin gate.
-- **Memory and cache**: Redis/SQLite L0 memory, L3 compressed memory, Exact/Faiss vector retrieval, VLM result cache, and image-prefix prompt KV cache based on llama.cpp sequence state (memory/Redis dual backend).
+- **Memory and cache**: Redis/SQLite L0 memory, L3 compressed memory, Exact/Faiss retrieval, L0 embedding micro-batches, asynchronous lookup/store, VLM result cache, and image-prefix prompt KV cache based on llama.cpp sequence state.
 - **Document pipeline**: DOCX/PPTX OOXML extraction, managed file storage, chunk analysis, metadata, and LLM/semantic caches.
 - **Real-time multimodal input**: WebRTC signaling (offer/answer/ICE/resume), GStreamer `webrtcbin` media pipeline, OpenCV dynamic frame sampling (MOG2/histogram/edge/EMA/cooldown), key frame JPEG/PNG encoding (NVIDIA/VAAPI/D3D11/QSV hardware acceleration with software fallback).
 - **Frame inference pipeline**: Shared-memory frame IPC (MPMC sequence ring, RAII claim, epoch recovery) + gRPC IPC control plane (grant/revoke/probe, lease coordination, cross-process fault recovery) form a data-plane/control-plane-separated transport layer; upper layers compose ordered admission, mmap disk spool overflow replay, private backlog, VLM coordinator, and execution-level sealed aggregation (running → sealing → replay → aggregate) into a controlled key-frame inference lifecycle.
@@ -59,6 +59,22 @@ Browser / Downstream Application
 ```
 
 Model inference defaults to independent processes with protobuf/gRPC contracts as the reuse boundary. Key frame transmission adopts separated shared-memory data plane + gRPC control plane: large frames use shared memory zero-copy, while grant/revoke/epoch lifecycle and fault recovery use gRPC control signaling. Gateway, persona, session, memory, media, and IPC can also be directly composed into downstream source builds via CMake targets.
+
+### Asynchronous Turn Sequence
+
+```text
+Session admission / deferred lane
+  -> User Emotion async
+  -> L0/L3 Memory Lookup async
+  -> Prompt Building
+  -> LLM async
+  -> AI Emotion async
+  -> Memory Admission async
+  -> Session commit
+  -> HTTP/WebSocket completion
+```
+
+The deferred lane remains held until commit to preserve same-session order. Emotion, memory, and LLM waits return workers to the pool so other sessions can progress. A CUDA service health check proves process availability only; production readiness also requires a real inference warm-up.
 
 ### Basic Servers
 
@@ -92,7 +108,7 @@ Available aliases include `core`, `net`, `tls`, `http_client`, `config`, `storag
 The static libraries, public and generated headers, runtime dependencies, and CMake config package can also be installed for independent downstream consumption:
 
 ```powershell
-& "C:\Program Files\CMake\bin\cmake.exe" --install build/x64-Release `
+cmake --install build/x64-Release `
   --config Release --prefix build/agentloom-package
 ```
 
@@ -128,16 +144,16 @@ Requirements:
 - CMake 3.20+
 - vcpkg manifest dependencies: gRPC, Protobuf, OpenSSL, spdlog, Redis clients, Boost.Asio/Redis/Interprocess, libzip, pugixml, and nlohmann/json; GTest for tests
 - Prebuilt or external ONNX Runtime, llama.cpp with mtmd, OpenCV, SQLite, Faiss, Eigen, MKL, and HuggingFace Tokenizers C API packages
-- **Toolchain note:** As of 2026-07-11, building the CUDA-enabled llama.cpp dependency with the latest VS2026/v145 generator fails during CUDA compilation, indicating that the installed CUDA Toolkit does not yet provide sufficient VS2026/v145 compatibility. The llama.cpp dependency used by this repository's current test baseline was therefore built with VS2022/v143. This theoretically introduces an ABI compatibility risk, but no related failure has appeared across the existing unit, stress, or integration test runs. Until official support is available, using VS2022/v143 consistently for the CUDA-enabled dependency is recommended.
+- **Toolchain note:** Windows builds must align the CMake generator, MSVC toolset, CRT configuration, and vcpkg/prebuilt dependency ABI. If dependencies are built with v145, the host must also use VS2026/v145. The ABI guard rejects known Debug/Release CRT conflicts, and release builds can enable `AGENT_LLAMA_STRICT_TOOLSET_ABI=ON` to require toolset alignment.
 
 The local `deps/` and `vcpkg_installed/` directories are not distributed with the source. Linux scripts prepare the required packages. On Windows, keep the CMake generator, MSVC toolset, and vcpkg ABI aligned.
 
 ### Windows
 
-Use a CMake version that supports the VS2026 generator, such as `C:\Program Files\CMake\bin\cmake.exe`:
+Use a CMake version that supports the VS2026 generator. Check the executable resolved from PATH with `cmake --version` and `cmake --help`:
 
 ```powershell
-& "C:\Program Files\CMake\bin\cmake.exe" -B build/x64-Release `
+cmake -B build/x64-Release `
   -G "Visual Studio 18 2026" -A x64 `
   -DCMAKE_CONFIGURATION_TYPES=Release `
   -DBERT_VCPKG_TRIPLET=x64-windows `
@@ -145,7 +161,7 @@ Use a CMake version that supports the VS2026 generator, such as `C:\Program File
   -DLLAMA_CPP_ROOT="<path-to-llama.cpp>" `
   -DLLAMA_CPP_BUILD="<path-to-llama.cpp-build>"
 
-& "C:\Program Files\CMake\bin\cmake.exe" --build build/x64-Release `
+cmake --build build/x64-Release `
   --config Release --parallel
 ```
 
@@ -173,6 +189,7 @@ Configuration uses JSON sections with CLI overrides. Treat `src/config/sections/
 
 | Process | Example |
 | --- | --- |
+| Shared ConfigSection field reference | [`config.example.json`](config.example.json) |
 | Gateway | [`config/agent_gateway.example.json`](config/agent_gateway.example.json) |
 | Multimodal inference | [`config/server.example.json`](config/server.example.json) |
 | Container emotion inference | [`config/emotion.container.example.json`](config/emotion.container.example.json) |
@@ -213,12 +230,10 @@ Public examples contain placeholder model paths. The gateway example expects `AG
 
 ## Tests
 
-CMake currently registers **420 CTest cases** covering core infrastructure, TLS/HTTP, LLM clients, configuration, SQLite, vector retrieval, semantic cache, documents, memory, media/IPC, persona/gateway behavior, and gRPC boundaries. Cross-process E2E and standalone benchmark targets are also included.
-
-As of 2026-07-11, the complete Windows VS2026/v145 Release build and **all 420 CTest cases pass** and have been verified across repeated runs, with no observed code regressions.
+CMake tests cover core infrastructure, TLS/HTTP, asynchronous LLM/emotion, configuration, SQLite, vector retrieval and batch coordination, semantic cache, documents, memory, media/IPC, persona/gateway behavior, and gRPC boundaries. Cross-process E2E and standalone benchmark targets are also included. The exact count evolves with the codebase and is not hard-coded in this README.
 
 ```powershell
-& "C:\Program Files\CMake\bin\cmake.exe" -B build/x64-Release-Tests-v145 `
+cmake -B build/x64-Release-Tests-v145 `
   -G "Visual Studio 18 2026" -A x64 `
   -DBERT_BUILD_TESTS=ON `
   -DBERT_VCPKG_TRIPLET=x64-windows `
@@ -226,7 +241,7 @@ As of 2026-07-11, the complete Windows VS2026/v145 Release build and **all 420 C
   -DLLAMA_CPP_ROOT="<path-to-llama.cpp>" `
   -DLLAMA_CPP_BUILD="<path-to-llama.cpp-build>"
 
-& "C:\Program Files\CMake\bin\cmake.exe" --build `
+cmake --build `
   build/x64-Release-Tests-v145 --config Release --parallel
 
 ctest --test-dir build/x64-Release-Tests-v145 `
@@ -248,13 +263,13 @@ Business extensions should use `I...` interfaces. AgentLoom provides base sessio
 
 See [docs/README.md](docs/README.md) for the complete categorized index. Recommended entry points:
 
-- [Architecture overview](docs/ARCHITECTURE_VISUAL.md)
-- [Conversation cache and inference strategy](docs/CONVERSATION_CACHE_AND_INFERENCE_STRATEGY.md)
-- [Configuration system](docs/CONFIG_SYSTEM.md)
-- [Deployment guide](docs/DEPLOYMENT.md)
-- [Frontend/backend API protocol](docs/FRONTEND_BACKEND_API_PROTOCOL.md)
-- [Extending AgentLoom](docs/EXTENDING_AGENTLOOM.md)
-- [Security engineering standard](docs/SECURITY_ENGINEERING_STANDARD.md)
+- [Architecture overview](docs/architecture/ARCHITECTURE_VISUAL.md)
+- [Conversation cache and inference strategy](docs/data/CONVERSATION_CACHE_AND_INFERENCE_STRATEGY.md)
+- [Configuration system](docs/runtime/CONFIG_SYSTEM.md)
+- [Deployment guide](docs/runtime/DEPLOYMENT.md)
+- [Frontend/backend API protocol](docs/gateway/FRONTEND_BACKEND_API_PROTOCOL.md)
+- [Extending AgentLoom](docs/runtime/EXTENDING_AGENTLOOM.md)
+- [Security engineering standard](docs/security/SECURITY_ENGINEERING_STANDARD.md)
 
 ## Contributing and License
 

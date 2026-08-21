@@ -14,8 +14,8 @@ VisualSkill 生命周期控制
 
 相关协议：
 
-- `docs/SKILL_SESSION_PROTOCOL.md`
-- `docs/VISUAL_TOOL_SESSION_PROTOCOL.md`
+- `docs/architecture/SKILL_SESSION_PROTOCOL.md`
+- `docs/archive/VISUAL_TOOL_SESSION_PROTOCOL.md`
 
 ## 1. 背景与问题
 

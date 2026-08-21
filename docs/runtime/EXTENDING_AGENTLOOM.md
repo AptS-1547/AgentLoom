@@ -54,7 +54,7 @@ AgentLoom::service
 安装式复用会导出相同的 `AgentLoom::...` target，并安装静态库、公共头文件、生成的 protobuf/gRPC 头及版本文件：
 
 ```powershell
-& "C:\Program Files\CMake\bin\cmake.exe" --install build/x64-Release `
+cmake --install build/x64-Release `
   --config Release --prefix build/agentloom-package
 ```
 

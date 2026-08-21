@@ -415,7 +415,7 @@ vector_entries  (memory_level = "L4")
 
 ## 10. 流媒体与视觉感知模块
 
-**详细架构请参阅**：[STREAMING_ARCHITECTURE.md](./STREAMING_ARCHITECTURE.md)
+**详细架构请参阅**：[STREAMING_ARCHITECTURE.md](STREAMING_ARCHITECTURE.md)
 
 ### 10.1 核心组件
 

@@ -164,7 +164,8 @@ struct EmotionFusionFeature {
     double margin_bonus = 0.0;
 };
 
-class FusedEmotionAnalyzer final : public IEmotionAnalyzer {
+class FusedEmotionAnalyzer final : public IEmotionAnalyzer,
+                                   public IAsyncEmotionAnalyzer {
 public:
     FusedEmotionAnalyzer(std::shared_ptr<IEmotionAnalyzer> primary,
                          EmotionFusionAnalyzerOptions options,
@@ -174,6 +175,11 @@ public:
     core::Result<EmotionAnalysis> Analyze(std::string_view text,
                                           std::string_view trace_id,
                                           std::shared_ptr<const PersonalityConfig> personality = nullptr) override;
+    core::Status AnalyzeAsync(
+        std::string text,
+        std::string trace_id,
+        std::shared_ptr<const PersonalityConfig> personality,
+        AnalyzeCompletion completion) override;
 
     core::Result<EmotionAnalysis> FuseForTesting(const EmotionAnalysis& primary,
                                                  const std::vector<EmotionEvidence>& evidence) const;
@@ -196,6 +202,11 @@ private:
     EmotionAnalysis ApplyFallbackGate(const EmotionAnalysis& fused,
                                       const EmotionAnalysis& fallback) const;
     bool ShouldUseFallback(const EmotionAnalysis& fused) const;
+    core::Result<EmotionAnalysis> FusePrimary(
+        std::string_view text,
+        std::string_view trace_id,
+        std::shared_ptr<const PersonalityConfig> personality,
+        EmotionAnalysis primary) const;
     double Reliability(std::string_view label) const;
     double SourceWeight(std::string_view source) const;
 

@@ -580,7 +580,8 @@ PersonaRuntime::PersonaRuntime(SessionManager& sessions,
                                core::LoggerAdapter logger,
                                std::shared_ptr<IEmotionCalibrationSampleSink> emotion_calibration_sink,
                                std::shared_ptr<llm::IAsyncLlmClient> async_llm_client,
-                               core::ThreadPool* continuation_pool)
+                               core::ThreadPool* continuation_pool,
+                               std::shared_ptr<agent::skill::ISkillToolCallCoordinator> skill_tool_coordinator)
     : sessions_(sessions),
       memory_provider_(std::move(memory_provider)),
       async_memory_provider_(
@@ -594,6 +595,7 @@ PersonaRuntime::PersonaRuntime(SessionManager& sessions,
       answer_cache_provider_(std::move(answer_cache_provider)),
       tool_memory_provider_(std::move(tool_memory_provider)),
       skill_session_manager_(std::move(skill_session_manager)),
+      skill_tool_coordinator_(std::move(skill_tool_coordinator)),
       emotion_calibration_sink_(std::move(emotion_calibration_sink)),
       options_(std::move(options)),
       logger_(std::move(logger)) {}
@@ -806,6 +808,7 @@ core::Result<PersonaRuntime::PreparedChat> PersonaRuntime::PrepareChatBeforeEmot
                          session.session_id,
                          tool_context.status().message());
         } else if (tool_context.value().hit && !tool_context.value().prompt_block.empty()) {
+            prepared.tools = tool_context.value().tools;
             vision_tool_triggered = ContainsVisionObserve(tool_context.value());
             if (!prepared.memory.system_context.empty()) {
                 prepared.memory.system_context += "\n";
@@ -1036,6 +1039,8 @@ core::Result<ChatResponse> PersonaRuntime::CompleteWithLlm(SessionState& session
         llm_req.temperature = static_cast<float>(prepared.generation.temperature);
         llm_req.max_tokens = prepared.generation.max_tokens;
         llm_req.top_p = static_cast<float>(prepared.generation.top_p);
+        llm_req.tools = prepared.tools;
+        if (!llm_req.tools.empty()) llm_req.tool_choice = "auto";
 
         auto llm_result = llm_client_->Complete(llm_req);
         prepared.latency.llm_total = Since(llm_start);
@@ -1043,6 +1048,29 @@ core::Result<ChatResponse> PersonaRuntime::CompleteWithLlm(SessionState& session
             return llm_result.status();
         }
         completion = std::move(llm_result).value();
+        // 同步阶段最多执行一轮工具调用；异步 continuation 保持后续扩展点。
+        if (!completion.tool_calls.empty() && skill_tool_coordinator_) {
+            llm::ChatMessage assistant;
+            assistant.role = llm::ChatRole::Assistant;
+            assistant.tool_calls = completion.tool_calls;
+            prepared.messages.push_back(std::move(assistant));
+            auto tool_messages = skill_tool_coordinator_->Execute(
+                completion,
+                agent::skill::SkillToolCallContext{
+                    session.session_id,
+                    session.user_uuid,
+                    session.persona_id,
+                    prepared.request.trace_id,
+                    std::chrono::seconds(30)});
+            if (!tool_messages.ok()) return tool_messages.status();
+            prepared.messages.insert(prepared.messages.end(),
+                                     std::make_move_iterator(tool_messages.value().begin()),
+                                     std::make_move_iterator(tool_messages.value().end()));
+            llm_req.messages = prepared.messages;
+            auto follow_up = llm_client_->Complete(llm_req);
+            if (!follow_up.ok()) return follow_up.status();
+            completion = std::move(follow_up).value();
+        }
     }
     auto finalized = FinalizeLlmCompletion(
         session,
@@ -1128,6 +1156,8 @@ core::Status PersonaRuntime::CompleteWithLlmAsync(
     request.temperature = static_cast<float>(prepared.generation.temperature);
     request.max_tokens = prepared.generation.max_tokens;
     request.top_p = static_cast<float>(prepared.generation.top_p);
+    request.tools = prepared.tools;
+    if (!request.tools.empty()) request.tool_choice = "auto";
     const auto llm_started_at = std::chrono::steady_clock::now();
     std::uint64_t operation_id = 0;
     {
@@ -1173,13 +1203,57 @@ core::Status PersonaRuntime::CompleteWithLlmAsync(
                     completion(result_holder->status());
                     return;
                 }
+                auto llm_completion = std::move(*result_holder).value();
+                if (!llm_completion.tool_calls.empty() &&
+                    skill_tool_coordinator_ && prepared_value.tool_round == 0) {
+                    llm::ChatMessage assistant;
+                    assistant.role = llm::ChatRole::Assistant;
+                    assistant.tool_calls = llm_completion.tool_calls;
+                    prepared_value.messages.push_back(std::move(assistant));
+                    prepared_value.tool_round = 1;
+                    const auto skill_context = agent::skill::SkillToolCallContext{
+                        session.session_id,
+                        session.user_uuid,
+                        session.persona_id,
+                        prepared_value.request.trace_id,
+                        std::chrono::seconds(30)};
+                    auto completion_holder =
+                        std::make_shared<std::function<void(core::Result<CompletedChat>)>>(
+                            std::move(completion));
+                    auto follow_up = [this,
+                                      session = std::move(session),
+                                      prepared = std::move(prepared_value),
+                                      completion_holder](
+                                         core::Result<std::vector<llm::ChatMessage>> tool_messages) mutable {
+                        if (!tool_messages.ok()) {
+                            (*completion_holder)(tool_messages.status());
+                            return;
+                        }
+                        prepared.messages.insert(
+                            prepared.messages.end(),
+                            std::make_move_iterator(tool_messages.value().begin()),
+                            std::make_move_iterator(tool_messages.value().end()));
+                        auto status = CompleteWithLlmAsync(
+                            std::move(session), std::move(prepared), *completion_holder);
+                        if (!status.ok()) {
+                            // CompleteWithLlmAsync 未接纳请求时没有异步 callback，需立即收口。
+                            (*completion_holder)(status);
+                        }
+                    };
+                    auto status = skill_tool_coordinator_->ExecuteAsync(
+                        llm_completion, skill_context, std::move(follow_up));
+                    if (!status.ok()) {
+                        (*completion_holder)(status);
+                    }
+                    return;
+                }
                 auto completion_holder =
                     std::make_shared<std::function<void(core::Result<CompletedChat>)>>(
                         std::move(completion));
                 auto status = FinalizeLlmCompletionAsync(
                     std::move(session),
                     std::move(prepared_value),
-                    std::move(*result_holder).value(),
+                    std::move(llm_completion),
                     std::move(answer_cache_lookup),
                     io_stage_start,
                     *completion_holder);

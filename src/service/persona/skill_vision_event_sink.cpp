@@ -1,6 +1,6 @@
 #include "skill_vision_event_sink.h"
 
-#include "third_party/nlohmann/json.hpp"
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <utility>

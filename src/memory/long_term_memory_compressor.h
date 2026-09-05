@@ -84,7 +84,7 @@ struct LongTermMemoryCompressorOptions {
 ///
 /// Thread-safety: no internal mutable state beyond logger; all storage access
 /// goes through thread-safe components (vector repo, redis pool, index manager).
-class LongTermMemoryCompressor {
+class LongTermMemoryCompressor final {
 public:
     static core::Result<std::unique_ptr<LongTermMemoryCompressor>> Create(
         LongTermMemoryCompressorOptions options);
@@ -130,7 +130,7 @@ public:
 
     /// Return all users that have been registered through this compressor.
     /// This is the source of truth for maintenance tasks.
-    core::Result<std::vector<std::string>> GetRegisteredUsers() const;
+    core::Result<std::vector<std::string>> GetRegisteredUsers();
 
 private:
     explicit LongTermMemoryCompressor(LongTermMemoryCompressorOptions options);
@@ -162,4 +162,4 @@ private:
     LongTermMemoryCompressorOptions options_;
 };
 
-}  // namespace agent::memory
+}

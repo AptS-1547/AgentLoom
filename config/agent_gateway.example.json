@@ -99,6 +99,12 @@
     "disable_tls_verify_on_windows": false,
     "ca_bundle_path": "certs/mozilla-ca-bundle.pem"
   },
+  "skills": {
+    "enabled": true,
+    "manifest_directory": "../skills",
+    "manifest_filename_regex": ".*skill.*\\.json$",
+    "manifests": []
+  },
   "local_llm": {
     "enabled": false,
     "target": "127.0.0.1:50051",

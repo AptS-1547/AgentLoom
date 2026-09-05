@@ -64,6 +64,8 @@ struct EntryRecord {
     std::string emotion;
     float emotion_intensity = 0.0f;
     float state_arousal = 0.0f;
+    // 检索时由 VectorIndexManager 回填的相似度分数；不持久化，仅用于结果排序与阈值判断。
+    float search_score = 0.0f;
     std::string answer_type;  // reserved for Phase 5 semantic cache
 
     // Payload (actual answer / state snapshot JSON)

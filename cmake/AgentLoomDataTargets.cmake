@@ -1,4 +1,6 @@
 add_library(agent_semantic_cache STATIC
+    src/semantic_cache/l0_batch_metadata_store.cpp
+    src/semantic_cache/l0_batch_metadata_store.h
     src/semantic_cache/semantic_cache_types.h
     src/semantic_cache/isemantic_cache.h
     src/semantic_cache/context_risk_detector.h
@@ -149,6 +151,7 @@ if(BERT_BUILD_TESTS)
     add_executable(semantic_cache_tests
         tests/semantic_cache/semantic_cache_pipeline_test.cpp
         tests/semantic_cache/test_reload_batch_cycle.cpp
+        tests/semantic_cache/l0_batch_metadata_store_test.cpp
     )
 
     target_link_libraries(semantic_cache_tests PRIVATE
@@ -251,6 +254,8 @@ target_link_libraries(agent_memory PUBLIC
 add_library(agent_storage STATIC
     src/storage/sqlite/sqlite_async_executor.cpp
     src/storage/sqlite/sqlite_async_executor.h
+    src/storage/sqlite/sqlite_migration.cpp
+    src/storage/sqlite/sqlite_migration.h
     src/storage/sqlite/sqlite_connection.cpp
     src/storage/sqlite/sqlite_connection.h
     src/storage/sqlite/sqlite_connection_pool.cpp

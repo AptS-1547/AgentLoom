@@ -21,7 +21,8 @@ enum class ErrorCode {
     Unimplemented,
     ResourceExhausted,
     Unavailable,
-    InternalError
+    InternalError,
+    DataLoss
 };
 
 /// 跨模块统一状态；成功状态的 code 为 ErrorCode::Ok。

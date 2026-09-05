@@ -588,6 +588,57 @@ TEST(ConfigLlmSectionTest, JsonConfigLoadsLlmSection) {
     UnsetLlmEnv();
 }
 
+TEST(ConfigSkillSectionTest, JsonConfigLoadsSkillManifests) {
+    ScopedTempDirectory tmp("skill_cfg");
+    auto config_file = tmp.path() / "config.json";
+    WriteFile(config_file, R"({
+        "skills": {"manifests": [{
+            "skill_id": "vision.observe",
+            "version": "1.0.0",
+            "description": "observe",
+            "input_schema": {"type": "object"},
+            "output_schema": {"type": "object"},
+            "executor": {"type": "native", "reference": "vision.observe"}
+        }]}
+    })");
+    auto opts = Parse({"server", "--llm", "llm.gguf", "--config", config_file.string()});
+    ASSERT_EQ(opts.skill_manifests.size(), 1u);
+    EXPECT_EQ(opts.skill_manifests[0].skill_id, "vision.observe");
+    EXPECT_EQ(opts.skill_manifests[0].executor.reference, "vision.observe");
+}
+
+TEST(ConfigSkillSectionTest, LoadsMatchingManifestFilesFromConfiguredDirectory) {
+    ScopedTempDirectory tmp("skill_manifest_dir");
+    const auto manifest_dir = tmp.path() / "skills";
+    std::filesystem::create_directories(manifest_dir);
+    WriteFile(manifest_dir / "vision_skill.json", R"({
+        "skill_id": "vision.observe",
+        "version": "2.0.0",
+        "tool_name": "vision_observe",
+        "description": "observe",
+        "input_schema": {"type": "object"},
+        "output_schema": {"type": "object"},
+        "executor": {"type": "native", "reference": "vision.observe"}
+    })");
+    WriteFile(manifest_dir / "ignored.json", R"({
+        "skill_id": "ignored.skill",
+        "version": "1.0.0",
+        "executor": {"type": "native", "reference": "ignored.skill"}
+    })");
+    const auto config_file = WriteFile(tmp.path() / "config.json", R"({
+        "skills": {
+            "enabled": true,
+            "manifest_directory": "skills",
+            "manifest_filename_regex": ".*_skill\\.json$"
+        }
+    })");
+    auto options = Parse({"server", "--llm", "llm.gguf", "--config", config_file.string()});
+    ASSERT_EQ(options.skill_manifests.size(), 1u);
+    EXPECT_EQ(options.skill_manifests[0].skill_id, "vision.observe");
+    EXPECT_EQ(options.skill_manifests[0].version, "2.0.0");
+    EXPECT_EQ(options.skills.manifest_directory, manifest_dir);
+}
+
 TEST(ConfigLlmSectionTest, RejectsPerOriginIdleLimitAboveGlobalLimit) {
     UnsetLlmEnv();
     ScopedTempDirectory tmp("llm_bad_keep_alive_pool");

@@ -21,6 +21,7 @@ add_library(agent_agent_runtime STATIC
     src/service/persona/persona_algorithm.h
     src/service/persona/session_manager.cpp
     src/service/persona/session_manager.h
+    src/service/persona/session_persistence_contracts.h
     src/service/persona/gateway_session_affinity_scheduler.cpp
     src/service/persona/gateway_session_affinity_scheduler.h
     src/service/persona/persona_runtime.cpp
@@ -29,6 +30,14 @@ add_library(agent_agent_runtime STATIC
     src/service/persona/skill_session_manager.h
     src/service/persona/tool_memory_provider.cpp
     src/service/persona/tool_memory_provider.h
+    src/skill/skill_manifest.h
+    src/skill/skill_manifest_json.h
+    src/skill/skill_registry.h
+    src/skill/skill_registry.cpp
+    src/skill/skill_prompt_compiler.h
+    src/skill/skill_prompt_compiler.cpp
+    src/skill/skill_executor.h
+    src/skill/skill_executor.cpp
     src/service/persona/emotion_fusion_analyzer.cpp
     src/service/persona/emotion_fusion_analyzer.h
     src/service/persona/grpc_emotion_analyzer.cpp
@@ -340,12 +349,15 @@ if(BERT_BUILD_TESTS)
     add_executable(service_tests
         tests/service/persona_algorithm_test.cpp
         tests/service/session_manager_test.cpp
+        tests/service/session_persistence_contract_test.cpp
         tests/service/persona_runtime_test.cpp
         tests/service/semantic_memory_context_provider_test.cpp
         tests/service/media_inference_execution_test.cpp
         tests/service/emotion_fusion_analyzer_test.cpp
         tests/service/gateway_foundation_test.cpp
         tests/service/persona_gateway_service_test.cpp
+        tests/service/skill_registry_test.cpp
+        tests/service/skill_prompt_compiler_test.cpp
     )
 
     target_link_libraries(service_tests PRIVATE

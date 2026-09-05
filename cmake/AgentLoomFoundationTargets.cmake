@@ -206,6 +206,22 @@ if(WIN32)
 endif()
 link_whole_archive(llm_smoke_test agent_config)
 
+# ──────────── Manual real-provider Skill tool-call E2E (not part of CTest) ────────────
+add_executable(skill_llm_e2e_test tools/skill_llm_e2e_test.cpp)
+target_include_directories(skill_llm_e2e_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/skill
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/llm
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/net
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/config
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/storage/vector
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/storage/sqlite
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/vector
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/service/persona
+)
+target_link_libraries(skill_llm_e2e_test PRIVATE
+    agent_agent_runtime agent_tls agent_config agent_vector agent_vector_storage agent_storage)
+link_whole_archive(skill_llm_e2e_test agent_config)
+
 # ──────────── L3 compression E2E test (not part of CTest) ────────────
 add_executable(l3_compression_e2e_test
     tools/l3_compression_e2e_test.cpp

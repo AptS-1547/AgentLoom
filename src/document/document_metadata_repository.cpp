@@ -3,6 +3,7 @@
 #include "sqlite/sqlite_statement.h"
 
 #include <chrono>
+#include <array>
 #include <utility>
 
 namespace agent::document {
@@ -46,20 +47,8 @@ constexpr const char* kColumns =
     "storage_path, uploaded_at_ms, last_analyzed_at_ms, last_accessed_at_ms, "
     "analysis_status, analysis_trace_id, size_bytes, schema_version";
 
-} // namespace
-
-DocumentMetadataRepository::DocumentMetadataRepository(std::shared_ptr<storage::sqlite::SqliteConnectionPool> pool)
-    : pool_(std::move(pool)) {}
-
-core::Status DocumentMetadataRepository::EnsureSchema() {
-    if (!pool_) {
-        return core::Status::Error(core::ErrorCode::FailedPrecondition, "document metadata repository pool is not configured");
-    }
-    auto lease_result = AcquireWrite(*pool_);
-    if (!lease_result.ok()) {
-        return lease_result.status();
-    }
-    return std::move(lease_result).value().connection().Execute(R"SQL(
+core::Status ApplyDocumentMetadataV1(storage::sqlite::SqliteConnection& connection) {
+    return connection.Execute(R"SQL(
 CREATE TABLE IF NOT EXISTS document_files (
     document_id TEXT PRIMARY KEY,
     content_hash TEXT NOT NULL,
@@ -79,6 +68,40 @@ CREATE TABLE IF NOT EXISTS document_files (
 CREATE INDEX IF NOT EXISTS idx_document_files_content_hash ON document_files(content_hash);
 CREATE INDEX IF NOT EXISTS idx_document_files_owner_access ON document_files(owner_user_uuid, last_accessed_at_ms);
 )SQL");
+}
+
+const std::array<storage::sqlite::SqliteMigrationStep, 1> kDocumentMetadataMigrations{{
+    {
+        .version = 1,
+        .name = "create_document_files",
+        .checksum = "document_metadata_v1_create_document_files",
+        .apply = ApplyDocumentMetadataV1,
+    },
+}};
+
+}
+
+DocumentMetadataRepository::DocumentMetadataRepository(std::shared_ptr<storage::sqlite::SqliteConnectionPool> pool)
+    : pool_(std::move(pool)) {}
+
+core::Status DocumentMetadataRepository::EnsureSchema() {
+    if (!pool_) {
+        return core::Status::Error(
+            core::ErrorCode::FailedPrecondition,
+            "document metadata repository pool is not configured");
+    }
+    storage::sqlite::SqliteMigrationRunner runner(pool_);
+    std::array<storage::sqlite::ISqliteMigrationSource*, 1> sources{this};
+    return runner.ApplyAll(sources);
+}
+
+std::string_view DocumentMetadataRepository::MigrationNamespace() const noexcept {
+    return "document_metadata";
+}
+
+std::span<const storage::sqlite::SqliteMigrationStep>
+DocumentMetadataRepository::MigrationSteps() const noexcept {
+    return kDocumentMetadataMigrations;
 }
 
 core::Status DocumentMetadataRepository::Upsert(DocumentMetadataRecord record) {
@@ -261,4 +284,4 @@ core::Status DocumentMetadataRepository::DeleteByDocumentId(const std::string& d
     return core::Status::Ok();
 }
 
-} // namespace agent::document
+}

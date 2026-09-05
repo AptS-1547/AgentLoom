@@ -154,13 +154,112 @@ public:
         std::lock_guard lock(mutex_);
         last_request = req;
         ChatCompletionResponse response;
-        response.content = "这是回复";
+        if (tool_round_trip && call_count++ == 0) {
+            response.tool_calls.push_back({"persona-call-1", "vision.observe", R"({"reason":"look"})"});
+        } else {
+            response.content = "工具结果后的最终回复";
+        }
         response.total_tokens = 42;
         return response;
     }
 
+    bool tool_round_trip = false;
+    int call_count = 0;
     ChatCompletionRequest last_request;
     std::mutex mutex_;
+};
+
+class RecordingToolCallCoordinator final
+    : public agent::skill::ISkillToolCallCoordinator {
+public:
+    core::Result<std::vector<agent::llm::ChatMessage>> Execute(
+        const agent::llm::ChatCompletionResponse& response,
+        const agent::skill::SkillToolCallContext&) override {
+        ++execute_count;
+        if (!status.ok()) return status;
+        EXPECT_EQ(response.tool_calls.size(), 1u);
+        agent::skill::SkillResult result;
+        result.call_id = response.tool_calls.front().id;
+        result.skill_id = response.tool_calls.front().name;
+        result.result_json = R"({"observed":true})";
+        return std::vector<agent::llm::ChatMessage>{agent::skill::MakeToolResultMessage(result)};
+    }
+
+    core::Status ExecuteAsync(
+        const agent::llm::ChatCompletionResponse& response,
+        agent::skill::SkillToolCallContext context,
+        Completion completion) override {
+        auto result = Execute(response, context);
+        completion(std::move(result));
+        return core::Status::Ok();
+    }
+
+    int execute_count = 0;
+    core::Status status = core::Status::Ok();
+};
+
+class DeferredToolCallCoordinator final
+    : public agent::skill::ISkillToolCallCoordinator {
+public:
+    core::Result<std::vector<agent::llm::ChatMessage>> Execute(
+        const agent::llm::ChatCompletionResponse& response,
+        const agent::skill::SkillToolCallContext& context) override {
+        return ExecuteResult(response, context);
+    }
+
+    core::Status ExecuteAsync(
+        const agent::llm::ChatCompletionResponse& response,
+        agent::skill::SkillToolCallContext context,
+        Completion completion) override {
+        {
+            std::lock_guard lock(mutex_);
+            pending_response_ = response;
+            pending_context_ = std::move(context);
+            pending_completion_ = std::move(completion);
+        }
+        condition_.notify_all();
+        return core::Status::Ok();
+    }
+
+    bool WaitUntilPending(std::chrono::milliseconds timeout) {
+        std::unique_lock lock(mutex_);
+        return condition_.wait_for(lock, timeout, [&] { return static_cast<bool>(pending_completion_); });
+    }
+
+    void CompletePending() {
+        Completion completion;
+        agent::llm::ChatCompletionResponse response;
+        agent::skill::SkillToolCallContext context;
+        {
+            std::lock_guard lock(mutex_);
+            completion = std::move(pending_completion_);
+            response = std::move(pending_response_);
+            context = std::move(pending_context_);
+        }
+        ASSERT_TRUE(completion);
+        completion(ExecuteResult(response, context));
+    }
+
+    int execution_count() const noexcept { return execution_count_; }
+
+private:
+    std::vector<agent::llm::ChatMessage> ExecuteResult(
+        const agent::llm::ChatCompletionResponse& response,
+        const agent::skill::SkillToolCallContext&) {
+        ++execution_count_;
+        agent::skill::SkillResult result;
+        result.call_id = response.tool_calls.front().id;
+        result.skill_id = response.tool_calls.front().name;
+        result.result_json = R"({"observed":true})";
+        return {agent::skill::MakeToolResultMessage(result)};
+    }
+
+    mutable std::mutex mutex_;
+    std::condition_variable condition_;
+    agent::llm::ChatCompletionResponse pending_response_;
+    agent::skill::SkillToolCallContext pending_context_;
+    Completion pending_completion_;
+    int execution_count_ = 0;
 };
 
 class ManualAsyncLlmClient final : public agent::llm::IAsyncLlmClient {
@@ -223,6 +322,27 @@ public:
         response.content = std::move(content);
         response.model = "async-test-model";
         pending->Finish(std::move(response));
+    }
+
+    void CompleteWithToolCall(std::size_t index,
+                              std::string id,
+                              std::string name,
+                              std::string arguments) {
+        std::shared_ptr<Pending> pending;
+        {
+            std::lock_guard lock(mutex_);
+            ASSERT_LT(index, pending_.size());
+            pending = pending_[index];
+        }
+        ChatCompletionResponse response;
+        response.model = "async-test-model";
+        response.tool_calls.push_back({std::move(id), std::move(name), std::move(arguments)});
+        pending->Finish(std::move(response));
+    }
+
+    ChatCompletionRequest RequestAt(std::size_t index) const {
+        std::lock_guard lock(mutex_);
+        return pending_.at(index)->request;
     }
 
     std::size_t Count() const {
@@ -329,6 +449,7 @@ public:
         ToolMemoryContext context;
         context.hit = hit;
         context.prompt_block = prompt_block;
+        context.tools = tools;
         return context;
     }
 
@@ -339,6 +460,7 @@ public:
         "  instruction: use structured visual tool call only when needed\n"
         "</tool_memory_l4>";
     ToolMemoryQuery last_query;
+    std::vector<agent::llm::ChatCompletionRequest::Tool> tools;
     std::mutex mutex_;
 };
 
@@ -565,6 +687,94 @@ TEST(PersonaRuntimeTest, AsyncEmotionPrecedesMemoryAndReleasesTurnWorker) {
     auto result = completed_future.get();
     ASSERT_TRUE(result.ok()) << result.status().message();
     EXPECT_EQ(result.value().response, "按严格阶段顺序生成的回复");
+
+    runtime.Shutdown();
+    sessions.Shutdown();
+    turn_pool.Shutdown(true);
+    io.Shutdown(true);
+    compute.Shutdown(true);
+}
+
+TEST(PersonaRuntimeTest, AsyncSkillExecutionReleasesWorkerAndResubmitsFollowUp) {
+    core::ThreadPool compute({1, 32, "runtime-async-skill-compute"});
+    core::ThreadPool io({1, 32, "runtime-async-skill-io"});
+    core::ThreadPool turn_pool({1, 32, "runtime-async-skill-turn",
+                                std::make_shared<GatewaySessionAffinityScheduler>()});
+    ASSERT_TRUE(compute.Start().ok());
+    ASSERT_TRUE(io.Start().ok());
+    ASSERT_TRUE(turn_pool.Start().ok());
+
+    SessionManager sessions(compute, io, {}, core::LoggerAdapter::ForModule("service"), &turn_pool);
+    auto first = MakeSessionRequest();
+    first.session_id = "session-async-skill-a";
+    ASSERT_TRUE(sessions.CreateSession(std::move(first)).ok());
+    auto second = MakeSessionRequest();
+    second.session_id = "session-async-skill-b";
+    second.user_uuid = "user-async-skill-b";
+    ASSERT_TRUE(sessions.CreateSession(std::move(second)).ok());
+
+    auto cache = std::make_shared<FakeSemanticCache>();
+    cache->lookup_hit = false;
+    auto memory = std::make_shared<SemanticMemoryContextProvider>(cache);
+    auto async_llm = std::make_shared<ManualAsyncLlmClient>();
+    auto tool_memory = std::make_shared<FakeToolMemoryProvider>();
+    tool_memory->tools.push_back({"vision_observe", "observe", R"({"type":"object"})"});
+    auto coordinator = std::make_shared<DeferredToolCallCoordinator>();
+    PersonaRuntime runtime(
+        sessions,
+        memory,
+        std::make_shared<NeutralEmotionAnalyzer>(),
+        std::make_shared<FakeLlmClient>(),
+        PersonaRuntimeOptions{.default_model = "test-model"},
+        nullptr,
+        tool_memory,
+        nullptr,
+        core::LoggerAdapter::ForModule("service"),
+        nullptr,
+        async_llm,
+        &turn_pool,
+        coordinator);
+
+    std::promise<core::Result<ChatResponse>> first_done;
+    auto first_future = first_done.get_future();
+    ChatRequest first_request;
+    first_request.session_id = "session-async-skill-a";
+    first_request.user_input = "inspect the current screen";
+    first_request.trace_id = "trace-async-skill-a";
+    ASSERT_TRUE(runtime.SubmitChat(std::move(first_request),
+        [&first_done](auto result) { first_done.set_value(std::move(result)); }).ok());
+    ASSERT_TRUE(async_llm->WaitForCount(1, std::chrono::seconds(1)));
+    async_llm->CompleteWithToolCall(0, "async-call-1", "vision_observe", R"({"reason":"inspect"})");
+    ASSERT_TRUE(coordinator->WaitUntilPending(std::chrono::seconds(1)));
+
+    // Skill execution is pending, but the single turn worker must accept another Session key.
+    std::promise<core::Result<ChatResponse>> second_done;
+    auto second_future = second_done.get_future();
+    ChatRequest second_request;
+    second_request.session_id = "session-async-skill-b";
+    second_request.user_input = "ordinary response";
+    second_request.trace_id = "trace-async-skill-b";
+    ASSERT_TRUE(runtime.SubmitChat(std::move(second_request),
+        [&second_done](auto result) { second_done.set_value(std::move(result)); }).ok());
+    ASSERT_TRUE(async_llm->WaitForCount(2, std::chrono::seconds(1)));
+    async_llm->Complete(1, "second session response");
+    ASSERT_EQ(second_future.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+    ASSERT_TRUE(second_future.get().ok());
+
+    coordinator->CompletePending();
+    ASSERT_TRUE(async_llm->WaitForCount(3, std::chrono::seconds(1)));
+    auto follow_up_request = async_llm->RequestAt(2);
+    ASSERT_GE(follow_up_request.messages.size(), 4u);
+    EXPECT_EQ(follow_up_request.messages[follow_up_request.messages.size() - 2].role,
+              agent::llm::ChatRole::Assistant);
+    EXPECT_EQ(follow_up_request.messages.back().role, agent::llm::ChatRole::Tool);
+    EXPECT_EQ(follow_up_request.messages.back().tool_call_id, "async-call-1");
+    async_llm->Complete(2, "async skill follow-up response");
+    ASSERT_EQ(first_future.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+    auto first_result = first_future.get();
+    ASSERT_TRUE(first_result.ok()) << first_result.status().message();
+    EXPECT_EQ(first_result.value().response, "async skill follow-up response");
+    EXPECT_EQ(coordinator->execution_count(), 1);
 
     runtime.Shutdown();
     sessions.Shutdown();
@@ -1310,6 +1520,101 @@ TEST(SkillSessionManagerTest, ExpiresStartingSessionThroughMaintenanceTask) {
     ASSERT_TRUE(current.value().has_value());
     EXPECT_EQ(current.value()->state, SkillSessionState::Expired);
     EXPECT_EQ(current.value()->last_error, "startup_timeout");
+}
+
+TEST(PersonaRuntimeTest, CompletesSynchronousToolCallFollowUpRoundTrip) {
+    core::ThreadPool compute({1, 32, "runtime-compute"});
+    core::ThreadPool io({1, 32, "runtime-io"});
+    ASSERT_TRUE(compute.Start().ok());
+    ASSERT_TRUE(io.Start().ok());
+    SessionManager sessions(compute, io);
+    ASSERT_TRUE(sessions.CreateSession(MakeSessionRequest()).ok());
+
+    auto cache = std::make_shared<FakeSemanticCache>();
+    cache->lookup_hit = false;
+    auto memory = std::make_shared<SemanticMemoryContextProvider>(cache);
+    auto emotion = std::make_shared<NeutralEmotionAnalyzer>();
+    auto llm = std::make_shared<FakeLlmClient>();
+    llm->tool_round_trip = true;
+    auto tool_memory = std::make_shared<FakeToolMemoryProvider>();
+    tool_memory->prompt_block = "<tool_memory_l4>vision.observe</tool_memory_l4>";
+    auto coordinator = std::make_shared<RecordingToolCallCoordinator>();
+    PersonaRuntime runtime(
+        sessions, memory, emotion, llm,
+        PersonaRuntimeOptions{.recent_raw_turns = 10, .default_model = "test-model"},
+        nullptr, tool_memory, nullptr, core::LoggerAdapter::ForModule("test"),
+        nullptr, nullptr, nullptr, coordinator);
+
+    std::promise<core::Result<ChatResponse>> promise;
+    auto future = promise.get_future();
+    ChatRequest request;
+    request.session_id = "session-runtime";
+    request.user_input = "请观察当前画面";
+    request.trace_id = "trace-tool-round-trip";
+    ASSERT_TRUE(runtime.SubmitChat(std::move(request),
+        [&promise](core::Result<ChatResponse> result) mutable {
+            promise.set_value(std::move(result));
+        }).ok());
+    ASSERT_EQ(future.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+    auto result = future.get();
+    ASSERT_TRUE(result.ok()) << result.status().message();
+    EXPECT_EQ(result.value().response, "工具结果后的最终回复");
+    EXPECT_EQ(coordinator->execute_count, 1);
+    {
+        std::lock_guard lock(llm->mutex_);
+        EXPECT_EQ(llm->call_count, 2);
+        ASSERT_EQ(llm->last_request.messages.size(), 4u);
+        EXPECT_EQ(llm->last_request.messages[2].role, agent::llm::ChatRole::Assistant);
+        EXPECT_EQ(llm->last_request.messages[3].role, agent::llm::ChatRole::Tool);
+        EXPECT_EQ(llm->last_request.messages[3].tool_call_id, "persona-call-1");
+    }
+    compute.Shutdown(true);
+    io.Shutdown(true);
+}
+
+TEST(PersonaRuntimeTest, PropagatesToolExecutionFailureWithoutFollowUpLlmCall) {
+    core::ThreadPool compute({1, 32, "runtime-compute"});
+    core::ThreadPool io({1, 32, "runtime-io"});
+    ASSERT_TRUE(compute.Start().ok());
+    ASSERT_TRUE(io.Start().ok());
+    SessionManager sessions(compute, io);
+    ASSERT_TRUE(sessions.CreateSession(MakeSessionRequest()).ok());
+    auto cache = std::make_shared<FakeSemanticCache>();
+    cache->lookup_hit = false;
+    auto memory = std::make_shared<SemanticMemoryContextProvider>(cache);
+    auto emotion = std::make_shared<NeutralEmotionAnalyzer>();
+    auto llm = std::make_shared<FakeLlmClient>();
+    llm->tool_round_trip = true;
+    auto tool_memory = std::make_shared<FakeToolMemoryProvider>();
+    auto coordinator = std::make_shared<RecordingToolCallCoordinator>();
+    coordinator->status = core::Status::Error(core::ErrorCode::Unavailable, "executor unavailable");
+    PersonaRuntime runtime(
+        sessions, memory, emotion, llm,
+        PersonaRuntimeOptions{.recent_raw_turns = 10, .default_model = "test-model"},
+        nullptr, tool_memory, nullptr, core::LoggerAdapter::ForModule("test"),
+        nullptr, nullptr, nullptr, coordinator);
+
+    std::promise<core::Result<ChatResponse>> promise;
+    auto future = promise.get_future();
+    ChatRequest request;
+    request.session_id = "session-runtime";
+    request.user_input = "请观察当前画面";
+    request.trace_id = "trace-tool-failure";
+    ASSERT_TRUE(runtime.SubmitChat(std::move(request),
+        [&promise](core::Result<ChatResponse> result) mutable {
+            promise.set_value(std::move(result));
+        }).ok());
+    ASSERT_EQ(future.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+    auto result = future.get();
+    ASSERT_FALSE(result.ok());
+    EXPECT_EQ(result.status().code(), core::ErrorCode::Unavailable);
+    EXPECT_EQ(coordinator->execute_count, 1);
+    {
+        std::lock_guard lock(llm->mutex_);
+        EXPECT_EQ(llm->call_count, 1);
+    }
+    compute.Shutdown(true);
+    io.Shutdown(true);
 }
 
 TEST(SkillSessionManagerTest, ExpiresClosingSessionThatMissesAtomicDrainDeadline) {

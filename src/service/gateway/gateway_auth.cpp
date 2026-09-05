@@ -501,7 +501,62 @@ core::Status EnsureColumn(SqliteConnection& connection,
         "ALTER TABLE " + std::string(table) + " ADD COLUMN " + std::string(definition));
 }
 
-} // namespace
+core::Status ApplyGatewayAuthV1(SqliteConnection& connection) {
+    auto create = connection.Execute(
+        "CREATE TABLE IF NOT EXISTS gateway_auth_sessions ("
+        "token_id TEXT PRIMARY KEY,"
+        "user_uuid TEXT NOT NULL,"
+        "tenant_id TEXT NOT NULL,"
+        "subject TEXT,"
+        "issued_at INTEGER NOT NULL,"
+        "expires_at INTEGER NOT NULL,"
+        "revoked INTEGER NOT NULL DEFAULT 0,"
+        "revoked_reason TEXT,"
+        "updated_at INTEGER NOT NULL"
+        ")");
+    if (!create.ok()) return create;
+    auto cleanup_index = connection.Execute(
+        "CREATE INDEX IF NOT EXISTS idx_gateway_auth_sessions_cleanup "
+        "ON gateway_auth_sessions(revoked, expires_at, updated_at)");
+    if (!cleanup_index.ok()) return cleanup_index;
+    return connection.Execute(
+        "CREATE TABLE IF NOT EXISTS gateway_auth_users ("
+        "user_uuid TEXT PRIMARY KEY,"
+        "tenant_id TEXT NOT NULL,"
+        "username TEXT NOT NULL UNIQUE,"
+        "password_hash TEXT NOT NULL,"
+        "password_salt TEXT NOT NULL,"
+        "password_iterations INTEGER NOT NULL,"
+        "subject TEXT,"
+        "created_at INTEGER NOT NULL,"
+        "updated_at INTEGER NOT NULL"
+        ")");
+}
+
+core::Status ApplyGatewayAuthV2(SqliteConnection& connection) {
+    return EnsureColumn(
+        connection,
+        "gateway_auth_users",
+        "disabled",
+        "disabled INTEGER NOT NULL DEFAULT 0");
+}
+
+const std::array<storage::sqlite::SqliteMigrationStep, 2> kGatewayAuthMigrations{{
+    {
+        .version = 1,
+        .name = "create_gateway_auth_tables",
+        .checksum = "gateway_auth_v1_create_tables",
+        .apply = ApplyGatewayAuthV1,
+    },
+    {
+        .version = 2,
+        .name = "add_gateway_auth_user_disabled",
+        .checksum = "gateway_auth_v2_add_disabled",
+        .apply = ApplyGatewayAuthV2,
+    },
+}};
+
+}
 
 JwtCookieAuthenticator::JwtCookieAuthenticator(GatewayAuthOptions options,
                                                std::shared_ptr<IAuthSessionStore> session_store,
@@ -885,45 +940,23 @@ SqliteAuthSessionStore::SqliteAuthSessionStore(std::shared_ptr<SqliteConnectionP
     : pool_(std::move(pool)) {}
 
 core::Status SqliteAuthSessionStore::EnsureSchema() {
-    auto lease_result = AcquireStoreConnection(pool_, true);
-    if (!lease_result.ok()) {
-        return lease_result.status();
+    if (!pool_) {
+        return core::Status::Error(
+            core::ErrorCode::FailedPrecondition,
+            "auth session store pool is not configured");
     }
-    auto lease = std::move(lease_result).value();
-    auto& connection = lease.connection();
-    auto create = connection.Execute(
-        "CREATE TABLE IF NOT EXISTS gateway_auth_sessions ("
-        "token_id TEXT PRIMARY KEY,"
-        "user_uuid TEXT NOT NULL,"
-        "tenant_id TEXT NOT NULL,"
-        "subject TEXT,"
-        "issued_at INTEGER NOT NULL,"
-        "expires_at INTEGER NOT NULL,"
-        "revoked INTEGER NOT NULL DEFAULT 0,"
-        "revoked_reason TEXT,"
-        "updated_at INTEGER NOT NULL"
-        ")");
-    if (!create.ok()) return create;
-    auto cleanup_index = connection.Execute(
-        "CREATE INDEX IF NOT EXISTS idx_gateway_auth_sessions_cleanup "
-        "ON gateway_auth_sessions(revoked, expires_at, updated_at)");
-    if (!cleanup_index.ok()) return cleanup_index;
-    auto create_users = connection.Execute(
-        "CREATE TABLE IF NOT EXISTS gateway_auth_users ("
-        "user_uuid TEXT PRIMARY KEY,"
-        "tenant_id TEXT NOT NULL,"
-        "username TEXT NOT NULL UNIQUE,"
-        "password_hash TEXT NOT NULL,"
-        "password_salt TEXT NOT NULL,"
-        "password_iterations INTEGER NOT NULL,"
-        "subject TEXT,"
-        "created_at INTEGER NOT NULL,"
-        "updated_at INTEGER NOT NULL,"
-        "disabled INTEGER NOT NULL DEFAULT 0"
-        ")");
-    if (!create_users.ok()) return create_users;
-    if (auto status = EnsureColumn(connection, "gateway_auth_users", "disabled", "disabled INTEGER NOT NULL DEFAULT 0"); !status.ok()) return status;
-    return core::Status::Ok();
+    storage::sqlite::SqliteMigrationRunner runner(pool_);
+    std::array<storage::sqlite::ISqliteMigrationSource*, 1> sources{this};
+    return runner.ApplyAll(sources);
+}
+
+std::string_view SqliteAuthSessionStore::MigrationNamespace() const noexcept {
+    return "gateway_auth";
+}
+
+std::span<const storage::sqlite::SqliteMigrationStep>
+SqliteAuthSessionStore::MigrationSteps() const noexcept {
+    return kGatewayAuthMigrations;
 }
 
 core::Result<AuthSessionRecord> SqliteAuthSessionStore::ResolveSession(std::string_view token_id) {
@@ -1383,4 +1416,4 @@ core::Result<GatewayDevelopmentKeyPair> GenerateDevelopmentRsaKeyPair() {
     };
 }
 
-} // namespace agent::service::gateway
+}

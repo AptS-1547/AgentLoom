@@ -22,6 +22,7 @@ grpc::StatusCode ToGrpcStatusCode(core::ErrorCode code) noexcept {
     case core::ErrorCode::Unimplemented: return grpc::StatusCode::UNIMPLEMENTED;
     case core::ErrorCode::ResourceExhausted: return grpc::StatusCode::RESOURCE_EXHAUSTED;
     case core::ErrorCode::Unavailable: return grpc::StatusCode::UNAVAILABLE;
+    case core::ErrorCode::DataLoss: return grpc::StatusCode::DATA_LOSS;
     case core::ErrorCode::InternalError:
     case core::ErrorCode::Unknown:
     default: return grpc::StatusCode::INTERNAL;
@@ -46,8 +47,8 @@ core::ErrorCode ToCoreErrorCode(grpc::StatusCode code) noexcept {
     case grpc::StatusCode::ABORTED: return core::ErrorCode::FailedPrecondition;
     case grpc::StatusCode::UNIMPLEMENTED: return core::ErrorCode::Unimplemented;
     case grpc::StatusCode::UNAVAILABLE: return core::ErrorCode::Unavailable;
-    case grpc::StatusCode::INTERNAL:
-    case grpc::StatusCode::DATA_LOSS: return core::ErrorCode::InternalError;
+    case grpc::StatusCode::INTERNAL: return core::ErrorCode::InternalError;
+    case grpc::StatusCode::DATA_LOSS: return core::ErrorCode::DataLoss;
     case grpc::StatusCode::UNKNOWN:
     case grpc::StatusCode::DO_NOT_USE:
     default: return core::ErrorCode::Unknown;

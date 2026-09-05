@@ -3,11 +3,13 @@
 #include "http_types.h"
 #include "logger_adapter.h"
 #include "result.h"
+#include "sqlite/sqlite_migration.h"
 
 #include <cstddef>
 #include <chrono>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 
@@ -177,7 +179,9 @@ private:
     core::LoggerAdapter logger_;
 };
 
-class SqliteAuthSessionStore final : public IAuthSessionStore {
+class SqliteAuthSessionStore final
+    : public IAuthSessionStore,
+      public storage::sqlite::ISqliteMigrationSource {
 public:
     explicit SqliteAuthSessionStore(std::string database_path);
     explicit SqliteAuthSessionStore(std::shared_ptr<storage::sqlite::SqliteConnectionPool> pool);
@@ -191,6 +195,10 @@ public:
     core::Result<std::size_t> CleanupExpired(
         std::chrono::system_clock::time_point now,
         std::size_t max_records) override;
+
+    std::string_view MigrationNamespace() const noexcept override;
+    std::span<const storage::sqlite::SqliteMigrationStep>
+    MigrationSteps() const noexcept override;
 
 private:
     std::shared_ptr<storage::sqlite::SqliteConnectionPool> pool_;
@@ -223,4 +231,4 @@ private:
 std::optional<std::string> ExtractCookieValue(std::string_view cookie_header, std::string_view name);
 core::Result<GatewayDevelopmentKeyPair> GenerateDevelopmentRsaKeyPair();
 
-} // namespace agent::service::gateway
+}

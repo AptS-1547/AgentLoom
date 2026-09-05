@@ -1,6 +1,6 @@
 #include "tool_memory_provider.h"
 
-#include "third_party/nlohmann/json.hpp"
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <sstream>
@@ -10,8 +10,6 @@ namespace agent::service::persona {
 namespace {
 
 using Json = nlohmann::json;
-
-constexpr std::string_view kVisionToolId = "vision.observe";
 
 int JsonInt(const Json& body, std::string_view key, int fallback) {
     auto it = body.find(std::string(key));
@@ -29,14 +27,27 @@ std::string JsonString(const Json& body, std::string_view key, std::string fallb
     return it->get<std::string>();
 }
 
-std::string DefaultVisionInstruction() {
-    return "用户可能正在请求视觉观察。若需要调用视觉工具，只输出 "
-           "<agent_tool_call>{\"tool\":\"vision.observe\",\"arguments\":{\"top_k\":2,\"reason\":\"简短原因\"}}</agent_tool_call>。"
-           "没有工具结果前，不要编造画面内容。";
+// 转义正则元字符，使关键词按字面量匹配（对齐下游 behavior_rule_config 的 QuoteMeta 语义）。
+std::string EscapeRegex(std::string_view text) {
+    static constexpr std::string_view kMeta = R"(\.^$|()[]{}*+?)";
+    std::string out;
+    out.reserve(text.size());
+    for (const char ch : text) {
+        if (kMeta.find(ch) != std::string_view::npos) out.push_back('\\');
+        out.push_back(ch);
+    }
+    return out;
 }
 
-std::string DefaultVisionSchema() {
-    return R"({"tool":"vision.observe","arguments":{"top_k":2,"reason":"用户请求观察画面"}})";
+// 把关键词列表按固定格式编译为交替正则：逐词转义 + 竖线交替。空结果返回空串。
+std::string JoinAlternation(const std::vector<std::string>& keywords) {
+    std::string pattern;
+    for (const auto& keyword : keywords) {
+        if (keyword.empty()) continue;
+        if (!pattern.empty()) pattern += '|';
+        pattern += EscapeRegex(keyword);
+    }
+    return pattern;
 }
 
 } // namespace
@@ -45,12 +56,30 @@ VectorToolMemoryProvider::VectorToolMemoryProvider(
     std::shared_ptr<::vector::EmbeddingPipeline> embedding_pipeline,
     std::shared_ptr<vector::VectorIndexManager> index_manager,
     std::shared_ptr<vector_storage::PartitionRegistry> partition_registry,
-    VectorToolMemoryProviderOptions options)
+    VectorToolMemoryProviderOptions options,
+    std::shared_ptr<::vector::EmbeddingBatchCoordinator> embedding_batch)
     : embedding_pipeline_(std::move(embedding_pipeline)),
       index_manager_(std::move(index_manager)),
       partition_registry_(std::move(partition_registry)),
       options_(std::move(options)),
-      vision_regex_(R"(看看|看一下|看到|你看[看到见]?|你能看|画面|摄像头|你的眼|周围|在做什么|在干什么|你见|你注意到|屏幕|你面前|我的样子)") {}
+      embedding_batch_(std::move(embedding_batch)) {
+    // 按固定格式把每个工具的关键词编译成正则：逐词转义 + 竖线交替，作为确定性兜底通道。
+    for (const auto& trigger : options_.keyword_triggers) {
+        const std::string positive = JoinAlternation(trigger.keywords);
+        if (positive.empty()) continue;
+        CompiledKeywordTrigger compiled;
+        compiled.tool_id = trigger.tool_id;
+        compiled.instruction = trigger.instruction;
+        compiled.schema_json = trigger.schema_json;
+        compiled.regex = std::regex(positive);
+        const std::string negative = JoinAlternation(trigger.negative_keywords);
+        if (!negative.empty()) {
+            compiled.negative_regex = std::regex(negative);
+            compiled.has_negative = true;
+        }
+        keyword_triggers_.push_back(std::move(compiled));
+    }
+}
 
 core::Result<ToolMemoryContext> VectorToolMemoryProvider::Query(const ToolMemoryQuery& request) {
     ToolMemoryContext context;
@@ -68,6 +97,59 @@ core::Result<ToolMemoryContext> VectorToolMemoryProvider::Query(const ToolMemory
         hits.insert(hits.end(), std::make_move_iterator(vector_hits.value().begin()), std::make_move_iterator(vector_hits.value().end()));
     }
 
+    return BuildContext(std::move(hits));
+}
+
+core::Status IToolMemoryProvider::QueryAsync(ToolMemoryQuery request,
+                                             QueryCompletion completion) {
+    if (!completion) {
+        return core::Status::Error(core::ErrorCode::InvalidArgument,
+                                   "tool memory query completion is required");
+    }
+    completion(Query(request));
+    return core::Status::Ok();
+}
+
+core::Status VectorToolMemoryProvider::QueryAsync(ToolMemoryQuery request,
+                                                  QueryCompletion completion) {
+    if (!completion) {
+        return core::Status::Error(core::ErrorCode::InvalidArgument,
+                                   "tool memory query completion is required");
+    }
+    if (!embedding_batch_ || !options_.enable_vector || request.query.empty()) {
+        completion(Query(request));
+        return core::Status::Ok();
+    }
+    auto regex_hits = options_.enable_regex ? RegexHits(request.query)
+                                            : std::vector<ToolMemoryHit>{};
+    ::vector::EmbeddingBatchRequest embedding_request;
+    embedding_request.session_id = request.session_id;
+    embedding_request.user_uuid = request.user_uuid;
+    embedding_request.trace_id = request.trace_id;
+    embedding_request.text = request.query;
+    embedding_request.completion = [this, regex_hits = std::move(regex_hits),
+                                    completion = std::move(completion)](
+                                       core::Result<std::vector<float>> embedding) mutable {
+        if (!embedding.ok()) {
+            completion(embedding.status());
+            return;
+        }
+        auto vector_hits = VectorHitsFromEmbedding(embedding.value());
+        if (!vector_hits.ok()) {
+            completion(vector_hits.status());
+            return;
+        }
+        auto hits = regex_hits;
+        auto& values = vector_hits.value();
+        hits.insert(hits.end(),
+                    std::make_move_iterator(values.begin()),
+                    std::make_move_iterator(values.end()));
+        completion(BuildContext(std::move(hits)));
+    };
+    return embedding_batch_->Submit(std::move(embedding_request));
+}
+
+ToolMemoryContext VectorToolMemoryProvider::BuildContext(std::vector<ToolMemoryHit> hits) const {
     std::unordered_set<std::string> seen;
     std::vector<ToolMemoryHit> deduped;
     for (auto& hit : hits) {
@@ -86,29 +168,39 @@ core::Result<ToolMemoryContext> VectorToolMemoryProvider::Query(const ToolMemory
         deduped.resize(static_cast<std::size_t>(options_.top_k));
     }
 
+    ToolMemoryContext context;
     context.hit = !deduped.empty();
     context.prompt_block = BuildPromptBlock(deduped);
+    for (const auto& hit : deduped) {
+        llm::ChatCompletionRequest::Tool tool;
+        tool.name = hit.tool_id;
+        tool.description = hit.instruction;
+        if (!hit.schema_json.empty()) tool.parameters_json = hit.schema_json;
+        context.tools.push_back(std::move(tool));
+    }
     context.hits = std::move(deduped);
     return context;
 }
 
-ToolMemoryHit VectorToolMemoryProvider::MakeVisionRegexHit() {
-    ToolMemoryHit hit;
-    hit.tool_id = std::string(kVisionToolId);
-    hit.memory_hash = "global:l4:vision.observe:regex";
-    hit.instruction = DefaultVisionInstruction();
-    hit.schema_json = DefaultVisionSchema();
-    hit.score = 1.0;
-    hit.priority = 100;
-    hit.regex_hit = true;
-    return hit;
-}
-
 std::vector<ToolMemoryHit> VectorToolMemoryProvider::RegexHits(std::string_view query) const {
-    if (query.empty() || !std::regex_search(query.begin(), query.end(), vision_regex_)) {
-        return {};
+    std::vector<ToolMemoryHit> hits;
+    if (query.empty()) return hits;
+    for (const auto& trigger : keyword_triggers_) {
+        if (!std::regex_search(query.begin(), query.end(), trigger.regex)) continue;
+        // 命中否定排除词（如"不用看"）时取消该工具的正则触发，回退给向量召回判断。
+        if (trigger.has_negative &&
+            std::regex_search(query.begin(), query.end(), trigger.negative_regex)) continue;
+        ToolMemoryHit hit;
+        hit.tool_id = trigger.tool_id;
+        hit.memory_hash = "global:l4:" + trigger.tool_id + ":keyword";
+        hit.instruction = trigger.instruction;
+        hit.schema_json = trigger.schema_json;
+        hit.score = 1.0;
+        hit.priority = 100;
+        hit.regex_hit = true;
+        hits.push_back(std::move(hit));
     }
-    return {MakeVisionRegexHit()};
+    return hits;
 }
 
 core::Result<std::vector<ToolMemoryHit>> VectorToolMemoryProvider::VectorHits(std::string_view query) const {
@@ -138,7 +230,26 @@ core::Result<std::vector<ToolMemoryHit>> VectorToolMemoryProvider::VectorHits(st
     search_options.include_forgotten = false;
     search_options.memory_type = "capability";
     search_options.min_score = static_cast<float>(options_.min_score);
-    auto entries = index_manager_->Search(partition.value().value(), embedding.value(), search_options);
+    return VectorHitsFromEmbedding(embedding.value());
+}
+
+core::Result<std::vector<ToolMemoryHit>> VectorToolMemoryProvider::VectorHitsFromEmbedding(
+    std::span<const float> embedding) const {
+    if (!index_manager_ || !partition_registry_) return std::vector<ToolMemoryHit>{};
+    vector_storage::PartitionKey key;
+    key.collection_id = options_.collection_id;
+    key.tenant_id = options_.tenant_id;
+    key.user_id = "";
+    key.memory_level = "L4";
+    auto partition = partition_registry_->Lookup(key);
+    if (!partition.ok()) return partition.status();
+    if (!partition.value().has_value()) return std::vector<ToolMemoryHit>{};
+    vector::IndexSearchOptions search_options;
+    search_options.top_k = static_cast<std::size_t>(std::max(1, options_.top_k));
+    search_options.include_forgotten = false;
+    search_options.memory_type = "capability";
+    search_options.min_score = static_cast<float>(options_.min_score);
+    auto entries = index_manager_->Search(partition.value().value(), embedding, search_options);
     if (!entries.ok()) {
         return entries.status();
     }
@@ -147,7 +258,7 @@ core::Result<std::vector<ToolMemoryHit>> VectorToolMemoryProvider::VectorHits(st
     for (const auto& entry : entries.value()) {
         ToolMemoryHit hit;
         hit.memory_hash = entry.memory_hash;
-        hit.score = entry.emotion_intensity;
+        hit.score = entry.search_score;
         hit.vector_hit = true;
         hit.instruction = entry.payload;
         try {

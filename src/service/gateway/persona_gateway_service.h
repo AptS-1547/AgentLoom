@@ -7,11 +7,13 @@
 #include "persona_interaction.h"
 #include "report_evaluator.h"
 #include "session_manager.h"
+#include "sqlite/sqlite_migration.h"
 
 #include <functional>
 #include <future>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <unordered_map>
 
 namespace storage::sqlite {
@@ -84,7 +86,9 @@ private:
     std::shared_ptr<IPersonaMetadataStore> account_;
 };
 
-class SqlitePersonaMetadataStore final : public IPersonaMetadataStore {
+class SqlitePersonaMetadataStore final
+    : public IPersonaMetadataStore,
+      public storage::sqlite::ISqliteMigrationSource {
 public:
     explicit SqlitePersonaMetadataStore(std::string database_path);
     explicit SqlitePersonaMetadataStore(std::shared_ptr<storage::sqlite::SqliteConnectionPool> pool);
@@ -96,6 +100,10 @@ public:
                                             std::string_view persona_id) const override;
     core::Result<std::vector<PersonaMetadataRecord>> ListByAccount(std::string_view tenant_id,
                                                                    std::string_view user_uuid) const override;
+
+    std::string_view MigrationNamespace() const noexcept override;
+    std::span<const storage::sqlite::SqliteMigrationStep>
+    MigrationSteps() const noexcept override;
 
 private:
     std::shared_ptr<storage::sqlite::SqliteConnectionPool> pool_;
@@ -198,4 +206,4 @@ private:
     core::LoggerAdapter logger_;
 };
 
-} // namespace agent::service::gateway
+}

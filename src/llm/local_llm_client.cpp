@@ -34,6 +34,7 @@ std::string RoleLabel(ChatRole role) {
     case ChatRole::System: return "system";
     case ChatRole::User: return "user";
     case ChatRole::Assistant: return "assistant";
+    case ChatRole::Tool: return "tool";
     }
     return "user";
 }

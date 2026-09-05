@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <optional>
 #include <string>
+#include "../skill/skill_manifest.h"
 #include <unordered_map>
 #include <vector>
 
@@ -370,6 +371,12 @@ struct SkillSessionConfigOptions {
     int cleanup_interval_seconds = 30;
 };
 
+struct SkillRegistryConfigOptions {
+    bool enabled = true;
+    std::filesystem::path manifest_directory;
+    std::string manifest_filename_regex = R"(.*skill.*\.json$)";
+};
+
 template <typename GatewayAuthOptionsT>
 GatewayAuthOptionsT ToGatewayAuthOptions(const GatewayAuthConfigOptions& config) {
     GatewayAuthOptionsT options;
@@ -401,6 +408,7 @@ GatewayAuthOptionsT ToGatewayAuthOptions(const GatewayAuthConfigOptions& config)
 }
 
 struct MultimodalServerOptions {
+    std::vector<agent::skill::SkillManifest> skill_manifests;
     server_common::GrpcServerOptions grpc;
     net::HttpServerOptions http;
     BertRuntimeConfigOptions bert_runtime;
@@ -419,6 +427,7 @@ struct MultimodalServerOptions {
     GatewayAuthConfigOptions gateway_auth;
     PersonaGatewayConfigOptions persona_gateway;
     SkillSessionConfigOptions skill_session;
+    SkillRegistryConfigOptions skills;
     request_validation::RequestLimits limits;
     VramGuardOptions vram;
     VlmCacheConfigOptions vlm_cache;

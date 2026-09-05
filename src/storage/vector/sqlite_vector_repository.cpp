@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <chrono>
 #include <cstring>
+#include <array>
 
 namespace agent::vector_storage {
 
@@ -32,6 +33,25 @@ std::string LoadSchemaSQL() {
     buffer << file.rdbuf();
     return buffer.str();
 }
+
+core::Status ApplyVectorSchemaV1(storage::sqlite::SqliteConnection& connection) {
+    const auto schema_sql = LoadSchemaSQL();
+    if (schema_sql.empty()) {
+        return core::Status::Error(
+            core::ErrorCode::InternalError,
+            "failed to load vector schema.sql");
+    }
+    return connection.Execute(schema_sql);
+}
+
+const std::array<storage::sqlite::SqliteMigrationStep, 1> kVectorMigrations{{
+    {
+        .version = 1,
+        .name = "create_vector_repository_schema",
+        .checksum = "vector_repository_v1_schema_sql",
+        .apply = ApplyVectorSchemaV1,
+    },
+}};
 
 std::size_t HashCombine(std::size_t seed, std::size_t value) noexcept {
     return seed ^ (value + 0x9e3779b9 + (seed << 6) + (seed >> 2));
@@ -72,7 +92,7 @@ std::optional<std::int64_t> ColumnOptInt64(const SqliteStatement& stmt, int inde
     return stmt.ColumnInt64(index);
 }
 
-}  // namespace
+}
 
 std::size_t PartitionKeyHash::operator()(const PartitionKey& key) const noexcept {
     std::size_t seed = 0;
@@ -169,7 +189,7 @@ constexpr const char* kInsertEntrySQL =
     "state_arousal, answer_type, payload, extra_metadata, created_at_ms, expires_at_ms"
     ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
 
-}  // namespace
+}
 
 SqliteVectorRepository::SqliteVectorRepository(std::shared_ptr<SqliteConnectionPool> pool)
     : impl_(std::make_unique<Impl>(std::move(pool))) {}
@@ -177,13 +197,23 @@ SqliteVectorRepository::SqliteVectorRepository(std::shared_ptr<SqliteConnectionP
 SqliteVectorRepository::~SqliteVectorRepository() = default;
 
 core::Status SqliteVectorRepository::EnsureSchema() {
-    std::string schema_sql = LoadSchemaSQL();
-    if (schema_sql.empty()) {
-        return core::Status::Error(core::ErrorCode::InternalError, "Failed to load schema.sql");
+    if (!impl_ || !impl_->pool) {
+        return core::Status::Error(
+            core::ErrorCode::FailedPrecondition,
+            "vector repository pool is not configured");
     }
-    auto lease_r = impl_->AcquireWrite();
-    if (!lease_r) return lease_r.status();
-    return std::move(lease_r).value().connection().Execute(schema_sql);
+    storage::sqlite::SqliteMigrationRunner runner(impl_->pool);
+    std::array<storage::sqlite::ISqliteMigrationSource*, 1> sources{this};
+    return runner.ApplyAll(sources);
+}
+
+std::string_view SqliteVectorRepository::MigrationNamespace() const noexcept {
+    return "vector_repository";
+}
+
+std::span<const storage::sqlite::SqliteMigrationStep>
+SqliteVectorRepository::MigrationSteps() const noexcept {
+    return kVectorMigrations;
 }
 
 core::Result<std::int64_t> SqliteVectorRepository::EnsureCollection(const CollectionDescriptor& desc) {
@@ -645,4 +675,4 @@ core::Status SqliteVectorRepository::DeleteEntry(std::int64_t id) {
     return tx.Commit();
 }
 
-}  // namespace agent::vector_storage
+}

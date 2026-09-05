@@ -9,6 +9,8 @@
 #include <mutex>
 #include <string>
 #include <filesystem>
+#include <vector>
+#include <optional>
 #include <../core/result.h>
 namespace agent::llm {
 
@@ -31,6 +33,7 @@ enum class ChatRole {
     System,
     User,
     Assistant,
+    Tool,
 };
 
 enum class ChatContentPartType {
@@ -48,10 +51,20 @@ struct ChatContentPart {
     static ChatContentPart ImageData(std::string_view media_type, std::string_view base64_data);
 };
 
+// 工具调用标识必须原样回传；arguments 在协议层保留为 JSON 文本。
+struct ChatToolCall {
+    std::string id;
+    std::string name;
+    std::string arguments_json;
+};
+
 struct ChatMessage {
     ChatRole role = ChatRole::User;
     std::string content;
     std::vector<ChatContentPart> parts;
+    std::vector<ChatToolCall> tool_calls;
+    std::string tool_call_id;
+    std::optional<std::string> reasoning_content;
 };
 
 struct ChatCompletionRequest {
@@ -62,6 +75,15 @@ struct ChatCompletionRequest {
     float top_p = 1.0f;
     int n = 1;
     bool stream = false;
+    // schema 文本保持接口轻量；发送前必须校验，不能静默降级为空对象。
+    struct Tool {
+        std::string name;
+        std::string description;
+        std::string parameters_json = R"({"type":"object"})";
+    };
+    std::vector<Tool> tools;
+    std::string tool_choice; // 空串遵循 Provider 默认，另支持 none/auto/required。
+    std::optional<bool> parallel_tool_calls;
 };
 
 struct ChatCompletionResponse {
@@ -71,7 +93,13 @@ struct ChatCompletionResponse {
     int prompt_tokens = 0;
     int completion_tokens = 0;
     int total_tokens = 0;
+    std::vector<ChatToolCall> tool_calls;
+    std::string finish_reason;
+    std::optional<std::string> reasoning_content;
 };
+
+// 同步和异步传输共用协议校验，错误请求不访问 Provider。
+core::Status ValidateChatCompletionRequest(const ChatCompletionRequest& request);
 
 class ILlmClient {
 public:

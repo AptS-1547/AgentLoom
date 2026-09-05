@@ -29,6 +29,7 @@ std::string ErrorCodeName(core::ErrorCode code) {
     case core::ErrorCode::Unavailable: return "UNAVAILABLE";
     case core::ErrorCode::Timeout: return "TIMEOUT";
     case core::ErrorCode::InternalError: return "INTERNAL_ERROR";
+    case core::ErrorCode::DataLoss: return "DATA_LOSS";
     default: return "UNKNOWN";
     }
 }

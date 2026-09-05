@@ -1,8 +1,10 @@
 #pragma once
 
 #include "vector_repository.h"
+#include "sqlite/sqlite_migration.h"
 
 #include <memory>
+#include <span>
 
 namespace storage::sqlite {
 class SqliteConnectionPool;
@@ -12,7 +14,9 @@ namespace agent::vector_storage {
 
 /// SQLite-backed vector repository implementation
 /// Uses pImpl to hide sqlite3* handles from public interface
-class SqliteVectorRepository : public IVectorRepository {
+class SqliteVectorRepository final
+    : public IVectorRepository,
+      public storage::sqlite::ISqliteMigrationSource {
 public:
     explicit SqliteVectorRepository(std::shared_ptr<storage::sqlite::SqliteConnectionPool> pool);
     ~SqliteVectorRepository() override;
@@ -24,6 +28,10 @@ public:
 
     /// Schema initialization (idempotent, CREATE TABLE IF NOT EXISTS)
     core::Status EnsureSchema();
+
+    std::string_view MigrationNamespace() const noexcept override;
+    std::span<const storage::sqlite::SqliteMigrationStep>
+    MigrationSteps() const noexcept override;
 
     // IVectorRepository interface
     core::Result<std::int64_t> EnsureCollection(const CollectionDescriptor& desc) override;
@@ -50,4 +58,4 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-}  // namespace agent::vector_storage
+}

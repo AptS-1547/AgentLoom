@@ -371,6 +371,19 @@ TEST_F(OpenAiLlmClientTest, PlainTextMessageKeepsStringContentFormat) {
     EXPECT_EQ(behavior_->last_body.find("\"content\":[{"), std::string::npos);
 }
 
+TEST_F(OpenAiLlmClientTest, SerializesToolsAndParsesToolCalls) {
+    behavior_->body = R"({"id":"cmpl-tool","model":"deepseek-chat","choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call-1","type":"function","function":{"name":"vision.observe","arguments":"{\"reason\":\"look\"}"}}]}}]})";
+    ChatCompletionRequest request;
+    request.tools.push_back({"vision.observe", "observe", R"({"type":"object"})"});
+    request.tool_choice = "auto";
+    auto result = client_->Complete(request);
+    ASSERT_TRUE(result.ok()) << result.status().message();
+    ASSERT_EQ(result.value().tool_calls.size(), 1u);
+    EXPECT_EQ(result.value().tool_calls[0].name, "vision.observe");
+    EXPECT_NE(behavior_->last_body.find("\"tools\""), std::string::npos);
+    EXPECT_NE(behavior_->last_body.find("vision.observe"), std::string::npos);
+}
+
 // ── unit: HTTP-level error responses ────────────────────────────────────────
 
 TEST_F(OpenAiLlmClientTest, FourXxReturnsError) {

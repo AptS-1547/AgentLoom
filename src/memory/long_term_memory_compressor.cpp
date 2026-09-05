@@ -2,16 +2,54 @@
 #include "../core/logger_adapter.h"
 #include "../semantic_cache/semantic_cache_pipeline.h"
 #include "../storage/sqlite/sqlite_statement.h"
+#include "../storage/sqlite/sqlite_migration.h"
 
 #include <nlohmann/json.hpp>
 #include <chrono>
 #include <sstream>
 #include <ctime>
 #include <map>
+#include <array>
 
 using json = nlohmann::json;
 
 namespace agent::memory {
+
+namespace {
+
+core::Status ApplyL3RegistryV1(storage::sqlite::SqliteConnection& connection) {
+    return connection.Execute(
+        "CREATE TABLE IF NOT EXISTS l3_user_registry ("
+        "user_uuid TEXT PRIMARY KEY NOT NULL, "
+        "first_seen_at_ms INTEGER NOT NULL, "
+        "last_seen_at_ms INTEGER NOT NULL)");
+}
+
+const std::array<storage::sqlite::SqliteMigrationStep, 1> kL3RegistryMigrations{{
+    {
+        .version = 1,
+        .name = "create_l3_user_registry",
+        .checksum = "long_term_memory_v1_l3_user_registry",
+        .apply = ApplyL3RegistryV1,
+    },
+}};
+
+class L3RegistryMigrationSource final
+    : public storage::sqlite::ISqliteMigrationSource {
+public:
+    std::string_view MigrationNamespace() const noexcept override {
+        return "long_term_memory";
+    }
+
+    std::span<const storage::sqlite::SqliteMigrationStep>
+    MigrationSteps() const noexcept override {
+        return kL3RegistryMigrations;
+    }
+};
+
+L3RegistryMigrationSource kL3RegistryMigrationSource;
+
+}
 
 static const char* FACT_EXTRACTION_PROMPT = R"(从以下会话状态记录中抽取用户的长期偏好、重要特征、关键决策。
 只输出 JSON 数组，每条字符串不超过 50 字，不要任何解释。
@@ -63,16 +101,10 @@ core::Status LongTermMemoryCompressor::EnsureRegistrySchema() const {
     if (!options_.registry_pool) {
         return core::Status::Ok();
     }
-    auto lease_r = options_.registry_pool->AcquireWrite();
-    if (!lease_r.ok()) {
-        return lease_r.status();
-    }
-    auto lease = std::move(lease_r).value();
-    return lease->Execute(
-        "CREATE TABLE IF NOT EXISTS l3_user_registry ("
-        "user_uuid TEXT PRIMARY KEY NOT NULL, "
-        "first_seen_at_ms INTEGER NOT NULL, "
-        "last_seen_at_ms INTEGER NOT NULL)");
+    storage::sqlite::SqliteMigrationRunner runner(options_.registry_pool);
+    std::array<storage::sqlite::ISqliteMigrationSource*, 1> sources{
+        &kL3RegistryMigrationSource};
+    return runner.ApplyAll(sources);
 }
 
 core::Status LongTermMemoryCompressor::RegisterUser(const std::string& user_uuid) const {
@@ -114,7 +146,7 @@ core::Status LongTermMemoryCompressor::RegisterUser(const std::string& user_uuid
     return core::Status::Ok();
 }
 
-core::Result<std::vector<std::string>> LongTermMemoryCompressor::GetRegisteredUsers() const {
+core::Result<std::vector<std::string>> LongTermMemoryCompressor::GetRegisteredUsers() {
     if (!options_.registry_pool) {
         return std::vector<std::string>{};
     }
@@ -616,4 +648,4 @@ core::Result<std::vector<vector_storage::EntryRecord>> LongTermMemoryCompressor:
         search_opts);
 }
 
-}  // namespace agent::memory
+}

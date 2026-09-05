@@ -1,7 +1,7 @@
 #include "webrtc_signaling_handler.h"
 
 #include "memory_pool.h"
-#include "third_party/nlohmann/json.hpp"
+#include <nlohmann/json.hpp>
 
 #include <gtest/gtest.h>
 

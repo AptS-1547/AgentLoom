@@ -28,6 +28,7 @@ std::string_view ErrorCodeName(core::ErrorCode code) noexcept {
     case core::ErrorCode::ResourceExhausted: return "RESOURCE_EXHAUSTED";
     case core::ErrorCode::Unavailable: return "UNAVAILABLE";
     case core::ErrorCode::InternalError: return "INTERNAL_ERROR";
+    case core::ErrorCode::DataLoss: return "DATA_LOSS";
     }
     return "UNKNOWN";
 }

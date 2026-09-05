@@ -5,6 +5,7 @@
 // maintenance tasks.
 
 #include "persona_gateway_server.h"
+#include "../../skill/skill_registry.h"
 #include "grpc_emotion_analyzer.h"
 #include "emotion_fusion_analyzer.h"
 #include "semantic_cache_types.h"
@@ -875,6 +876,18 @@ int main(int argc, char** argv) {
                  config.emotion_analyzer.enabled ? "grpc" : "neutral");
 
         agent::service::gateway::PersonaGatewayServerDependencies dependencies;
+        auto skill_registry = std::make_shared<agent::skill::InMemorySkillRegistry>();
+        if (config.skills.enabled) {
+            if (auto status = skill_registry->RegisterAll(config.skill_manifests); !status.ok()) {
+                logging::Shutdown();
+                return Fail("Skill manifest registration: " + status.message());
+            }
+        }
+        dependencies.skill_registry = skill_registry;
+        LOG_INFO("[agent-gateway] Skill manifests registered count={} directory={} regex={}",
+                 config.skill_manifests.size(),
+                 config.skills.manifest_directory.string(),
+                 config.skills.manifest_filename_regex);
         dependencies.memory_provider = std::move(memory);
         dependencies.emotion_analyzer = std::move(emotion).value();
         dependencies.llm_client = llm_client;

@@ -28,6 +28,10 @@ bool MatchesOwner(const CacheLookupRequest& req, const storage::CacheRecord& rec
     if (!req.user_id.empty() && record.metadata.user_id != req.user_id) {
         return false;
     }
+    // L0 严格绑定当前 Session；缺少 session_id 的历史记录不能进入有 Session 约束的结果。
+    if (!req.session_id.empty() && record.metadata.session_id != req.session_id) {
+        return false;
+    }
     return true;
 }
 
@@ -93,7 +97,7 @@ std::shared_ptr<storage::sqlite::SqliteConnectionPool> MakeL0SqlitePool(
     return std::make_shared<storage::sqlite::SqliteConnectionPool>(std::move(options));
 }
 
-} // namespace
+}
 
 L0MemoryCacheAdapter::L0MemoryCacheAdapter(
     std::shared_ptr<::vector::EmbeddingPipeline> embedding,
@@ -117,11 +121,29 @@ L0MemoryCacheAdapter::L0MemoryCacheAdapter(
       redis_pool_(std::move(redis_pool)),
       sqlite_pool_(MakeL0SqlitePool(std::move(sqlite_path))),
       max_cached_records_(max_cached_records),
-      options_(options) {}
+      options_(options),
+      metadata_store_(std::make_shared<SqliteL0SessionBatchMetadataStore>(sqlite_pool_)) {
+    auto sqlite_store = std::static_pointer_cast<SqliteL0SessionBatchMetadataStore>(metadata_store_);
+    metadata_ready_ = [sqlite_store = std::move(sqlite_store)] {
+        return EnsureL0MetadataReady(*sqlite_store);
+    };
+}
 
 L0MemoryCacheAdapter::~L0MemoryCacheAdapter() {
     ShutdownBatching();
 }
+
+L0MemoryCacheAdapter::L0MemoryCacheAdapter(
+    std::shared_ptr<::vector::EmbeddingPipeline> embedding,
+    std::shared_ptr<RedisConnectionPool> redis_pool,
+    std::shared_ptr<IL0SessionBatchMetadataStore> metadata_store,
+    std::size_t max_cached_records,
+    L0MemoryCacheAdapterOptions options)
+    : embedding_(std::move(embedding)),
+      redis_pool_(std::move(redis_pool)),
+      max_cached_records_(max_cached_records),
+      options_(options),
+      metadata_store_(std::move(metadata_store)) {}
 
 core::Status L0MemoryCacheAdapter::ConfigureBatching(
     core::ThreadPool& compute_pool,
@@ -175,6 +197,9 @@ core::Result<std::shared_ptr<L0MemoryCacheAdapter::SessionIndexEntry>> L0MemoryC
         std::shared_lock lock(indices_mutex_);
         auto found = per_session_indices_.find(key);
         if (found != per_session_indices_.end()) {
+            if (found->second->released.load(std::memory_order_acquire)) {
+                return core::Status::Error(core::ErrorCode::Cancelled, "L0 session has been released");
+            }
             return found->second;
         }
     }
@@ -182,11 +207,20 @@ core::Result<std::shared_ptr<L0MemoryCacheAdapter::SessionIndexEntry>> L0MemoryC
     if (auto status = sqlite_pool_->Start(); !status.ok()) {
         return status;
     }
+    if (metadata_ready_) {
+        if (auto status = metadata_ready_(); !status.ok()) {
+            return status;
+        }
+    }
     // 索引初始化可能访问 SQLite，放在映射锁之外，避免一个新 Session 阻塞全部热路径。
     auto index = std::make_shared<cache_vector::VectorIndexManager>(
-        key,
+        L0SessionKey{
+            .tenant_id = req.tenant_id.empty() ? "default" : req.tenant_id,
+            .user_id = req.user_id,
+            .session_id = req.session_id,
+        },
         redis_pool_,
-        sqlite_pool_,
+        metadata_store_,
         max_cached_records_);
     auto candidate = std::make_shared<SessionIndexEntry>(std::move(index));
 
@@ -201,7 +235,12 @@ void L0MemoryCacheAdapter::ReleaseSession(std::string_view session_id) {
         return;
     }
     std::unique_lock lock(indices_mutex_);
-    per_session_indices_.erase(std::string(session_id));
+    auto found = per_session_indices_.find(std::string(session_id));
+    if (found != per_session_indices_.end()) {
+        // 先标记关闭再移出 map，保证已捕获 entry 的异步回调不会重新写入 Session。
+        found->second->released.store(true, std::memory_order_release);
+        per_session_indices_.erase(found);
+    }
 }
 
 core::Result<CacheLookupResult> L0MemoryCacheAdapter::LookupWithEmbedding(
@@ -218,6 +257,16 @@ core::Result<CacheLookupResult> L0MemoryCacheAdapter::LookupWithEmbedding(
     if (!entry.ok()) {
         return entry.status();
     }
+    return LookupWithEmbedding(req, entry.value(), query_embedding);
+}
+
+core::Result<CacheLookupResult> L0MemoryCacheAdapter::LookupWithEmbedding(
+    const CacheLookupRequest& req,
+    const std::shared_ptr<SessionIndexEntry>& entry,
+    const std::vector<float>& query_embedding) {
+    if (entry->released.load(std::memory_order_acquire)) {
+        return core::Status::Error(core::ErrorCode::Cancelled, "L0 session has been released");
+    }
 
     const auto candidate_multiplier = std::max<std::size_t>(1, options_.candidate_multiplier);
     const auto max_top_k = std::numeric_limits<std::size_t>::max() / candidate_multiplier;
@@ -225,8 +274,12 @@ core::Result<CacheLookupResult> L0MemoryCacheAdapter::LookupWithEmbedding(
         ? std::numeric_limits<std::size_t>::max()
         : options_.top_k * candidate_multiplier;
     core::Result<std::vector<cache_vector::SearchWithContextResult>> hits = [&] {
-        std::lock_guard lock(entry.value()->operation_mutex);
-        return entry.value()->index->SearchWithContext(
+        std::lock_guard lock(entry->operation_mutex);
+        if (entry->released.load(std::memory_order_acquire)) {
+            return core::Result<std::vector<cache_vector::SearchWithContextResult>>(
+                core::Status::Error(core::ErrorCode::Cancelled, "L0 session has been released"));
+        }
+        return entry->index->SearchWithContext(
             query_embedding, candidate_k, options_.neighbors_per_hit);
     }();
     if (!hits.ok()) {
@@ -338,6 +391,10 @@ core::Status L0MemoryCacheAdapter::LookupAsync(
             "asynchronous L0 lookup requires shared adapter ownership");
     }
     auto request_holder = std::make_shared<CacheLookupRequest>(std::move(request));
+    auto entry = ResolveIndex(*request_holder);
+    if (!entry.ok()) {
+        return entry.status();
+    }
     return batch_coordinator_->Submit({
         .session_id = request_holder->session_id,
         .tenant_id = request_holder->tenant_id,
@@ -346,14 +403,14 @@ core::Status L0MemoryCacheAdapter::LookupAsync(
             ? request_holder->extra.at("trace_id")
             : std::string{},
         .text = request_holder->text,
-        .completion = [self = std::move(self), request_holder,
+        .completion = [self = std::move(self), request_holder, entry = std::move(entry).value(),
                        completion = std::move(completion)](
             core::Result<std::vector<float>> embedding) mutable {
             if (!embedding.ok()) {
                 completion(embedding.status());
                 return;
             }
-            completion(self->LookupWithEmbedding(*request_holder, embedding.value()));
+            completion(self->LookupWithEmbedding(*request_holder, entry, embedding.value()));
         },
     });
 }
@@ -405,6 +462,10 @@ core::Status L0MemoryCacheAdapter::StoreAsync(
             "asynchronous L0 store requires shared adapter ownership");
     }
     auto request_holder = std::make_shared<CacheStoreRequest>(std::move(request));
+    auto entry = ResolveIndex(request_holder->origin);
+    if (!entry.ok()) {
+        return entry.status();
+    }
     return batch_coordinator_->Submit({
         .session_id = request_holder->origin.session_id,
         .tenant_id = request_holder->origin.tenant_id,
@@ -413,7 +474,7 @@ core::Status L0MemoryCacheAdapter::StoreAsync(
             ? request_holder->origin.extra.at("trace_id")
             : std::string{},
         .text = request_holder->origin.text,
-        .completion = [self = std::move(self), request_holder,
+        .completion = [self = std::move(self), request_holder, entry = std::move(entry).value(),
                        completion = std::move(completion)](
             core::Result<std::vector<float>> embedding) mutable {
             if (!embedding.ok()) {
@@ -421,7 +482,7 @@ core::Status L0MemoryCacheAdapter::StoreAsync(
                 return;
             }
             completion(self->StoreWithEmbedding(
-                *request_holder, std::move(embedding).value()));
+                *request_holder, entry, std::move(embedding).value()));
         },
     });
 }
@@ -432,6 +493,16 @@ core::Status L0MemoryCacheAdapter::StoreWithEmbedding(
     auto entry = ResolveIndex(req.origin);
     if (!entry.ok()) {
         return entry.status();
+    }
+    return StoreWithEmbedding(req, entry.value(), std::move(text_embedding));
+}
+
+core::Status L0MemoryCacheAdapter::StoreWithEmbedding(
+    const CacheStoreRequest& req,
+    const std::shared_ptr<SessionIndexEntry>& entry,
+    std::vector<float> text_embedding) {
+    if (entry->released.load(std::memory_order_acquire)) {
+        return core::Status::Error(core::ErrorCode::Cancelled, "L0 session has been released");
     }
 
     storage::CacheRecord record;
@@ -455,8 +526,11 @@ core::Status L0MemoryCacheAdapter::StoreWithEmbedding(
             std::chrono::duration_cast<std::chrono::milliseconds>(*req.ttl).count();
     }
     record.extra_metadata = req.origin.extra;
-    std::lock_guard lock(entry.value()->operation_mutex);
-    return entry.value()->index->AddRecord(record);
+    std::lock_guard lock(entry->operation_mutex);
+    if (entry->released.load(std::memory_order_acquire)) {
+        return core::Status::Error(core::ErrorCode::Cancelled, "L0 session has been released");
+    }
+    return entry->index->AddRecord(record);
 }
 
-} // namespace agent::semantic_cache
+}

@@ -8,6 +8,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -48,6 +49,28 @@ public:
                          std::string sqlite_path,
                          std::size_t max_cached_records,
                          L0MemoryCacheAdapterOptions options = {});
+    L0MemoryCacheAdapter(
+        std::shared_ptr<::vector::EmbeddingPipeline> embedding,
+        std::shared_ptr<RedisConnectionPool> redis_pool,
+        std::shared_ptr<IL0SessionBatchMetadataStore> metadata_store,
+        std::size_t max_cached_records,
+        L0MemoryCacheAdapterOptions options = {});
+
+    template <L0SessionMetadataProvider Provider>
+    L0MemoryCacheAdapter(
+        std::shared_ptr<::vector::EmbeddingPipeline> embedding,
+        std::shared_ptr<RedisConnectionPool> redis_pool,
+        std::shared_ptr<Provider> metadata_store,
+        std::size_t max_cached_records,
+        L0MemoryCacheAdapterOptions options = {})
+        : embedding_(std::move(embedding)),
+          redis_pool_(std::move(redis_pool)),
+          max_cached_records_(max_cached_records),
+          options_(options),
+          metadata_store_(metadata_store),
+          metadata_ready_([metadata_store = std::move(metadata_store)] {
+              return EnsureL0MetadataReady(*metadata_store);
+          }) {}
     ~L0MemoryCacheAdapter() override;
 
     core::Result<CacheLookupResult> Lookup(const CacheLookupRequest& req) override;
@@ -72,6 +95,7 @@ private:
             : index(std::move(value)) {}
 
         std::shared_ptr<cache_vector::VectorIndexManager> index;
+        std::atomic<bool> released{false};
         // VectorIndexManager 仍包含批次游标等可变状态；同一 Session 暂时严格保序。
         std::mutex operation_mutex;
     };
@@ -81,14 +105,24 @@ private:
     core::Result<CacheLookupResult> LookupWithEmbedding(
         const CacheLookupRequest& req,
         const std::vector<float>& query_embedding);
+    core::Result<CacheLookupResult> LookupWithEmbedding(
+        const CacheLookupRequest& req,
+        const std::shared_ptr<SessionIndexEntry>& entry,
+        const std::vector<float>& query_embedding);
     core::Status StoreWithEmbedding(
         const CacheStoreRequest& req,
+        std::vector<float> text_embedding);
+    core::Status StoreWithEmbedding(
+        const CacheStoreRequest& req,
+        const std::shared_ptr<SessionIndexEntry>& entry,
         std::vector<float> text_embedding);
 
     std::shared_ptr<::vector::EmbeddingPipeline> embedding_;
     std::shared_ptr<cache_vector::VectorIndexManager> index_;
     std::shared_ptr<RedisConnectionPool> redis_pool_;
     std::shared_ptr<storage::sqlite::SqliteConnectionPool> sqlite_pool_;
+    std::shared_ptr<IL0SessionBatchMetadataStore> metadata_store_;
+    std::function<core::Status()> metadata_ready_;
     std::size_t max_cached_records_ = 1000;
     std::shared_ptr<SessionIndexEntry> fixed_index_entry_;
     std::unordered_map<std::string, std::shared_ptr<SessionIndexEntry>> per_session_indices_;
@@ -98,4 +132,4 @@ private:
     mutable std::shared_mutex indices_mutex_;
 };
 
-} // namespace agent::semantic_cache
+}

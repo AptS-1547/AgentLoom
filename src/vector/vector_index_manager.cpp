@@ -96,6 +96,7 @@ core::Result<std::vector<vector_storage::EntryRecord>> VectorIndexManager::Searc
         if (options.memory_type && entry.memory_type != *options.memory_type) continue;
         if (options.min_score && r.score < *options.min_score) continue;
 
+        entry.search_score = r.score;
         out.push_back(std::move(entry));
         if (out.size() >= options.top_k) break;
     }

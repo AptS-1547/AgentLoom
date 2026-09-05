@@ -44,6 +44,30 @@ struct CloudTaskChunkResult {
     core::Status status = core::Status::Ok();
 };
 
+struct CloudTaskSummary {
+    CloudTaskId task;
+    std::size_t chunk_count = 0;
+    std::size_t completed_chunks = 0;
+    std::size_t successful_chunks = 0;
+    std::size_t failed_chunks = 0;
+    core::Status status = core::Status::Ok();
+};
+
+class ICloudTaskResultSink {
+public:
+    virtual ~ICloudTaskResultSink() = default;
+
+    virtual core::Status OnChunk(CloudTaskChunkResult result) = 0;
+    virtual core::Status OnCompleted(CloudTaskSummary summary) = 0;
+};
+
+class ICloudTaskOperation {
+public:
+    virtual ~ICloudTaskOperation() = default;
+
+    virtual void Cancel() noexcept = 0;
+};
+
 struct CloudTaskCoordinatorOptions {
     std::size_t worker_count = 4;
     std::size_t max_chunks = 256;
@@ -71,6 +95,10 @@ public:
     virtual core::Result<std::future<core::Result<std::vector<CloudTaskChunkResult>>>> ExecuteAsync(
         std::vector<CloudTaskChunk> chunks) = 0;
 
+    virtual core::Result<std::shared_ptr<ICloudTaskOperation>> StartAsync(
+        std::vector<CloudTaskChunk> chunks,
+        std::shared_ptr<ICloudTaskResultSink> sink) = 0;
+
     virtual CloudTaskCoordinatorSnapshot Snapshot() const = 0;
 };
 
@@ -78,6 +106,10 @@ class CloudTaskCoordinator final : public ICloudTaskCoordinator {
 public:
     CloudTaskCoordinator(
         std::shared_ptr<ILlmClient> llm_client,
+        CloudTaskCoordinatorOptions options = {},
+        core::LoggerAdapter logger = {});
+    CloudTaskCoordinator(
+        std::shared_ptr<IAsyncLlmClient> llm_client,
         CloudTaskCoordinatorOptions options = {},
         core::LoggerAdapter logger = {});
     ~CloudTaskCoordinator() override;
@@ -91,11 +123,15 @@ public:
     core::Result<std::future<core::Result<std::vector<CloudTaskChunkResult>>>> ExecuteAsync(
         std::vector<CloudTaskChunk> chunks) override;
 
+    core::Result<std::shared_ptr<ICloudTaskOperation>> StartAsync(
+        std::vector<CloudTaskChunk> chunks,
+        std::shared_ptr<ICloudTaskResultSink> sink) override;
+
     CloudTaskCoordinatorSnapshot Snapshot() const override;
 
 private:
     class Impl;
-    std::unique_ptr<Impl> impl_;
+    std::shared_ptr<Impl> impl_;
 };
 
-} // namespace agent::llm
+}

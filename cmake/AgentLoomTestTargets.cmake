@@ -272,6 +272,7 @@ if(BERT_BUILD_TESTS)
 
     add_executable(storage_tests
         tests/storage/sqlite_storage_test.cpp
+        tests/storage/sqlite_migration_test.cpp
     )
 
     target_link_libraries(storage_tests PRIVATE

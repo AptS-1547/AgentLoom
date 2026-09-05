@@ -8,6 +8,7 @@
 #include <fstream>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace agent::llm {
 
@@ -20,6 +21,7 @@ std::string RoleToString(ChatRole role) {
         case ChatRole::System: return "system";
         case ChatRole::User: return "user";
         case ChatRole::Assistant: return "assistant";
+        case ChatRole::Tool: return "tool";
     }
     return "user";
 }
@@ -49,6 +51,16 @@ Json BuildRequestJson(const ChatCompletionRequest& req, const std::string& defau
                 msg_obj["content"].push_back(ContentPartToJson(part));
             }
         }
+        if (!msg.tool_calls.empty()) {
+            if (msg.content.empty()) msg_obj["content"] = nullptr;
+            msg_obj["tool_calls"] = Json::array();
+            for (const auto& call : msg.tool_calls) {
+                msg_obj["tool_calls"].push_back({{"id", call.id}, {"type", "function"},
+                    {"function", {{"name", call.name}, {"arguments", call.arguments_json}}}});
+            }
+        }
+        if (msg.role == ChatRole::Tool) msg_obj["tool_call_id"] = msg.tool_call_id;
+        if (msg.reasoning_content) msg_obj["reasoning_content"] = *msg.reasoning_content;
         j["messages"].push_back(msg_obj);
     }
     j["temperature"] = req.temperature;
@@ -58,6 +70,17 @@ Json BuildRequestJson(const ChatCompletionRequest& req, const std::string& defau
     j["top_p"] = req.top_p;
     j["n"] = req.n;
     j["stream"] = req.stream;
+    if (!req.tools.empty()) {
+        j["tools"] = Json::array();
+        for (const auto& tool : req.tools) {
+            const auto parameters = Json::parse(tool.parameters_json);
+            j["tools"].push_back({{"type", "function"}, {"function", {
+                {"name", tool.name}, {"description", tool.description}, {"parameters", parameters}
+            }}});
+        }
+    }
+    if (!req.tool_choice.empty()) j["tool_choice"] = req.tool_choice;
+    if (req.parallel_tool_calls) j["parallel_tool_calls"] = *req.parallel_tool_calls;
     return j;
 }
 
@@ -103,11 +126,51 @@ core::Result<ChatCompletionResponse> ParseResponse(const std::string& body, int 
     }
 
     const auto& message = choice["message"];
-    if (!message.contains("content") || !message["content"].is_string()) {
-        return core::Status(core::ErrorCode::InternalError,
-            "LLM response missing content field");
+    if (message.contains("content") && !message["content"].is_null() && !message["content"].is_string()) {
+        return core::Status::Error(core::ErrorCode::DataLoss, "LLM content must be text or null");
     }
-    resp.content = message["content"].get<std::string>();
+    const bool has_content = message.contains("content") && message["content"].is_string();
+    if (has_content) {
+        resp.content = message["content"].get<std::string>();
+    }
+    if (choice.contains("finish_reason") && choice["finish_reason"].is_string()) {
+        resp.finish_reason = choice["finish_reason"].get<std::string>();
+    }
+    if (message.contains("reasoning_content") && message["reasoning_content"].is_string()) {
+        resp.reasoning_content = message["reasoning_content"].get<std::string>();
+    }
+    if (message.contains("tool_calls") && !message["tool_calls"].is_null()) {
+        if (!message["tool_calls"].is_array()) {
+            return core::Status::Error(core::ErrorCode::DataLoss, "LLM tool_calls must be an array");
+        }
+        std::unordered_set<std::string> ids;
+        for (const auto& call : message["tool_calls"]) {
+            // 整批拒绝损坏调用，避免部分执行产生不可解释的副作用。
+            if (!call.is_object() || !call.contains("id") || !call["id"].is_string() ||
+                !call.contains("type") || call["type"] != "function" ||
+                !call.contains("function") || !call["function"].is_object()) {
+                return core::Status::Error(core::ErrorCode::DataLoss, "malformed LLM tool call");
+            }
+            const auto& fn = call["function"];
+            if (!fn.contains("name") || !fn["name"].is_string() ||
+                !fn.contains("arguments") ||
+                (!fn["arguments"].is_string() && !fn["arguments"].is_object())) {
+                return core::Status::Error(core::ErrorCode::DataLoss, "malformed LLM function fields");
+            }
+            const auto arguments = fn["arguments"].is_string()
+                ? fn["arguments"].get<std::string>()
+                : fn["arguments"].dump();
+            ChatToolCall parsed{call["id"].get<std::string>(), fn["name"].get<std::string>(), arguments};
+            if (parsed.id.empty() || parsed.name.empty() || !ids.insert(parsed.id).second) {
+                return core::Status::Error(core::ErrorCode::DataLoss, "invalid or duplicate LLM tool call id");
+            }
+            resp.tool_calls.push_back(std::move(parsed));
+        }
+    }
+    if (!has_content && resp.tool_calls.empty()) {
+        return core::Status(core::ErrorCode::InternalError,
+            "LLM response contains neither content nor tool_calls");
+    }
 
     if (j.contains("usage") && j["usage"].is_object()) {
         const auto& usage = j["usage"];
@@ -126,6 +189,54 @@ core::Result<ChatCompletionResponse> ParseResponse(const std::string& body, int 
 }
 
 }  // namespace
+
+core::Status ValidateChatCompletionRequest(const ChatCompletionRequest& request) {
+    const auto invalid = [](const char* reason) {
+        return core::Status::Error(core::ErrorCode::InvalidArgument, reason);
+    };
+    if (request.stream) return invalid("streaming completions are not implemented by this client");
+    if (request.tool_choice != "" && request.tool_choice != "none" &&
+        request.tool_choice != "auto" && request.tool_choice != "required") {
+        return invalid("unsupported tool_choice");
+    }
+    if ((request.tool_choice == "auto" || request.tool_choice == "required" ||
+         request.parallel_tool_calls.has_value()) && request.tools.empty()) {
+        return invalid("tool selection requires tool definitions");
+    }
+    std::unordered_set<std::string> names;
+    for (const auto& tool : request.tools) {
+        const auto schema = Json::parse(tool.parameters_json, nullptr, false);
+        if (tool.name.empty() || !names.insert(tool.name).second || !schema.is_object() ||
+            !schema.contains("type") || schema["type"] != "object") {
+            return invalid("tools require unique names and an object parameter schema");
+        }
+    }
+    // 一次 assistant 调用批次必须收齐结果，才能继续用户/助手消息。
+    std::unordered_set<std::string> pending;
+    std::unordered_set<std::string> used;
+    for (const auto& message : request.messages) {
+        if (message.role == ChatRole::Tool) {
+            if (message.tool_call_id.empty() || pending.erase(message.tool_call_id) != 1 ||
+                !message.tool_calls.empty() || !message.parts.empty() || message.reasoning_content) {
+                return invalid("tool result does not match a pending assistant call");
+            }
+            continue;
+        }
+        if (!pending.empty()) return invalid("assistant tool calls are missing results");
+        if (!message.tool_call_id.empty() ||
+            (message.role != ChatRole::Assistant && (!message.tool_calls.empty() || message.reasoning_content))) {
+            return invalid("tool metadata belongs to assistant or tool messages only");
+        }
+        for (const auto& call : message.tool_calls) {
+            if (call.id.empty() || call.name.empty() || !used.insert(call.id).second) {
+                return invalid("assistant tool call id is empty or duplicated");
+            }
+            pending.insert(call.id);
+        }
+    }
+    if (!pending.empty()) return invalid("assistant tool calls are missing results");
+    return core::Status::Ok();
+}
 
 ChatContentPart ChatContentPart::Text(std::string text) {
     ChatContentPart part;
@@ -227,6 +338,10 @@ OpenAiLlmClient::~OpenAiLlmClient() = default;
 core::Result<ChatCompletionResponse> OpenAiLlmClient::Complete(
     const ChatCompletionRequest& req) {
     try {
+        if (auto status = ValidateChatCompletionRequest(req); !status.ok()) {
+            core::LoggerAdapter::ForModule("llm-client").warn("LLM request rejected: {}", status.message());
+            return status;
+        }
         return ExecuteWithRetry(req);
     } catch (const std::exception& e) {
         return core::Status(core::ErrorCode::InternalError,
@@ -597,6 +712,10 @@ core::Result<std::shared_ptr<IAsyncLlmOperation>> OpenAiAsyncLlmClient::Complete
     if (!callback) {
         return core::Status::Error(core::ErrorCode::InvalidArgument,
                                    "async LLM callback is required");
+    }
+    if (auto status = ValidateChatCompletionRequest(request); !status.ok()) {
+        impl_->logger.warn("LLM request rejected: {}", status.message());
+        return status;
     }
     try {
         auto operation = std::make_shared<AsyncOpenAiOperation>(

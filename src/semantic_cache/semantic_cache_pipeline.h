@@ -1,5 +1,7 @@
 #pragma once
 
+#include "l0_batch_metadata_store.h"
+
 #include "context_risk_detector.h"
 #include "isemantic_cache.h"
 #include "semantic_cache_policy.h"
@@ -199,6 +201,11 @@ namespace cache_vector {
                                std::shared_ptr<RedisConnectionPool> redis_pool,
                                std::shared_ptr<storage::sqlite::SqliteConnectionPool> sqlite_pool,
                                std::size_t max_cached_records = 1000);
+            VectorIndexManager(
+                L0SessionKey session_key,
+                std::shared_ptr<RedisConnectionPool> redis_pool,
+                std::shared_ptr<IL0SessionBatchMetadataStore> metadata_store,
+                std::size_t max_cached_records = 1000);
             VectorIndexManager(const VectorIndexManager&) = delete;
             VectorIndexManager& operator=(const VectorIndexManager&) = delete;
 
@@ -229,9 +236,12 @@ namespace cache_vector {
             core::Status PromoteBatchToIndex();
             std::string BuildBatchKey(std::int64_t timestamp) const;
             std::size_t max_cached_records_;
+            L0SessionKey session_key_;
+            bool session_scoped_key_ = false;
             std::string user_uuid_;
             std::shared_ptr<RedisConnectionPool> redis_pool_;
             std::shared_ptr<storage::sqlite::SqliteConnectionPool> sqlite_pool_;
+            std::shared_ptr<IL0SessionBatchMetadataStore> metadata_store_;
             core::Status initialization_status_;
             std::deque<std::int64_t> timestamp_index_;
             std::vector<std::int64_t> backpack_timestamps_;
@@ -287,4 +297,4 @@ private:
     SemanticCachePipelineDeps deps_;
 };
 
-}  // namespace agent::semantic_cache
+}

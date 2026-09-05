@@ -1,6 +1,6 @@
 #include "webrtc_session_registry.h"
 
-#include "third_party/nlohmann/json.hpp"
+#include <nlohmann/json.hpp>
 
 #include <chrono>
 #include <random>

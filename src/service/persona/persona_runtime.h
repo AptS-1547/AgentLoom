@@ -5,6 +5,7 @@
 #include "openai_llm_client.h"
 #include "session_manager.h"
 #include "skill_session_manager.h"
+#include "../../skill/skill_executor.h"
 #include "tool_memory_provider.h"
 
 #include <chrono>
@@ -290,7 +291,8 @@ public:
                    core::LoggerAdapter logger = core::LoggerAdapter::ForModule("service"),
                    std::shared_ptr<IEmotionCalibrationSampleSink> emotion_calibration_sink = nullptr,
                    std::shared_ptr<llm::IAsyncLlmClient> async_llm_client = nullptr,
-                   core::ThreadPool* continuation_pool = nullptr);
+                   core::ThreadPool* continuation_pool = nullptr,
+                   std::shared_ptr<agent::skill::ISkillToolCallCoordinator> skill_tool_coordinator = nullptr);
     ~PersonaRuntime();
 
     /// 异步提交对话；callback 恰好调用一次并携带最终 Result。
@@ -321,6 +323,8 @@ private:
         EmotionAnalysis user_emotion;
         GenerationParams generation;
         std::vector<llm::ChatMessage> messages;
+        std::vector<llm::ChatCompletionRequest::Tool> tools;
+        std::size_t tool_round = 0;
         AnswerCacheInfo answer_cache;
         std::chrono::steady_clock::time_point started_at;
         std::chrono::steady_clock::time_point io_submitted_at;
@@ -419,6 +423,7 @@ private:
     std::shared_ptr<IAnswerCacheProvider> answer_cache_provider_;
     std::shared_ptr<IToolMemoryProvider> tool_memory_provider_;
     std::shared_ptr<ISkillSessionManager> skill_session_manager_;
+    std::shared_ptr<agent::skill::ISkillToolCallCoordinator> skill_tool_coordinator_;
     std::shared_ptr<IEmotionCalibrationSampleSink> emotion_calibration_sink_;
     PersonaRuntimeOptions options_;
     core::LoggerAdapter logger_;

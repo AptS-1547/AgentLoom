@@ -11,6 +11,7 @@
 
 #include <chrono>
 #include <algorithm>
+#include <array>
 #include <ctime>
 #include <iomanip>
 #include <sstream>
@@ -221,7 +222,7 @@ core::Status EnsureSessionOwner(const persona::SessionSnapshot& session,
     return core::Status::Ok();
 }
 
-} // namespace
+}
 
 std::string InMemoryPersonaMetadataStore::Key(std::string_view tenant_id,
                                               std::string_view user_uuid,
@@ -415,12 +416,19 @@ SqlitePersonaMetadataStore::SqlitePersonaMetadataStore(std::shared_ptr<SqliteCon
     : pool_(std::move(pool)) {}
 
 core::Status SqlitePersonaMetadataStore::EnsureSchema() {
-    auto lease_result = AcquirePersonaMetadataConnection(pool_, true);
-    if (!lease_result.ok()) {
-        return lease_result.status();
+    if (!pool_) {
+        return core::Status::Error(
+            core::ErrorCode::FailedPrecondition,
+            "persona metadata store pool is not configured");
     }
-    auto lease = std::move(lease_result).value();
-    auto& connection = lease.connection();
+    storage::sqlite::SqliteMigrationRunner runner(pool_);
+    std::array<storage::sqlite::ISqliteMigrationSource*, 1> sources{this};
+    return runner.ApplyAll(sources);
+}
+
+namespace {
+
+core::Status ApplyPersonaMetadataV1(storage::sqlite::SqliteConnection& connection) {
     return connection.Execute(
         "CREATE TABLE IF NOT EXISTS gateway_persona_metadata ("
         "tenant_id TEXT NOT NULL,"
@@ -431,6 +439,26 @@ core::Status SqlitePersonaMetadataStore::EnsureSchema() {
         "updated_at INTEGER NOT NULL,"
         "PRIMARY KEY(tenant_id,user_uuid,persona_id)"
         ")");
+}
+
+const std::array<storage::sqlite::SqliteMigrationStep, 1> kPersonaMetadataMigrations{{
+    {
+        .version = 1,
+        .name = "create_gateway_persona_metadata",
+        .checksum = "gateway_persona_metadata_v1_create_table",
+        .apply = ApplyPersonaMetadataV1,
+    },
+}};
+
+}
+
+std::string_view SqlitePersonaMetadataStore::MigrationNamespace() const noexcept {
+    return "gateway_persona_metadata";
+}
+
+std::span<const storage::sqlite::SqliteMigrationStep>
+SqlitePersonaMetadataStore::MigrationSteps() const noexcept {
+    return kPersonaMetadataMigrations;
 }
 
 core::Status SqlitePersonaMetadataStore::Upsert(PersonaMetadataRecord record) {
@@ -1340,4 +1368,4 @@ std::string PersonaGatewayService::EnsureTrace(std::string trace_id) const {
     return core::GenerateTraceId();
 }
 
-} // namespace agent::service::gateway
+}

@@ -166,6 +166,7 @@ add_library(agent_config STATIC
     src/config/sections/model_config_section.cpp
     src/config/sections/persona_gateway_config_section.cpp
     src/config/sections/skill_session_config_section.cpp
+    src/config/sections/skill_registry_config_section.cpp
     src/config/sections/vlm_cache_config_section.cpp
     src/config/sections/vram_config_section.cpp
     src/config/server_config.cpp

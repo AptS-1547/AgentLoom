@@ -156,7 +156,7 @@ CacheEntryMetadata MetadataFromStoreRequest(const CacheStoreRequest& req) {
     }
     return metadata;
 }
-}  // namespace
+}
 
 // ──────────────────────────────────────────────────────────────────────────
 // CacheRecord binary serialization
@@ -484,11 +484,14 @@ cache_vector::VectorIndexManager::VectorIndexManager(
     std::shared_ptr<storage::sqlite::SqliteConnectionPool> sqlite_pool,
     std::size_t max_cached_records)
     : max_cached_records_(max_cached_records),
+      session_key_({.tenant_id = "default", .user_id = user_uuid, .session_id = "legacy"}),
+      session_scoped_key_(false),
       user_uuid_(std::move(user_uuid)),
       redis_pool_(std::move(redis_pool)),
       sqlite_pool_(std::move(sqlite_pool)),
       active_timestamp_(0),
       active_count_(0) {
+    // 旧构造路径保留 legacy SQLite 表和 Redis key，避免静默丢失已有数据。
     initialization_status_ = EnsureSchema();
     if (initialization_status_.ok()) {
         initialization_status_ = LoadActiveBatch();
@@ -498,7 +501,34 @@ cache_vector::VectorIndexManager::VectorIndexManager(
     }
 }
 
+cache_vector::VectorIndexManager::VectorIndexManager(
+    L0SessionKey session_key,
+    std::shared_ptr<RedisConnectionPool> redis_pool,
+    std::shared_ptr<IL0SessionBatchMetadataStore> metadata_store,
+    std::size_t max_cached_records)
+    : max_cached_records_(max_cached_records),
+      session_key_(std::move(session_key)),
+      session_scoped_key_(true),
+      user_uuid_(session_key_.user_id),
+      redis_pool_(std::move(redis_pool)),
+      metadata_store_(std::move(metadata_store)),
+      active_timestamp_(0),
+      active_count_(0) {
+    initialization_status_ = metadata_store_
+        ? core::Status::Ok()
+        : core::Status::Error(core::ErrorCode::FailedPrecondition, "L0 metadata store is missing");
+    if (initialization_status_.ok()) {
+        initialization_status_ = LoadActiveBatch();
+    }
+    if (initialization_status_.ok()) {
+        initialization_status_ = LoadTimestampIndex();
+    }
+}
+
 core::Status cache_vector::VectorIndexManager::EnsureSchema() {
+    if (metadata_store_) {
+        return core::Status::Ok();
+    }
     {
         auto read_lease_result = AcquireIndexConnection(sqlite_pool_, false);
         if (!read_lease_result.ok()) {
@@ -564,6 +594,11 @@ std::size_t cache_vector::VectorIndexManager::CurrentSize() const {
 }
 
 std::string cache_vector::VectorIndexManager::BuildBatchKey(std::int64_t timestamp) const {
+    if (session_scoped_key_) {
+        return "cache:v2:batch:" + session_key_.tenant_id + ":" +
+               session_key_.user_id + ":" + session_key_.session_id + ":" +
+               std::to_string(timestamp);
+    }
     return "cache:batch:" + user_uuid_ + ":" + std::to_string(timestamp);
 }
 
@@ -641,16 +676,27 @@ core::Status cache_vector::VectorIndexManager::ReloadNextBatch() {
         return core::Status::Error(core::ErrorCode::FailedPrecondition, "redis pool not available");
     }
 
-    std::int64_t timestamp;
+    std::int64_t timestamp = 0;
+    bool need_rebuild = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (timestamp_index_.empty()) {
-            // Fallback: rebuild from Redis SCAN
-            auto rebuild_status = RebuildTimestampIndexFromRedis();
-            if (!rebuild_status.ok() || timestamp_index_.empty()) {
-                return core::Status::Error(core::ErrorCode::NotFound, "no batches to reload");
-            }
-            read_cursor_ = 0;
+            need_rebuild = true;
+        }
+    }
+
+    // Redis SCAN 和 SQLite repair 不能在持有内存状态锁时执行，否则 repair 写回会重入同一把锁。
+    if (need_rebuild) {
+        auto rebuild_status = RebuildTimestampIndexFromRedis();
+        if (!rebuild_status.ok()) {
+            return rebuild_status;
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (timestamp_index_.empty()) {
+            return core::Status::Error(core::ErrorCode::NotFound, "no batches to reload");
         }
 
         // All batches have been read this round — reset cursor for next round
@@ -715,9 +761,13 @@ core::Status cache_vector::VectorIndexManager::RebuildTimestampIndexFromRedis() 
     }
 
     if (!rebuilt.empty()) {
-        timestamp_index_ = std::move(rebuilt);
-        read_cursor_ = 0;
-        StoreTimestampIndex();
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            timestamp_index_ = std::move(rebuilt);
+            read_cursor_ = 0;
+        }
+        // 使用锁外快照写回 SQLite，避免 Redis repair 与 metadata writer 互相阻塞。
+        static_cast<void>(StoreTimestampIndex());
     }
 
     return core::Status::Ok();
@@ -1046,6 +1096,18 @@ core::Result<std::vector<cache_vector::SearchWithContextResult>> cache_vector::V
 }
 
 core::Status cache_vector::VectorIndexManager::LoadActiveBatch() {
+    if (metadata_store_) {
+        auto loaded = metadata_store_->LoadActiveBatch(session_key_);
+        if (!loaded.ok()) return loaded.status();
+        if (!loaded.value().has_value()) {
+            active_timestamp_ = 0;
+            active_count_ = 0;
+        } else {
+            active_timestamp_ = loaded.value()->timestamp;
+            active_count_ = loaded.value()->count;
+        }
+        return core::Status::Ok();
+    }
     auto lease_result = AcquireIndexConnection(sqlite_pool_, false);
     if (!lease_result.ok()) {
         return lease_result.status();
@@ -1082,6 +1144,11 @@ core::Status cache_vector::VectorIndexManager::LoadActiveBatch() {
 }
 
 core::Status cache_vector::VectorIndexManager::SaveActiveBatch() {
+    if (metadata_store_) {
+        return metadata_store_->SaveActiveBatch(
+            session_key_,
+            L0ActiveBatchState{.timestamp = active_timestamp_, .count = active_count_});
+    }
     auto lease_result = AcquireIndexConnection(sqlite_pool_, true);
     if (!lease_result.ok()) {
         return lease_result.status();
@@ -1131,6 +1198,14 @@ core::Status cache_vector::VectorIndexManager::PromoteBatchToIndex() {
         return status;
     }
 
+    if (metadata_store_) {
+        status = metadata_store_->ClearActiveBatch(session_key_);
+        if (!status.ok()) return status;
+        active_timestamp_ = 0;
+        active_count_ = 0;
+        return core::Status::Ok();
+    }
+
     auto lease_result = AcquireIndexConnection(sqlite_pool_, true);
     if (!lease_result.ok()) {
         return lease_result.status();
@@ -1160,6 +1235,14 @@ core::Status cache_vector::VectorIndexManager::PromoteBatchToIndex() {
 }
 
 core::Status cache_vector::VectorIndexManager::StoreTimestampIndex() {
+    if (metadata_store_) {
+        std::vector<std::int64_t> snapshot;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            snapshot.assign(timestamp_index_.begin(), timestamp_index_.end());
+        }
+        return metadata_store_->ReplaceTimestampIndex(session_key_, snapshot);
+    }
     auto lease_result = AcquireIndexConnection(sqlite_pool_, true);
     if (!lease_result.ok()) {
         return lease_result.status();
@@ -1219,8 +1302,12 @@ core::Status cache_vector::VectorIndexManager::StoreTimestampIndex() {
     }
     auto stmt = std::move(stmt_result.value());
 
-    std::lock_guard<std::mutex> lock(mutex_);
-    for (auto ts : timestamp_index_) {
+    std::vector<std::int64_t> timestamp_snapshot;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        timestamp_snapshot.assign(timestamp_index_.begin(), timestamp_index_.end());
+    }
+    for (auto ts : timestamp_snapshot) {
         status = stmt.BindText(1, user_uuid_);
         if (!status.ok()) {
             txn.Rollback();
@@ -1247,6 +1334,15 @@ core::Status cache_vector::VectorIndexManager::StoreTimestampIndex() {
 }
 
 core::Status cache_vector::VectorIndexManager::LoadTimestampIndex() {
+    if (metadata_store_) {
+        auto loaded = metadata_store_->LoadTimestampIndex(session_key_);
+        if (!loaded.ok()) return loaded.status();
+        std::lock_guard<std::mutex> lock(mutex_);
+        timestamp_index_.assign(loaded.value().begin(), loaded.value().end());
+        backpack_timestamps_.assign(loaded.value().begin(), loaded.value().end());
+        read_cursor_ = 0;
+        return core::Status::Ok();
+    }
     auto lease_result = AcquireIndexConnection(sqlite_pool_, false);
     if (!lease_result.ok()) {
         return lease_result.status();
@@ -1284,4 +1380,4 @@ core::Status cache_vector::VectorIndexManager::LoadTimestampIndex() {
     return core::Status::Ok();
 }
 
-}  // namespace agent::semantic_cache
+}

@@ -54,6 +54,7 @@ public:
     core::Status SubmitAnalyze(DocumentAnalyzeRequest request, DocumentAnalyzeCallback callback);
 
     core::Status SetRepository(std::shared_ptr<storage::sqlite::SqliteConnectionPool> repository_pool);
+    core::Status SetMetadataRepository(std::shared_ptr<IDocumentMetadataRepository> metadata_repository);
     core::Status SetFileStore(std::shared_ptr<DocumentFileStore> file_store);
     core::Result<DocumentMetadataRecord> ImportManagedFile(const std::filesystem::path& source_path,
                                                            std::string_view display_name = {},
@@ -76,7 +77,7 @@ private:
     core::ThreadPool& compute_pool_;
     core::ThreadPool& io_pool_;
     std::shared_ptr<storage::sqlite::SqliteConnectionPool> repository_pool_;
-    std::shared_ptr<DocumentMetadataRepository> metadata_repository_;
+    std::shared_ptr<IDocumentMetadataRepository> metadata_repository_;
     std::shared_ptr<DocumentFileStore> file_store_;
     core::LoggerAdapter logger_;
     std::deque<DocumentLruEntry> document_lru_;
@@ -85,4 +86,4 @@ private:
     std::chrono::seconds cleanup_interval_{std::chrono::seconds(60)};
 };
 
-} // namespace agent::document
+}

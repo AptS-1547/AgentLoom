@@ -6,12 +6,15 @@
 
 - [架构总览](ARCHITECTURE_VISUAL.md)
 - [Skill Session Protocol](SKILL_SESSION_PROTOCOL.md)
+- [Skill Tool-Calling Runtime (2026-09)](SKILL_TOOL_CALLING_RUNTIME_2026_09.md)
 - [Streaming Architecture](STREAMING_ARCHITECTURE.md)
 - [Multimodal Perception Layers](MULTIMODAL_PERCEPTION_LAYERS.md)
 
 ## 当前设计
 
 - [Resource Governance Refactor](RESOURCE_GOVERNANCE_REFACTOR_DESIGN.md)
+- [Downstream Integration Execution Plan (2026-08)](DOWNSTREAM_INTEGRATION_EXECUTION_PLAN_2026_08.md)
+- [Session Persistence Contracts (2026-08)](SESSION_PERSISTENCE_CONTRACTS_2026_08.md)
 - [Skill Media Drain/Spool](SKILL_MEDIA_DRAIN_SPOOL_DESIGN.md)
 - [Chat Prompt KV Cache](CHAT_PROMPT_KV_CACHE_REUSE_DESIGN.md)
 

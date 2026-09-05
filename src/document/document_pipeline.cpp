@@ -1,9 +1,11 @@
 #include "document_analysis_service.h"
 #include "ooxml_extractor.h"
 #include "sqlite/sqlite_statement.h"
+#include "sqlite/sqlite_migration.h"
 #include "trace_context.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <ctime>
 #include <iomanip>
@@ -230,7 +232,7 @@ core::Result<std::vector<DocumentBlock>> ExtractByType(const std::filesystem::pa
     return core::Status::Error(core::ErrorCode::InvalidArgument, "unsupported document type: " + std::string(file_type));
 }
 
-core::Status EnsureRepositorySchema(storage::sqlite::SqliteConnection& connection) {
+core::Status ApplyDocumentAnalysisResultsV1(storage::sqlite::SqliteConnection& connection) {
     return connection.Execute(R"SQL(
 CREATE TABLE IF NOT EXISTS document_analysis_results (
     document_id TEXT PRIMARY KEY,
@@ -243,6 +245,44 @@ CREATE TABLE IF NOT EXISTS document_analysis_results (
     updated_at_ms INTEGER NOT NULL
 );
 )SQL");
+}
+
+const std::array<storage::sqlite::SqliteMigrationStep, 1>
+    kDocumentAnalysisResultMigrations{{
+        {
+            .version = 1,
+            .name = "create_document_analysis_results",
+            .checksum = "document_analysis_v1_results_table",
+            .apply = ApplyDocumentAnalysisResultsV1,
+        },
+    }};
+
+class DocumentAnalysisResultMigrationSource final
+    : public storage::sqlite::ISqliteMigrationSource {
+public:
+    std::string_view MigrationNamespace() const noexcept override {
+        return "document_analysis";
+    }
+
+    std::span<const storage::sqlite::SqliteMigrationStep>
+    MigrationSteps() const noexcept override {
+        return kDocumentAnalysisResultMigrations;
+    }
+};
+
+DocumentAnalysisResultMigrationSource kDocumentAnalysisResultMigrationSource;
+
+core::Status EnsureRepositorySchema(
+    const std::shared_ptr<storage::sqlite::SqliteConnectionPool>& pool) {
+    if (!pool) {
+        return core::Status::Error(
+            core::ErrorCode::FailedPrecondition,
+            "document analysis repository pool is not configured");
+    }
+    storage::sqlite::SqliteMigrationRunner runner(pool);
+    std::array<storage::sqlite::ISqliteMigrationSource*, 1> sources{
+        &kDocumentAnalysisResultMigrationSource};
+    return runner.ApplyAll(sources);
 }
 
 std::int64_t NowUnixMs() {
@@ -322,7 +362,7 @@ ON CONFLICT(document_id) DO UPDATE SET
     return core::Status::Ok();
 }
 
-} // namespace
+}
 
 core::Result<nlohmann::json> AnalyzeDocument(const std::filesystem::path& path,
                                              std::string_view file_name,
@@ -545,21 +585,20 @@ core::Status DocumentAnalysisService::SetRepository(std::shared_ptr<storage::sql
         metadata_repository_.reset();
         return core::Status::Ok();
     }
-    {
-        auto lease_result = repository_pool->AcquireWrite();
-        if (!lease_result.ok()) {
-            return lease_result.status();
-        }
-        auto lease = std::move(lease_result).value();
-        if (auto status = EnsureRepositorySchema(lease.connection()); !status.ok()) {
-            return status;
-        }
+    if (auto status = EnsureRepositorySchema(repository_pool); !status.ok()) {
+        return status;
     }
     auto metadata_repository = std::make_shared<DocumentMetadataRepository>(repository_pool);
     if (auto status = metadata_repository->EnsureSchema(); !status.ok()) {
         return status;
     }
     repository_pool_ = std::move(repository_pool);
+    metadata_repository_ = std::move(metadata_repository);
+    return core::Status::Ok();
+}
+
+core::Status DocumentAnalysisService::SetMetadataRepository(
+    std::shared_ptr<IDocumentMetadataRepository> metadata_repository) {
     metadata_repository_ = std::move(metadata_repository);
     return core::Status::Ok();
 }
@@ -793,4 +832,4 @@ core::Status DocumentAnalysisService::SubmitAnalyze(DocumentAnalyzeRequest reque
     return status;
 }
 
-} // namespace agent::document
+}

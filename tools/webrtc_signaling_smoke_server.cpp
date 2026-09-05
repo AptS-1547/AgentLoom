@@ -8,7 +8,7 @@
 #include "webrtc_session_registry.h"
 #include "webrtc_signaling_handler.h"
 
-#include "third_party/nlohmann/json.hpp"
+#include <nlohmann/json.hpp>
 
 #include <atomic>
 #include <csignal>

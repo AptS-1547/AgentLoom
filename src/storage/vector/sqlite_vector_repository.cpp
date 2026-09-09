@@ -484,6 +484,26 @@ core::Result<EntryRecord> SqliteVectorRepository::GetEntry(std::int64_t entry_id
     return Impl::ReadEntry(stmt);
 }
 
+core::Result<std::optional<std::int64_t>> SqliteVectorRepository::FindEntryIdByMemoryHash(
+    std::int64_t partition_id, std::string_view memory_hash) const {
+    auto lease_r = impl_->AcquireRead();
+    if (!lease_r) return lease_r.status();
+    auto lease = std::move(lease_r).value();
+
+    auto stmt_r = lease.connection().Prepare(
+        "SELECT entry_id FROM vector_entries WHERE partition_id = ? AND memory_hash = ?");
+    if (!stmt_r) return stmt_r.status();
+    auto stmt = std::move(stmt_r).value();
+    if (auto rc = stmt.BindInt64(1, partition_id); !rc.ok()) return rc;
+    if (auto rc = stmt.BindText(2, std::string(memory_hash)); !rc.ok()) return rc;
+    auto step_r = stmt.Step();
+    if (!step_r) return step_r.status();
+    if (std::move(step_r).value() != SqliteStepResult::Row) {
+        return std::optional<std::int64_t>{};
+    }
+    return std::optional<std::int64_t>{stmt.ColumnInt64(0)};
+}
+
 core::Result<std::vector<EntryRecord>> SqliteVectorRepository::LookupEntries(
     std::span<const std::int64_t> ids) const {
     std::vector<EntryRecord> out;

@@ -24,6 +24,13 @@ struct ClosePersonaSessionRequest {
     std::string reason = "client_close";
 };
 
+struct PersonaSessionReclamationRequest {
+    std::string session_id;
+    std::string trace_id;
+    std::string trusted_user_uuid;
+    std::chrono::steady_clock::time_point retain_until{};
+};
+
 struct PersonaTurnRequest {
     ChatRequest turn;
     std::string trusted_user_uuid;
@@ -44,6 +51,8 @@ public:
     virtual core::Result<SessionSnapshot> CreateSession(CreateSessionRequest request) = 0;
     virtual core::Result<SessionSnapshot> GetSession(PersonaSessionQuery query) const = 0;
     virtual core::Result<SessionSnapshot> CloseSession(ClosePersonaSessionRequest request) = 0;
+    virtual core::Status HoldReclamationUntil(PersonaSessionReclamationRequest request) = 0;
+    virtual core::Status ReleaseReclamationHold(PersonaSessionQuery query) = 0;
     virtual core::Status SubmitTurn(PersonaTurnRequest request, TurnCallback callback) = 0;
     virtual PersonaInteractionSnapshot SystemSnapshot() const = 0;
 };
@@ -60,6 +69,8 @@ public:
     core::Result<SessionSnapshot> CreateSession(CreateSessionRequest request) override;
     core::Result<SessionSnapshot> GetSession(PersonaSessionQuery query) const override;
     core::Result<SessionSnapshot> CloseSession(ClosePersonaSessionRequest request) override;
+    core::Status HoldReclamationUntil(PersonaSessionReclamationRequest request) override;
+    core::Status ReleaseReclamationHold(PersonaSessionQuery query) override;
     core::Status SubmitTurn(PersonaTurnRequest request, TurnCallback callback) override;
     PersonaInteractionSnapshot SystemSnapshot() const override;
 

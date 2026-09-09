@@ -121,6 +121,8 @@ add_library(agent_gateway_foundation STATIC
     src/service/gateway/gateway_lifecycle.h
     src/service/gateway/gateway_maintenance.cpp
     src/service/gateway/gateway_maintenance.h
+    src/service/gateway/runtime_maintenance_service.cpp
+    src/service/gateway/runtime_maintenance_service.h
 )
 
 target_include_directories(agent_gateway_foundation PUBLIC
@@ -133,8 +135,15 @@ target_link_libraries(agent_gateway_foundation PUBLIC
     agent_gateway_routing
     agent_core
     agent_net
+    agent_document
+    agent_ipc
     spdlog::spdlog
 )
+
+if(TARGET agent_media)
+    target_compile_definitions(agent_gateway_foundation PRIVATE AGENTLOOM_HAS_MEDIA=1)
+    target_link_libraries(agent_gateway_foundation PRIVATE agent_media)
+endif()
 
 add_library(agent_gateway INTERFACE)
 
@@ -146,6 +155,8 @@ target_link_libraries(agent_gateway INTERFACE
 
 if(AGENTLOOM_BUILD_REFERENCE_GATEWAY)
 add_library(agent_gateway_server_lib STATIC
+    src/service/gateway/auth_session_maintenance_task.cpp
+    src/service/gateway/auth_session_maintenance_task.h
     src/service/gateway/classroom_scheduler.cpp
     src/service/gateway/classroom_scheduler.h
     src/service/gateway/gateway_models.h
@@ -156,8 +167,6 @@ add_library(agent_gateway_server_lib STATIC
     src/service/gateway/persona_gateway_service.cpp
     src/service/gateway/persona_gateway_service.h
     src/service/gateway/report_evaluator.h
-    src/service/gateway/runtime_maintenance_service.cpp
-    src/service/gateway/runtime_maintenance_service.h
     src/service/gateway/persona_gateway_server.cpp
     src/service/gateway/persona_gateway_server.h
 )
@@ -369,6 +378,8 @@ if(BERT_BUILD_TESTS)
         target_link_libraries(service_tests PRIVATE
             agent_skill_media
         )
+        # Skill 的静态注册对象可能没有其它符号引用，必须 whole-archive 保证注册发生。
+        link_whole_archive(service_tests agent_skill_media)
     endif()
 
     target_include_directories(service_tests PRIVATE

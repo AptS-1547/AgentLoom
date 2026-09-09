@@ -11,6 +11,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <functional>
 #include <vector>
 #include <concepts>
 #include <type_traits>
@@ -21,7 +22,24 @@ struct L0SessionKey {
     std::string tenant_id = "default";
     std::string user_id;
     std::string session_id;
+
+    bool operator==(const L0SessionKey&) const = default;
 };
+
+struct L0SessionKeyHash {
+    std::size_t operator()(const L0SessionKey& key) const noexcept;
+};
+
+/// 构造 L0 v2 Redis batch key。timestamp 必须是 Unix 毫秒。
+std::string BuildL0BatchKey(const L0SessionKey& key, std::int64_t timestamp_ms);
+
+/// 构造当前 Session 的 L0 v2 Redis SCAN pattern。
+std::string BuildL0BatchScanPattern(const L0SessionKey& key);
+
+/// 构造 tenant/user 下所有 Session 的 L0 v2 Redis SCAN pattern。
+std::string BuildL0OwnerBatchScanPattern(
+    std::string_view tenant_id,
+    std::string_view user_id);
 
 struct L0ActiveBatchState {
     std::int64_t timestamp = 0;

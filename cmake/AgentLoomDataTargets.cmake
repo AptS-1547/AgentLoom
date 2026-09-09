@@ -38,9 +38,11 @@ target_link_libraries(agent_conversation PUBLIC
 if(BERT_BUILD_TESTS)
     add_executable(conversation_tests
         tests/conversation/dialogue_segmenter_test.cpp
+        tests/conversation/async_embedding_test.cpp
     )
     target_link_libraries(conversation_tests PRIVATE
         agent_conversation
+        agent_vector
         GTest::gtest_main
     )
     gtest_discover_tests(conversation_tests DISCOVERY_MODE PRE_TEST)

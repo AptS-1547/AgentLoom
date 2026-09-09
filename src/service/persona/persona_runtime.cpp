@@ -143,15 +143,6 @@ std::optional<std::string> EmotionCalibrationReason(const EmotionAnalysis& emoti
     return std::nullopt;
 }
 
-bool ContainsVisionObserve(const ToolMemoryContext& context) {
-    for (const auto& hit : context.hits) {
-        if (hit.tool_id == "vision.observe") {
-            return true;
-        }
-    }
-    return context.prompt_block.find("vision.observe") != std::string::npos;
-}
-
 std::string SkillStateName(SkillSessionState state) {
     switch (state) {
     case SkillSessionState::Idle:
@@ -239,7 +230,8 @@ core::Result<RecalledContext> SemanticMemoryContextProvider::BuildContext(
     }
 
     if (l3_memory_) {
-        auto facts = l3_memory_->SearchFacts(request.user_uuid, request.query, options_.l3_top_k);
+        auto facts = l3_memory_->SearchFacts(
+            {request.tenant_id, request.user_uuid}, request.query, options_.l3_top_k);
         if (!facts.ok()) {
             return facts.status();
         }
@@ -279,14 +271,15 @@ core::Status SemanticMemoryContextProvider::BuildContextAsync(
     const auto query = request.query;
 
     auto complete_remaining =
-        [l3_memory, l3_top_k, user_uuid, query, completion_state](
+        [l3_memory, l3_top_k, tenant_id = request.tenant_id, user_uuid, query, completion_state](
             RecalledContext value) mutable {
             std::vector<std::string> sections;
             if (!value.system_context.empty()) {
                 sections.push_back(std::move(value.system_context));
             }
             if (l3_memory) {
-                auto facts = l3_memory->SearchFacts(user_uuid, query, l3_top_k);
+                auto facts = l3_memory->SearchFacts(
+                    {tenant_id, user_uuid}, query, l3_top_k);
                 if (!facts.ok()) {
                     completion_state->TryComplete(facts.status());
                     return;
@@ -390,6 +383,7 @@ core::Status SemanticMemoryContextProvider::AdmitTurnAsync(
         return core::Status::Error(core::ErrorCode::FailedPrecondition,
                                    "L0 memory cache is not initialized");
     }
+    const memory::MemoryOwner owner{tenant_id, user_uuid};
     auto async_l0 = std::dynamic_pointer_cast<semantic_cache::IAsyncSemanticCache>(l0_cache_);
     if (!async_l0) {
         return core::Status::Error(
@@ -410,12 +404,16 @@ core::Status SemanticMemoryContextProvider::AdmitTurnAsync(
     store.answer_type = semantic_cache::AnswerType::Personalized;
 
     auto completion_state = std::make_shared<std::atomic<bool>>(false);
-    auto guarded_completion = [completion = std::move(completion), completion_state](
+    auto guarded_completion = [completion = std::move(completion), completion_state,
+                               l3_memory = l3_memory_, owner](
                                   core::Status status) mutable {
         bool expected = false;
         if (!completion_state->compare_exchange_strong(
                 expected, true, std::memory_order_acq_rel)) {
             return;
+        }
+        if (status.ok() && l3_memory) {
+            status = l3_memory->RegisterOwner(owner);
         }
         try {
             completion(std::move(status));
@@ -453,6 +451,7 @@ core::Status SemanticMemoryContextProvider::AdmitTurn(std::string_view session_i
         return core::Status::Ok();
     }
 
+    const memory::MemoryOwner owner{std::string(tenant_id), std::string(user_uuid)};
     semantic_cache::CacheStoreRequest store;
     store.origin.text = turn.user_input;
     store.origin.scope = semantic_cache::CacheScope::User;
@@ -475,7 +474,11 @@ core::Status SemanticMemoryContextProvider::AdmitTurn(std::string_view session_i
     store.origin.extra["payload_type"] = "conversation_turn";
     store.response_payload = turn.response;
     store.answer_type = semantic_cache::AnswerType::Personalized;
-    return l0_cache_->Store(store);
+    auto status = l0_cache_->Store(store);
+    if (status.ok() && l3_memory_) {
+        status = l3_memory_->RegisterOwner(owner);
+    }
+    return status;
 }
 
 core::Result<EmotionAnalysis> NeutralEmotionAnalyzer::Analyze(std::string_view,
@@ -581,7 +584,8 @@ PersonaRuntime::PersonaRuntime(SessionManager& sessions,
                                std::shared_ptr<IEmotionCalibrationSampleSink> emotion_calibration_sink,
                                std::shared_ptr<llm::IAsyncLlmClient> async_llm_client,
                                core::ThreadPool* continuation_pool,
-                               std::shared_ptr<agent::skill::ISkillToolCallCoordinator> skill_tool_coordinator)
+                               std::shared_ptr<agent::skill::ISkillToolCallCoordinator> skill_tool_coordinator,
+                               std::shared_ptr<IStatefulSkillExecutionRouter> stateful_skill_router)
     : sessions_(sessions),
       memory_provider_(std::move(memory_provider)),
       async_memory_provider_(
@@ -596,6 +600,7 @@ PersonaRuntime::PersonaRuntime(SessionManager& sessions,
       tool_memory_provider_(std::move(tool_memory_provider)),
       skill_session_manager_(std::move(skill_session_manager)),
       skill_tool_coordinator_(std::move(skill_tool_coordinator)),
+      stateful_skill_router_(std::move(stateful_skill_router)),
       emotion_calibration_sink_(std::move(emotion_calibration_sink)),
       options_(std::move(options)),
       logger_(std::move(logger)) {}
@@ -793,7 +798,7 @@ core::Result<PersonaRuntime::PreparedChat> PersonaRuntime::PrepareChatBeforeEmot
     prepared.started_at = memory_start;
     prepared.request = std::move(request);
     prepared.memory = std::move(memory);
-    bool vision_tool_triggered = false;
+    std::vector<std::string> triggered_skills;
     if (tool_memory_provider_) {
         ToolMemoryQuery tool_query;
         tool_query.session_id = session.session_id;
@@ -809,7 +814,12 @@ core::Result<PersonaRuntime::PreparedChat> PersonaRuntime::PrepareChatBeforeEmot
                          tool_context.status().message());
         } else if (tool_context.value().hit && !tool_context.value().prompt_block.empty()) {
             prepared.tools = tool_context.value().tools;
-            vision_tool_triggered = ContainsVisionObserve(tool_context.value());
+            for (const auto& hit : tool_context.value().hits) {
+                if (!hit.tool_id.empty() &&
+                    StatefulSkillRegistry::Instance().Contains(hit.tool_id)) {
+                    triggered_skills.push_back(hit.tool_id);
+                }
+            }
             if (!prepared.memory.system_context.empty()) {
                 prepared.memory.system_context += "\n";
             }
@@ -818,16 +828,18 @@ core::Result<PersonaRuntime::PreparedChat> PersonaRuntime::PrepareChatBeforeEmot
         }
     }
     if (skill_session_manager_) {
-        if (vision_tool_triggered) {
+        for (const auto& skill_id : triggered_skills) {
             SkillSessionStartRequest skill_start;
-            skill_start.skill_id = "vision.observe";
+            skill_start.skill_id = skill_id;
             skill_start.session_id = session.session_id;
             skill_start.user_uuid = session.user_uuid;
             skill_start.persona_id = session.persona_id;
             skill_start.trace_id = prepared.request.trace_id;
             skill_start.source = "l4";
-            skill_start.reason = "用户输入触发视觉 Skill";
-            auto started_skill = skill_session_manager_->Start(skill_start);
+            skill_start.reason = "用户输入触发有状态 Skill";
+            auto started_skill = stateful_skill_router_
+                ? stateful_skill_router_->Start(skill_start)
+                : skill_session_manager_->Start(skill_start);
             if (!started_skill.ok()) {
                 logger_.warn("[trace={}] [persona_runtime] skill session start skipped session={} reason={}",
                              prepared.request.trace_id,
@@ -835,17 +847,19 @@ core::Result<PersonaRuntime::PreparedChat> PersonaRuntime::PrepareChatBeforeEmot
                              started_skill.status().message());
             }
         }
-        auto vision_session = skill_session_manager_->Get(session.session_id, "vision.observe");
-        if (!vision_session.ok()) {
+        auto active_skills = skill_session_manager_->List(session.session_id, session.user_uuid);
+        if (!active_skills.ok()) {
             logger_.warn("[trace={}] [persona_runtime] skill session query skipped session={} reason={}",
                          prepared.request.trace_id,
                          session.session_id,
-                         vision_session.status().message());
-        } else if (vision_session.value().has_value()) {
-            if (!prepared.memory.system_context.empty()) {
-                prepared.memory.system_context += "\n";
+                         active_skills.status().message());
+        } else {
+            for (const auto& skill : active_skills.value()) {
+                if (!prepared.memory.system_context.empty()) {
+                    prepared.memory.system_context += "\n";
+                }
+                prepared.memory.system_context += FormatSkillPromptBlock(skill);
             }
-            prepared.memory.system_context += FormatSkillPromptBlock(*vision_session.value());
         }
     }
     prepared.latency.memory_context = Since(memory_start);

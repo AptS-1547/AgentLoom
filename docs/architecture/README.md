@@ -17,6 +17,8 @@
 - [Session Persistence Contracts (2026-08)](SESSION_PERSISTENCE_CONTRACTS_2026_08.md)
 - [Skill Media Drain/Spool](SKILL_MEDIA_DRAIN_SPOOL_DESIGN.md)
 - [Chat Prompt KV Cache](CHAT_PROMPT_KV_CACHE_REUSE_DESIGN.md)
+- [Memory Runtime 加固设计（2026-09）](MEMORY_RUNTIME_HARDENING_DESIGN_2026_09.md)
+- [记忆遗忘算法迁移前设计（2026-09）](MEMORY_FORGETTING_MIGRATION_DESIGN_2026_09.md)
 
 ## 使用规则
 

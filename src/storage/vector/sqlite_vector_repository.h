@@ -46,6 +46,8 @@ public:
     core::Result<std::vector<EntryRecord>> LookupEntries(std::span<const std::int64_t> ids) const override;
     core::Result<std::vector<EntryRecord>> ListEntries(
         std::int64_t partition_id, bool include_forgotten) const override;
+    core::Result<std::optional<std::int64_t>> FindEntryIdByMemoryHash(
+        std::int64_t partition_id, std::string_view memory_hash) const override;
 
     core::Status MarkRecalled(std::span<const std::int64_t> ids, std::int64_t now_ms) override;
     core::Status MarkForgotten(std::span<const std::int64_t> ids,

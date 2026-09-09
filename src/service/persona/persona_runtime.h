@@ -5,6 +5,7 @@
 #include "openai_llm_client.h"
 #include "session_manager.h"
 #include "skill_session_manager.h"
+#include "stateful_skill_registry.h"
 #include "../../skill/skill_executor.h"
 #include "tool_memory_provider.h"
 
@@ -292,7 +293,8 @@ public:
                    std::shared_ptr<IEmotionCalibrationSampleSink> emotion_calibration_sink = nullptr,
                    std::shared_ptr<llm::IAsyncLlmClient> async_llm_client = nullptr,
                    core::ThreadPool* continuation_pool = nullptr,
-                   std::shared_ptr<agent::skill::ISkillToolCallCoordinator> skill_tool_coordinator = nullptr);
+                   std::shared_ptr<agent::skill::ISkillToolCallCoordinator> skill_tool_coordinator = nullptr,
+                   std::shared_ptr<IStatefulSkillExecutionRouter> stateful_skill_router = nullptr);
     ~PersonaRuntime();
 
     /// 异步提交对话；callback 恰好调用一次并携带最终 Result。
@@ -424,6 +426,7 @@ private:
     std::shared_ptr<IToolMemoryProvider> tool_memory_provider_;
     std::shared_ptr<ISkillSessionManager> skill_session_manager_;
     std::shared_ptr<agent::skill::ISkillToolCallCoordinator> skill_tool_coordinator_;
+    std::shared_ptr<IStatefulSkillExecutionRouter> stateful_skill_router_;
     std::shared_ptr<IEmotionCalibrationSampleSink> emotion_calibration_sink_;
     PersonaRuntimeOptions options_;
     core::LoggerAdapter logger_;

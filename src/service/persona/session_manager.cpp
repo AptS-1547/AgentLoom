@@ -253,6 +253,56 @@ core::Status SessionManager::TouchSession(std::string_view session_id, std::stri
     return core::Status::Ok();
 }
 
+core::Status SessionManager::HoldReclamationUntil(
+    std::string_view session_id,
+    std::chrono::steady_clock::time_point retain_until,
+    std::string_view trace_id) {
+    if (retain_until <= std::chrono::steady_clock::now()) {
+        return core::Status::Error(
+            core::ErrorCode::InvalidArgument,
+            "session reclamation hold must expire in the future");
+    }
+    auto slot = FindSlot(session_id);
+    if (!slot.ok()) {
+        return slot.status();
+    }
+    const auto trace = NonEmptyOrGeneratedTrace(std::string(trace_id));
+    {
+        std::lock_guard lock(slot.value()->mutex);
+        if (slot.value()->state.status != SessionStatus::Active) {
+            return core::Status::Error(
+                core::ErrorCode::FailedPrecondition,
+                "session is not active");
+        }
+        slot.value()->state.reclamation_hold_until = retain_until;
+        slot.value()->state.last_trace_id = trace;
+    }
+    logger_.debug("[trace={}] [session] reclamation held session={}", trace, session_id);
+    return core::Status::Ok();
+}
+
+core::Status SessionManager::ReleaseReclamationHold(
+    std::string_view session_id,
+    std::string_view trace_id) {
+    auto slot = FindSlot(session_id);
+    if (!slot.ok()) {
+        return slot.status();
+    }
+    const auto trace = NonEmptyOrGeneratedTrace(std::string(trace_id));
+    {
+        std::lock_guard lock(slot.value()->mutex);
+        if (slot.value()->state.status != SessionStatus::Active) {
+            return core::Status::Error(
+                core::ErrorCode::FailedPrecondition,
+                "session is not active");
+        }
+        slot.value()->state.reclamation_hold_until.reset();
+        slot.value()->state.last_trace_id = trace;
+    }
+    logger_.debug("[trace={}] [session] reclamation hold released session={}", trace, session_id);
+    return core::Status::Ok();
+}
+
 std::vector<SessionSnapshot> SessionManager::CleanupExpired() {
     const auto now = std::chrono::steady_clock::now();
     std::vector<std::shared_ptr<SessionSlot>> expired;
@@ -262,7 +312,9 @@ std::vector<SessionSnapshot> SessionManager::CleanupExpired() {
             bool remove = false;
             {
                 std::lock_guard slot_lock(it->second->mutex);
-                remove = it->second->state.status == SessionStatus::Active &&
+                const auto& hold_until = it->second->state.reclamation_hold_until;
+                const bool held = hold_until && now < *hold_until;
+                remove = it->second->state.status == SessionStatus::Active && !held &&
                          now - it->second->state.last_active > options_.idle_timeout;
                 if (remove) {
                     it->second->state.status = SessionStatus::Closing;

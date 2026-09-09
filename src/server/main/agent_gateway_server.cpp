@@ -29,8 +29,11 @@
 #include "embedding_pipeline.h"
 #include "hf_tokenizer.h"
 #include "onnx_text_embedding_model.h"
+#include "tool_memory_provider.h"
 #include "option_parser.h"
 #include "server_options.h"
+
+#include <nlohmann/json.hpp>
 
 #ifdef _WIN32
 #include "crash_dump.h"
@@ -725,6 +728,124 @@ core::Result<std::shared_ptr<agent::memory::LongTermMemoryCompressor>> CreateL3M
     return std::shared_ptr<agent::memory::LongTermMemoryCompressor>(std::move(compressor).value());
 }
 
+// 构造 L4 工具记忆 provider：建 L4 sqlite/collection/partition，为每个 skill 写入一条
+// 能力种子记忆，并以 keyword 正则 + 向量双通道召回。与 skill_llm_e2e_test 的构造流程一致。
+core::Result<std::shared_ptr<agent::service::persona::IToolMemoryProvider>> CreateL4ToolMemoryProvider(
+    const ToolConfig& config,
+    std::shared_ptr<vector::OnnxTextEmbeddingModel> embedding_model) {
+    // 空 sqlite 路径或无 skill 时跳过 L4 工具记忆。
+    if (config.skills.tool_memory_sqlite_path.empty() || config.skill_manifests.empty()) {
+        return std::shared_ptr<agent::service::persona::IToolMemoryProvider>{};
+    }
+    if (!embedding_model) {
+        return core::Status::Error(
+            core::ErrorCode::FailedPrecondition,
+            "shared embedding model is required for L4 tool memory");
+    }
+    auto embedding_pipeline = CreateEmbeddingPipeline(config, std::move(embedding_model));
+    if (!embedding_pipeline.ok()) return embedding_pipeline.status();
+
+    fs::create_directories(config.skills.tool_memory_sqlite_path.parent_path());
+    storage::sqlite::SqliteConnectionPoolOptions pool_options;
+    pool_options.path = config.skills.tool_memory_sqlite_path.string();
+    pool_options.read_connection_count = 2;
+    pool_options.write_connection_count = 1;
+    pool_options.enable_wal = true;
+    auto sqlite_pool = std::make_shared<storage::sqlite::SqliteConnectionPool>(pool_options);
+    if (auto status = sqlite_pool->Start(); !status.ok()) return status;
+
+    auto repository = std::make_shared<agent::vector_storage::SqliteVectorRepository>(sqlite_pool);
+    if (auto status = repository->EnsureSchema(); !status.ok()) return status;
+
+    agent::vector_storage::CollectionDescriptor collection;
+    collection.name = config.skills.tool_memory_collection_name;
+    collection.embedding_model_fingerprint = "configured";
+    collection.tokenizer_fingerprint = "configured";
+    collection.pooling_strategy = config.embedding.pooling_strategy;
+    collection.normalization = config.embedding.normalize ? "l2" : "none";
+    collection.dimension = static_cast<std::size_t>(config.embedding.expected_dimension);
+    collection.corpus_version = "skill-l4";
+    collection.policy_version = "skill-l4";
+    auto collection_id = repository->EnsureCollection(collection);
+    if (!collection_id.ok()) return collection_id.status();
+
+    auto partition_registry = std::make_shared<agent::vector_storage::PartitionRegistry>(repository);
+    agent::vector_storage::PartitionKey partition_key;
+    partition_key.collection_id = collection_id.value();
+    partition_key.memory_level = "L4";
+    auto partition = partition_registry->Resolve(partition_key);
+    if (!partition.ok()) return partition.status();
+
+    // 为每个 skill 写入一条 L4 能力种子记忆（语义描述 embedding + 关键词正则触发）。
+    for (const auto& manifest : config.skill_manifests) {
+        const std::string& payload =
+            manifest.l4_payload.empty() ? manifest.description : manifest.l4_payload;
+        if (payload.empty()) continue;
+        std::string memory_hash = "global:l4:" + manifest.skill_id;
+        if (!manifest.intent.empty()) memory_hash += ":intent." + manifest.intent;
+
+        // 幂等：同 memory_hash 种子已存在则跳过（也省去重复 embedding）。
+        if (auto existing = repository->FindEntryIdByMemoryHash(partition.value(), memory_hash);
+            !existing.ok()) {
+            return existing.status();
+        } else if (existing.value().has_value()) {
+            continue;
+        }
+
+        auto encoded = embedding_pipeline.value()->Encode(payload);
+        if (!encoded.ok()) return encoded.status();
+        agent::vector_storage::EntryRecord entry;
+        entry.partition_id = partition.value();
+        entry.cache_key = manifest.skill_id;
+        entry.text_hash = "skill-l4-canonical";
+        entry.content_hash = "skill-l4-canonical";
+        entry.memory_hash = std::move(memory_hash);
+        entry.vector = std::move(encoded).value();
+        entry.memory_type = "capability";
+        entry.emotion_intensity = 0.0F;
+        entry.payload = payload;
+        nlohmann::json meta{
+            {"skill_id", manifest.skill_id},
+            {"tool_id", manifest.skill_id},
+            {"priority", 100},
+            {"instruction", manifest.prompt_instruction},
+            {"schema", manifest.input_schema_json},
+        };
+        entry.extra_metadata_json = meta.dump();
+        if (auto status = repository->InsertEntry(std::move(entry)); !status.ok()) return status.status();
+    }
+
+    agent::vector::IndexManagerOptions index_options;
+    index_options.max_resident_partitions = 8;
+    index_options.log_hydration = false;
+    auto index_manager = std::make_shared<agent::vector::VectorIndexManager>(
+        repository, partition_registry,
+        static_cast<std::size_t>(config.embedding.expected_dimension), index_options);
+
+    agent::service::persona::VectorToolMemoryProviderOptions provider_options;
+    provider_options.collection_id = collection_id.value();
+    provider_options.top_k = config.skills.tool_memory_top_k;
+    provider_options.min_score = config.skills.tool_memory_min_score;
+    provider_options.enable_regex = true;
+    provider_options.enable_vector = true;
+    for (const auto& manifest : config.skill_manifests) {
+        agent::service::persona::ToolKeywordTrigger trigger;
+        trigger.tool_id = manifest.skill_id;
+        trigger.instruction = manifest.prompt_instruction;
+        trigger.schema_json = manifest.input_schema_json;
+        trigger.keywords = manifest.keywords;
+        trigger.negative_keywords = manifest.negative_keywords;
+        provider_options.keyword_triggers.push_back(std::move(trigger));
+    }
+
+    return std::shared_ptr<agent::service::persona::IToolMemoryProvider>(
+        std::make_shared<agent::service::persona::VectorToolMemoryProvider>(
+            std::move(embedding_pipeline).value(),
+            std::move(index_manager),
+            std::move(partition_registry),
+            std::move(provider_options)));
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -888,6 +1009,16 @@ int main(int argc, char** argv) {
                  config.skill_manifests.size(),
                  config.skills.manifest_directory.string(),
                  config.skills.manifest_filename_regex);
+        auto l4_tool_memory = CreateL4ToolMemoryProvider(config, embedding_model);
+        if (!l4_tool_memory.ok()) {
+            logging::Shutdown();
+            return Fail("L4 tool memory: " + l4_tool_memory.status().message());
+        }
+        dependencies.tool_memory_provider = std::move(l4_tool_memory).value();
+        if (dependencies.tool_memory_provider) {
+            LOG_INFO("[agent-gateway] L4 tool memory seeded collection={}",
+                     config.skills.tool_memory_collection_name);
+        }
         dependencies.memory_provider = std::move(memory);
         dependencies.emotion_analyzer = std::move(emotion).value();
         dependencies.llm_client = llm_client;
@@ -902,6 +1033,9 @@ int main(int argc, char** argv) {
                 skill_options,
                 core::LoggerAdapter::ForModule("skill"));
             dependencies.skill_session_manager = skill_sessions;
+            // 静态注册的有状态 Skill 共享同一个公共 Session manager；每次 Start 再创建独立 execution。
+            dependencies.stateful_skill_router =
+                std::make_shared<agent::service::persona::StatefulSkillExecutionRouter>(skill_sessions);
             dependencies.maintenance_tasks.push_back(
                 std::make_shared<agent::service::gateway::SkillSessionMaintenanceTask>(
                     skill_sessions,
@@ -933,7 +1067,9 @@ int main(int argc, char** argv) {
             flush_options.flush_minute = config.l3_flush_scheduler.flush_minute;
             flush_options.flush_date_offset_days = config.l3_flush_scheduler.flush_date_offset_days;
             flush_options.defer_when_sessions_active = config.l3_flush_scheduler.defer_when_sessions_active;
-            flush_options.user_uuids = config.l3_memory.user_uuids;
+            for (const auto& user_id : config.l3_memory.user_uuids) {
+                flush_options.owners.push_back({"default", user_id});
+            }
             auto task = std::make_shared<agent::service::gateway::L3MemoryFlushMaintenanceTask>(
                 l3_memory,
                 server.sessions(),

@@ -41,6 +41,7 @@ using agent::service::persona::SkillSessionStopRequest;
 using agent::service::persona::SkillVisionEventSink;
 using agent::service::persona::SkillVisionEventSinkOptions;
 using agent::service::persona::ToolMemoryContext;
+using agent::service::persona::ToolMemoryHit;
 using agent::service::persona::ToolMemoryQuery;
 
 class ManualMemoryContextProvider final
@@ -449,6 +450,7 @@ public:
         ToolMemoryContext context;
         context.hit = hit;
         context.prompt_block = prompt_block;
+        context.hits = hits;
         context.tools = tools;
         return context;
     }
@@ -460,6 +462,7 @@ public:
         "  instruction: use structured visual tool call only when needed\n"
         "</tool_memory_l4>";
     ToolMemoryQuery last_query;
+    std::vector<ToolMemoryHit> hits;
     std::vector<agent::llm::ChatCompletionRequest::Tool> tools;
     std::mutex mutex_;
 };
@@ -1321,6 +1324,7 @@ TEST(PersonaRuntimeTest, StartsVisionSkillSessionWhenL4VisionToolIsTriggered) {
     auto emotion = std::make_shared<NeutralEmotionAnalyzer>();
     auto llm = std::make_shared<FakeLlmClient>();
     auto tool_memory = std::make_shared<FakeToolMemoryProvider>();
+    tool_memory->hits.push_back(ToolMemoryHit{.tool_id = "vision.observe"});
     auto skill_sessions = std::make_shared<SkillSessionManager>();
     PersonaRuntime runtime(
         sessions,

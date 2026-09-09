@@ -1,4 +1,5 @@
 #include "skill_vision_event_sink.h"
+#include "stateful_skill_registry.h"
 
 #include <nlohmann/json.hpp>
 
@@ -10,7 +11,26 @@ namespace {
 
 using Json = nlohmann::json;
 
+// 视觉事件由外部 Media pipeline 驱动；execution 只登记公共生命周期，
+// 不在静态注册阶段创建推理资源。
+class VisionObserveStatefulExecution final : public IStatefulSkillExecution {
+public:
+    explicit VisionObserveStatefulExecution(StatefulSkillExecutionContext context)
+        : context_(std::move(context)) {}
+
+    core::Status Start() override { return core::Status::Ok(); }
+
+    core::Status Stop(const SkillSessionStopRequest& request) override {
+        return context_.sessions->Stop(request).status();
+    }
+
+private:
+    StatefulSkillExecutionContext context_;
+};
+
 } // namespace
+
+REGISTER_STATEFUL_SKILL(VisionObserveStatefulExecution, "vision.observe", "1.0.0");
 
 SkillVisionEventSink::SkillVisionEventSink(std::shared_ptr<ISkillSessionManager> manager,
                                            SkillVisionEventSinkOptions options)

@@ -192,7 +192,11 @@ core::Result<std::shared_ptr<L0MemoryCacheAdapter::SessionIndexEntry>> L0MemoryC
         return core::Status::Error(core::ErrorCode::FailedPrecondition, "L0 memory sqlite path is not configured");
     }
 
-    const std::string key(req.session_id);
+    const L0SessionKey key{
+        .tenant_id = req.tenant_id.empty() ? "default" : req.tenant_id,
+        .user_id = req.user_id,
+        .session_id = req.session_id,
+    };
     {
         std::shared_lock lock(indices_mutex_);
         auto found = per_session_indices_.find(key);
@@ -214,11 +218,7 @@ core::Result<std::shared_ptr<L0MemoryCacheAdapter::SessionIndexEntry>> L0MemoryC
     }
     // 索引初始化可能访问 SQLite，放在映射锁之外，避免一个新 Session 阻塞全部热路径。
     auto index = std::make_shared<cache_vector::VectorIndexManager>(
-        L0SessionKey{
-            .tenant_id = req.tenant_id.empty() ? "default" : req.tenant_id,
-            .user_id = req.user_id,
-            .session_id = req.session_id,
-        },
+        key,
         redis_pool_,
         metadata_store_,
         max_cached_records_);
@@ -230,12 +230,12 @@ core::Result<std::shared_ptr<L0MemoryCacheAdapter::SessionIndexEntry>> L0MemoryC
     return found->second;
 }
 
-void L0MemoryCacheAdapter::ReleaseSession(std::string_view session_id) {
-    if (session_id.empty()) {
+void L0MemoryCacheAdapter::ReleaseSession(const L0SessionKey& key) {
+    if (key.tenant_id.empty() || key.user_id.empty() || key.session_id.empty()) {
         return;
     }
     std::unique_lock lock(indices_mutex_);
-    auto found = per_session_indices_.find(std::string(session_id));
+    auto found = per_session_indices_.find(key);
     if (found != per_session_indices_.end()) {
         // 先标记关闭再移出 map，保证已捕获 entry 的异步回调不会重新写入 Session。
         found->second->released.store(true, std::memory_order_release);

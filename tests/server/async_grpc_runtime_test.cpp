@@ -11,6 +11,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <functional>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -76,6 +77,41 @@ private:
     Callback callback_;
 };
 
+class DeferredEmotionHandler final : public EmotionHandler {
+public:
+    DeferredEmotionHandler(
+        std::promise<void>& entered,
+        std::shared_future<void> release)
+        : entered_(entered), release_(std::move(release)) {}
+
+    core::Status Handle(
+        const grpc_runtime::AsyncGrpcCallContext&,
+        const multimodal_inference::EmotionRequest&,
+        multimodal_inference::EmotionResponse&) override {
+        return core::Status::Error(
+            core::ErrorCode::InternalError,
+            "deferred handler must use HandleAsync");
+    }
+
+    core::Status HandleAsync(
+        const grpc_runtime::AsyncGrpcCallContext&,
+        const multimodal_inference::EmotionRequest&,
+        multimodal_inference::EmotionResponse& response,
+        AsyncCompletion completion) override {
+        response.add_emotion_logits(0.5f);
+        entered_.set_value();
+        std::thread([release = release_, completion = std::move(completion)]() mutable {
+            release.wait();
+            completion(core::Status::Ok());
+        }).detach();
+        return core::Status::Ok();
+    }
+
+private:
+    std::promise<void>& entered_;
+    std::shared_future<void> release_;
+};
+
 multimodal_inference::EmotionRequest Request() {
     multimodal_inference::EmotionRequest request;
     request.add_input_ids(1);
@@ -137,6 +173,43 @@ TEST(AsyncGrpcRuntimeTest, PropagatesTraceDeadlineAndResponse) {
     EXPECT_GT(observed_context->deadline, std::chrono::system_clock::now());
     ASSERT_EQ(response.emotion_logits_size(), 1);
     EXPECT_FLOAT_EQ(response.emotion_logits(0), 0.75f);
+    pool->Shutdown(true);
+}
+
+TEST(AsyncGrpcRuntimeTest, DeferredHandlerReleasesWorkerUntilCompletion) {
+    auto pool = StartedPool(1);
+    auto runtime = CreateRuntime(pool);
+    std::promise<void> entered;
+    auto entered_future = entered.get_future();
+    std::promise<void> release;
+    auto handler = std::make_shared<DeferredEmotionHandler>(
+        entered,
+        release.get_future().share());
+    server::grpc_service::AsyncEmotionGrpcService service(runtime, handler);
+    GrpcServerHarness server(service);
+    auto stub = multimodal_inference::MultimodalInference::NewStub(server.channel());
+
+    grpc::ClientContext context;
+    multimodal_inference::EmotionResponse response;
+    grpc::Status status;
+    std::thread client([&] {
+        status = stub->PredictEmotion(&context, Request(), &response);
+    });
+    ASSERT_EQ(entered_future.wait_for(2s), std::future_status::ready);
+
+    std::promise<void> worker_available;
+    auto worker_available_future = worker_available.get_future();
+    ASSERT_TRUE(pool->Submit([&worker_available](auto&) {
+        worker_available.set_value();
+        return core::Status::Ok();
+    }).ok());
+    EXPECT_EQ(worker_available_future.wait_for(1s), std::future_status::ready);
+
+    release.set_value();
+    client.join();
+    ASSERT_TRUE(status.ok()) << status.error_message();
+    ASSERT_EQ(response.emotion_logits_size(), 1);
+    EXPECT_FLOAT_EQ(response.emotion_logits(0), 0.5f);
     pool->Shutdown(true);
 }
 

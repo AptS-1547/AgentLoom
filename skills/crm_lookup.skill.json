@@ -1,0 +1,30 @@
+{
+  "skill_id": "crm.lookup",
+  "version": "1.0.0",
+  "tool_name": "crm_lookup",
+  "kind": "native",
+  "description": "查询客户的 CRM 基本资料与最近跟进记录，用于了解客户背景。",
+  "input_schema": {
+    "type": "object",
+    "required": ["reason"],
+    "properties": {
+      "reason": { "type": "string", "description": "本次查询原因" },
+      "customer_name": { "type": "string", "description": "客户姓名（可选，模糊匹配）" },
+      "customer_phone": { "type": "string", "description": "客户电话（可选）" }
+    }
+  },
+  "output_schema": {
+    "type": "object",
+    "properties": {
+      "found": { "type": "boolean" },
+      "customer": { "type": "object" },
+      "recent_followups": { "type": "array" }
+    }
+  },
+  "prompt_instruction": "仅在需要了解客户背景、跟进历史或当前状态时调用；不要用它推断成交结果。",
+  "keywords": ["客户", "CRM", "跟进", "资料"],
+  "executor": {
+    "type": "native",
+    "reference": "crm.lookup"
+  }
+}

@@ -1,6 +1,7 @@
 #include "session_manager.h"
 #include "gateway_session_affinity_scheduler.h"
 #include "runtime_maintenance_service.h"
+#include "auth_session_maintenance_task.h"
 #include "inference_frame_ipc_control.h"
 
 #include <gtest/gtest.h>
@@ -862,6 +863,34 @@ TEST(RuntimeMaintenanceServiceTest, SessionCleanupTaskExpiresIdleSessions) {
     maintenance.Stop();
 
     EXPECT_EQ(manager.SessionCount(), 0u);
+    compute.Shutdown(true);
+    io.Shutdown(true);
+}
+
+TEST(SessionManagerTest, ReclamationHoldDefersIdleCleanupUntilReleased) {
+    core::ThreadPool compute({1, 8, "test-compute"});
+    core::ThreadPool io({1, 8, "test-io"});
+    ASSERT_TRUE(compute.Start().ok());
+    ASSERT_TRUE(io.Start().ok());
+
+    SessionOptions options;
+    options.idle_timeout = std::chrono::minutes(0);
+    SessionManager manager(compute, io, options);
+    ASSERT_TRUE(manager.CreateSession(MakeCreateRequest("session-reclamation-hold")).ok());
+    ASSERT_TRUE(manager.HoldReclamationUntil(
+        "session-reclamation-hold",
+        std::chrono::steady_clock::now() + std::chrono::hours(1),
+        "trace-hold").ok());
+
+    EXPECT_TRUE(manager.CleanupExpired().empty());
+    EXPECT_EQ(manager.SessionCount(), 1u);
+
+    ASSERT_TRUE(manager.ReleaseReclamationHold(
+        "session-reclamation-hold",
+        "trace-release").ok());
+    EXPECT_EQ(manager.CleanupExpired().size(), 1u);
+    EXPECT_EQ(manager.SessionCount(), 0u);
+
     compute.Shutdown(true);
     io.Shutdown(true);
 }

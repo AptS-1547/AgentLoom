@@ -104,6 +104,9 @@ public:
     /// 查询会话快照；不存在时成功返回 std::nullopt。
     virtual core::Result<std::optional<SkillSessionSnapshot>> Get(std::string_view session_id,
                                                                   std::string_view skill_id) const = 0;
+    /// 查询当前业务会话中仍可供 Persona 注入的非终态 Skill。
+    virtual core::Result<std::vector<SkillSessionSnapshot>> List(
+        std::string_view session_id, std::string_view user_uuid = {}) const = 0;
     /// 标记外部资源已就绪。
     /// @param status_text 面向用户或诊断的简短状态文本。
     virtual core::Status MarkReady(std::string_view session_id,
@@ -160,6 +163,8 @@ public:
     core::Result<SkillSessionSnapshot> Stop(const SkillSessionStopRequest& request) override;
     core::Result<std::optional<SkillSessionSnapshot>> Get(std::string_view session_id,
                                                           std::string_view skill_id) const override;
+    core::Result<std::vector<SkillSessionSnapshot>> List(
+        std::string_view session_id, std::string_view user_uuid = {}) const override;
     core::Status MarkReady(std::string_view session_id,
                            std::string_view skill_id,
                            std::string status_text,

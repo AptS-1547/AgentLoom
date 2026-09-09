@@ -1,11 +1,44 @@
 #include "../../src/skill/skill_registry.h"
 #include "../../src/skill/skill_executor.h"
+#include "../../src/service/persona/stateful_skill_registry.h"
 
 #include <gtest/gtest.h>
 
 #include <future>
 
 namespace {
+
+class RegisteredStatefulSkill final : public agent::service::persona::IStatefulSkillExecution {
+public:
+    explicit RegisteredStatefulSkill(
+        agent::service::persona::StatefulSkillExecutionContext context)
+        : context_(std::move(context)) {}
+
+    core::Status Start() override {
+        return context_.sessions->MarkReady(
+            context_.start_request.session_id,
+            context_.start_request.skill_id,
+            "registered skill ready",
+            context_.start_request.trace_id);
+    }
+
+    core::Status Stop(const agent::service::persona::SkillSessionStopRequest& request) override {
+        auto status = context_.sessions->BeginClosing(
+            request.session_id, request.skill_id,
+            context_.start_request.execution_id,
+            request.reason, request.trace_id);
+        if (!status.ok()) return status;
+        return context_.sessions->CompleteClosing(
+            request.session_id, request.skill_id,
+            context_.start_request.execution_id,
+            "registered skill closed", request.trace_id);
+    }
+
+private:
+    agent::service::persona::StatefulSkillExecutionContext context_;
+};
+
+REGISTER_STATEFUL_SKILL(RegisteredStatefulSkill, "test.stateful", "1.0.0");
 
 agent::skill::SkillManifest MakeManifest() {
     agent::skill::SkillManifest manifest;
@@ -43,6 +76,22 @@ TEST(SkillRegistryTest, RegistersJsonManifest) {
     EXPECT_TRUE(registry.Require("crm.lookup", "1.0.0").ok());
 }
 
+TEST(SkillRegistryTest, ParsesL4SeedFieldsFromJson) {
+    agent::skill::InMemorySkillRegistry registry;
+    ASSERT_TRUE(registry.RegisterJson(
+        R"({"skill_id":"vision.observe","version":"1.0.0",)"
+        R"("l4_payload":"用户请求观察画面时使用该工具。","intent":"camera",)"
+        R"("negative_keywords":["不用看","别看"],)"
+        R"("executor":{"type":"native","reference":"vision.observe"}})").ok());
+    auto manifest = registry.Require("vision.observe", "1.0.0");
+    ASSERT_TRUE(manifest.ok());
+    EXPECT_EQ(manifest.value().l4_payload, "用户请求观察画面时使用该工具。");
+    EXPECT_EQ(manifest.value().intent, "camera");
+    ASSERT_EQ(manifest.value().negative_keywords.size(), 2u);
+    EXPECT_EQ(manifest.value().negative_keywords[0], "不用看");
+    EXPECT_EQ(manifest.value().negative_keywords[1], "别看");
+}
+
 TEST(SkillRegistryTest, RegistersAllManifestsAtomicallyForStartupValidation) {
     agent::skill::InMemorySkillRegistry registry;
     auto first = MakeManifest();
@@ -52,6 +101,38 @@ TEST(SkillRegistryTest, RegistersAllManifestsAtomicallyForStartupValidation) {
     ASSERT_TRUE(registry.RegisterAll({first, second}).ok());
     EXPECT_TRUE(registry.Require("vision.observe").ok());
     EXPECT_TRUE(registry.Require("document.analyze").ok());
+}
+
+TEST(StatefulSkillRegistryTest, MacroRegistersFactoryAndRouterOwnsExecutionLifecycle) {
+    auto sessions = std::make_shared<agent::service::persona::SkillSessionManager>();
+    agent::service::persona::StatefulSkillExecutionRouter router(sessions);
+    agent::service::persona::SkillSessionStartRequest start;
+    start.skill_id = "test.stateful";
+    start.session_id = "stateful-session";
+    start.user_uuid = "stateful-user";
+    start.trace_id = "stateful-trace";
+    start.reason = "test";
+
+    auto started = router.Start(start, "1.0.0");
+    ASSERT_TRUE(started.ok()) << started.status().message();
+    EXPECT_EQ(started.value().state,
+              agent::service::persona::SkillSessionState::Ready);
+
+    auto repeated = router.Start(start, "1.0.0");
+    ASSERT_TRUE(repeated.ok()) << repeated.status().message();
+    EXPECT_EQ(repeated.value().execution_id, started.value().execution_id);
+
+    agent::service::persona::SkillSessionStopRequest stop;
+    stop.skill_id = start.skill_id;
+    stop.session_id = start.session_id;
+    stop.authenticated_user_uuid = start.user_uuid;
+    stop.execution_id = started.value().execution_id;
+    stop.trace_id = start.trace_id;
+    stop.reason = "test complete";
+    auto stopped = router.Stop(stop);
+    ASSERT_TRUE(stopped.ok()) << stopped.status().message();
+    EXPECT_EQ(stopped.value().state,
+              agent::service::persona::SkillSessionState::Closed);
 }
 
 TEST(SkillExecutorFactoryTest, ResolvesRegisteredExecutorType) {

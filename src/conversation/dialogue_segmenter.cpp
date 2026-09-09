@@ -1,5 +1,6 @@
 #include "dialogue_segmenter.h"
 
+#include "async_embedding.h"
 #include "embedding_pipeline.h"
 #include "semantic_cache_pipeline.h"
 
@@ -55,7 +56,12 @@ core::Status ValidateOptions(const DialogueSegmenterOptions& options) {
     return core::Status::Ok();
 }
 
-core::Status ValidateBatchRows(const ITextEmbeddingProvider::Batch& batch) {
+// 归一化探测容差：模型 normalize=true 的输出平方范数应≈1；
+// |‖v‖²−1| 超过该阈值即视为未归一化输入（仅异步路径开启探测）。
+constexpr float kUnitNormSquaredTolerance = 1e-3f;
+
+core::Status ValidateBatchRows(const ITextEmbeddingProvider::Batch& batch,
+                               bool require_unit_norm = false) {
     for (std::size_t row_index = 0; row_index < batch.batch_size; ++row_index) {
         const auto* row = batch.embeddings.data() + row_index * batch.dimension;
         for (std::size_t component = 0; component < batch.dimension; ++component) {
@@ -71,6 +77,12 @@ core::Status ValidateBatchRows(const ITextEmbeddingProvider::Batch& batch) {
             return core::Status::Error(
                 core::ErrorCode::InvalidArgument,
                 "embedding norm is zero");
+        }
+        if (require_unit_norm &&
+            std::fabs(squared_norm - 1.0f) > kUnitNormSquaredTolerance) {
+            return core::Status::Error(
+                core::ErrorCode::InvalidArgument,
+                "embedding is not L2-normalized");
         }
     }
     return core::Status::Ok();
@@ -365,6 +377,12 @@ BoundedDpDialogueSegmenter::BoundedDpDialogueSegmenter(
     : embedding_provider_(std::move(embedding_provider)),
       options_(std::move(options)) {}
 
+BoundedDpDialogueSegmenter::BoundedDpDialogueSegmenter(
+    std::shared_ptr<vector::EmbeddingBatchCoordinator> coordinator,
+    DialogueSegmenterOptions options)
+    : coordinator_(std::move(coordinator)),
+      options_(std::move(options)) {}
+
 core::Result<DialogueSegmentationResult> BoundedDpDialogueSegmenter::Segment(
     std::string_view session_id,
     const std::vector<DialogueTurn>& turns) {
@@ -444,13 +462,21 @@ core::Result<DialogueSegmentationResult> BoundedDpDialogueSegmenter::Segment(
             batch.embeddings.end());
     }
 
-    if (embeddings.size() != turns.size() * dimension) {
+    return RunDp(session_id, turns, embeddings, dimension);
+}
+
+core::Result<DialogueSegmentationResult> BoundedDpDialogueSegmenter::RunDp(
+    std::string_view session_id,
+    const std::vector<DialogueTurn>& turns,
+    const std::vector<float>& embeddings,
+    std::size_t dimension) const {
+    const auto count = turns.size();
+    if (embeddings.size() != count * dimension) {
         return core::Status::Error(
             core::ErrorCode::InternalError,
             "dialogue embedding matrix is incomplete");
     }
 
-    const auto count = turns.size();
     const auto invalid = std::numeric_limits<double>::infinity();
     std::vector<double> dp(count + 1, invalid);
     std::vector<std::size_t> previous(count + 1, 0);
@@ -561,6 +587,83 @@ core::Result<DialogueSegmentationResult> BoundedDpDialogueSegmenter::Segment(
         result.blocks.push_back(std::move(block));
     }
     return result;
+}
+
+core::async::task<core::Result<DialogueSegmentationResult>>
+BoundedDpDialogueSegmenter::SegmentAsync(
+    std::string_view session_id,
+    const std::vector<DialogueTurn>& turns) {
+    auto options_status = ValidateOptions(options_);
+    if (!options_status.ok()) {
+        co_return options_status;
+    }
+    if (session_id.empty()) {
+        co_return core::Status::Error(core::ErrorCode::InvalidArgument, "session_id is required");
+    }
+    if (turns.empty()) {
+        co_return core::Status::Error(core::ErrorCode::InvalidArgument, "dialogue turns are empty");
+    }
+    if (!coordinator_) {
+        co_return core::Status::Error(core::ErrorCode::FailedPrecondition, "embedding coordinator is required");
+    }
+
+    std::vector<float> embeddings;
+    std::size_t dimension = 0;
+    std::vector<std::string_view> batch_texts;
+    batch_texts.reserve(std::min(options_.embedding_batch_size, turns.size()));
+    for (std::size_t batch_begin = 0; batch_begin < turns.size();
+         batch_begin += options_.embedding_batch_size) {
+        const auto batch_end = std::min(
+            batch_begin + options_.embedding_batch_size, turns.size());
+        batch_texts.clear();
+        for (std::size_t index = batch_begin; index < batch_end; ++index) {
+            const auto& turn = turns[index];
+            if (turn.turn_id.empty()) {
+                co_return core::Status::Error(core::ErrorCode::InvalidArgument, "dialogue turn_id is required");
+            }
+            if (turn.text.empty()) {
+                co_return core::Status::Error(core::ErrorCode::InvalidArgument, "dialogue turn text is empty");
+            }
+            batch_texts.push_back(turn.embedding_text.empty() ? turn.text : turn.embedding_text);
+        }
+
+        auto embedded = co_await EmbedBatchAsync(*coordinator_, batch_texts, session_id);
+        if (!embedded.ok()) {
+            co_return embedded.status();
+        }
+        auto batch = std::move(embedded).value();
+        if (batch.batch_size != batch_texts.size() || batch.dimension == 0 ||
+            batch.batch_size > std::numeric_limits<std::size_t>::max() / batch.dimension ||
+            batch.embeddings.size() != batch.batch_size * batch.dimension) {
+            co_return core::Status::Error(
+                core::ErrorCode::InvalidArgument,
+                "embedding batch shape does not match dialogue input");
+        }
+        if (dimension == 0) {
+            dimension = batch.dimension;
+            if (turns.size() > std::numeric_limits<std::size_t>::max() / dimension) {
+                co_return core::Status::Error(
+                    core::ErrorCode::ResourceExhausted,
+                    "dialogue embedding matrix is too large");
+            }
+            embeddings.reserve(turns.size() * dimension);
+        } else if (dimension != batch.dimension) {
+            co_return core::Status::Error(core::ErrorCode::InvalidArgument, "embedding dimensions do not match");
+        }
+
+        // 异步路径不信任 provider 的归一化声明，改为运行时探测每行为单位范数；
+        // 非归一化输入直接拒绝，而不是像同步 Segment 那样静默 L2 归一化。
+        auto rows_status = ValidateBatchRows(batch, /*require_unit_norm=*/true);
+        if (!rows_status.ok()) {
+            co_return rows_status;
+        }
+        embeddings.insert(
+            embeddings.end(),
+            batch.embeddings.begin(),
+            batch.embeddings.end());
+    }
+
+    co_return RunDp(session_id, turns, embeddings, dimension);
 }
 
 } // namespace agent::conversation

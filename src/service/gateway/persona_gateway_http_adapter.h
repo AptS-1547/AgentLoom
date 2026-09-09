@@ -7,6 +7,7 @@
 #include "persona_gateway_service.h"
 #include "request_interfaces.h"
 #include "skill_session_manager.h"
+#include "stateful_skill_registry.h"
 
 #include <cstdint>
 #include <filesystem>
@@ -35,7 +36,8 @@ public:
                                        std::shared_ptr<document::IDocumentLlmChunkCache> llm_chunk_cache = nullptr,
                                        std::shared_ptr<semantic_cache::ISemanticCache> document_semantic_cache = nullptr,
                                        std::shared_ptr<persona::ISkillSessionManager> skill_session_manager = nullptr,
-                                       bool enable_dev_registration = false);
+                                       bool enable_dev_registration = false,
+                                       std::shared_ptr<persona::IStatefulSkillExecutionRouter> stateful_skill_router = nullptr);
     explicit PersonaGatewayHttpAdapter(PersonaGatewayService& service,
                                        std::shared_ptr<IGatewayAuthenticator> authenticator,
                                        std::shared_ptr<IAuthRegistrationService> auth_registration,
@@ -45,7 +47,8 @@ public:
                                        std::shared_ptr<document::IDocumentLlmChunkCache> llm_chunk_cache,
                                        std::shared_ptr<semantic_cache::ISemanticCache> document_semantic_cache,
                                        std::shared_ptr<persona::ISkillSessionManager> skill_session_manager,
-                                       PersonaGatewayHttpAdapterOptions options);
+                                       PersonaGatewayHttpAdapterOptions options,
+                                       std::shared_ptr<persona::IStatefulSkillExecutionRouter> stateful_skill_router = nullptr);
 
     static bool IsApiRequest(std::string_view target) noexcept;
 
@@ -63,6 +66,7 @@ private:
     std::shared_ptr<document::IDocumentLlmChunkCache> llm_chunk_cache_;
     std::shared_ptr<semantic_cache::ISemanticCache> document_semantic_cache_;
     std::shared_ptr<persona::ISkillSessionManager> skill_session_manager_;
+    std::shared_ptr<persona::IStatefulSkillExecutionRouter> stateful_skill_router_;
     PersonaGatewayHttpAdapterOptions options_;
     std::mutex document_upload_mutex_;
     std::unordered_map<std::string, DocumentUploadSession> document_uploads_;

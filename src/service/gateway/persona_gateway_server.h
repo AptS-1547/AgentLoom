@@ -92,6 +92,7 @@ struct PersonaGatewayServerDependencies {
     std::shared_ptr<persona::IEmotionAnalyzer> emotion_analyzer;
     std::shared_ptr<persona::IToolMemoryProvider> tool_memory_provider;
     std::shared_ptr<persona::ISkillSessionManager> skill_session_manager;
+    std::shared_ptr<persona::IStatefulSkillExecutionRouter> stateful_skill_router;
     /// 启动期校验并注册的 Skill manifest；Server 共享其生命周期供下游装配使用。
     std::shared_ptr<agent::skill::ISkillRegistry> skill_registry;
     std::shared_ptr<llm::ILlmClient> llm_client;

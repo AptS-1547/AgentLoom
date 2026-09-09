@@ -595,9 +595,7 @@ std::size_t cache_vector::VectorIndexManager::CurrentSize() const {
 
 std::string cache_vector::VectorIndexManager::BuildBatchKey(std::int64_t timestamp) const {
     if (session_scoped_key_) {
-        return "cache:v2:batch:" + session_key_.tenant_id + ":" +
-               session_key_.user_id + ":" + session_key_.session_id + ":" +
-               std::to_string(timestamp);
+        return BuildL0BatchKey(session_key_, timestamp);
     }
     return "cache:batch:" + user_uuid_ + ":" + std::to_string(timestamp);
 }
@@ -607,7 +605,7 @@ core::Status cache_vector::VectorIndexManager::AddRecord(const storage::CacheRec
         return initialization_status_;
     }
     if (active_timestamp_ == 0) {
-        active_timestamp_ = std::chrono::system_clock::now().time_since_epoch().count();
+        active_timestamp_ = NowUnixMs();
     }
 
     std::string key = BuildBatchKey(active_timestamp_);
@@ -641,7 +639,7 @@ core::Status cache_vector::VectorIndexManager::Store(const std::vector<storage::
     }
 
     if (active_timestamp_ == 0) {
-        active_timestamp_ = std::chrono::system_clock::now().time_since_epoch().count();
+        active_timestamp_ = NowUnixMs();
     }
 
     std::string key = BuildBatchKey(active_timestamp_);
@@ -739,7 +737,9 @@ core::Status cache_vector::VectorIndexManager::RebuildTimestampIndexFromRedis() 
         return core::Status::Error(core::ErrorCode::FailedPrecondition, "redis pool not available");
     }
 
-    std::string pattern = "cache:batch:" + user_uuid_ + ":*";
+    const std::string pattern = session_scoped_key_
+        ? BuildL0BatchScanPattern(session_key_)
+        : "cache:batch:" + user_uuid_ + ":*";
     std::deque<std::int64_t> rebuilt;
 
     auto result = redis_pool_->Scan(pattern);

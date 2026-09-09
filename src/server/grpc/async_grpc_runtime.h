@@ -58,9 +58,26 @@ class IAsyncUnaryRpcHandler {
 public:
     virtual ~IAsyncUnaryRpcHandler() = default;
 
+    using AsyncCompletion = std::function<void(core::Status)>;
+
     virtual core::Status Handle(const AsyncGrpcCallContext& context,
                                 const Request& request,
                                 Response& response) = 0;
+
+    // 默认实现是同步兼容桥；真正异步实现必须在稍后恰好调用 completion 一次。
+    virtual core::Status HandleAsync(
+        const AsyncGrpcCallContext& context,
+        const Request& request,
+        Response& response,
+        AsyncCompletion completion) {
+        if (!completion) {
+            return core::Status::Error(
+                core::ErrorCode::InvalidArgument,
+                "async gRPC completion callback is required");
+        }
+        completion(Handle(context, request, response));
+        return core::Status::Ok();
+    }
 };
 
 namespace detail {
@@ -129,7 +146,7 @@ public:
     }
 
 private:
-    class CallState final {
+    class CallState final : public std::enable_shared_from_this<CallState> {
     public:
         CallState(std::shared_ptr<AsyncGrpcRuntimeState> runtime_state,
                   grpc::CallbackServerContext& grpc_context,
@@ -179,41 +196,43 @@ private:
                 return;
             }
 
-            core::Status status = CancellationStatus();
-            if (status.ok()) {
-                try {
-                    core::TraceContext trace_context{call_context_.trace_id, {}, {}};
-                    core::TraceScope trace_scope(trace_context);
-                    status = handler_->Handle(call_context_, request_, response_);
-                } catch (const core::AppException& exception) {
-                    status = exception.status();
-                } catch (const std::exception& exception) {
-                    runtime_state_->logger.error(
-                        "[AsyncGrpcException] method={} trace_id={} error={}",
-                        call_context_.method_name,
-                        call_context_.trace_id,
-                        exception.what());
-                    status = core::Status::Error(
-                        core::ErrorCode::InternalError,
-                        "unhandled async gRPC handler exception");
-                } catch (...) {
-                    runtime_state_->logger.error(
-                        "[AsyncGrpcException] method={} trace_id={} error=unknown",
-                        call_context_.method_name,
-                        call_context_.trace_id);
-                    status = core::Status::Error(
-                        core::ErrorCode::InternalError,
-                        "unknown async gRPC handler exception");
+            auto status = CancellationStatus();
+            if (!status.ok()) {
+                CompleteRunning(std::move(status));
+                return;
+            }
+            try {
+                core::TraceContext trace_context{call_context_.trace_id, {}, {}};
+                core::TraceScope trace_scope(trace_context);
+                const auto submit_status = handler_->HandleAsync(
+                    call_context_,
+                    request_,
+                    response_,
+                    [self = this->shared_from_this()](core::Status completion_status) {
+                        self->CompleteRunning(std::move(completion_status));
+                    });
+                if (!submit_status.ok()) {
+                    CompleteRunning(submit_status);
                 }
-            }
-            if (status.ok()) {
-                status = CancellationStatus();
-            }
-
-            expected = Phase::Running;
-            if (phase_.compare_exchange_strong(
-                    expected, Phase::Finishing, std::memory_order_acq_rel)) {
-                Finish(std::move(status));
+            } catch (const core::AppException& exception) {
+                CompleteRunning(exception.status());
+            } catch (const std::exception& exception) {
+                runtime_state_->logger.error(
+                    "[AsyncGrpcException] method={} trace_id={} error={}",
+                    call_context_.method_name,
+                    call_context_.trace_id,
+                    exception.what());
+                CompleteRunning(core::Status::Error(
+                    core::ErrorCode::InternalError,
+                    "unhandled async gRPC handler exception"));
+            } catch (...) {
+                runtime_state_->logger.error(
+                    "[AsyncGrpcException] method={} trace_id={} error=unknown",
+                    call_context_.method_name,
+                    call_context_.trace_id);
+                CompleteRunning(core::Status::Error(
+                    core::ErrorCode::InternalError,
+                    "unknown async gRPC handler exception"));
             }
         }
 
@@ -221,6 +240,15 @@ private:
             FinishQueued(core::Status::Error(
                 core::ErrorCode::Unavailable,
                 "async gRPC worker task was discarded"));
+        }
+
+        void CompleteRunning(core::Status status) noexcept {
+            if (status.ok()) status = CancellationStatus();
+            Phase expected = Phase::Running;
+            if (phase_.compare_exchange_strong(
+                    expected, Phase::Finishing, std::memory_order_acq_rel)) {
+                Finish(std::move(status));
+            }
         }
 
     private:

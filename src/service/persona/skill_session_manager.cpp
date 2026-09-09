@@ -111,6 +111,26 @@ core::Result<std::optional<SkillSessionSnapshot>> SkillSessionManager::Get(std::
     return std::optional<SkillSessionSnapshot>{SnapshotLocked(it->second)};
 }
 
+core::Result<std::vector<SkillSessionSnapshot>> SkillSessionManager::List(
+    std::string_view session_id, std::string_view user_uuid) const {
+    if (EmptyId(session_id)) {
+        return core::Status::Error(core::ErrorCode::InvalidArgument,
+                                   "session_id is required");
+    }
+    std::vector<SkillSessionSnapshot> result;
+    std::lock_guard lock(mutex_);
+    const std::string prefix = std::string(session_id) + "\n";
+    for (const auto& [key, session] : sessions_) {
+        if (key.rfind(prefix, 0) != 0 ||
+            (!user_uuid.empty() && session.user_uuid != user_uuid) ||
+            Terminal(session.state)) {
+            continue;
+        }
+        result.push_back(SnapshotLocked(session));
+    }
+    return result;
+}
+
 core::Status SkillSessionManager::MarkReady(std::string_view session_id,
                                             std::string_view skill_id,
                                             std::string status_text,

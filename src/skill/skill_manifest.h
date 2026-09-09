@@ -33,6 +33,12 @@ struct SkillManifest {
     std::string prompt_instruction;
     // 触发该工具的关键词；由 provider 编译为确定性正则兜底通道，与向量召回互补。
     std::vector<std::string> keywords;
+    // 否定排除关键词：命中即取消该工具的正则触发（向量召回不受影响）。
+    std::vector<std::string> negative_keywords;
+    // L4 工具记忆种子语义描述（embedding 用）；空则回退 description。
+    std::string l4_payload;
+    // 意图标识：用于派生 L4 memory_hash 后缀（可选）。
+    std::string intent;
     ExecutionMode execution_mode = ExecutionMode::Exclusive;
     std::size_t max_parallel_per_session = 1;
     bool requires_confirmation = false;

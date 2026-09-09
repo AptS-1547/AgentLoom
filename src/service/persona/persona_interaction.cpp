@@ -87,6 +87,30 @@ core::Result<SessionSnapshot> PersonaInteraction::CloseSession(
     return closed;
 }
 
+core::Status PersonaInteraction::HoldReclamationUntil(
+    PersonaSessionReclamationRequest request) {
+    auto snapshot = GetSession(PersonaSessionQuery{
+        request.session_id,
+        request.trace_id,
+        request.trusted_user_uuid,
+    });
+    if (!snapshot.ok()) {
+        return snapshot.status();
+    }
+    return sessions_.HoldReclamationUntil(
+        request.session_id,
+        request.retain_until,
+        request.trace_id);
+}
+
+core::Status PersonaInteraction::ReleaseReclamationHold(PersonaSessionQuery query) {
+    auto snapshot = GetSession(query);
+    if (!snapshot.ok()) {
+        return snapshot.status();
+    }
+    return sessions_.ReleaseReclamationHold(query.session_id, query.trace_id);
+}
+
 core::Status PersonaInteraction::SubmitTurn(PersonaTurnRequest request,
                                             TurnCallback callback) {
     if (!callback) {

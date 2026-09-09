@@ -1,4 +1,5 @@
 #include "persona_gateway_server.h"
+#include "auth_session_maintenance_task.h"
 
 #include "document_file_store.h"
 #include "gateway_session_affinity_scheduler.h"
@@ -169,7 +170,9 @@ PersonaGatewayServer::PersonaGatewayServer(PersonaGatewayServerOptions options,
                logger_,
                nullptr,
                dependencies_.async_llm_client,
-               &llm_pool_),
+               &llm_pool_,
+               nullptr,
+               dependencies_.stateful_skill_router),
       classroom_scheduler_({}, core::LoggerAdapter::ForModule("classroom")),
       gateway_metadata_pool_(MakeGatewayMetadataPool(options_.auth)),
       auth_session_store_(MakeAuthSessionStore(options_.auth, auth_redis_, gateway_metadata_pool_)),
@@ -205,14 +208,15 @@ PersonaGatewayServer::PersonaGatewayServer(PersonaGatewayServerOptions options,
                    .enable_path_register_test_endpoint =
                        options_.document_store.enable_path_register_test_endpoint,
                    .enable_path_analyze_test_endpoint =
-                       options_.document_store.enable_path_analyze_test_endpoint}),
+                       options_.document_store.enable_path_analyze_test_endpoint},
+               dependencies_.stateful_skill_router),
       http_server_(ResolveHttpOptions(options_)),
       maintenance_(core::LoggerAdapter::ForModule("gateway")),
       lifecycle_(core::LoggerAdapter::ForModule("gateway")) {
     if (dependencies_.l0_memory_adapter) {
         auto l0 = dependencies_.l0_memory_adapter;
         sessions_.SetSessionClosedCallback([l0 = std::move(l0)](const persona::SessionSnapshot& snapshot) {
-            l0->ReleaseSession(snapshot.session_id);
+            l0->ReleaseSession({snapshot.tenant_id, snapshot.user_uuid, snapshot.session_id});
         });
         if (options_.embedding_batch.enabled) {
             ::vector::EmbeddingBatchCoordinatorOptions batch_options;

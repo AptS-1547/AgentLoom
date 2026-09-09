@@ -79,7 +79,7 @@ public:
     core::Status StoreAsync(CacheStoreRequest request,
                             StoreCompletion completion) override;
     core::Status Store(const CacheStoreRequest& req) override;
-    void ReleaseSession(std::string_view session_id);
+    void ReleaseSession(const L0SessionKey& key);
 
     /// 在 Gateway 线程池启动前装配；StartBatching/ShutdownBatching 由生命周期负责。
     core::Status ConfigureBatching(
@@ -125,7 +125,8 @@ private:
     std::function<core::Status()> metadata_ready_;
     std::size_t max_cached_records_ = 1000;
     std::shared_ptr<SessionIndexEntry> fixed_index_entry_;
-    std::unordered_map<std::string, std::shared_ptr<SessionIndexEntry>> per_session_indices_;
+    std::unordered_map<L0SessionKey, std::shared_ptr<SessionIndexEntry>, L0SessionKeyHash>
+        per_session_indices_;
     L0MemoryCacheAdapterOptions options_;
     std::shared_ptr<::vector::EmbeddingBatchCoordinator> batch_coordinator_;
     // 仅保护 Session 到索引的映射，严禁在持锁期间执行 Embedding、Redis 或 SQLite I/O。

@@ -20,6 +20,22 @@ core::Status ValidateKey(const L0SessionKey& key) {
     return core::Status::Ok();
 }
 
+std::size_t HashCombine(std::size_t seed, std::size_t value) noexcept {
+    return seed ^ (value + 0x9e3779b9U + (seed << 6U) + (seed >> 2U));
+}
+
+std::string EscapeRedisGlob(std::string_view value) {
+    std::string escaped;
+    escaped.reserve(value.size());
+    for (const char ch : value) {
+        if (ch == '*' || ch == '?' || ch == '[' || ch == ']' || ch == '\\') {
+            escaped.push_back('\\');
+        }
+        escaped.push_back(ch);
+    }
+    return escaped;
+}
+
 core::Status ApplyL0SessionMetadataV1(storage::sqlite::SqliteConnection& connection) {
     return connection.Execute(R"SQL(
 CREATE TABLE IF NOT EXISTS l0_active_batch_v2 (
@@ -51,6 +67,31 @@ const std::array<storage::sqlite::SqliteMigrationStep, 1> kL0SessionMetadataMigr
     },
 }};
 
+}
+
+std::size_t L0SessionKeyHash::operator()(const L0SessionKey& key) const noexcept {
+    std::size_t seed = 0;
+    seed = HashCombine(seed, std::hash<std::string>{}(key.tenant_id));
+    seed = HashCombine(seed, std::hash<std::string>{}(key.user_id));
+    seed = HashCombine(seed, std::hash<std::string>{}(key.session_id));
+    return seed;
+}
+
+std::string BuildL0BatchKey(const L0SessionKey& key, std::int64_t timestamp_ms) {
+    return "cache:v2:batch:" + key.tenant_id + ":" + key.user_id + ":" +
+           key.session_id + ":" + std::to_string(timestamp_ms);
+}
+
+std::string BuildL0BatchScanPattern(const L0SessionKey& key) {
+    return "cache:v2:batch:" + EscapeRedisGlob(key.tenant_id) + ":" +
+           EscapeRedisGlob(key.user_id) + ":" + EscapeRedisGlob(key.session_id) + ":*";
+}
+
+std::string BuildL0OwnerBatchScanPattern(
+    std::string_view tenant_id,
+    std::string_view user_id) {
+    return "cache:v2:batch:" + EscapeRedisGlob(tenant_id) + ":" +
+           EscapeRedisGlob(user_id) + ":*";
 }
 
 SqliteL0SessionBatchMetadataStore::SqliteL0SessionBatchMetadataStore(

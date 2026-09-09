@@ -2,6 +2,7 @@
 
 #include "optimizer.h"
 #include "result.h"
+#include "../core/coroutine_task.h"
 
 #include <array>
 #include <cstddef>
@@ -15,6 +16,7 @@
 
 namespace vector {
 class EmbeddingPipeline;
+class EmbeddingBatchCoordinator;
 }
 
 namespace agent::conversation {
@@ -197,12 +199,30 @@ public:
         std::shared_ptr<ITextEmbeddingProvider> embedding_provider,
         DialogueSegmenterOptions options = {});
 
+    // 异步构造：直接持有 EmbeddingBatchCoordinator，供离线批量分块走协程 SegmentAsync。
+    BoundedDpDialogueSegmenter(
+        std::shared_ptr<vector::EmbeddingBatchCoordinator> coordinator,
+        DialogueSegmenterOptions options = {});
+
     core::Result<DialogueSegmentationResult> Segment(
         std::string_view session_id,
         const std::vector<DialogueTurn>& turns) override;
 
+    // 异步分块：co_await 批量 embedding，不阻塞调用线程（要求由 coordinator 构造）。
+    core::async::task<core::Result<DialogueSegmentationResult>> SegmentAsync(
+        std::string_view session_id,
+        const std::vector<DialogueTurn>& turns);
+
 private:
+    // 共享的 DP 阶段：由 embeddings 计算分块边界并组装结果。
+    core::Result<DialogueSegmentationResult> RunDp(
+        std::string_view session_id,
+        const std::vector<DialogueTurn>& turns,
+        const std::vector<float>& embeddings,
+        std::size_t dimension) const;
+
     std::shared_ptr<ITextEmbeddingProvider> embedding_provider_;
+    std::shared_ptr<vector::EmbeddingBatchCoordinator> coordinator_;
     DialogueSegmenterOptions options_;
 };
 

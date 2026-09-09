@@ -10,6 +10,7 @@
 #include <ctime>
 #include <iomanip>
 #include <sstream>
+#include <tuple>
 #include <utility>
 
 namespace agent::service::gateway {
@@ -31,38 +32,6 @@ std::tm LocalTime(std::time_t value) {
 }
 
 } // namespace
-
-AuthSessionMaintenanceTask::AuthSessionMaintenanceTask(
-    std::shared_ptr<IAuthSessionStore> store,
-    std::chrono::milliseconds interval,
-    std::size_t batch_size,
-    core::LoggerAdapter logger)
-    : store_(std::move(store)),
-      interval_(interval),
-      batch_size_(batch_size),
-      logger_(std::move(logger)) {}
-
-std::string_view AuthSessionMaintenanceTask::Name() const noexcept {
-    return "gateway_auth_session_cleanup";
-}
-
-std::chrono::milliseconds AuthSessionMaintenanceTask::Interval() const noexcept {
-    return interval_;
-}
-
-core::Status AuthSessionMaintenanceTask::Tick(std::stop_token stop_token) {
-    if (stop_token.stop_requested() || !store_) {
-        return core::Status::Ok();
-    }
-    auto cleanup = store_->CleanupExpired(std::chrono::system_clock::now(), batch_size_);
-    if (!cleanup.ok()) {
-        return cleanup.status();
-    }
-    if (cleanup.value() > 0) {
-        logger_.info("[maintenance] gateway auth session cleanup removed_count={}", cleanup.value());
-    }
-    return core::Status::Ok();
-}
 
 DocumentRetentionMaintenanceTask::DocumentRetentionMaintenanceTask(
     std::shared_ptr<document::DocumentAnalysisService> documents,
@@ -245,47 +214,49 @@ core::Status L3MemoryFlushMaintenanceTask::Tick(std::stop_token stop_token) {
         }
     }
 
-    std::vector<std::string> users = options_.user_uuids;
-    auto registered_users = compressor_->GetRegisteredUsers();
-    if (!registered_users.ok()) {
-        return registered_users.status();
+    std::vector<memory::MemoryOwner> owners = options_.owners;
+    auto registered_owners = compressor_->GetRegisteredOwners();
+    if (!registered_owners.ok()) {
+        return registered_owners.status();
     }
-    users.insert(users.end(), registered_users.value().begin(), registered_users.value().end());
-    std::sort(users.begin(), users.end());
-    users.erase(std::unique(users.begin(), users.end()), users.end());
-    users.erase(std::remove_if(users.begin(), users.end(), [](const std::string& user) {
-                    return user.empty();
+    owners.insert(
+        owners.end(), registered_owners.value().begin(), registered_owners.value().end());
+    std::sort(owners.begin(), owners.end(), [](const auto& lhs, const auto& rhs) {
+        return std::tie(lhs.tenant_id, lhs.user_id) < std::tie(rhs.tenant_id, rhs.user_id);
+    });
+    owners.erase(std::unique(owners.begin(), owners.end()), owners.end());
+    owners.erase(std::remove_if(owners.begin(), owners.end(), [](const auto& owner) {
+                    return owner.tenant_id.empty() || owner.user_id.empty();
                 }),
-                users.end());
-    if (users.empty()) {
+                owners.end());
+    if (owners.empty()) {
         return core::Status::Ok();
     }
 
     std::size_t success_count = 0;
     std::size_t failure_count = 0;
     std::string first_failure;
-    for (const auto& user_uuid : users) {
+    for (const auto& owner : owners) {
         if (stop_token.stop_requested()) {
             break;
         }
-        if (user_uuid.empty()) {
-            continue;
-        }
-        auto result = compressor_->CompressDailyMemory(user_uuid, date);
+        auto result = compressor_->CompressDailyMemory(owner, date);
         if (!result.ok()) {
             ++failure_count;
             if (first_failure.empty()) {
                 first_failure = result.status().message();
             }
-            logger_.warn("[maintenance] l3 flush failed user={} date={} reason={}",
-                         user_uuid,
+            logger_.warn("[maintenance] l3 flush failed tenant={} user={} date={} reason={}",
+                         owner.tenant_id,
+                         owner.user_id,
                          date,
                          result.status().message());
             continue;
         }
         ++success_count;
-        logger_.info("[maintenance] l3 flush user={} date={} source_records={}",
-                     user_uuid,
+        logger_.info("[maintenance] l3 flush tenant={} user={} date={} source_records={}",
+                     owner.tenant_id,
+                     owner.user_id,
                      date,
                      result.value());
     }

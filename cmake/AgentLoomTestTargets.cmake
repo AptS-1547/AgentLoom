@@ -92,6 +92,7 @@ if(BERT_BUILD_TESTS)
         tests/core/keyed_serial_executor_test.cpp
         tests/core/optimizer_test.cpp
         tests/core/ordered_bitmap_window_test.cpp
+        tests/core/coroutine_awaitable_test.cpp
     )
 
     target_link_libraries(core_tests PRIVATE

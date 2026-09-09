@@ -24,6 +24,13 @@ inline SkillManifest ParseSkillManifestJson(const nlohmann::json& object) {
             if (keyword.is_string()) manifest.keywords.push_back(keyword.get<std::string>());
         }
     }
+    if (object.contains("negative_keywords") && object["negative_keywords"].is_array()) {
+        for (const auto& keyword : object["negative_keywords"]) {
+            if (keyword.is_string()) manifest.negative_keywords.push_back(keyword.get<std::string>());
+        }
+    }
+    if (object.contains("l4_payload") && object["l4_payload"].is_string()) manifest.l4_payload = object["l4_payload"].get<std::string>();
+    if (object.contains("intent") && object["intent"].is_string()) manifest.intent = object["intent"].get<std::string>();
     if (object.contains("executor") && object["executor"].is_object()) {
         const auto& executor = object["executor"];
         if (executor.contains("type") && executor["type"].is_string()) manifest.executor.type = executor["type"].get<std::string>();

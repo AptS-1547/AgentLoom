@@ -28,6 +28,8 @@ public:
     virtual core::Result<std::vector<EntryRecord>> LookupEntries(std::span<const std::int64_t> ids) const = 0;
     virtual core::Result<std::vector<EntryRecord>> ListEntries(
         std::int64_t partition_id, bool include_forgotten) const = 0;
+    virtual core::Result<std::optional<std::int64_t>> FindEntryIdByMemoryHash(
+        std::int64_t partition_id, std::string_view memory_hash) const = 0;
 
     // Lifecycle updates
     virtual core::Status MarkRecalled(std::span<const std::int64_t> ids, std::int64_t now_ms) = 0;

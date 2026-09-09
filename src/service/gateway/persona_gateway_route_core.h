@@ -7,6 +7,7 @@
 #include "persona_gateway_service.h"
 #include "request_interfaces.h"
 #include "skill_session_manager.h"
+#include "stateful_skill_registry.h"
 
 #include <nlohmann/json.hpp>
 
@@ -41,6 +42,7 @@ struct HttpRouteContext {
     std::shared_ptr<document::IDocumentLlmChunkCache> llm_chunk_cache;
     std::shared_ptr<semantic_cache::ISemanticCache> document_semantic_cache;
     std::shared_ptr<persona::ISkillSessionManager> skill_session_manager;
+    std::shared_ptr<persona::IStatefulSkillExecutionRouter> stateful_skill_router;
     std::shared_ptr<IAuthRegistrationService> auth_registration;
     bool enable_dev_registration = false;
     bool enable_path_register_test_endpoint = false;
@@ -62,6 +64,7 @@ struct WsRouteContext {
     std::shared_ptr<document::IDocumentLlmChunkCache> llm_chunk_cache;
     std::shared_ptr<semantic_cache::ISemanticCache> document_semantic_cache;
     std::shared_ptr<persona::ISkillSessionManager> skill_session_manager;
+    std::shared_ptr<persona::IStatefulSkillExecutionRouter> stateful_skill_router;
     std::shared_ptr<::net::IWebSocketStreamRequest> request;
     const nlohmann::json& body;
     const AuthIdentity& identity;

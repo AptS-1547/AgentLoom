@@ -75,6 +75,12 @@ void SkillRegistryConfigSection::LoadJson(const Json& root, MultimodalServerOpti
         options.skills.manifest_directory = legacy_directory->get<std::string>();
     }
     SetString(*section, Name(), "manifest_filename_regex", options.skills.manifest_filename_regex);
+    SetPath(*section, Name(), "tool_memory_sqlite_path", options.skills.tool_memory_sqlite_path);
+    SetString(*section, Name(), "tool_memory_collection_name", options.skills.tool_memory_collection_name);
+    SetInt(*section, Name(), "tool_memory_top_k", options.skills.tool_memory_top_k, 1, 64);
+    float tool_memory_min_score = static_cast<float>(options.skills.tool_memory_min_score);
+    SetFloat(*section, Name(), "tool_memory_min_score", tool_memory_min_score, 0.0F, 1.0F);
+    options.skills.tool_memory_min_score = tool_memory_min_score;
     const Json* manifests = FindField(*section, Name(), "manifests");
     if (manifests) AppendManifestJson(*manifests, "skills.manifests", options.skill_manifests);
 }
@@ -82,6 +88,8 @@ void SkillRegistryConfigSection::LoadJson(const Json& root, MultimodalServerOpti
 void SkillRegistryConfigSection::Validate(MultimodalServerOptions& options) const {
     options.skills.manifest_directory = ResolveRelativeToConfig(
         options.skills.manifest_directory, options.config_file_path);
+    options.skills.tool_memory_sqlite_path = ResolveRelativeToConfig(
+        options.skills.tool_memory_sqlite_path, options.config_file_path);
     if (!options.skills.enabled) return;
     try {
         const std::regex filename_regex(options.skills.manifest_filename_regex);

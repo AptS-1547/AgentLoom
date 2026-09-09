@@ -815,7 +815,8 @@ PersonaGatewayHttpAdapter::PersonaGatewayHttpAdapter(PersonaGatewayService& serv
                                                      std::shared_ptr<document::IDocumentLlmChunkCache> llm_chunk_cache,
                                                      std::shared_ptr<semantic_cache::ISemanticCache> document_semantic_cache,
                                                      std::shared_ptr<persona::ISkillSessionManager> skill_session_manager,
-                                                     bool enable_dev_registration)
+                                                     bool enable_dev_registration,
+                                                     std::shared_ptr<persona::IStatefulSkillExecutionRouter> stateful_skill_router)
     : PersonaGatewayHttpAdapter(service,
                                 std::move(authenticator),
                                 std::move(auth_registration),
@@ -828,7 +829,8 @@ PersonaGatewayHttpAdapter::PersonaGatewayHttpAdapter(PersonaGatewayService& serv
                                 PersonaGatewayHttpAdapterOptions{
                                     .enable_dev_registration = enable_dev_registration,
                                     .enable_path_register_test_endpoint = false,
-                                    .enable_path_analyze_test_endpoint = false}) {}
+                                    .enable_path_analyze_test_endpoint = false},
+                                std::move(stateful_skill_router)) {}
 
 PersonaGatewayHttpAdapter::PersonaGatewayHttpAdapter(PersonaGatewayService& service,
                                                      std::shared_ptr<IGatewayAuthenticator> authenticator,
@@ -839,7 +841,8 @@ PersonaGatewayHttpAdapter::PersonaGatewayHttpAdapter(PersonaGatewayService& serv
                                                      std::shared_ptr<document::IDocumentLlmChunkCache> llm_chunk_cache,
                                                      std::shared_ptr<semantic_cache::ISemanticCache> document_semantic_cache,
                                                      std::shared_ptr<persona::ISkillSessionManager> skill_session_manager,
-                                                     PersonaGatewayHttpAdapterOptions options)
+                                                     PersonaGatewayHttpAdapterOptions options,
+                                                     std::shared_ptr<persona::IStatefulSkillExecutionRouter> stateful_skill_router)
     : service_(service),
       authenticator_(std::move(authenticator)),
       auth_registration_(std::move(auth_registration)),
@@ -849,6 +852,7 @@ PersonaGatewayHttpAdapter::PersonaGatewayHttpAdapter(PersonaGatewayService& serv
       llm_chunk_cache_(std::move(llm_chunk_cache)),
       document_semantic_cache_(std::move(document_semantic_cache)),
       skill_session_manager_(std::move(skill_session_manager)),
+      stateful_skill_router_(std::move(stateful_skill_router)),
       options_(options) {}
 
 bool PersonaGatewayHttpAdapter::IsApiRequest(std::string_view target) noexcept {
@@ -925,6 +929,7 @@ void PersonaGatewayHttpAdapter::HandleHttp(std::shared_ptr<::net::IHttpRequest> 
             llm_chunk_cache_,
             document_semantic_cache_,
             skill_session_manager_,
+            stateful_skill_router_,
             auth_registration_,
             options_.enable_dev_registration,
             options_.enable_path_register_test_endpoint,
@@ -1028,6 +1033,7 @@ void PersonaGatewayHttpAdapter::HandleWebSocket(std::shared_ptr<::net::IWebSocke
             llm_chunk_cache_,
             document_semantic_cache_,
             skill_session_manager_,
+            stateful_skill_router_,
             std::move(request),
             body,
             identity,

@@ -1,7 +1,6 @@
 #pragma once
 
 #include "document_analysis_service.h"
-#include "gateway_auth.h"
 #include "gateway_maintenance.h"
 #include "long_term_memory_compressor.h"
 #include "skill_session_manager.h"
@@ -69,24 +68,6 @@ private:
     core::LoggerAdapter logger_;
 };
 
-class AuthSessionMaintenanceTask final : public IRuntimeMaintenanceTask {
-public:
-    AuthSessionMaintenanceTask(std::shared_ptr<IAuthSessionStore> store,
-                               std::chrono::milliseconds interval,
-                               std::size_t batch_size = 256,
-                               core::LoggerAdapter logger = core::LoggerAdapter::ForModule("gateway"));
-
-    std::string_view Name() const noexcept override;
-    std::chrono::milliseconds Interval() const noexcept override;
-    core::Status Tick(std::stop_token stop_token) override;
-
-private:
-    std::shared_ptr<IAuthSessionStore> store_;
-    std::chrono::milliseconds interval_;
-    std::size_t batch_size_;
-    core::LoggerAdapter logger_;
-};
-
 class InferenceFrameIpcPeerMaintenanceTask final : public IRuntimeMaintenanceTask {
 public:
     InferenceFrameIpcPeerMaintenanceTask(
@@ -110,7 +91,7 @@ struct L3MemoryFlushMaintenanceOptions {
     int flush_minute = 0;
     int flush_date_offset_days = 0;
     bool defer_when_sessions_active = true;
-    std::vector<std::string> user_uuids;
+    std::vector<memory::MemoryOwner> owners;
 };
 
 class L3MemoryFlushMaintenanceTask final : public IRuntimeMaintenanceTask {

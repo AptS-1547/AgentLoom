@@ -275,7 +275,9 @@ DECLARE_AUTHENTICATED_HTTP_ROUTE(SkillSessionStartRoute, ::net::http::verb::post
     if (max_duration_ms > 0) {
         req.max_duration = std::chrono::milliseconds(max_duration_ms);
     }
-    auto result = context.skill_session_manager->Start(req);
+    auto result = context.stateful_skill_router
+        ? context.stateful_skill_router->Start(req)
+        : context.skill_session_manager->Start(req);
     SendResult(context.request, std::move(result), context.trace_id, [&trace_id = context.trace_id](const auto& snapshot) {
         return SkillSessionEnvelope(trace_id, snapshot);
     });
@@ -297,7 +299,9 @@ DECLARE_AUTHENTICATED_HTTP_ROUTE(SkillSessionStopRoute, ::net::http::verb::post,
     req.reason = context.body.value("reason", std::string{"client_stop"});
     req.summarize = context.body.value("summarize", true);
     req.write_l3 = context.body.value("writeL3", context.body.value("write_l3", false));
-    auto result = context.skill_session_manager->Stop(req);
+    auto result = context.stateful_skill_router
+        ? context.stateful_skill_router->Stop(req)
+        : context.skill_session_manager->Stop(req);
     SendResult(context.request, std::move(result), context.trace_id, [&trace_id = context.trace_id](const auto& snapshot) {
         return SkillSessionEnvelope(trace_id, snapshot);
     });
@@ -423,7 +427,9 @@ DECLARE_AUTHENTICATED_WS_ROUTE(SkillSessionStartWsRoute, "skill.session.start") 
     if (max_duration_ms > 0) {
         req.max_duration = std::chrono::milliseconds(max_duration_ms);
     }
-    auto result = context.skill_session_manager->Start(req);
+    auto result = context.stateful_skill_router
+        ? context.stateful_skill_router->Start(req)
+        : context.skill_session_manager->Start(req);
     Json out = result.ok()
         ? Json{{"type", "skill.session.started"}, {"payload", SkillSessionEnvelope(context.trace_id, result.value())}}
         : Json{{"type", "error"}, {"payload", ErrorEnvelope(context.trace_id, result.status())}};
@@ -449,7 +455,9 @@ DECLARE_AUTHENTICATED_WS_ROUTE(SkillSessionStopWsRoute, "skill.session.stop") {
     req.reason = payload.value("reason", std::string{"client_stop"});
     req.summarize = payload.value("summarize", true);
     req.write_l3 = payload.value("writeL3", payload.value("write_l3", false));
-    auto result = context.skill_session_manager->Stop(req);
+    auto result = context.stateful_skill_router
+        ? context.stateful_skill_router->Stop(req)
+        : context.skill_session_manager->Stop(req);
     Json out = result.ok()
         ? Json{{"type", "skill.session.stopped"}, {"payload", SkillSessionEnvelope(context.trace_id, result.value())}}
         : Json{{"type", "error"}, {"payload", ErrorEnvelope(context.trace_id, result.status())}};

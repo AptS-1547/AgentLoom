@@ -363,6 +363,9 @@ target_link_libraries(agent_gateway_server PRIVATE
 if(WIN32)
     link_whole_archive(agent_gateway_server agent_config)
 endif()
+if(TARGET agent_skill_media)
+    link_whole_archive(agent_gateway_server agent_skill_media)
+endif()
 agentloom_copy_gateway_runtime_files(agent_gateway_server)
 
 add_executable(persona_config_migration

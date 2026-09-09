@@ -375,6 +375,11 @@ struct SkillRegistryConfigOptions {
     bool enabled = true;
     std::filesystem::path manifest_directory;
     std::string manifest_filename_regex = R"(.*skill.*\.json$)";
+    // L4 工具记忆：tool_memory_sqlite_path 为空表示跳过种子写入与 provider 构造。
+    std::filesystem::path tool_memory_sqlite_path;
+    std::string tool_memory_collection_name = "skill_l4";
+    int tool_memory_top_k = 3;
+    double tool_memory_min_score = 0.78;
 };
 
 template <typename GatewayAuthOptionsT>

@@ -126,6 +126,7 @@ struct SessionState {
     std::string close_reason;
     std::chrono::steady_clock::time_point created_at{};
     std::chrono::steady_clock::time_point last_active{};
+    std::optional<std::chrono::steady_clock::time_point> reclamation_hold_until;
     std::deque<ConversationTurn> recent_history;
     std::shared_ptr<const PersonalityConfig> personality;
     EmotionStateTracker emotion_state;
@@ -163,6 +164,15 @@ public:
     virtual core::Status CloseSession(std::string_view session_id, std::string_view trace_id = {}) = 0;
     /// 更新最后活动时间；不存在的 session 返回失败 Status。
     virtual core::Status TouchSession(std::string_view session_id, std::string_view trace_id = {}) = 0;
+    /// 在指定单调时钟时间前阻止 idle cleanup 回收；不改变 SessionStatus。
+    virtual core::Status HoldReclamationUntil(
+        std::string_view session_id,
+        std::chrono::steady_clock::time_point retain_until,
+        std::string_view trace_id = {}) = 0;
+    /// 解除 idle cleanup hold；重复解除保持幂等。
+    virtual core::Status ReleaseReclamationHold(
+        std::string_view session_id,
+        std::string_view trace_id = {}) = 0;
     virtual std::vector<SessionSnapshot> CleanupExpired() = 0;
     virtual std::size_t SessionCount() const = 0;
 };
@@ -197,6 +207,13 @@ public:
     core::Result<SessionSnapshot> GetSessionSnapshot(std::string_view session_id) const override;
     core::Status CloseSession(std::string_view session_id, std::string_view trace_id = {}) override;
     core::Status TouchSession(std::string_view session_id, std::string_view trace_id = {}) override;
+    core::Status HoldReclamationUntil(
+        std::string_view session_id,
+        std::chrono::steady_clock::time_point retain_until,
+        std::string_view trace_id = {}) override;
+    core::Status ReleaseReclamationHold(
+        std::string_view session_id,
+        std::string_view trace_id = {}) override;
     std::vector<SessionSnapshot> CleanupExpired() override;
     std::size_t SessionCount() const override;
     /// 阻止新 admission，并将所有 Session 置为 Closing；已在途 Turn 完成后再通知关闭。

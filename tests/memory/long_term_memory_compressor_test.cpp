@@ -5,11 +5,30 @@
 #include "../semantic_cache/redis_connection_pool.h"
 #include <gtest/gtest.h>
 #include <algorithm>
+#include <ctime>
 #include <filesystem>
 
 namespace fs = std::filesystem;
 
 namespace agent::memory {
+
+namespace {
+
+MemoryOwner Owner(std::string user_id, std::string tenant_id = "tenant-test") {
+    return MemoryOwner{std::move(tenant_id), std::move(user_id)};
+}
+
+std::int64_t LocalUnixMs(int year, int month, int day, int hour = 12) {
+    std::tm local{};
+    local.tm_year = year - 1900;
+    local.tm_mon = month - 1;
+    local.tm_mday = day;
+    local.tm_hour = hour;
+    local.tm_isdst = -1;
+    return static_cast<std::int64_t>(std::mktime(&local)) * 1000;
+}
+
+}
 
 class LongTermMemoryCompressorTest : public ::testing::Test {
 protected:
@@ -97,10 +116,68 @@ TEST_F(LongTermMemoryCompressorTest, CreateWithValidDeps) {
     EXPECT_NE(compressor, nullptr);
 }
 
+TEST(LongTermMemoryCompressorCodecTest, RejectsUnstructuredOrOversizedOutput) {
+    auto object = ParseL3CompressionFacts(R"({"fact":"not-an-array"})", 4, 64);
+    EXPECT_FALSE(object.ok());
+    EXPECT_EQ(object.status().code(), core::ErrorCode::InvalidArgument);
+
+    auto non_string = ParseL3CompressionFacts(R"(["ok", 1])", 4, 64);
+    EXPECT_FALSE(non_string.ok());
+    EXPECT_EQ(non_string.status().code(), core::ErrorCode::InvalidArgument);
+
+    auto too_many = ParseL3CompressionFacts(R"(["a","b","c"])", 2, 64);
+    EXPECT_FALSE(too_many.ok());
+    EXPECT_EQ(too_many.status().code(), core::ErrorCode::ResourceExhausted);
+
+    auto too_large = ParseL3CompressionFacts(R"(["12345"])", 4, 4);
+    EXPECT_FALSE(too_large.ok());
+    EXPECT_EQ(too_large.status().code(), core::ErrorCode::InvalidArgument);
+}
+
+TEST_F(LongTermMemoryCompressorTest, RedisL0SourceReadsV2RecordsByCompleteOwnerAndDate) {
+    const auto owner = Owner("source-user", "source-tenant");
+    const auto other = Owner("source-user", "other-tenant");
+    const auto timestamp = LocalUnixMs(2026, 5, 27);
+    const semantic_cache::L0SessionKey key{owner.tenant_id, owner.user_id, "session-a"};
+    const semantic_cache::L0SessionKey other_key{other.tenant_id, other.user_id, "session-a"};
+    const auto redis_key = semantic_cache::BuildL0BatchKey(key, timestamp);
+    const auto other_redis_key = semantic_cache::BuildL0BatchKey(other_key, timestamp);
+    const std::vector<std::string> cleanup{redis_key, other_redis_key};
+    static_cast<void>(redis_pool_->Del(cleanup));
+
+    storage::CacheRecord record;
+    record.embedding.assign(semantic_cache::kExpectedEmbeddingDim, 0.1f);
+    record.input = "owner input";
+    record.response = "owner response";
+    record.metadata.tenant_id = owner.tenant_id;
+    record.metadata.user_id = owner.user_id;
+    record.metadata.session_id = key.session_id;
+    record.metadata.created_at_ms = timestamp;
+    ASSERT_TRUE(redis_pool_->HSet(
+        redis_key, "0", semantic_cache::SerializeCacheRecord(record)).ok());
+
+    auto other_record = record;
+    other_record.input = "other tenant input";
+    other_record.metadata.tenant_id = other.tenant_id;
+    ASSERT_TRUE(redis_pool_->HSet(
+        other_redis_key, "0", semantic_cache::SerializeCacheRecord(other_record)).ok());
+
+    RedisL0RecordSource source(redis_pool_);
+    auto records = source.ListDailyRecords(owner, "2026-05-27", 10);
+    ASSERT_TRUE(records.ok()) << records.status().message();
+    ASSERT_EQ(records.value().size(), 1u);
+    EXPECT_EQ(records.value()[0].input, "owner input");
+    EXPECT_EQ(records.value()[0].metadata.tenant_id, owner.tenant_id);
+    EXPECT_TRUE(source.ListDailyRecords(owner, "2026-05-28", 10).value().empty());
+
+    ASSERT_TRUE(redis_pool_->Del(cleanup).ok());
+}
+
 TEST_F(LongTermMemoryCompressorTest, StoreSummaryAndRetrieve) {
     auto compressor = MakeCompressor();
 
     LongTermMemoryRecord record;
+    record.tenant_id = "tenant-test";
     record.user_uuid = "test-user-123";
     record.date = "2026-05-27";
     record.summary = "- User learned C++ template metaprogramming\n- Completed 3 exercises\n";
@@ -110,21 +187,23 @@ TEST_F(LongTermMemoryCompressorTest, StoreSummaryAndRetrieve) {
 
     auto store_status = compressor->StoreSummary(record);
     ASSERT_TRUE(store_status.ok()) << store_status.message();
+    ASSERT_TRUE(compressor->StoreSummary(record).ok());
 
-    auto retrieve_result = compressor->GetDailySummary("test-user-123", "2026-05-27");
+    auto retrieve_result = compressor->GetDailySummary(Owner("test-user-123"), "2026-05-27");
     ASSERT_TRUE(retrieve_result.ok()) << retrieve_result.status().message();
 
     const auto& retrieved = retrieve_result.value();
+    EXPECT_EQ(retrieved.tenant_id, "tenant-test");
     EXPECT_EQ(retrieved.user_uuid, "test-user-123");
     EXPECT_EQ(retrieved.date, "2026-05-27");
     EXPECT_EQ(retrieved.source_record_count, 15);
     EXPECT_TRUE(retrieved.summary.find("C++ template metaprogramming") != std::string::npos);
     EXPECT_TRUE(retrieved.summary.find("3 exercises") != std::string::npos);
 
-    auto users = compressor->GetRegisteredUsers();
-    ASSERT_TRUE(users.ok()) << users.status().message();
-    ASSERT_FALSE(users.value().empty());
-    EXPECT_NE(std::find(users.value().begin(), users.value().end(), "test-user-123"), users.value().end());
+    auto owners = compressor->GetRegisteredOwners();
+    ASSERT_TRUE(owners.ok()) << owners.status().message();
+    EXPECT_NE(std::find(owners.value().begin(), owners.value().end(), Owner("test-user-123")),
+              owners.value().end());
 }
 
 TEST_F(LongTermMemoryCompressorTest, GetUserSummariesOrderedByDate) {
@@ -133,6 +212,7 @@ TEST_F(LongTermMemoryCompressorTest, GetUserSummariesOrderedByDate) {
     std::vector<std::string> dates = {"2026-05-25", "2026-05-26", "2026-05-27"};
     for (const auto& date : dates) {
         LongTermMemoryRecord record;
+        record.tenant_id = "tenant-test";
         record.user_uuid = "test-user-456";
         record.date = date;
         record.summary = "- Summary for " + date + "\n";
@@ -144,7 +224,7 @@ TEST_F(LongTermMemoryCompressorTest, GetUserSummariesOrderedByDate) {
         ASSERT_TRUE(status.ok()) << status.message();
     }
 
-    auto summaries_result = compressor->GetUserSummaries("test-user-456", 10);
+    auto summaries_result = compressor->GetUserSummaries(Owner("test-user-456"), 10);
     ASSERT_TRUE(summaries_result.ok()) << summaries_result.status().message();
 
     const auto& summaries = summaries_result.value();
@@ -158,6 +238,7 @@ TEST_F(LongTermMemoryCompressorTest, StoresUserUuidInFactMetadata) {
     auto compressor = MakeCompressor();
 
     LongTermMemoryRecord record;
+    record.tenant_id = "tenant-test";
     record.user_uuid = "metadata-user";
     record.date = "2026-05-27";
     record.summary = "- Likes algebra practice\n";
@@ -170,6 +251,7 @@ TEST_F(LongTermMemoryCompressorTest, StoresUserUuidInFactMetadata) {
 
     vector_storage::PartitionKey key;
     key.collection_id = collection_id_;
+    key.tenant_id = "tenant-test";
     key.user_id = "metadata-user";
     key.memory_level = "L3";
     auto partition = partition_registry_->Lookup(key);
@@ -179,6 +261,8 @@ TEST_F(LongTermMemoryCompressorTest, StoresUserUuidInFactMetadata) {
     auto entries = vector_repo_->ListEntries(*partition.value(), false);
     ASSERT_TRUE(entries.ok()) << entries.status().message();
     ASSERT_EQ(entries.value().size(), 1);
+    EXPECT_NE(entries.value()[0].extra_metadata_json.find("\"tenant_id\":\"tenant-test\""),
+              std::string::npos);
     EXPECT_NE(entries.value()[0].extra_metadata_json.find("\"user_uuid\":\"metadata-user\""),
               std::string::npos);
 }
@@ -186,7 +270,7 @@ TEST_F(LongTermMemoryCompressorTest, StoresUserUuidInFactMetadata) {
 TEST_F(LongTermMemoryCompressorTest, GetDailySummaryNotFound) {
     auto compressor = MakeCompressor();
 
-    auto result = compressor->GetDailySummary("nonexistent-user", "2026-01-01");
+    auto result = compressor->GetDailySummary(Owner("nonexistent-user"), "2026-01-01");
     EXPECT_FALSE(result.ok());
     EXPECT_EQ(result.status().code(), core::ErrorCode::NotFound);
 }

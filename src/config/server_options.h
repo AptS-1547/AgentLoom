@@ -124,6 +124,10 @@ struct LlmOptions {
     /// HTTPS 校验使用的 PEM CA bundle，相对配置文件解析。
     /// Windows OpenSSL client 需要显式配置；Linux 留空时使用系统信任库。
     std::string ca_bundle_path;
+    std::string response_token_count_mode = "off";
+    std::filesystem::path response_tokenizer_path;
+    std::string response_tokenizer_model;
+    std::size_t response_max_token_difference = 2;
     std::unordered_map<std::string, std::filesystem::path> prompts;
 };
 
@@ -182,6 +186,21 @@ struct EmotionFusionConfigOptions {
     std::unordered_map<std::string, double> source_weights;
     std::unordered_map<std::string, double> label_reliability;
     std::vector<EmotionKeywordRuleConfigOptions> keyword_rules;
+};
+
+struct EmotionGenerationConfigOptions {
+    int max_tokens = 2048;
+    int min_tokens = 100;
+    double max_token_ratio = 1.25;
+    double default_token_weight = 1.0;
+    double high_intensity_threshold = 0.7;
+    double high_intensity_multiplier = 1.1;
+    std::unordered_map<std::string, double> token_weights{
+        {"neutral", 1.0}, {"joy", 1.0}, {"excitement", 1.05},
+        {"sadness", 1.1}, {"fear", 1.1}, {"anger", 1.05},
+        {"disgust", 1.0}, {"surprise", 1.05}, {"tenderness", 1.05},
+        {"curiosity", 1.15},
+    };
 };
 
 struct L0MemoryConfigOptions {
@@ -423,6 +442,7 @@ struct MultimodalServerOptions {
     LocalLlmConfigOptions local_llm;
     EmotionAnalyzerConfigOptions emotion_analyzer;
     EmotionFusionConfigOptions emotion_fusion;
+    EmotionGenerationConfigOptions emotion_generation;
     L0MemoryConfigOptions l0_memory;
     DocumentLlmChunkCacheConfigOptions document_llm_chunk_cache;
     DocumentSemanticCacheConfigOptions document_semantic_cache;
@@ -502,6 +522,19 @@ PersonaGatewayServerOptionsT ToPersonaGatewayServerOptions(const MultimodalServe
     options.runtime.default_model = config.persona_gateway.runtime_default_model.empty()
         ? config.llm.model
         : config.persona_gateway.runtime_default_model;
+    options.runtime.emotion_generation.default_generation.max_tokens =
+        config.emotion_generation.max_tokens;
+    options.runtime.emotion_generation.min_tokens = config.emotion_generation.min_tokens;
+    options.runtime.emotion_generation.max_token_ratio = config.emotion_generation.max_token_ratio;
+    options.runtime.emotion_generation.default_token_weight =
+        config.emotion_generation.default_token_weight;
+    options.runtime.emotion_generation.high_intensity_threshold =
+        config.emotion_generation.high_intensity_threshold;
+    options.runtime.emotion_generation.high_intensity_multiplier =
+        config.emotion_generation.high_intensity_multiplier;
+    options.runtime.emotion_generation.token_weights = {
+        config.emotion_generation.token_weights.begin(),
+        config.emotion_generation.token_weights.end()};
     if (config.persona_gateway.static_files.enabled) {
         StaticFileOptionsT static_files;
         static_files.root = config.persona_gateway.static_files.root;

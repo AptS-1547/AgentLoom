@@ -158,6 +158,7 @@ add_library(agent_config STATIC
     src/config/sections/auth_config_section.cpp
     src/config/sections/config_path_section.cpp
     src/config/sections/embedding_config_section.cpp
+    src/config/sections/emotion_config_section.cpp
     src/config/sections/grpc_config_section.cpp
     src/config/sections/gateway_auth_config_section.cpp
     src/config/sections/http_config_section.cpp

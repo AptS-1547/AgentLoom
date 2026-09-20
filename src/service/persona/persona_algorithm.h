@@ -51,6 +51,27 @@ struct GenerationParams {
     double top_p = 0.9;
 };
 
+struct EmotionGenerationOptions {
+    GenerationParams default_generation{0.7, 1024, 0.9};
+    int min_tokens = 100;
+    double max_token_ratio = 1.25;
+    double default_token_weight = 1.0;
+    double high_intensity_threshold = 0.7;
+    double high_intensity_multiplier = 1.1;
+    std::map<std::string, double> token_weights{
+        {"neutral", 1.0},
+        {"joy", 1.0},
+        {"excitement", 1.05},
+        {"sadness", 1.1},
+        {"fear", 1.1},
+        {"anger", 1.05},
+        {"disgust", 1.0},
+        {"surprise", 1.05},
+        {"tenderness", 1.05},
+        {"curiosity", 1.15},
+    };
+};
+
 struct EmotionStateSnapshot {
     EmotionState state;
     EmotionStateConfig config;

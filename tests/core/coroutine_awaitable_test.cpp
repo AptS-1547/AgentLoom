@@ -152,6 +152,24 @@ TEST(CoroutineTaskTest, GetDrivesAsyncTaskToCompletion) {
     EXPECT_EQ(r.value(), 42);
 }
 
+TEST(CoroutineTaskTest, GetDrivesAsyncVoidCallbackToCompletion) {
+    // void operation 通过 Result<void> 表达成功；异步 completion 必须恢复 task。
+    core::async::task<core::Result<void>> task =
+        []() -> core::async::task<core::Result<void>> {
+        auto result = co_await core::async::CallbackAwaiter<void>([](auto callback) {
+            std::thread([callback = std::move(callback)]() mutable {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                callback(core::Result<void>{});
+            }).detach();
+            return core::Status::Ok();
+        });
+        co_return result;
+    }();
+
+    auto result = task.get();
+    EXPECT_TRUE(result.ok()) << result.status().message();
+}
+
 TEST(CoroutineTaskTest, StartCompletesAsyncTaskWithoutBlockingCaller) {
     std::promise<core::Result<int>> completed;
     auto future = completed.get_future();

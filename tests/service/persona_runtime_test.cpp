@@ -26,6 +26,7 @@ using agent::service::persona::EmotionAnalysis;
 using agent::service::persona::EmotionCalibrationSample;
 using agent::service::persona::GatewaySessionAffinityScheduler;
 using agent::service::persona::GatewaySessionAffinitySchedulerOptions;
+using agent::service::persona::GenerationParams;
 using agent::service::persona::NeutralEmotionAnalyzer;
 using agent::service::persona::PersonaRuntime;
 using agent::service::persona::PersonaRuntimeOptions;
@@ -158,7 +159,7 @@ public:
         if (tool_round_trip && call_count++ == 0) {
             response.tool_calls.push_back({"persona-call-1", "vision.observe", R"({"reason":"look"})"});
         } else {
-            response.content = "工具结果后的最终回复";
+            response.content = tool_round_trip ? "工具结果后的最终回复" : "这是回复";
         }
         response.total_tokens = 42;
         return response;
@@ -1068,7 +1069,7 @@ TEST(PersonaRuntimeTest, AppliesEmotionAdaptiveGenerationWithoutBehaviorToneProm
     chat.session_id = "session-runtime";
     chat.user_input = "为什么天空是蓝色的？";
     chat.trace_id = "trace-adaptive";
-    chat.base_generation = {0.7, 2000, 0.9};
+    chat.generation_override = GenerationParams{0.7, 2000, 0.9};
     auto submit = runtime.SubmitChat(
         std::move(chat),
         [&promise](core::Result<ChatResponse> result) mutable {
@@ -1080,8 +1081,8 @@ TEST(PersonaRuntimeTest, AppliesEmotionAdaptiveGenerationWithoutBehaviorToneProm
     ASSERT_TRUE(result.ok()) << result.status().message();
 
     std::lock_guard lock(llm->mutex_);
-    EXPECT_GE(llm->last_request.max_tokens, 100);
-    EXPECT_LT(llm->last_request.max_tokens, 2000);
+    EXPECT_GE(llm->last_request.max_tokens, 2000);
+    EXPECT_LE(llm->last_request.max_tokens, 2500);
     ASSERT_FALSE(llm->last_request.messages.empty());
     EXPECT_EQ(llm->last_request.messages.front().content.find("unknown"), std::string::npos);
     EXPECT_EQ(llm->last_request.messages.front().content.find("neutral"), std::string::npos);

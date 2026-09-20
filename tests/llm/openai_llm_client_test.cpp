@@ -1,5 +1,7 @@
 #include "../../src/llm/openai_llm_client.h"
+#if defined(AGENTLOOM_TEST_LOCAL_LLM)
 #include "../../src/llm/local_llm_client.h"
+#endif
 #include "../../src/net/http_client/beast_http_client.h"
 #include <boost/asio.hpp>
 #include <boost/beast.hpp>
@@ -20,11 +22,15 @@ using agent::llm::ChatRole;
 using agent::llm::FallbackLlmClient;
 using agent::llm::FallbackLlmClientOptions;
 using agent::llm::ILlmClient;
+#if defined(AGENTLOOM_TEST_LOCAL_LLM)
 using agent::llm::ILocalLlm;
 using agent::llm::LlmPromptStore;
 using agent::llm::LocalLlmChatClient;
 using agent::llm::LocalLlmRequest;
 using agent::llm::LocalLlmResponse;
+#else
+using agent::llm::LlmPromptStore;
+#endif
 using agent::llm::OpenAiLlmClient;
 using agent::llm::OpenAiLlmClientOptions;
 using agent::llm::OpenAiAsyncLlmClient;
@@ -219,6 +225,7 @@ agent::net::HttpClientResponse MakeHttpResponse(int status, std::string body) {
     return response;
 }
 
+#if defined(AGENTLOOM_TEST_LOCAL_LLM)
 class FakeLocalLlm final : public ILocalLlm {
 public:
     core::Result<LocalLlmResponse> Generate(const LocalLlmRequest& request) override {
@@ -234,6 +241,21 @@ public:
 
     int call_count = 0;
     LocalLlmRequest last_request;
+};
+#endif
+
+class FixedTokenCounter final : public agent::llm::ICompletionTokenCounter {
+public:
+    explicit FixedTokenCounter(std::size_t count) : count_(count) {}
+
+    core::Result<std::size_t> CountTokens(
+        std::string_view,
+        const ChatCompletionResponse&) const override {
+        return count_;
+    }
+
+private:
+    std::size_t count_;
 };
 
 class OpenAiLlmClientTest : public ::testing::Test {
@@ -417,6 +439,75 @@ TEST_F(OpenAiLlmClientTest, MissingContentFieldReturnsError) {
     behavior_->body = R"({"choices":[{"message":{"role":"assistant"},"index":0}]})";
     auto r = client_->Complete(SimpleRequest());
     EXPECT_FALSE(r.ok());
+}
+
+TEST_F(OpenAiLlmClientTest, EmptyContentWithoutToolCallsReturnsUnavailable) {
+    behavior_->body = R"({"choices":[{"message":{"role":"assistant","content":""},"finish_reason":"stop"}]})";
+    auto result = client_->Complete(SimpleRequest());
+    ASSERT_FALSE(result.ok());
+    EXPECT_EQ(result.status().code(), core::ErrorCode::Unavailable);
+}
+
+TEST_F(OpenAiLlmClientTest, LengthFinishReasonReturnsResourceExhausted) {
+    behavior_->body = R"({"choices":[{"message":{"role":"assistant","content":"partial"},"finish_reason":"length"}],"usage":{"completion_tokens":128,"total_tokens":128}})";
+    auto result = client_->Complete(SimpleRequest());
+    ASSERT_FALSE(result.ok());
+    EXPECT_EQ(result.status().code(), core::ErrorCode::ResourceExhausted);
+}
+
+TEST_F(OpenAiLlmClientTest, ParsesReasoningAlongsideVisibleContent) {
+    behavior_->body = R"({"model":"deepseek-chat","choices":[{"message":{"role":"assistant","reasoning_content":"reason","content":"answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}})";
+    auto result = client_->Complete(SimpleRequest());
+    ASSERT_TRUE(result.ok()) << result.status().message();
+    ASSERT_TRUE(result.value().reasoning_content.has_value());
+    EXPECT_EQ(*result.value().reasoning_content, "reason");
+    EXPECT_EQ(result.value().content, "answer");
+}
+
+TEST_F(OpenAiLlmClientTest, RejectsInconsistentUsage) {
+    behavior_->body = R"({"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":12}})";
+    auto result = client_->Complete(SimpleRequest());
+    ASSERT_FALSE(result.ok());
+    EXPECT_EQ(result.status().code(), core::ErrorCode::DataLoss);
+}
+
+TEST_F(OpenAiLlmClientTest, RejectsMalformedUsageType) {
+    behavior_->body = R"({"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"completion_tokens":"5"}})";
+    auto result = client_->Complete(SimpleRequest());
+    ASSERT_FALSE(result.ok());
+    EXPECT_EQ(result.status().code(), core::ErrorCode::DataLoss);
+}
+
+TEST_F(OpenAiLlmClientTest, StrictTokenCountRejectsMismatch) {
+    OpenAiLlmClientOptions options;
+    options.base_url = MakeBaseUrl(server_->port());
+    options.api_key = "test-key";
+    options.retry_policy.max_retries = 0;
+    options.response_validation.token_count_mode =
+        agent::llm::CompletionTokenValidationMode::Strict;
+    options.response_validation.max_token_difference = 0;
+    options.response_validation.token_counter = std::make_shared<FixedTokenCounter>(2);
+    auto client = OpenAiLlmClient::Create(std::move(options), *http_client_).value();
+
+    auto result = client->Complete(SimpleRequest());
+    ASSERT_FALSE(result.ok());
+    EXPECT_EQ(result.status().code(), core::ErrorCode::DataLoss);
+}
+
+TEST_F(OpenAiLlmClientTest, AuditTokenCountKeepsValidResponse) {
+    OpenAiLlmClientOptions options;
+    options.base_url = MakeBaseUrl(server_->port());
+    options.api_key = "test-key";
+    options.retry_policy.max_retries = 0;
+    options.response_validation.token_count_mode =
+        agent::llm::CompletionTokenValidationMode::Audit;
+    options.response_validation.max_token_difference = 0;
+    options.response_validation.token_counter = std::make_shared<FixedTokenCounter>(2);
+    auto client = OpenAiLlmClient::Create(std::move(options), *http_client_).value();
+
+    auto result = client->Complete(SimpleRequest());
+    ASSERT_TRUE(result.ok()) << result.status().message();
+    EXPECT_EQ(result.value().content, "42");
 }
 
 // ── unit: retry behavior ─────────────────────────────────────────────────────
@@ -603,6 +694,7 @@ TEST(OpenAiLlmClientCreateTest, AllowsLocalOpenAiCompatibleEndpointWithoutApiKey
     EXPECT_TRUE(r.ok()) << r.status().message();
 }
 
+#if defined(AGENTLOOM_TEST_LOCAL_LLM)
 TEST(LocalLlmChatClientTest, AdaptsChatCompletionToLocalGrpcContract) {
     auto local = std::make_shared<FakeLocalLlm>();
     LocalLlmChatClient client(local, {.default_model = "local-model", .task_type = "persona_chat"});
@@ -632,6 +724,7 @@ TEST(LocalLlmChatClientTest, AdaptsChatCompletionToLocalGrpcContract) {
     EXPECT_NE(local->last_request.prompt.find("<user>"), std::string::npos);
     EXPECT_NE(local->last_request.prompt.find("hello"), std::string::npos);
 }
+#endif
 
 TEST(LlmPromptStoreTest, LoadAndGet) {
     // Write a temp file

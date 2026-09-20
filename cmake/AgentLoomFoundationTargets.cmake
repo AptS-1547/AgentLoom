@@ -16,6 +16,7 @@ add_library(agent_core STATIC
     src/core/shared_memory_block.h
     src/core/task_group.cpp
     src/core/task_group.h
+    src/core/text_validation.h
     src/core/thread_pool.cpp
     src/core/thread_pool.h
     src/core/thread_pool_scheduler.cpp
@@ -144,6 +145,7 @@ if(AGENTLOOM_BUILD_LOCAL_LLM)
     target_sources(agent_llm PRIVATE
         src/llm/local_llm_client.h
         src/llm/local_llm_client.cpp)
+    target_compile_definitions(agent_llm PUBLIC AGENTLOOM_HAS_LOCAL_LLM=1)
 endif()
 
 target_include_directories(agent_llm PUBLIC
@@ -168,6 +170,9 @@ if(BERT_BUILD_TESTS)
         agent_llm
         GTest::gtest_main
     )
+    if(AGENTLOOM_BUILD_LOCAL_LLM)
+        target_compile_definitions(llm_tests PRIVATE AGENTLOOM_TEST_LOCAL_LLM=1)
+    endif()
     gtest_discover_tests(llm_tests DISCOVERY_MODE PRE_TEST)
 
     add_executable(llm_integration_tests

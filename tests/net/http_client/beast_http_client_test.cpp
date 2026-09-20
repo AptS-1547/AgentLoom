@@ -126,6 +126,51 @@ private:
     std::uint16_t port_ = 0;
 };
 
+class TruncatedHttpServer {
+public:
+    TruncatedHttpServer()
+        : acceptor_(io_context_, tcp::endpoint(asio::ip::make_address("127.0.0.1"), 0)),
+          port_(acceptor_.local_endpoint().port()),
+          thread_([this] { Serve(); }) {}
+
+    ~TruncatedHttpServer() {
+        beast::error_code ignored;
+        acceptor_.close(ignored);
+        if (thread_.joinable()) {
+            thread_.join();
+        }
+    }
+
+    std::uint16_t port() const noexcept { return port_; }
+
+private:
+    void Serve() {
+        beast::error_code error;
+        tcp::socket socket(io_context_);
+        acceptor_.accept(socket, error);
+        if (error) {
+            return;
+        }
+        beast::flat_buffer buffer;
+        http::request<http::string_body> request;
+        http::read(socket, buffer, request, error);
+        if (error) {
+            return;
+        }
+        const std::string response =
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+            "Content-Length: 64\r\nConnection: close\r\n\r\n{}";
+        asio::write(socket, asio::buffer(response), error);
+        socket.shutdown(tcp::socket::shutdown_both, error);
+        socket.close(error);
+    }
+
+    asio::io_context io_context_;
+    tcp::acceptor acceptor_;
+    std::uint16_t port_ = 0;
+    std::thread thread_;
+};
+
 std::string Url(std::uint16_t port, std::string_view path) {
     return "http://127.0.0.1:" + std::to_string(port) + std::string(path);
 }
@@ -221,6 +266,18 @@ TEST_F(BeastHttpClientTest, EmptyBodyResponse) {
     ASSERT_TRUE(r.ok());
     EXPECT_EQ(r.value().status, 204);
     EXPECT_TRUE(r.value().body.empty());
+}
+
+TEST(BeastHttpClientFramingTest, RejectsTruncatedContentLengthBody) {
+    TruncatedHttpServer server;
+    auto client = BeastHttpClient::Create({}).value();
+    HttpClientRequest request;
+    request.method = "GET";
+    request.url = Url(server.port(), "/truncated");
+
+    auto result = client->Execute(request);
+    ASSERT_FALSE(result.ok());
+    EXPECT_EQ(result.status().code(), core::ErrorCode::DataLoss);
 }
 
 TEST_F(BeastHttpClientTest, TimeoutFiresWhenServerStalls) {

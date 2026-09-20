@@ -2,9 +2,14 @@
 #include <AgentLoom/config/config_section.h>
 #include <AgentLoom/config/server_config.h>
 #include <AgentLoom/generated/bert_inference.grpc.pb.h>
+#include <AgentLoom/net/http_server.h>
 #include <AgentLoom/service/gateway/gateway_lifecycle.h>
 #include <AgentLoom/service/gateway/gateway_routing.h>
 #include <AgentLoom/service/persona/persona_interaction.h>
+
+#include <boost/asio/connect.hpp>
+#include <boost/asio/ip/tcp.hpp>
+#include <boost/beast/websocket.hpp>
 
 #include <filesystem>
 #include <fstream>
@@ -34,6 +39,37 @@ public:
 std::unique_ptr<agent::service::gateway::ITypedHttpRoute<ConsumerRouteContext>>
 MakeConsumerRoute() {
     return std::make_unique<ConsumerRoute>();
+}
+
+bool VerifyInstalledWebSocketUpgrade() {
+    ::net::HttpServer server({.address = "127.0.0.1", .port = 0, .io_threads = 1});
+    server.SetWebSocketHandler(
+        "/sdk-ws",
+        [](::net::WebSocketSessionHandle&, ::net::WebSocketMessage) {});
+    if (auto status = server.Start(); !status.ok()) {
+        return false;
+    }
+
+    namespace asio = boost::asio;
+    namespace websocket = boost::beast::websocket;
+    using tcp = asio::ip::tcp;
+    asio::io_context io_context;
+    tcp::resolver resolver(io_context);
+    websocket::stream<tcp::socket> client(io_context);
+    boost::system::error_code error;
+    auto endpoints = resolver.resolve("127.0.0.1", std::to_string(server.port()), error);
+    if (!error) {
+        asio::connect(client.next_layer(), endpoints, error);
+    }
+    if (!error) {
+        client.handshake("127.0.0.1", "/sdk-ws", error);
+    }
+    const bool upgraded = !error;
+    if (upgraded) {
+        client.close(websocket::close_code::normal, error);
+    }
+    server.Stop();
+    return upgraded;
 }
 
 }
@@ -96,6 +132,9 @@ int main() {
     agent::service::gateway::GatewayLifecycleCoordinator lifecycle;
     if (!lifecycle.Start().ok() || !lifecycle.Stop().ok()) {
         return 7;
+    }
+    if (!VerifyInstalledWebSocketUpgrade()) {
+        return 8;
     }
     return options.llm.api_key == "package-key" &&
                    options.auth.token == "registered" &&

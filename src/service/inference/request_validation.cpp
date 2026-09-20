@@ -1,4 +1,5 @@
 #include "request_validation.h"
+#include "text_validation.h"
 
 #include <algorithm>
 #include <cctype>
@@ -29,70 +30,6 @@ bool ConstantTimeEquals(std::string_view lhs, std::string_view rhs) {
         diff |= static_cast<unsigned char>(l ^ r);
     }
     return diff == 0;
-}
-
-bool IsValidUtf8(std::string_view value) {
-    size_t i = 0;
-    while (i < value.size()) {
-        const unsigned char c = static_cast<unsigned char>(value[i]);
-        if (c <= 0x7F) {
-            ++i;
-            continue;
-        }
-
-        uint32_t code_point = 0;
-        size_t extra = 0;
-        uint32_t min_value = 0;
-        if ((c & 0xE0) == 0xC0) {
-            code_point = c & 0x1F;
-            extra = 1;
-            min_value = 0x80;
-        } else if ((c & 0xF0) == 0xE0) {
-            code_point = c & 0x0F;
-            extra = 2;
-            min_value = 0x800;
-        } else if ((c & 0xF8) == 0xF0) {
-            code_point = c & 0x07;
-            extra = 3;
-            min_value = 0x10000;
-        } else {
-            return false;
-        }
-
-        if (i + extra >= value.size()) {
-            return false;
-        }
-
-        for (size_t j = 1; j <= extra; ++j) {
-            const unsigned char next = static_cast<unsigned char>(value[i + j]);
-            if ((next & 0xC0) != 0x80) {
-                return false;
-            }
-            code_point = (code_point << 6) | (next & 0x3F);
-        }
-
-        if (code_point < min_value || code_point > 0x10FFFF) {
-            return false;
-        }
-        if (code_point >= 0xD800 && code_point <= 0xDFFF) {
-            return false;
-        }
-
-        i += extra + 1;
-    }
-    return true;
-}
-
-bool HasInvalidTextControl(std::string_view value) {
-    for (unsigned char c : value) {
-        if (c == 0) {
-            return true;
-        }
-        if (c < 0x20 && c != '\n' && c != '\r' && c != '\t') {
-            return true;
-        }
-    }
-    return false;
 }
 
 uint16_t ReadBe16(const uint8_t* data) {
@@ -327,10 +264,10 @@ ValidationResult ValidateText(std::string_view text, size_t max_bytes, bool requ
     if (text.size() > max_bytes) {
         return Fail(std::string(name) + " exceeds byte limit");
     }
-    if (!IsValidUtf8(text)) {
+    if (!core::IsValidUtf8(text)) {
         return Fail(std::string(name) + " is not valid UTF-8");
     }
-    if (HasInvalidTextControl(text)) {
+    if (core::HasInvalidTextControl(text)) {
         return Fail(std::string(name) + " contains invalid control characters");
     }
     return Ok();

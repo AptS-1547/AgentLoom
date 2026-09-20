@@ -3,6 +3,7 @@
 #include "protocol_types.h"
 
 #include <boost/beast/http.hpp>
+#include <boost/version.hpp>
 
 #include <functional>
 #include <string>
@@ -10,6 +11,13 @@
 #include <utility>
 
 namespace net {
+
+#if defined(AGENTLOOM_BUILT_BOOST_VERSION)
+static_assert(BOOST_VERSION == AGENTLOOM_BUILT_BOOST_VERSION,
+              "AgentLoom and its consumer must use the same Boost headers");
+#endif
+static_assert(static_cast<unsigned>(boost::beast::http::field::connection) == 59u,
+              "AgentLoom requires the Boost.Beast 1.85 HTTP field layout");
 
 namespace beast = boost::beast;
 namespace http = beast::http;

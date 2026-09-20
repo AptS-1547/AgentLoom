@@ -279,7 +279,24 @@ require_path("${BERT_BOOST_ROOT}/boost/redis.hpp" "Boost.Redis header")
 require_path("${BERT_BOOST_ROOT}/boost/redis/src.hpp" "Boost.Redis source header")
 
 add_library(boost_asio_headers INTERFACE)
-target_include_directories(boost_asio_headers INTERFACE "${BERT_BOOST_ROOT}")
+file(STRINGS "${BERT_BOOST_ROOT}/boost/version.hpp" _agentloom_boost_version_line
+    REGEX "^#define BOOST_VERSION [0-9]+$" LIMIT_COUNT 1)
+file(STRINGS "${BERT_BOOST_ROOT}/boost/version.hpp" _agentloom_boost_lib_version_line
+    REGEX "^#define BOOST_LIB_VERSION \"[0-9_]+\"$" LIMIT_COUNT 1)
+string(REGEX REPLACE ".*BOOST_VERSION ([0-9]+).*" "\\1"
+    AGENTLOOM_BOOST_VERSION "${_agentloom_boost_version_line}")
+string(REGEX REPLACE ".*BOOST_LIB_VERSION \"([0-9_]+)\".*" "\\1"
+    AGENTLOOM_BOOST_LIB_VERSION "${_agentloom_boost_lib_version_line}")
+string(REPLACE "_" "." AGENTLOOM_BOOST_VERSION_STRING
+    "${AGENTLOOM_BOOST_LIB_VERSION}")
+if(NOT AGENTLOOM_BOOST_VERSION MATCHES "^[0-9]+$" OR
+        NOT AGENTLOOM_BOOST_VERSION_STRING MATCHES "^[0-9]+\\.[0-9]+$")
+    message(FATAL_ERROR "Unable to determine Boost version from ${BERT_BOOST_ROOT}")
+endif()
+target_include_directories(boost_asio_headers BEFORE INTERFACE
+    "$<BUILD_INTERFACE:${BERT_BOOST_ROOT}>")
+target_compile_definitions(boost_asio_headers INTERFACE
+    "AGENTLOOM_BUILT_BOOST_VERSION=${AGENTLOOM_BOOST_VERSION}")
 target_link_libraries(boost_asio_headers INTERFACE "$<INSTALL_INTERFACE:Boost::headers>")
 if(WIN32)
     target_compile_definitions(boost_asio_headers INTERFACE _WIN32_WINNT=0x0602)

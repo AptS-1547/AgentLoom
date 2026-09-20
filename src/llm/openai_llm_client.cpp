@@ -1,11 +1,14 @@
 #include "openai_llm_client.h"
+#include "text_validation.h"
 #include "logger_adapter.h"
 
 #include <boost/asio.hpp>
 #include <nlohmann/json.hpp>
 #include <atomic>
+#include <cstdint>
 #include <exception>
 #include <fstream>
+#include <limits>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -84,7 +87,12 @@ Json BuildRequestJson(const ChatCompletionRequest& req, const std::string& defau
     return j;
 }
 
-core::Result<ChatCompletionResponse> ParseResponse(const std::string& body, int status_code) {
+core::Result<ChatCompletionResponse> ParseResponse(
+    const std::string& body,
+    int status_code,
+    const ChatCompletionRequest& request,
+    const OpenAiLlmClientOptions& options,
+    core::LoggerAdapter& logger) {
     if (status_code != 200) {
         core::ErrorCode code = core::ErrorCode::InternalError;
         if (status_code == 401 || status_code == 403) {
@@ -98,11 +106,14 @@ core::Result<ChatCompletionResponse> ParseResponse(const std::string& body, int 
             "LLM API returned status " + std::to_string(status_code) + ": " + body);
     }
 
+    if (body.empty()) {
+        return core::Status::Error(core::ErrorCode::DataLoss, "LLM response body is empty");
+    }
     Json j;
     try {
         j = Json::parse(body);
     } catch (const std::exception& e) {
-        return core::Status(core::ErrorCode::InternalError,
+        return core::Status(core::ErrorCode::DataLoss,
             std::string("Failed to parse LLM response: ") + e.what());
     }
 
@@ -115,13 +126,13 @@ core::Result<ChatCompletionResponse> ParseResponse(const std::string& body, int 
     }
 
     if (!j.contains("choices") || !j["choices"].is_array() || j["choices"].empty()) {
-        return core::Status(core::ErrorCode::InternalError,
+        return core::Status(core::ErrorCode::DataLoss,
             "LLM response missing choices array");
     }
 
     const auto& choice = j["choices"][0];
     if (!choice.contains("message") || !choice["message"].is_object()) {
-        return core::Status(core::ErrorCode::InternalError,
+        return core::Status(core::ErrorCode::DataLoss,
             "LLM response missing message object");
     }
 
@@ -133,10 +144,18 @@ core::Result<ChatCompletionResponse> ParseResponse(const std::string& body, int 
     if (has_content) {
         resp.content = message["content"].get<std::string>();
     }
-    if (choice.contains("finish_reason") && choice["finish_reason"].is_string()) {
+    if (choice.contains("finish_reason") && !choice["finish_reason"].is_null()) {
+        if (!choice["finish_reason"].is_string()) {
+            return core::Status::Error(core::ErrorCode::DataLoss,
+                                       "LLM finish_reason must be text or null");
+        }
         resp.finish_reason = choice["finish_reason"].get<std::string>();
     }
-    if (message.contains("reasoning_content") && message["reasoning_content"].is_string()) {
+    if (message.contains("reasoning_content") && !message["reasoning_content"].is_null()) {
+        if (!message["reasoning_content"].is_string()) {
+            return core::Status::Error(core::ErrorCode::DataLoss,
+                                       "LLM reasoning_content must be text or null");
+        }
         resp.reasoning_content = message["reasoning_content"].get<std::string>();
     }
     if (message.contains("tool_calls") && !message["tool_calls"].is_null()) {
@@ -167,21 +186,105 @@ core::Result<ChatCompletionResponse> ParseResponse(const std::string& body, int 
             resp.tool_calls.push_back(std::move(parsed));
         }
     }
-    if (!has_content && resp.tool_calls.empty()) {
-        return core::Status(core::ErrorCode::InternalError,
-            "LLM response contains neither content nor tool_calls");
+    if (j.contains("usage") && !j["usage"].is_null() && !j["usage"].is_object()) {
+        return core::Status::Error(core::ErrorCode::DataLoss,
+                                   "LLM usage must be an object or null");
     }
-
     if (j.contains("usage") && j["usage"].is_object()) {
         const auto& usage = j["usage"];
-        if (usage.contains("prompt_tokens") && usage["prompt_tokens"].is_number()) {
-            resp.prompt_tokens = usage["prompt_tokens"].get<int>();
+        const auto read_tokens = [&usage](std::string_view name, int& target) -> core::Status {
+            const auto found = usage.find(std::string(name));
+            if (found == usage.end()) {
+                return core::Status::Ok();
+            }
+            if (!found->is_number_integer() && !found->is_number_unsigned()) {
+                return core::Status::Error(
+                    core::ErrorCode::DataLoss,
+                    "LLM usage." + std::string(name) + " must be a non-negative integer");
+            }
+            try {
+                const auto value = found->get<std::int64_t>();
+                if (value < 0 || value > std::numeric_limits<int>::max()) {
+                    return core::Status::Error(
+                        core::ErrorCode::DataLoss,
+                        "LLM usage." + std::string(name) + " is out of range");
+                }
+                target = static_cast<int>(value);
+                return core::Status::Ok();
+            } catch (const std::exception&) {
+                return core::Status::Error(
+                    core::ErrorCode::DataLoss,
+                    "LLM usage." + std::string(name) + " is out of range");
+            }
+        };
+        if (auto status = read_tokens("prompt_tokens", resp.prompt_tokens); !status.ok()) {
+            return status;
         }
-        if (usage.contains("completion_tokens") && usage["completion_tokens"].is_number()) {
-            resp.completion_tokens = usage["completion_tokens"].get<int>();
+        if (auto status = read_tokens("completion_tokens", resp.completion_tokens); !status.ok()) {
+            return status;
         }
-        if (usage.contains("total_tokens") && usage["total_tokens"].is_number()) {
-            resp.total_tokens = usage["total_tokens"].get<int>();
+        if (auto status = read_tokens("total_tokens", resp.total_tokens); !status.ok()) {
+            return status;
+        }
+    }
+
+    if (resp.prompt_tokens < 0 || resp.completion_tokens < 0 || resp.total_tokens < 0 ||
+        (resp.total_tokens > 0 &&
+         resp.total_tokens < resp.prompt_tokens + resp.completion_tokens)) {
+        return core::Status::Error(core::ErrorCode::DataLoss,
+                                   "LLM response contains inconsistent token usage");
+    }
+    if (options.response_validation.reject_length_finish && resp.finish_reason == "length") {
+        return core::Status::Error(
+            core::ErrorCode::ResourceExhausted,
+            "LLM generation was truncated because the token budget was exhausted");
+    }
+    if (has_content) {
+        if (!core::IsValidUtf8(resp.content) || core::HasInvalidTextControl(resp.content)) {
+            return core::Status::Error(core::ErrorCode::DataLoss,
+                                       "LLM content is not valid UTF-8 text");
+        }
+    }
+    if (resp.reasoning_content &&
+        (!core::IsValidUtf8(*resp.reasoning_content) ||
+         core::HasInvalidTextControl(*resp.reasoning_content))) {
+        return core::Status::Error(core::ErrorCode::DataLoss,
+                                   "LLM reasoning_content is not valid UTF-8 text");
+    }
+    if (resp.tool_calls.empty() &&
+        (!has_content ||
+         (options.response_validation.reject_empty_content && core::IsBlankAscii(resp.content)))) {
+        return core::Status::Error(core::ErrorCode::Unavailable,
+                                   "LLM response contains no usable content or tool calls");
+    }
+
+    const auto& validation = options.response_validation;
+    if (validation.token_count_mode != CompletionTokenValidationMode::Off &&
+        validation.token_counter && resp.completion_tokens > 0) {
+        const auto model = resp.model.empty()
+            ? (request.model.empty() ? options.default_model : request.model)
+            : resp.model;
+        auto counted = validation.token_counter->CountTokens(model, resp);
+        if (!counted.ok()) {
+            if (validation.token_count_mode == CompletionTokenValidationMode::Strict) {
+                return counted.status();
+            }
+            logger.warn("LLM token count audit skipped model={} reason={}",
+                        model, counted.status().message());
+        } else {
+            const auto reported = static_cast<std::size_t>(resp.completion_tokens);
+            const auto actual = counted.value();
+            const auto difference = actual > reported ? actual - reported : reported - actual;
+            if (difference > validation.max_token_difference) {
+                if (validation.token_count_mode == CompletionTokenValidationMode::Strict) {
+                    return core::Status::Error(
+                        core::ErrorCode::DataLoss,
+                        "LLM completion token count differs from provider usage");
+                }
+                logger.warn(
+                    "LLM token count audit mismatch model={} reported={} actual={} difference={}",
+                    model, reported, actual, difference);
+            }
         }
     }
 
@@ -399,7 +502,8 @@ core::Result<ChatCompletionResponse> OpenAiLlmClient::ExecuteWithRetry(
             }
         }
 
-        return ParseResponse(http_resp.body, http_resp.status);
+        auto logger = core::LoggerAdapter::ForModule("llm-client");
+        return ParseResponse(http_resp.body, http_resp.status, req, options_, logger);
     }
 
     return last_result_status;
@@ -501,7 +605,8 @@ public:
                          ChatCompletionRequest request,
                          IAsyncLlmClient::Callback callback)
         : owner_(std::move(owner)),
-          http_request_(BuildHttpRequest(owner_->options, request)),
+          request_(std::move(request)),
+          http_request_(BuildHttpRequest(owner_->options, request_)),
           retry_timer_(owner_->retry_context),
           callback_(std::move(callback)) {}
 
@@ -570,7 +675,8 @@ private:
             ScheduleRetry();
             return;
         }
-        Finish(ParseResponse(response.body, response.status));
+        Finish(ParseResponse(
+            response.body, response.status, request_, owner_->options, owner_->logger));
     }
 
     void OnAttemptFailure(const core::Status& status) noexcept {
@@ -632,6 +738,7 @@ private:
     }
 
     std::shared_ptr<OpenAiAsyncLlmClient::Impl> owner_;
+    ChatCompletionRequest request_;
     net::HttpClientRequest http_request_;
     boost::asio::steady_timer retry_timer_;
     IAsyncLlmClient::Callback callback_;

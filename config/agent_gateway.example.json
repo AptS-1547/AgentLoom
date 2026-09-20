@@ -94,6 +94,12 @@
     "http_max_idle_connections": 128,
     "http_max_idle_connections_per_origin": 64,
     "http_idle_timeout_ms": 30000,
+    "response_validation": {
+      "token_count_mode": "off",
+      "tokenizer_path": "",
+      "tokenizer_model": "deepseek-chat",
+      "max_token_difference": 2
+    },
     "require_api_key": true,
     "allow_placeholder": false,
     "disable_tls_verify_on_windows": false,
@@ -177,6 +183,28 @@
       "curiosity": [
         "为什么|怎么来的|能不能再讲"
       ]
+    }
+  },
+  "emotion": {
+    "generation": {
+      "max_tokens": 2048,
+      "min_tokens": 100,
+      "max_token_ratio": 1.25,
+      "default_token_weight": 1.0,
+      "high_intensity_threshold": 0.7,
+      "high_intensity_multiplier": 1.1,
+      "token_weights": {
+        "neutral": 1.0,
+        "joy": 1.0,
+        "excitement": 1.05,
+        "sadness": 1.1,
+        "fear": 1.1,
+        "anger": 1.05,
+        "disgust": 1.0,
+        "surprise": 1.05,
+        "tenderness": 1.05,
+        "curiosity": 1.15
+      }
     }
   },
   "l0_memory": {

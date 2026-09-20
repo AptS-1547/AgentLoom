@@ -172,8 +172,13 @@ HttpClientResponse ConvertResponse(http::response<http::string_body>& response) 
 }
 
 core::Status TransportError(std::string_view stage, const beast::error_code& error) {
+    if (error == http::error::partial_message || error == http::error::unexpected_body) {
+        return core::Status::Error(
+            core::ErrorCode::DataLoss,
+            std::string(stage) + ": incomplete or malformed HTTP message: " + error.message());
+    }
     return core::Status::Error(
-        core::ErrorCode::InternalError,
+        core::ErrorCode::Unavailable,
         std::string(stage) + ": " + error.message());
 }
 

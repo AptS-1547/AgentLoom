@@ -16,6 +16,7 @@ AgentLoom 使用 JSON 配置、CLI override 和 section registry 组合加载 Se
 | `embedding` | tokenizer、ONNX embedding 和 pooling |
 | `vlm_cache` | 结果缓存、vector cache 和 Prompt KV Cache |
 | `llm` | OpenAI-compatible LLM backend 和凭据来源 |
+| `emotion` | Persona 情绪驱动的生成预算策略 |
 | `http` | HTTP/WebSocket runtime |
 | `gateway_auth` | Gateway JWT、cookie、SQLite/Redis session store |
 | `persona_gateway` | Persona 默认配置、线程池、静态文件和文档存储 |
@@ -64,6 +65,60 @@ AgentLoom 使用 JSON 配置、CLI override 和 section registry 组合加载 Se
 --http-body-limit 16
 --http-websocket-buffer-limit 16
 ```
+
+## Persona 情绪生成预算
+
+参考 Gateway 通过 `emotion.generation` 提供默认生成预算和情绪标签倍率。SDK Runtime
+保留标签乘法预算与 V-A 情绪状态调整，并在两阶段完成后统一按 `max_token_ratio`
+限幅。调用方可通过 `ChatRequest::generation_override` 覆盖单次请求的基础参数。
+
+```json
+{
+  "emotion": {
+    "generation": {
+      "max_tokens": 2048,
+      "min_tokens": 100,
+      "max_token_ratio": 1.25,
+      "default_token_weight": 1.0,
+      "high_intensity_threshold": 0.7,
+      "high_intensity_multiplier": 1.1,
+      "token_weights": {
+        "neutral": 1.0,
+        "curiosity": 1.15
+      }
+    }
+  }
+}
+```
+
+`token_weights` 是相对于基础 `max_tokens` 的乘法比例，不是百分比加成。
+`min_tokens` 不会突破单次请求按 `max_token_ratio` 计算出的上限。
+
+## LLM 响应完整性校验
+
+HTTP framing、JSON、UTF-8、空内容、`finish_reason=length` 和 usage 一致性始终校验。
+与模型 tokenizer 相关的 Token 数比较是可选增强：
+
+```json
+{
+  "llm": {
+    "response_validation": {
+      "token_count_mode": "audit",
+      "tokenizer_path": "models/deepseek/tokenizer.json",
+      "tokenizer_model": "deepseek-chat",
+      "max_token_difference": 2
+    }
+  }
+}
+```
+
+- `off`：不加载 tokenizer；不影响其他完整性校验。
+- `audit`：记录 Token 偏差；词表不可用或模型不匹配时跳过，不拒绝响应。
+- `strict`：词表为必需项；计数失败或偏差超过阈值时返回错误。
+
+Tokenizer 必须与实际 Provider 模型版本一致。动态模型别名、未回传的 reasoning Token
+或 Provider 专用控制 Token 会影响严格计数，因此生产环境默认使用 `off`，确认 Provider
+统计口径后再启用 `audit` 或 `strict`。
 
 ## Embedding 模型配置
 

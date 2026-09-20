@@ -188,7 +188,7 @@ struct ChatRequest {
     std::string user_input;
     std::string trace_id;
     std::string context_id;
-    GenerationParams base_generation{0.7, 1024, 0.9};
+    std::optional<GenerationParams> generation_override;
     std::string model;
 };
 
@@ -269,6 +269,7 @@ struct PersonaRuntimeOptions {
     std::size_t recent_raw_turns = 10;
     std::string default_model;
     EmotionCalibrationOptions emotion_calibration;
+    EmotionGenerationOptions emotion_generation;
 };
 
 class PersonaRuntime {

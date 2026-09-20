@@ -12,7 +12,9 @@
 #include "document_llm_chunk_cache.h"
 #include "isemantic_cache.h"
 #include "openai_llm_client.h"
+#if defined(AGENTLOOM_HAS_LOCAL_LLM)
 #include "local_llm_client.h"
+#endif
 #include "beast_http_client.h"
 #include "async_beast_http_client.h"
 #include "tls_context.h"
@@ -40,6 +42,7 @@
 #endif
 
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -47,6 +50,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -229,6 +233,79 @@ struct LlmClientBundle {
     std::shared_ptr<agent::llm::IAsyncLlmClient> async;
 };
 
+class HfCompletionTokenCounter final : public agent::llm::ICompletionTokenCounter {
+public:
+    HfCompletionTokenCounter(std::shared_ptr<vector::HfTokenizer> tokenizer,
+                             std::string expected_model)
+        : tokenizer_(std::move(tokenizer)), expected_model_(std::move(expected_model)) {}
+
+    core::Result<std::size_t> CountTokens(
+        std::string_view model,
+        const agent::llm::ChatCompletionResponse& response) const override {
+        if (!expected_model_.empty() && model != expected_model_) {
+            return core::Status::Error(
+                core::ErrorCode::FailedPrecondition,
+                "configured response tokenizer does not match model " + std::string(model));
+        }
+        std::size_t total = 0;
+        const auto append_count = [this, &total](std::string_view text) -> core::Status {
+            if (text.empty()) {
+                return core::Status::Ok();
+            }
+            vector::EncodeOptions options;
+            // UTF-8 字节数是不添加特殊 Token 时 Token 数的安全上界。
+            options.max_length = std::max<std::size_t>(1, text.size());
+            options.truncation = false;
+            options.padding = false;
+            options.pad_to_longest_in_batch = false;
+            options.add_special_tokens = false;
+            auto encoded = tokenizer_->Encode(text, options);
+            if (!encoded.ok()) {
+                return encoded.status();
+            }
+            if (encoded.value().sequence_length >
+                std::numeric_limits<std::size_t>::max() - total) {
+                return core::Status::Error(core::ErrorCode::ResourceExhausted,
+                                           "completion token count overflow");
+            }
+            total += encoded.value().sequence_length;
+            return core::Status::Ok();
+        };
+
+        if (response.reasoning_content) {
+            if (auto status = append_count(*response.reasoning_content); !status.ok()) {
+                return status;
+            }
+        }
+        if (auto status = append_count(response.content); !status.ok()) {
+            return status;
+        }
+        for (const auto& call : response.tool_calls) {
+            if (auto status = append_count(call.name); !status.ok()) {
+                return status;
+            }
+            if (auto status = append_count(call.arguments_json); !status.ok()) {
+                return status;
+            }
+        }
+        return total;
+    }
+
+private:
+    std::shared_ptr<vector::HfTokenizer> tokenizer_;
+    std::string expected_model_;
+};
+
+agent::llm::CompletionTokenValidationMode ParseTokenValidationMode(std::string_view mode) {
+    if (mode == "audit") {
+        return agent::llm::CompletionTokenValidationMode::Audit;
+    }
+    if (mode == "strict") {
+        return agent::llm::CompletionTokenValidationMode::Strict;
+    }
+    return agent::llm::CompletionTokenValidationMode::Off;
+}
+
 core::Result<LlmClientBundle> CreateLlmClient(const ToolConfig& config,
                                               std::string_view default_model) {
     std::shared_ptr<agent::llm::ILlmClient> primary;
@@ -274,6 +351,36 @@ core::Result<LlmClientBundle> CreateLlmClient(const ToolConfig& config,
         cloud_options.timeout_ms = config.llm.timeout_ms;
         cloud_options.retry_policy.max_retries = config.llm.max_retries;
         cloud_options.require_api_key = config.llm.require_api_key;
+        cloud_options.response_validation.token_count_mode =
+            ParseTokenValidationMode(config.llm.response_token_count_mode);
+        cloud_options.response_validation.max_token_difference =
+            config.llm.response_max_token_difference;
+        if (cloud_options.response_validation.token_count_mode !=
+            agent::llm::CompletionTokenValidationMode::Off) {
+            if (config.llm.response_tokenizer_path.empty()) {
+                LOG_WARN("[agent-gateway] LLM token count audit disabled: tokenizer_path is empty");
+            } else {
+                auto tokenizer = vector::HfTokenizer::LoadFromFile(
+                    config.llm.response_tokenizer_path);
+                if (!tokenizer.ok()) {
+                    if (cloud_options.response_validation.token_count_mode ==
+                        agent::llm::CompletionTokenValidationMode::Strict) {
+                        return tokenizer.status();
+                    }
+                    LOG_WARN("[agent-gateway] LLM token count audit disabled: {}",
+                             tokenizer.status().message());
+                } else {
+                    auto tokenizer_ptr = std::make_shared<vector::HfTokenizer>(
+                        std::move(tokenizer).value());
+                    cloud_options.response_validation.token_counter =
+                        std::make_shared<HfCompletionTokenCounter>(
+                            std::move(tokenizer_ptr),
+                            config.llm.response_tokenizer_model.empty()
+                                ? config.llm.model
+                                : config.llm.response_tokenizer_model);
+                }
+            }
+        }
         auto cloud = agent::llm::OpenAiLlmClient::Create(cloud_options, *http_client);
         if (!cloud.ok()) {
             return cloud.status();
@@ -327,6 +434,7 @@ core::Result<LlmClientBundle> CreateLlmClient(const ToolConfig& config,
         async_primary = std::move(async_holder);
     }
 
+#if defined(AGENTLOOM_HAS_LOCAL_LLM)
     if (config.local_llm.enabled) {
         agent::llm::GrpcLocalLlmClientOptions grpc_local_options;
         grpc_local_options.target = config.local_llm.target;
@@ -340,6 +448,13 @@ core::Result<LlmClientBundle> CreateLlmClient(const ToolConfig& config,
             : std::string(default_model);
         fallback = std::make_shared<agent::llm::LocalLlmChatClient>(std::move(local_llm), local_options);
     }
+#else
+    if (config.local_llm.enabled) {
+        return core::Status::Error(
+            core::ErrorCode::FailedPrecondition,
+            "local_llm is enabled but AgentLoom was built without local LLM support");
+    }
+#endif
 
     if (primary && fallback) {
         // Fallback 当前仍是同步组合接口；在完成异步 gRPC fallback 编排前保留既有语义。

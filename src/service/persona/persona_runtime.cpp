@@ -37,30 +37,45 @@ std::chrono::milliseconds Since(std::chrono::steady_clock::time_point start) {
 }
 
 GenerationParams ApplyEmotionAdaptiveGeneration(const GenerationParams& base,
-                                                const EmotionAnalysis& emotion) {
-    static const std::map<std::string, double> token_weights{
-        {"neutral", 0.0125},
-        {"joy", 0.02},
-        {"excitement", 0.025},
-        {"sadness", 0.03},
-        {"fear", 0.03},
-        {"anger", 0.025},
-        {"disgust", 0.02},
-        {"surprise", 0.025},
-        {"tenderness", 0.025},
-        {"curiosity", 0.0375},
-    };
-
+                                                const EmotionAnalysis& emotion,
+                                                const EmotionGenerationOptions& options) {
     auto adjusted = base;
-    const auto weight_it = token_weights.find(emotion.emotion.primary);
-    double weight = weight_it == token_weights.end() ? 0.02 : weight_it->second;
-    if (emotion.emotion.intensity >= 0.7) {
-        weight *= 1.5;
+    const auto weight_it = options.token_weights.find(emotion.emotion.primary);
+    double weight = weight_it == options.token_weights.end()
+        ? options.default_token_weight
+        : weight_it->second;
+    if (emotion.emotion.intensity >= options.high_intensity_threshold) {
+        weight *= options.high_intensity_multiplier;
     }
-
-    const int adaptive_tokens = std::max(100, static_cast<int>(base.max_tokens * weight));
-    adjusted.max_tokens = std::min(base.max_tokens, std::max(1, adaptive_tokens));
+    const int maximum = std::max(
+        1,
+        static_cast<int>(std::floor(base.max_tokens * options.max_token_ratio)));
+    const int minimum = std::min(options.min_tokens, maximum);
+    const int adaptive_tokens = static_cast<int>(std::lround(base.max_tokens * weight));
+    adjusted.max_tokens = std::clamp(adaptive_tokens, minimum, maximum);
     return adjusted;
+}
+
+core::Status ValidateEmotionGenerationOptions(const EmotionGenerationOptions& options) {
+    if (options.default_generation.max_tokens <= 0 || options.min_tokens <= 0 ||
+        !std::isfinite(options.max_token_ratio) || options.max_token_ratio < 1.0 ||
+        !std::isfinite(options.default_token_weight) || options.default_token_weight <= 0.0 ||
+        !std::isfinite(options.high_intensity_threshold) ||
+        options.high_intensity_threshold < 0.0 || options.high_intensity_threshold > 1.0 ||
+        !std::isfinite(options.high_intensity_multiplier) ||
+        options.high_intensity_multiplier <= 0.0 ||
+        static_cast<double>(options.min_tokens) >
+            options.default_generation.max_tokens * options.max_token_ratio) {
+        return core::Status::Error(core::ErrorCode::InvalidArgument,
+                                   "emotion generation options are invalid");
+    }
+    for (const auto& [label, weight] : options.token_weights) {
+        if (label.empty() || !std::isfinite(weight) || weight <= 0.0) {
+            return core::Status::Error(core::ErrorCode::InvalidArgument,
+                                       "emotion generation token weights are invalid");
+        }
+    }
+    return core::Status::Ok();
 }
 
 std::vector<ConversationTurn> TakeRecent(std::span<const ConversationTurn> turns, std::size_t limit) {
@@ -619,6 +634,14 @@ core::Status PersonaRuntime::SubmitChat(ChatRequest request, ChatCallback callba
     if (request.session_id.empty() || request.user_input.empty()) {
         return core::Status::Error(core::ErrorCode::InvalidArgument, "session_id and user_input are required");
     }
+    if (auto status = ValidateEmotionGenerationOptions(options_.emotion_generation); !status.ok()) {
+        logger_.warn("[persona_runtime] generation options rejected: {}", status.message());
+        return status;
+    }
+    if (request.generation_override && request.generation_override->max_tokens <= 0) {
+        return core::Status::Error(core::ErrorCode::InvalidArgument,
+                                   "generation override max_tokens must be positive");
+    }
     if (request.trace_id.empty()) {
         request.trace_id = core::GenerateTraceId();
     }
@@ -893,8 +916,19 @@ core::Result<PersonaRuntime::PreparedChat> PersonaRuntime::PrepareChatAfterEmoti
                      calibration_status.message());
     }
 
-    auto adjusted = ApplyEmotionAdaptiveGeneration(prepared.request.base_generation, prepared.user_emotion);
+    const auto base_generation = prepared.request.generation_override.value_or(
+        options_.emotion_generation.default_generation);
+    auto adjusted = ApplyEmotionAdaptiveGeneration(
+        base_generation, prepared.user_emotion, options_.emotion_generation);
     adjusted = session.emotion_state.GetParamAdjustments(adjusted);
+    const int maximum_tokens = std::max(
+        1,
+        static_cast<int>(std::floor(
+            base_generation.max_tokens * options_.emotion_generation.max_token_ratio)));
+    const int minimum_tokens = std::min(
+        options_.emotion_generation.min_tokens, maximum_tokens);
+    adjusted.max_tokens = std::clamp(
+        adjusted.max_tokens, minimum_tokens, maximum_tokens);
     prepared.generation = adjusted;
     auto hint = session.emotion_state.GetPromptHint();
 

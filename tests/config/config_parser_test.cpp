@@ -115,6 +115,65 @@ TEST(ConfigSectionSelectionTest, BuildsAndValidatesOnlySelectedSections) {
     EXPECT_THROW(server_config::ValidateOptions(options), std::runtime_error);
 }
 
+TEST(ConfigEmotionSectionTest, LoadsGenerationBudgetAndWeights) {
+    ScopedTempDirectory tmp("emotion_generation_cfg");
+    const auto config_file = tmp.path() / "config.json";
+    WriteFile(config_file, R"({
+        "emotion": {
+            "generation": {
+                "max_tokens": 3072,
+                "min_tokens": 256,
+                "max_token_ratio": 1.5,
+                "default_token_weight": 0.95,
+                "high_intensity_threshold": 0.8,
+                "high_intensity_multiplier": 1.2,
+                "token_weights": {"neutral": 1.0, "curiosity": 1.25}
+            }
+        }
+    })");
+
+    auto options = Parse({"server", "--llm", "llm.gguf", "--config", config_file.string()});
+    EXPECT_EQ(options.emotion_generation.max_tokens, 3072);
+    EXPECT_EQ(options.emotion_generation.min_tokens, 256);
+    EXPECT_DOUBLE_EQ(options.emotion_generation.max_token_ratio, 1.5);
+    EXPECT_DOUBLE_EQ(options.emotion_generation.token_weights.at("curiosity"), 1.25);
+}
+
+TEST(ConfigLlmSectionTest, RejectsStrictTokenValidationWithoutTokenizer) {
+    ScopedTempDirectory tmp("llm_validation_cfg");
+    const auto config_file = tmp.path() / "config.json";
+    WriteFile(config_file, R"({
+        "llm": {
+            "response_validation": {"token_count_mode": "strict"}
+        }
+    })");
+
+    EXPECT_THROW(
+        Parse({"server", "--llm", "llm.gguf", "--config", config_file.string()}),
+        std::runtime_error);
+}
+
+TEST(ConfigLlmSectionTest, LoadsAuditTokenValidationOptions) {
+    ScopedTempDirectory tmp("llm_validation_audit_cfg");
+    const auto config_file = tmp.path() / "config.json";
+    WriteFile(config_file, R"({
+        "llm": {
+            "response_validation": {
+                "token_count_mode": "audit",
+                "tokenizer_path": "tokenizer.json",
+                "tokenizer_model": "deepseek-v3",
+                "max_token_difference": 4
+            }
+        }
+    })");
+
+    auto options = Parse({"server", "--llm", "llm.gguf", "--config", config_file.string()});
+    EXPECT_EQ(options.llm.response_token_count_mode, "audit");
+    EXPECT_EQ(options.llm.response_tokenizer_path, tmp.path() / "tokenizer.json");
+    EXPECT_EQ(options.llm.response_tokenizer_model, "deepseek-v3");
+    EXPECT_EQ(options.llm.response_max_token_difference, 4u);
+}
+
 TEST(ConfigOptionParserTest, ParsesCliFallbackOptionsThroughSections) {
     auto options = Parse({
         "server",

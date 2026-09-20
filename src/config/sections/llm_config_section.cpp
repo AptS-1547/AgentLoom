@@ -47,6 +47,19 @@ void LlmConfigSection::LoadJson(const Json& root, MultimodalServerOptions& optio
     SetBool(*section, Name(), "allow_placeholder", options.llm.allow_placeholder);
     SetBool(*section, Name(), "disable_tls_verify_on_windows", options.llm.disable_tls_verify_on_windows);
     SetString(*section, Name(), "ca_bundle_path", options.llm.ca_bundle_path);
+    if (const Json* validation = FindField(*section, Name(), "response_validation")) {
+        if (!validation->is_object()) {
+            throw std::runtime_error("llm.response_validation must be an object");
+        }
+        SetString(*validation, "llm.response_validation", "token_count_mode",
+                  options.llm.response_token_count_mode);
+        SetPath(*validation, "llm.response_validation", "tokenizer_path",
+                options.llm.response_tokenizer_path);
+        SetString(*validation, "llm.response_validation", "tokenizer_model",
+                  options.llm.response_tokenizer_model);
+        SetSize(*validation, "llm.response_validation", "max_token_difference",
+                options.llm.response_max_token_difference, 0, 1024);
+    }
 
     // Prompt 路径保持配置中的相对形式，由 LlmPromptStore::Load 统一解析。
     if (const Json* prompts_field = FindField(*section, Name(), "prompts")) {
@@ -111,7 +124,7 @@ std::string ReadKeyFromFile(const std::filesystem::path& path) {
 
 std::filesystem::path ResolveRelativeToConfig(const std::filesystem::path& p,
                                                const std::filesystem::path& config_path) {
-    if (p.is_absolute() || config_path.empty()) {
+    if (p.empty() || p.is_absolute() || config_path.empty()) {
         return p;
     }
     return config_path.parent_path() / p;
@@ -120,6 +133,19 @@ std::filesystem::path ResolveRelativeToConfig(const std::filesystem::path& p,
 }
 
 void LlmConfigSection::Validate(MultimodalServerOptions& options) const {
+    if (options.llm.response_token_count_mode != "off" &&
+        options.llm.response_token_count_mode != "audit" &&
+        options.llm.response_token_count_mode != "strict") {
+        throw std::runtime_error(
+            "llm.response_validation.token_count_mode must be off, audit, or strict");
+    }
+    options.llm.response_tokenizer_path = ResolveRelativeToConfig(
+        options.llm.response_tokenizer_path, options.config_file_path);
+    if (options.llm.response_token_count_mode == "strict" &&
+        options.llm.response_tokenizer_path.empty()) {
+        throw std::runtime_error(
+            "llm.response_validation.tokenizer_path is required in strict mode");
+    }
     // 未启用或未配置 base_url 时允许只使用本地 LLM。
     if (!options.llm.enabled || options.llm.base_url.empty()) {
         return;

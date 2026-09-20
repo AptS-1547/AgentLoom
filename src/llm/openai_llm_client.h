@@ -14,6 +14,24 @@
 #include <../core/result.h>
 namespace agent::llm {
 
+struct ChatCompletionResponse;
+
+enum class CompletionTokenValidationMode {
+    Off,
+    Audit,
+    Strict,
+};
+
+class ICompletionTokenCounter;
+
+struct CompletionResponseValidationOptions {
+    bool reject_empty_content = true;
+    bool reject_length_finish = true;
+    CompletionTokenValidationMode token_count_mode = CompletionTokenValidationMode::Off;
+    std::size_t max_token_difference = 2;
+    std::shared_ptr<const ICompletionTokenCounter> token_counter;
+};
+
 struct OpenAiLlmClientOptions {
     /// Base URL for the OpenAI-compatible API (e.g., "https://api.deepseek.com/v1").
     std::string base_url;
@@ -27,6 +45,7 @@ struct OpenAiLlmClientOptions {
     net::RetryPolicy retry_policy;
     /// Local OpenAI-compatible endpoints normally do not require a bearer key.
     bool require_api_key = true;
+    CompletionResponseValidationOptions response_validation;
 };
 
 enum class ChatRole {
@@ -96,6 +115,14 @@ struct ChatCompletionResponse {
     std::vector<ChatToolCall> tool_calls;
     std::string finish_reason;
     std::optional<std::string> reasoning_content;
+};
+
+class ICompletionTokenCounter {
+public:
+    virtual ~ICompletionTokenCounter() = default;
+    virtual core::Result<std::size_t> CountTokens(
+        std::string_view model,
+        const ChatCompletionResponse& response) const = 0;
 };
 
 // 同步和异步传输共用协议校验，错误请求不访问 Provider。

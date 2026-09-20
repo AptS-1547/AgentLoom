@@ -139,6 +139,51 @@ private:
     std::thread thread_;
 };
 
+class AsyncTruncatedHttpServer {
+public:
+    AsyncTruncatedHttpServer()
+        : acceptor_(io_context_, tcp::endpoint(asio::ip::make_address("127.0.0.1"), 0)),
+          port_(acceptor_.local_endpoint().port()),
+          thread_([this] { Serve(); }) {}
+
+    ~AsyncTruncatedHttpServer() {
+        beast::error_code ignored;
+        acceptor_.close(ignored);
+        if (thread_.joinable()) {
+            thread_.join();
+        }
+    }
+
+    std::uint16_t port() const noexcept { return port_; }
+
+private:
+    void Serve() {
+        beast::error_code error;
+        tcp::socket socket(io_context_);
+        acceptor_.accept(socket, error);
+        if (error) {
+            return;
+        }
+        beast::flat_buffer buffer;
+        http::request<http::string_body> request;
+        http::read(socket, buffer, request, error);
+        if (error) {
+            return;
+        }
+        const std::string response =
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+            "Content-Length: 64\r\nConnection: close\r\n\r\n{}";
+        asio::write(socket, asio::buffer(response), error);
+        socket.shutdown(tcp::socket::shutdown_both, error);
+        socket.close(error);
+    }
+
+    asio::io_context io_context_;
+    tcp::acceptor acceptor_;
+    std::uint16_t port_ = 0;
+    std::thread thread_;
+};
+
 std::string Url(std::uint16_t port, std::string_view target = "/") {
     return "http://127.0.0.1:" + std::to_string(port) + std::string(target);
 }
@@ -189,6 +234,16 @@ TEST(AsyncBeastHttpClientTest, RejectsInvalidOptionsAndRequest) {
     auto invalid_request = client->ExecuteAsync(std::move(request), [](auto) {});
     EXPECT_FALSE(invalid_request.ok());
     EXPECT_EQ(invalid_request.status().code(), core::ErrorCode::InvalidArgument);
+}
+
+TEST(AsyncBeastHttpClientTest, RejectsTruncatedContentLengthBody) {
+    AsyncTruncatedHttpServer server;
+    auto client = CreateClient();
+    ASSERT_NE(client, nullptr);
+
+    auto result = ExecuteAndWait(*client, Url(server.port(), "/truncated"));
+    ASSERT_FALSE(result.ok());
+    EXPECT_EQ(result.status().code(), core::ErrorCode::DataLoss);
 }
 
 TEST(AsyncBeastHttpClientTest, ReusesKeepAliveConnectionForSequentialRequests) {

@@ -21,7 +21,7 @@ using tcp = boost::asio::ip::tcp;
 namespace {
 
 core::Status MakeStatus(const beast::error_code& ec, std::string_view stage) {
-    return core::Status(core::ErrorCode::InternalError,
+    return core::Status(core::ErrorCode::Unavailable,
         std::string(stage) + ": " + ec.message());
 }
 
@@ -122,7 +122,11 @@ core::Status FromOpErr(const beast::error_code& ec, std::string_view stage) {
         return core::Status(core::ErrorCode::Timeout,
             std::string(stage) + ": timed out");
     }
-    return core::Status(core::ErrorCode::InternalError,
+    if (ec == http::error::partial_message || ec == http::error::unexpected_body) {
+        return core::Status(core::ErrorCode::DataLoss,
+            std::string(stage) + ": incomplete or malformed HTTP message: " + ec.message());
+    }
+    return core::Status(core::ErrorCode::Unavailable,
         std::string(stage) + ": " + ec.message());
 }
 

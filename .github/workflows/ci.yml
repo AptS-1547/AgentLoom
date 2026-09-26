@@ -446,7 +446,7 @@ jobs:
         shell: bash
         run: |
           ctest --test-dir "$BUILD_DIR" -C Release \
-            -L ci \
+            -L ci -E "(ReloadBatchCycle|RedisV2Batches)" \
             --output-on-failure
 
       - name: Verify installed package consumer

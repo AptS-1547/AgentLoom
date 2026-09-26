@@ -12,6 +12,26 @@
 
 namespace {
 
+class RuntimeTriggeredStatefulSkill final
+    : public agent::service::persona::IStatefulSkillExecution {
+public:
+    explicit RuntimeTriggeredStatefulSkill(
+        agent::service::persona::StatefulSkillExecutionContext context)
+        : context_(std::move(context)) {}
+
+    core::Status Start() override { return core::Status::Ok(); }
+
+    core::Status Stop(
+        const agent::service::persona::SkillSessionStopRequest& request) override {
+        return context_.sessions->Stop(request).status();
+    }
+
+private:
+    agent::service::persona::StatefulSkillExecutionContext context_;
+};
+
+REGISTER_STATEFUL_SKILL(RuntimeTriggeredStatefulSkill, "test.runtime.triggered", "1.0.0");
+
 using agent::llm::ChatCompletionRequest;
 using agent::llm::ChatCompletionResponse;
 using agent::llm::ChatMessage;
@@ -1307,8 +1327,7 @@ TEST(PersonaRuntimeTest, InjectsTriggeredL4ToolMemoryIntoSystemPrompt) {
     io.Shutdown(true);
 }
 
-#if defined(AGENTLOOM_HAS_SKILL_MEDIA)
-TEST(PersonaRuntimeTest, StartsVisionSkillSessionWhenL4VisionToolIsTriggered) {
+TEST(PersonaRuntimeTest, StartsStatefulSkillSessionWhenL4ToolIsTriggered) {
     core::ThreadPool compute({1, 32, "runtime-compute"});
     core::ThreadPool io({1, 32, "runtime-io"});
     ASSERT_TRUE(compute.Start().ok());
@@ -1323,7 +1342,7 @@ TEST(PersonaRuntimeTest, StartsVisionSkillSessionWhenL4VisionToolIsTriggered) {
     auto emotion = std::make_shared<NeutralEmotionAnalyzer>();
     auto llm = std::make_shared<FakeLlmClient>();
     auto tool_memory = std::make_shared<FakeToolMemoryProvider>();
-    tool_memory->hits.push_back(ToolMemoryHit{.tool_id = "vision.observe"});
+    tool_memory->hits.push_back(ToolMemoryHit{.tool_id = "test.runtime.triggered"});
     auto skill_sessions = std::make_shared<SkillSessionManager>();
     PersonaRuntime runtime(
         sessions,
@@ -1351,7 +1370,7 @@ TEST(PersonaRuntimeTest, StartsVisionSkillSessionWhenL4VisionToolIsTriggered) {
     auto result = future.get();
     ASSERT_TRUE(result.ok()) << result.status().message();
 
-    auto session = skill_sessions->Get("session-runtime", "vision.observe");
+    auto session = skill_sessions->Get("session-runtime", "test.runtime.triggered");
     ASSERT_TRUE(session.ok()) << session.status().message();
     ASSERT_TRUE(session.value().has_value());
     EXPECT_EQ(session.value()->state, SkillSessionState::Starting);
@@ -1359,12 +1378,13 @@ TEST(PersonaRuntimeTest, StartsVisionSkillSessionWhenL4VisionToolIsTriggered) {
     std::lock_guard lock(llm->mutex_);
     ASSERT_FALSE(llm->last_request.messages.empty());
     EXPECT_NE(llm->last_request.messages.front().content.find("<skill_status"), std::string::npos);
-    EXPECT_NE(llm->last_request.messages.front().content.find("vision.observe"), std::string::npos);
+    EXPECT_NE(
+        llm->last_request.messages.front().content.find("test.runtime.triggered"),
+        std::string::npos);
 
     compute.Shutdown(true);
     io.Shutdown(true);
 }
-#endif
 
 TEST(PersonaRuntimeTest, InjectsVisionObservationFromRunningSkillSession) {
     core::ThreadPool compute({1, 32, "runtime-compute"});

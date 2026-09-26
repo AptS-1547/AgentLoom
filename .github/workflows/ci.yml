@@ -413,10 +413,11 @@ jobs:
             -DLLAMA_CPP_BUILD="$GITHUB_WORKSPACE/$LLAMA_CPP_BUILD" \
             -DOpenCV_DIR=/usr/lib/x86_64-linux-gnu/cmake/opencv4
 
-      - name: Build test targets
+      - name: Build SDK and test targets
         shell: bash
         run: |
           cmake --build "$BUILD_DIR" --target \
+            agentloom_sdk \
             core_tests \
             net_tests \
             http_client_tests \
@@ -425,7 +426,8 @@ jobs:
             semantic_cache_tests \
             document_tests \
             config_tests \
-            service_tests \
+            persona_runtime_tests \
+            gateway_service_tests \
             async_grpc_runtime_tests \
             --parallel
           ccache --show-stats --verbose || true
@@ -441,35 +443,17 @@ jobs:
         shell: bash
         run: |
           ctest --test-dir "$BUILD_DIR" -C Release \
-            -R "(Core|Net|HttpClient|Tls|Storage|SemanticCache|Document|Config|PersonaGateway|SessionManager|PersonaRuntime|PersonaAlgorithm|AsyncGrpcRuntime)" \
+            -L ci \
             --output-on-failure
-
-      - name: Configure minimal package
-        shell: bash
-        run: |
-          cmake -S . -B build/gha-linux-package \
-            -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
-            -DBERT_BUILD_TESTS=OFF \
-            -DBERT_VCPKG_TRIPLET="$VCPKG_TRIPLET" \
-            -DBERT_USE_ONNXRUNTIME_GPU=OFF \
-            -DBERT_OPENBLAS_LIBRARY="$BERT_OPENBLAS_LIBRARY" \
-            -DONNXRUNTIME_CPU_ROOT="$GITHUB_WORKSPACE/$ONNXRUNTIME_ROOT" \
-            -DAGENTLOOM_BUILD_LOCAL_LLM=OFF \
-            -DAGENTLOOM_BUILD_MEDIA=OFF \
-            -DAGENTLOOM_BUILD_REFERENCE_GATEWAY=OFF \
-            -DAGENTLOOM_BUILD_TOOLS=OFF \
-            -DBERT_BUILD_MULTIMODAL_INFERENCE_SERVER=OFF
 
       - name: Verify installed package consumer
         shell: bash
         run: |
           cmake \
             -DAGENTLOOM_SOURCE_DIR="$GITHUB_WORKSPACE" \
-            -DAGENTLOOM_PACKAGE_BUILD_DIR="$GITHUB_WORKSPACE/build/gha-linux-package" \
-            -DAGENTLOOM_INSTALL_PREFIX="$GITHUB_WORKSPACE/build/gha-linux-package-install" \
-            -DAGENTLOOM_CONSUMER_BUILD_DIR="$GITHUB_WORKSPACE/build/gha-linux-package-consumer" \
+            -DAGENTLOOM_PACKAGE_BUILD_DIR="$GITHUB_WORKSPACE/$BUILD_DIR" \
+            -DAGENTLOOM_INSTALL_PREFIX="$GITHUB_WORKSPACE/build/gha-linux-tests-install" \
+            -DAGENTLOOM_CONSUMER_BUILD_DIR="$GITHUB_WORKSPACE/build/gha-linux-tests-consumer" \
             -DAGENTLOOM_CONSUMER_GENERATOR=Ninja \
             -DAGENTLOOM_CONSUMER_BUILD_TYPE=Release \
             -DAGENTLOOM_CONSUMER_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/vcpkg/scripts/buildsystems/vcpkg.cmake" \

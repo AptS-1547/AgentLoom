@@ -1307,6 +1307,7 @@ TEST(PersonaRuntimeTest, InjectsTriggeredL4ToolMemoryIntoSystemPrompt) {
     io.Shutdown(true);
 }
 
+#if defined(AGENTLOOM_HAS_SKILL_MEDIA)
 TEST(PersonaRuntimeTest, StartsVisionSkillSessionWhenL4VisionToolIsTriggered) {
     core::ThreadPool compute({1, 32, "runtime-compute"});
     core::ThreadPool io({1, 32, "runtime-io"});
@@ -1363,6 +1364,7 @@ TEST(PersonaRuntimeTest, StartsVisionSkillSessionWhenL4VisionToolIsTriggered) {
     compute.Shutdown(true);
     io.Shutdown(true);
 }
+#endif
 
 TEST(PersonaRuntimeTest, InjectsVisionObservationFromRunningSkillSession) {
     core::ThreadPool compute({1, 32, "runtime-compute"});

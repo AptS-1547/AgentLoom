@@ -378,6 +378,9 @@ if(BERT_BUILD_TESTS)
             tests/service/media_inference_execution_test.cpp
             tests/service/skill_vision_event_sink_test.cpp
         )
+        target_compile_definitions(service_tests PRIVATE
+            AGENTLOOM_HAS_SKILL_MEDIA=1
+        )
         target_link_libraries(service_tests PRIVATE
             agent_skill_media
         )

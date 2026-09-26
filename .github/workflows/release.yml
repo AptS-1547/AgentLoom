@@ -20,6 +20,8 @@ permissions:
 
 env:
   RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
 
 jobs:
   build:
@@ -45,12 +47,19 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Validate versioned build inputs
+        shell: bash
+        run: bash ./.github/scripts/validate-build-inputs.sh
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
           cache-dependency-path: .github/workflows/release.yml
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Install Python tools
         run: |
@@ -70,16 +79,15 @@ jobs:
           sudo apt-get clean
           df -h
 
-      - name: Cache vcpkg install root
-        id: cache-vcpkg
-        uses: actions/cache@v4
+      - name: Restore vcpkg binary cache
+        id: restore-vcpkg-cache
+        uses: actions/cache/restore@v4
         with:
-          path: |
-            build/linux-vcpkg-installed
-            build/vcpkg-binary-cache
+          path: build/vcpkg-binary-cache
           key: ${{ matrix.os }}-${{ matrix.triplet }}-vcpkg-features-core-${{ hashFiles('vcpkg.json', 'triplets/ci/x64-linux-release.cmake') }}
           restore-keys: |
             ${{ matrix.os }}-${{ matrix.triplet }}-vcpkg-features-core-
+            ${{ matrix.os }}-${{ matrix.triplet }}-vcpkg-
 
       - name: Cache ONNX Runtime archive
         uses: actions/cache@v4
@@ -99,6 +107,12 @@ jobs:
           key: ${{ matrix.os }}-${{ matrix.triplet }}-ccache-${{ github.sha }}
           restore-keys: |
             ${{ matrix.os }}-${{ matrix.triplet }}-ccache-
+
+      - name: Cache Rust dependencies and tokenizer outputs
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: hf-tokenizers-release-v1
+          workspaces: third_party/hf_tokenizers_capi -> target
 
       - name: Bootstrap vcpkg
         shell: bash
@@ -123,12 +137,20 @@ jobs:
         run: |
           ./vcpkg/vcpkg install \
             --triplet ${{ matrix.triplet }} \
+            --host-triplet ${{ matrix.triplet }} \
             --x-manifest-root="$GITHUB_WORKSPACE" \
             --x-install-root="$GITHUB_WORKSPACE/build/linux-vcpkg-installed" \
             --overlay-triplets="$GITHUB_WORKSPACE/triplets/ci" \
             "--binarysource=clear;files,$GITHUB_WORKSPACE/build/vcpkg-binary-cache,readwrite" \
             --clean-after-build
           ln -s "$GITHUB_WORKSPACE/build/linux-vcpkg-installed" "$GITHUB_WORKSPACE/vcpkg_installed"
+
+      - name: Save vcpkg binary cache
+        if: steps.restore-vcpkg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: build/vcpkg-binary-cache
+          key: ${{ steps.restore-vcpkg-cache.outputs.cache-primary-key }}
 
       - name: Download ONNX Runtime
         shell: bash

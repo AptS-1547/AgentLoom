@@ -15,6 +15,12 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_TEST_CODEGEN_UNITS: "16"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
 jobs:
   linux-tests:
     name: Linux Release Tests
@@ -44,12 +50,21 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Validate versioned build inputs
+        shell: bash
+        run: bash ./.github/scripts/validate-build-inputs.sh
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: "pip"
           cache-dependency-path: .github/workflows/ci.yml
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
 
       - name: Install Python tools
         run: |
@@ -85,20 +100,19 @@ jobs:
             libopenblas-dev \
             libopencv-dev
 
-      - name: Cache vcpkg install root
-        id: cache-vcpkg
-        uses: actions/cache@v4
+      - name: Restore vcpkg binary cache
+        id: restore-vcpkg-cache
+        uses: actions/cache/restore@v4
         with:
-          path: |
-            build/linux-vcpkg-installed
-            build/vcpkg-binary-cache
+          path: build/vcpkg-binary-cache
           key: ${{ env.CACHE_PLATFORM }}-${{ env.VCPKG_TRIPLET }}-vcpkg-features-tests-${{ hashFiles('vcpkg.json', 'triplets/ci/x64-linux-release.cmake') }}
           restore-keys: |
             ${{ env.CACHE_PLATFORM }}-${{ env.VCPKG_TRIPLET }}-vcpkg-features-tests-
+            ${{ env.CACHE_PLATFORM }}-${{ env.VCPKG_TRIPLET }}-vcpkg-
 
-      - name: Cache binary dependency archives
-        id: cache-dependency-archives
-        uses: actions/cache@v4
+      - name: Restore binary dependency archives
+        id: restore-dependency-archives
+        uses: actions/cache/restore@v4
         with:
           path: |
             deps/*.tgz
@@ -116,6 +130,24 @@ jobs:
           key: ${{ env.CACHE_PLATFORM }}-${{ env.VCPKG_TRIPLET }}-ccache-${{ github.sha }}
           restore-keys: |
             ${{ env.CACHE_PLATFORM }}-${{ env.VCPKG_TRIPLET }}-ccache-
+
+      - name: Cache Rust dependencies and tokenizer outputs
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: hf-tokenizers-v1
+          workspaces: third_party/hf_tokenizers_capi -> target
+
+      - name: Verify tokenizer FFI
+        working-directory: third_party/hf_tokenizers_capi
+        run: |
+          cargo fmt -- --check
+          cargo test --locked
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo build --locked --release
+          c++ -std=c++20 -Iinclude tests/ffi_smoke.cpp \
+            target/release/libhf_tokenizers_capi.a \
+            -lpthread -ldl -lm -o target/ffi_smoke
+          target/ffi_smoke
 
       - name: Bootstrap vcpkg
         shell: bash
@@ -140,6 +172,7 @@ jobs:
         run: |
           ./vcpkg/vcpkg install \
             --triplet "$VCPKG_TRIPLET" \
+            --host-triplet "$VCPKG_TRIPLET" \
             --x-feature=tests \
             --x-manifest-root="$GITHUB_WORKSPACE" \
             --x-install-root="$GITHUB_WORKSPACE/$VCPKG_INSTALL_ROOT" \
@@ -147,6 +180,13 @@ jobs:
             "--binarysource=clear;files,$GITHUB_WORKSPACE/$VCPKG_BINARY_CACHE,readwrite" \
             --clean-after-build
           ln -s "$GITHUB_WORKSPACE/$VCPKG_INSTALL_ROOT" "$GITHUB_WORKSPACE/vcpkg_installed"
+
+      - name: Save vcpkg binary cache
+        if: steps.restore-vcpkg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: build/vcpkg-binary-cache
+          key: ${{ steps.restore-vcpkg-cache.outputs.cache-primary-key }}
 
       - name: Download ONNX Runtime
         shell: bash
@@ -320,6 +360,17 @@ jobs:
             fi
           fi
 
+      - name: Save binary dependency archives
+        if: steps.restore-dependency-archives.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            deps/*.tgz
+            deps/*.tar.gz
+            deps/*.zip
+            deps/*.conda
+          key: ${{ steps.restore-dependency-archives.outputs.cache-primary-key }}
+
       - name: Verify Linux native dependencies
         shell: bash
         run: |
@@ -420,4 +471,5 @@ jobs:
             -DAGENTLOOM_CONSUMER_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/vcpkg/scripts/buildsystems/vcpkg.cmake" \
             -DAGENTLOOM_CONSUMER_TRIPLET="$VCPKG_TRIPLET" \
             -DAGENTLOOM_CONSUMER_VCPKG_INSTALLED_DIR="$GITHUB_WORKSPACE/$VCPKG_INSTALL_ROOT" \
+            -DAGENTLOOM_CONSUMER_BOOST_ROOT="$GITHUB_WORKSPACE/deps/boost_1_85_0" \
             -P cmake/AgentLoomPackageConsumerTest.cmake

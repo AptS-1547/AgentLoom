@@ -32,7 +32,9 @@ jobs:
       VCPKG_INSTALL_ROOT: build/linux-vcpkg-installed
       VCPKG_BINARY_CACHE: build/vcpkg-binary-cache
       VCPKG_MAX_CONCURRENCY: 4
-      CMAKE_BUILD_PARALLEL_LEVEL: 4
+      # 4-way cache-miss builds were slower on the 4-vCPU hosted runner; keep
+      # two compiler jobs while allowing vcpkg's independent ports more concurrency.
+      CMAKE_BUILD_PARALLEL_LEVEL: 2
       CCACHE_DIR: ${{ github.workspace }}/build/ccache
       CCACHE_BASEDIR: ${{ github.workspace }}
       CCACHE_COMPILERCHECK: content

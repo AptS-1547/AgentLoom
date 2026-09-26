@@ -31,8 +31,13 @@ jobs:
       VCPKG_TRIPLET: x64-linux-release
       VCPKG_INSTALL_ROOT: build/linux-vcpkg-installed
       VCPKG_BINARY_CACHE: build/vcpkg-binary-cache
-      VCPKG_MAX_CONCURRENCY: 2
-      CMAKE_BUILD_PARALLEL_LEVEL: 2
+      VCPKG_MAX_CONCURRENCY: 4
+      CMAKE_BUILD_PARALLEL_LEVEL: 4
+      CCACHE_DIR: ${{ github.workspace }}/build/ccache
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_COMPILERCHECK: content
+      CCACHE_CACHE_VERSION: v2
+      MIN_FREE_DISK_GIB: 35
       DEPS_CACHE_VERSION: v2
       ONNXRUNTIME_URL: https://github.com/microsoft/onnxruntime/releases/download/v1.17.1/onnxruntime-linux-x64-1.17.1.tgz
       ONNXRUNTIME_ARCHIVE: deps/onnxruntime-linux-x64-1.17.1.tgz
@@ -71,18 +76,16 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install zstandard
 
-      - name: Free disk space
+      - name: Report runner resources
         shell: bash
         run: |
-          df -h
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /usr/local/.ghcup
-          sudo rm -rf /usr/share/swift
-          sudo docker image prune -af || true
-          sudo apt-get clean
-          df -h
+          echo "logical_cpus=$(nproc)"
+          free -h
+          df -h "$GITHUB_WORKSPACE"
+
+      - name: Ensure build disk space
+        shell: bash
+        run: bash ./.github/scripts/ensure-disk-space.sh
 
       - name: Install build tools and prebuilt small packages
         shell: bash
@@ -123,13 +126,14 @@ jobs:
           restore-keys: |
             ${{ env.CACHE_PLATFORM }}-ci-deps-
 
-      - name: Cache compiler outputs
-        uses: actions/cache@v4
+      - name: Restore compiler outputs
+        id: restore-compiler-cache
+        uses: actions/cache/restore@v4
         with:
-          path: ~/.cache/ccache
-          key: ${{ env.CACHE_PLATFORM }}-${{ env.VCPKG_TRIPLET }}-ccache-${{ github.sha }}
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ env.CACHE_PLATFORM }}-${{ env.VCPKG_TRIPLET }}-ccache-${{ env.CCACHE_CACHE_VERSION }}-${{ github.sha }}
           restore-keys: |
-            ${{ env.CACHE_PLATFORM }}-${{ env.VCPKG_TRIPLET }}-ccache-
+            ${{ env.CACHE_PLATFORM }}-${{ env.VCPKG_TRIPLET }}-ccache-${{ env.CCACHE_CACHE_VERSION }}-
 
       - name: Cache Rust dependencies and tokenizer outputs
         uses: Swatinem/rust-cache@v2
@@ -388,13 +392,12 @@ jobs:
 
       - name: Configure tests
         shell: bash
-        env:
-          CCACHE_BASEDIR: ${{ github.workspace }}
-          CCACHE_COMPILERCHECK: content
-          CCACHE_DIR: ~/.cache/ccache
         run: |
+          mkdir -p "$CCACHE_DIR"
+          ccache --set-config=cache_dir="$CCACHE_DIR"
           ccache --set-config=max_size=500M
           ccache --zero-stats || true
+          ccache --show-config
           cmake -S . -B "$BUILD_DIR" \
             -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
@@ -410,10 +413,6 @@ jobs:
 
       - name: Build test targets
         shell: bash
-        env:
-          CCACHE_BASEDIR: ${{ github.workspace }}
-          CCACHE_COMPILERCHECK: content
-          CCACHE_DIR: ~/.cache/ccache
         run: |
           cmake --build "$BUILD_DIR" --target \
             core_tests \
@@ -427,7 +426,14 @@ jobs:
             service_tests \
             async_grpc_runtime_tests \
             --parallel
-          ccache --show-stats || true
+          ccache --show-stats --verbose || true
+
+      - name: Save compiler outputs
+        if: always() && steps.restore-compiler-cache.outcome == 'success' && steps.restore-compiler-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ steps.restore-compiler-cache.outputs.cache-primary-key }}
 
       - name: Run tests
         shell: bash
@@ -438,10 +444,6 @@ jobs:
 
       - name: Configure minimal package
         shell: bash
-        env:
-          CCACHE_BASEDIR: ${{ github.workspace }}
-          CCACHE_COMPILERCHECK: content
-          CCACHE_DIR: ~/.cache/ccache
         run: |
           cmake -S . -B build/gha-linux-package \
             -G Ninja \

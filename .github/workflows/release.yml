@@ -22,6 +22,13 @@ env:
   RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
+  CMAKE_BUILD_PARALLEL_LEVEL: 4
+  VCPKG_MAX_CONCURRENCY: 4
+  CCACHE_DIR: ${{ github.workspace }}/build/ccache
+  CCACHE_BASEDIR: ${{ github.workspace }}
+  CCACHE_COMPILERCHECK: content
+  CCACHE_CACHE_VERSION: v2
+  MIN_FREE_DISK_GIB: 35
 
 jobs:
   build:
@@ -66,18 +73,16 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install onnx grpcio protobuf
 
-      - name: Free disk space
+      - name: Report runner resources
         shell: bash
         run: |
-          df -h
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /usr/local/.ghcup
-          sudo rm -rf /usr/share/swift
-          sudo docker image prune -af || true
-          sudo apt-get clean
-          df -h
+          echo "logical_cpus=$(nproc)"
+          free -h
+          df -h "$GITHUB_WORKSPACE"
+
+      - name: Ensure build disk space
+        shell: bash
+        run: bash ./.github/scripts/ensure-disk-space.sh
 
       - name: Restore vcpkg binary cache
         id: restore-vcpkg-cache
@@ -100,13 +105,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ninja-build pkg-config curl tar unzip zip ccache
 
-      - name: Cache ccache
-        uses: actions/cache@v4
+      - name: Restore compiler outputs
+        id: restore-compiler-cache
+        uses: actions/cache/restore@v4
         with:
-          path: ~/.cache/ccache
-          key: ${{ matrix.os }}-${{ matrix.triplet }}-ccache-${{ github.sha }}
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ matrix.os }}-${{ matrix.triplet }}-ccache-${{ env.CCACHE_CACHE_VERSION }}-${{ github.sha }}
           restore-keys: |
-            ${{ matrix.os }}-${{ matrix.triplet }}-ccache-
+            ${{ matrix.os }}-${{ matrix.triplet }}-ccache-${{ env.CCACHE_CACHE_VERSION }}-
 
       - name: Cache Rust dependencies and tokenizer outputs
         uses: Swatinem/rust-cache@v2
@@ -164,13 +170,12 @@ jobs:
 
       - name: Configure
         shell: bash
-        env:
-          CCACHE_BASEDIR: ${{ github.workspace }}
-          CCACHE_COMPILERCHECK: content
-          CCACHE_DIR: ~/.cache/ccache
         run: |
+          mkdir -p "$CCACHE_DIR"
+          ccache --set-config=cache_dir="$CCACHE_DIR"
           ccache --set-config=max_size=500M
           ccache --zero-stats || true
+          ccache --show-config
           cmake -S . -B "${{ matrix.build_dir }}" \
             -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
@@ -181,13 +186,16 @@ jobs:
 
       - name: Build
         shell: bash
-        env:
-          CCACHE_BASEDIR: ${{ github.workspace }}
-          CCACHE_COMPILERCHECK: content
-          CCACHE_DIR: ~/.cache/ccache
         run: |
           cmake --build "${{ matrix.build_dir }}" --parallel
-          ccache --show-stats || true
+          ccache --show-stats --verbose || true
+
+      - name: Save compiler outputs
+        if: always() && steps.restore-compiler-cache.outcome == 'success' && steps.restore-compiler-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ steps.restore-compiler-cache.outputs.cache-primary-key }}
 
       - name: Generate smoke-test model
         run: |

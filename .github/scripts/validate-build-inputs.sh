@@ -6,6 +6,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 required_files=(
     "vcpkg.json"
     "rust-toolchain.toml"
+    ".github/scripts/ensure-disk-space.sh"
     "triplets/ci/x64-linux-release.cmake"
     "third_party/hf_tokenizers_capi/Cargo.toml"
     "third_party/hf_tokenizers_capi/Cargo.lock"
